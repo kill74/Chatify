@@ -1,0 +1,5 @@
+error: can't find bin `clicord-server` at path `C:\Users\Guilherme Sales\Documents\Projects\Chatify\src\main.rs`
+ --> C:\Users\Guilherme Sales\Documents\Projects\Chatify\Cargo.toml
+error: can't find bin `clicord-server` at path `C:\Users\Guilherme Sales\Documents\Projects\Chatify\src\main.rs`
+ --> C:\Users\Guilherme Sales\Documents\Projects\Chatify\Cargo.toml
+error: could not compile due to 2 previous target resolution errors

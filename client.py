@@ -177,6 +177,28 @@ class Client:
         elif t == "err":
             self.show(f"{RED}error: {d.get('m','')}{R}")
 
+    #  Themes 
+    # Add theme support to client.py
+THEMES = {
+    "default": {"prompt": BLU, "user": CYN, "system": YLW},
+    "matrix": {"prompt": GRN, "user": GRN, "system": DIM + GRN},
+    "ocean": {"prompt": CYN, "user": BLU, "system": MAG},
+    "fire": {"prompt": RED, "user": YLW, "system": RED}
+}
+
+class Client:
+    def __init__(self):
+        # ... existing code ...
+        self.theme = "default"
+    
+    def set_theme(self, theme_name):
+        if theme_name in THEMES:
+            self.theme = theme_name
+            self.show(f"{GRN}Theme changed to {theme_name}{R}")
+        else:
+            self.show(f"{RED}Unknown theme. Available: {', '.join(THEMES.keys())}{R}")
+       
+
     # ── commands ──
 
     async def cmd(self, line):
