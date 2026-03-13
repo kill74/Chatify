@@ -498,3 +498,10 @@ Lines starting with `ALSA lib pcm.c:` are harmless warnings from the audio libra
 ## License
 
 GPL v3 — see [LICENSE](LICENSE).
+---
+## Logging and Testing
+
+- Python client now supports runtime logging via the --log flag. Example: `python client.py --log`.
+- Quick log sanity check: `python client.py --log-test` to print sample log lines to stdout.
+- You can also enable logging via environment variables: set CHATIFY_LOG=1 or LOGGING=1.
+- Rust server logging is not wired in this repo yet; we can enable similar on the Rust side if you want.

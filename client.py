@@ -26,6 +26,14 @@ def ucol(name): return _UCOLORS[sum(ord(c) for c in name) % len(_UCOLORS)]
 def ts(): return datetime.now().strftime("%H:%M")
 def p(text): print(text, flush=True)
 
+# Lightweight runtime logger (enabled via CLI flag or environment)
+LOGGING_ENABLED = False
+
+def log_line(level, message):
+    if LOGGING_ENABLED:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] {level}: {message}", flush=True)
+
 def pline(text=""):
     w = os.get_terminal_size().columns if sys.stdout.isatty() else 60
     p(f"{DIM}{'─'*w}{R}" if not text else f"{DIM}── {text} {'─'*(w-len(text)-4)}{R}")
@@ -112,6 +120,7 @@ class Client:
 
     async def connect(self, uri, username, password):
         self.me, self.pw = username, password
+        log_line("INFO", f"connecting to {uri} as {username}")
         p(f"{DIM}connecting to {BOLD}{uri}{R}{DIM}…{R}")
         self.ws = await websockets.connect(uri, ping_interval=20, ping_timeout=10)
 
@@ -127,6 +136,7 @@ class Client:
             raise ConnectionRefusedError(resp.get("m", "auth failed"))
 
         self.me = resp.get("u", username)
+        log_line("INFO", f"logged in as {self.me}. online users: {len(resp.get('users', []))}")
         for u in resp.get("users", []):
             self.users[u["u"]] = u.get("pk", "")
 
@@ -143,6 +153,7 @@ class Client:
         t, now_ts = d.get("t"), datetime.fromtimestamp(d.get("ts", time.time())).strftime("%H:%M")
 
         if t == "msg":
+            log_line("DEBUG", f"recv message t={t} ch={d.get('ch','?')} u={d.get('u','?')}")
             ch, u = d.get("ch","?"), d.get("u","?")
             try:
                 content = dec(self.ckey(ch), d["c"])
@@ -169,6 +180,7 @@ class Client:
                 self.show(f"{RED}[can't decrypt image from {u}]{R}", now_ts)
 
         elif t == "dm":
+            log_line("DEBUG", f"recv dm t={t} from {d.get('from','?')} to {d.get('to','?')}")
             frm, to = d.get("from","?"), d.get("to","?")
             outgoing = frm == self.me
             peer = to if outgoing else frm
@@ -184,6 +196,7 @@ class Client:
                 self.show(f"{RED}[can't decrypt dm]{R}", now_ts)
 
         elif t == "sys":
+            log_line("DEBUG", f"sys message: {d.get('m','')}")
             self.show(f"{YLW}{d.get('m','')}{R}", now_ts)
 
         elif t == "users":
@@ -196,16 +209,19 @@ class Client:
             self.show(f"{DIM}online ({len(self.users)}):{R} {names}")
 
         elif t == "joined":
+            log_line("DEBUG", f"joined channel #{d.get('ch','?')}")
             ch = d.get("ch","?")
             self.ch = ch; self.chs.add(ch)
             self.show(f"{CYN}→ #{ch}{R}")
             self.show_history(d.get("hist", []))
 
         elif t == "info":
+            log_line("DEBUG", f"info update: chs={d.get('chs','[]')}")
             chs = "  ".join(f"#{c}" for c in d.get("chs", []))
             self.show(f"{DIM}channels: {chs}  │  online: {d.get('online','?')}{R}")
 
         elif t == "vdata":
+            log_line("DEBUG", "voice data update")
             if self.voice:
                 self.voice.receive(d.get("a", ""))
 
@@ -312,6 +328,7 @@ class Client:
                 self.show(f"{RED}{e}{R}")
 
         elif c == "/image":
+            log_line("DEBUG", f"/image command invoked: path={parts[1] if len(parts)>1 else ''}")
             if len(parts) < 2:
                 return self.show(f"{RED}usage: /image <path>{R}")
             path = Path(parts[1].strip("'\""))
@@ -588,7 +605,18 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--tls", action="store_true")
+    ap.add_argument("--log", action="store_true", help="enable runtime logging to stdout")
+    ap.add_argument("--log-test", action="store_true", help="print sample log output for testing and exit")
     args = ap.parse_args()
+
+    # Enable logging via flag or environment variable
+    global LOGGING_ENABLED
+    LOGGING_ENABLED = bool(args.log or os.environ.get("CHATIFY_LOG") == "1" or os.environ.get("LOGGING") == "1")
+    if args.log_test:
+        log_line("INFO", "Logging test started")
+        log_line("DEBUG", "test-value=42")
+        log_line("INFO", "Logging test finished")
+        return
 
     scheme = "wss" if args.tls else "ws"
     uri = f"{scheme}://{args.host}:{args.port}"
