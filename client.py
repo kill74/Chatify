@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# clicord client — python client.py [--host IP] [--port 8765]
+# clicord client — python3 client.py [--host IP] [--port 8765]
 import argparse, asyncio, base64, getpass, json, os, sys, time
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +30,15 @@ def pline(text=""):
     w = os.get_terminal_size().columns if sys.stdout.isatty() else 60
     p(f"{DIM}{'─'*w}{R}" if not text else f"{DIM}── {text} {'─'*(w-len(text)-4)}{R}")
 
+# ── themes ───────────────────────────────────────────────────────────────────
+
+THEMES = {
+    "default": {"prompt": BLU, "user": CYN, "system": YLW},
+    "matrix": {"prompt": GRN, "user": GRN, "system": DIM + GRN},
+    "ocean": {"prompt": CYN, "user": BLU, "system": MAG},
+    "fire": {"prompt": RED, "user": YLW, "system": RED}
+}
+
 # ── client ───────────────────────────────────────────────────────────────────
 
 class Client:
@@ -46,6 +55,13 @@ class Client:
         self.running = True
         self.voice = None
         self.in_voice = False
+        self.theme = "default"
+        self.file_transfers = {}  # track ongoing file transfers
+        self.message_history = [] # store recent messages for search
+        self.status = {"text": "Online", "emoji": "🟢"}
+        self.status = {"text": "Away", "emoji": "🟡"}
+        self.status = {"text": "Offline", "emoji": "🔴"}
+        self.reactions = {}       # message_id → {emoji: count}
 
     def ckey(self, ch):
         if ch not in self.chan_keys:
@@ -63,6 +79,15 @@ class Client:
 
     def show(self, text, t=None):
         p(f"{DIM}{t or ts()}{R}  {text}")
+        # Store in message history for search
+        self.message_history.append({
+            "time": t or ts(),
+            "text": text,
+            "timestamp": time.time()
+        })
+        # Keep only last 100 messages
+        if len(self.message_history) > 100:
+            self.message_history.pop(0)
 
     def show_history(self, msgs):
         if not msgs: return
@@ -79,8 +104,9 @@ class Client:
         pline()
 
     def prompt_str(self):
+        theme_prompt = THEMES[self.theme]["prompt"]
         v = " 🎙" if self.in_voice else ""
-        return f"{DIM}[{R}{CYN}{self.me}{R}{DIM}@#{self.ch}{R}{DIM}]{R}{v}{BLU} ›{R} "
+        return f"{DIM}[{R}{theme_prompt}{self.me}{R}{DIM}@#{self.ch}{R}{DIM}]{R}{v}{theme_prompt} ›{R} "
 
     # ── connect ──
 
@@ -93,6 +119,7 @@ class Client:
             "t": "auth", "u": username,
             "pw": pw_hash(password),
             "pk": pub_b64(self.priv),
+            "status": self.status
         }))
 
         resp = json.loads(await self.ws.recv())
@@ -122,6 +149,10 @@ class Client:
                 tag = f"{DIM}#{ch}{R} " if ch != self.ch else ""
                 me_tag = f"{DIM} (you){R}" if u == self.me else ""
                 self.show(f"{ucol(u)}{BOLD}{u}{R}{me_tag} {tag}{content}", now_ts)
+                
+                # Desktop notification for mentions
+                if self.me.lower() in content.lower() and u != self.me:
+                    self.notify("Mention", f"{u}: {content}")
             except:
                 self.show(f"{RED}[can't decrypt from {u}]{R}", now_ts)
 
@@ -145,6 +176,10 @@ class Client:
                 content = dec(self.dmkey(peer), d["c"])
                 arrow = f"{DIM}→{R}" if outgoing else f"{MAG}←{R}"
                 self.show(f"{MAG}{BOLD}dm{R} {arrow} {BOLD}{peer}{R}: {content}", now_ts)
+                
+                # Desktop notification for DMs
+                if not outgoing:
+                    self.notify("Direct Message", f"From {frm}: {content}")
             except:
                 self.show(f"{RED}[can't decrypt dm]{R}", now_ts)
 
@@ -177,27 +212,85 @@ class Client:
         elif t == "err":
             self.show(f"{RED}error: {d.get('m','')}{R}")
 
-    #  Themes 
-    # Add theme support to client.py
-THEMES = {
-    "default": {"prompt": BLU, "user": CYN, "system": YLW},
-    "matrix": {"prompt": GRN, "user": GRN, "system": DIM + GRN},
-    "ocean": {"prompt": CYN, "user": BLU, "system": MAG},
-    "fire": {"prompt": RED, "user": YLW, "system": RED}
-}
+        elif t == "file_meta":
+            sender = d.get("from", "?")
+            filename = d.get("filename", "unknown")
+            size = d.get("size", 0)
+            file_id = d.get("file_id", f"{sender}_{time.time()}")
+            
+            self.file_transfers[file_id] = {
+                "filename": filename,
+                "size": size,
+                "chunks": [],
+                "received": 0
+            }
+            self.show(f"{ucol(sender)}{sender}{R} wants to send file: {filename} ({size} bytes)")
 
-class Client:
-    def __init__(self):
-        # ... existing code ...
-        self.theme = "default"
-    
-    def set_theme(self, theme_name):
-        if theme_name in THEMES:
-            self.theme = theme_name
-            self.show(f"{GRN}Theme changed to {theme_name}{R}")
-        else:
-            self.show(f"{RED}Unknown theme. Available: {', '.join(THEMES.keys())}{R}")
-       
+        elif t == "file_chunk":
+            file_id = d.get("file_id")
+            if file_id in self.file_transfers:
+                chunk_data = d.get("data", "")
+                self.file_transfers[file_id]["chunks"].append(chunk_data)
+                self.file_transfers[file_id]["received"] += 1
+                
+                # Check if complete
+                total_chunks = (self.file_transfers[file_id]["size"] + 8191) // 8192
+                if len(self.file_transfers[file_id]["chunks"]) >= total_chunks:
+                    self.save_received_file(file_id)
+
+        elif t == "status_update":
+            user = d.get("user")
+            status = d.get("status", {})
+            # Update user status in memory
+            if user in self.users:
+                self.users[user]["status"] = status
+            self.show(f"{ucol(user)}{user}{R} is now {status.get('emoji', '🟢')} {status.get('text', 'Online')}")
+
+        elif t == "reaction":
+            msg_id = d.get("msg_id")
+            emoji = d.get("emoji")
+            user = d.get("user")
+            if msg_id not in self.reactions:
+                self.reactions[msg_id] = {}
+            if emoji not in self.reactions[msg_id]:
+                self.reactions[msg_id][emoji] = 0
+            self.reactions[msg_id][emoji] += 1
+            self.show(f"{ucol(user)}{user}{R} reacted with {emoji}")
+
+    def save_received_file(self, file_id):
+        file_info = self.file_transfers[file_id]
+        filename = file_info["filename"]
+        chunks = file_info["chunks"]
+        
+        # Decode and reconstruct file
+        import base64
+        full_data = "".join(chunks)
+        file_data = base64.b64decode(full_data)
+        
+        # Save to downloads folder
+        downloads_dir = Path.home() / "Downloads"
+        downloads_dir.mkdir(exist_ok=True)
+        save_path = downloads_dir / filename
+        
+        with open(save_path, 'wb') as f:
+            f.write(file_data)
+            
+        self.show(f"{GRN}✓ File saved: {save_path}{R}")
+        del self.file_transfers[file_id]
+
+    def notify(self, title, message):
+        """Send desktop notification"""
+        try:
+            if os.name == 'nt':  # Windows
+                from win10toast import ToastNotifier
+                toaster = ToastNotifier()
+                toaster.show_toast(title, message, duration=5)
+            elif sys.platform == 'darwin':  # macOS
+                os.system(f"osascript -e 'display notification \"{message}\" with title \"{title}\"'")
+            else:  # Linux
+                os.system(f"notify-send '{title}' '{message}'")
+        except:
+            pass  # Silently fail if notifications aren't available
 
     # ── commands ──
 
@@ -270,11 +363,99 @@ class Client:
                 ("/voice",             "toggle voice chat"),
                 ("/clear",             "clear screen"),
                 ("/quit",              "exit"),
+                ("/theme <name>",      "change theme"),
+                ("/file <path>",       "send file to channel"),
+                ("/search <query>",    "search message history"),
+                ("/status <text>",     "set your status"),
+                ("/react <emoji>",     "react to last message"),
             ]
             pline("help")
             for cmd_s, desc in cmds:
                 p(f"  {CYN}{cmd_s:<22}{R} {DIM}{desc}{R}")
             pline()
+            p(f"{DIM}themes: {', '.join(THEMES.keys())}{R}")
+
+        elif c == "/theme":
+            theme_name = parts[1] if len(parts) > 1 else "default"
+            if theme_name in THEMES:
+                self.theme = theme_name
+                self.show(f"{GRN}Theme changed to {theme_name}{R}")
+            else:
+                self.show(f"{RED}Unknown theme. Available: {', '.join(THEMES.keys())}{R}")
+
+        elif c == "/file":
+            if len(parts) < 2:
+                return self.show(f"{RED}usage: /file <path>{R}")
+            path = Path(parts[1].strip("'\""))
+            if not path.exists():
+                return self.show(f"{RED}file not found: {path}{R}")
+            
+            # Read file and send
+            with open(path, 'rb') as f:
+                file_data = f.read()
+            
+            import base64
+            encoded = base64.b64encode(file_data).decode()
+            filename = path.name
+            file_id = f"{self.me}_{int(time.time())}"
+            
+            # Send metadata
+            await self.ws.send(json.dumps({
+                "t": "file_meta",
+                "ch": self.ch,
+                "filename": filename,
+                "size": len(file_data),
+                "file_id": file_id
+            }))
+            
+            # Send chunks
+            chunk_size = 8192
+            chunks = [encoded[i:i+chunk_size] for i in range(0, len(encoded), chunk_size)]
+            
+            for i, chunk in enumerate(chunks):
+                await self.ws.send(json.dumps({
+                    "t": "file_chunk",
+                    "ch": self.ch,
+                    "data": chunk,
+                    "index": i,
+                    "file_id": file_id
+                }))
+            
+            self.show(f"{GRN}✓ File sent: {filename}{R}")
+
+        elif c == "/search":
+            query = " ".join(parts[1:]) if len(parts) > 1 else ""
+            if not query:
+                return self.show(f"{RED}usage: /search <query>{R}")
+            
+            results = [msg for msg in self.message_history 
+                      if query.lower() in msg["text"].lower()]
+            
+            if results:
+                pline(f"search results for '{query}'")
+                for result in results[-10:]:  # Show last 10 matches
+                    p(f"{DIM}{result['time']}{R}  {result['text']}")
+                pline()
+            else:
+                self.show(f"{DIM}No results found for '{query}'{R}")
+
+        elif c == "/status":
+            status_text = " ".join(parts[1:]) if len(parts) > 1 else "Online"
+            self.status["text"] = status_text
+            await self.ws.send(json.dumps({
+                "t": "status",
+                "status": self.status
+            }))
+            self.show(f"{GRN}Status updated: {status_text}{R}")
+
+        elif c == "/react":
+            emoji = parts[1] if len(parts) > 1 else "👍"
+            # React to last message (would need message ID tracking)
+            await self.ws.send(json.dumps({
+                "t": "reaction",
+                "emoji": emoji,
+                "msg_id": "last"  # Simplified - would need actual message IDs
+            }))
 
         else:
             self.show(f"{RED}unknown command. /help for list{R}")

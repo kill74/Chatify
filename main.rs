@@ -56,6 +56,8 @@ struct State {
     users:      DashMap<String, String>,                      // name → pubkey
     channels:   DashMap<String, Channel>,
     voice:      DashMap<String, broadcast::Sender<String>>,   // room → audio tx
+    user_statuses: DashMap<String, Value>,                    // user → status
+    file_transfers: DashMap<String, Value>,                   // file_id → metadata
 }
 
 impl State {
@@ -65,6 +67,8 @@ impl State {
             users:    DashMap::new(),
             channels: DashMap::new(),
             voice:    DashMap::new(),
+            user_statuses: DashMap::new(),
+            file_transfers: DashMap::new(),
         });
         s.channels.insert("general".into(), Channel::new());
         s
@@ -84,7 +88,13 @@ impl State {
     fn users_json(&self) -> Value {
         Value::Array(
             self.users.iter()
-                .map(|e| serde_json::json!({"u": e.key(), "pk": e.value()}))
+                .map(|e| {
+                    let mut user_obj = serde_json::json!({"u": e.key(), "pk": e.value()});
+                    if let Some(status) = self.user_statuses.get(e.key()) {
+                        user_obj["status"] = status.clone();
+                    }
+                    user_obj
+                })
                 .collect()
         )
     }
@@ -147,8 +157,10 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     let base = if base.is_empty() { "anon" } else { base };
     let username = state.unique_name(base);
     let pubkey = d["pk"].as_str().unwrap_or("").to_string();
+    let status = d.get("status").cloned().unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
 
     state.users.insert(username.clone(), pubkey.clone());
+    state.user_statuses.insert(username.clone(), status);
 
     // subscribe to #general
     let general = state.chan("general");
@@ -161,11 +173,14 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 
     if sink.send(Message::Text(ok)).await.is_err() {
         state.users.remove(&username);
+        state.user_statuses.remove(&username);
         return;
     }
 
     // announce join
-    for e in state.channels.iter() { let _ = e.tx.send(sys(&format!("→ {} joined", username))); }
+    for e in state.channels.iter() { 
+        let _ = e.tx.send(sys(&format!("→ {} joined", username))); 
+    }
 
     log(&format!("+ {}", username));
 
@@ -309,12 +324,90 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 }
             }
             "ping" => { let _ = out_tx.send(r#"{"t":"pong"}"#.into()); }
+            
+            "file_meta" => {
+                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+                let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
+                let size = d["size"].as_u64().unwrap_or(0);
+                let file_id = d["file_id"].as_str().unwrap_or(&format!("{}_{}", username, now())).to_string();
+                
+                state.file_transfers.insert(file_id.clone(), d.clone());
+                
+                let file_announce = serde_json::json!({
+                    "t": "file_meta",
+                    "from": username,
+                    "filename": filename,
+                    "size": size,
+                    "file_id": file_id,
+                    "ch": ch,
+                    "ts": now()
+                }).to_string();
+                
+                let _ = state.chan(&ch).tx.send(file_announce);
+            }
+            
+            "file_chunk" => {
+                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+                let file_id = d["file_id"].as_str().unwrap_or("").to_string();
+                let chunk_data = d["data"].as_str().unwrap_or("").to_string();
+                let index = d["index"].as_u64().unwrap_or(0);
+                
+                // Forward chunk to channel
+                let chunk_msg = serde_json::json!({
+                    "t": "file_chunk",
+                    "from": username,
+                    "file_id": file_id,
+                    "data": chunk_data,
+                    "index": index,
+                    "ch": ch,
+                    "ts": now()
+                }).to_string();
+                
+                let _ = state.chan(&ch).tx.send(chunk_msg);
+            }
+            
+            "status" => {
+                if let Some(status_val) = d.get("status") {
+                    state.user_statuses.insert(username.clone(), status_val.clone());
+                    
+                    // Broadcast status update
+                    let status_update = serde_json::json!({
+                        "t": "status_update",
+                        "user": username,
+                        "status": status_val
+                    }).to_string();
+                    
+                    // Send to all channels
+                    for chan_entry in state.channels.iter() {
+                        let _ = chan_entry.tx.send(status_update.clone());
+                    }
+                }
+            }
+            
+            "reaction" => {
+                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+                let emoji = d["emoji"].as_str().unwrap_or("👍").to_string();
+                let msg_id = d["msg_id"].as_str().unwrap_or("unknown").to_string();
+                
+                let reaction_msg = serde_json::json!({
+                    "t": "reaction",
+                    "user": username,
+                    "emoji": emoji,
+                    "msg_id": msg_id,
+                    "ch": ch,
+                    "ts": now()
+                }).to_string();
+                
+                let _ = state.chan(&ch).tx.send(reaction_msg);
+            }
+            
             _ => {}
         }
     }
 
     // cleanup
     state.users.remove(&username);
+    state.user_statuses.remove(&username);
     let leave = sys(&format!("✖ {} left", username));
     for e in state.channels.iter() { let _ = e.tx.send(leave.clone()); }
     log(&format!("- {}", username));
@@ -335,6 +428,7 @@ async fn main() {
 
     println!("clicord running on ws://{addr}");
     println!("encryption: chacha20-poly1305 + x25519 | ip privacy: on");
+    println!("enhanced features: file transfer, themes, reactions, status");
     println!("ctrl+c to stop\n");
 
     loop {
