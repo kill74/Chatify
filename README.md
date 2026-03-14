@@ -2,14 +2,14 @@
 
 ```
         __          __  _ ____
-  _____/ /_  ____ _/ /_(_) __/_  __
- / ___/ __ \/ __ `/ __/ / /_/ / / /
-/ /__/ / / / /_/ / /_/ / __/ /_/ /
-\___/_/ /_/\__,_/\__/_/_/  \__, /
-                          /____/
+   _____/ /_  ____ _/ /_(_) __/_  __
+  / ___/ __ \/ __ `/ __/ / /_/ / / /
+ /__/ / / / /_/ / /_/ / __/ /_/ /
+ \___/_/ /_/\__,_/\__/_/_/  \__, /
+                           /____/
 ```
 
-A Discord-like chat app that runs entirely in your terminal. Self-hosted on your own machine — no accounts, no cloud, no IP leaks, no telemetry. End-to-end encrypted. Rust server, Python client.
+A Discord-like chat app that runs entirely in your terminal. Self-hosted on your own machine — no accounts, no cloud, no IP leaks, no telemetry. End-to-end encrypted. Rust server and client.
 
 ---
 
@@ -32,6 +32,7 @@ A Discord-like chat app that runs entirely in your terminal. Self-hosted on your
 - [File Structure](#file-structure)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
+- [Logging and Testing](#logging-and-testing)
 
 ---
 
@@ -54,45 +55,52 @@ A Discord-like chat app that runs entirely in your terminal. Self-hosted on your
 
 ## Requirements
 
-**Server** (the person hosting):
-- Linux x86-64 — pre-built binary included
-- OR: any OS with Rust installed to compile from source
-
-**Clients** (everyone connecting):
-- Python 3.9+
-- `websockets`, `cryptography`, `Pillow`
-- Voice chat (optional): `pyaudio` + system audio libraries
+**Server and Client** (everyone):
+- Rust toolchain (to build from source) — any OS that supports Rust
+- Optional: For voice chat, system audio libraries (see below)
 
 ---
 
 ## Installation
 
-### 1. Install Python dependencies
+### 1. Install Rust
 
 ```bash
-pip install -r requirements.txt
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
 ```
 
-### 2. (Optional) Install voice chat support
+### 2. (Optional) Install voice chat dependencies
 
 Voice is entirely optional — all other features work without it.
 
 **Ubuntu / Debian:**
 ```bash
 sudo apt install portaudio19-dev
-pip install pyaudio
 ```
 
 **macOS:**
 ```bash
 brew install portaudio
-pip install pyaudio
 ```
 
 **Windows:**
+No additional system packages needed; the Rust crates will work with the default audio system.
+
+---
+
+## Building from Source
+
 ```bash
-pip install pyaudio
+git clone <repository-url>
+cd chatify
+cargo build --release
+# binaries will be at:
+#   target/release/clicord-server
+#   target/release/clicord-client
 ```
+
+`Cargo.lock` is included so you get the exact same dependency versions.
 
 ---
 
@@ -101,8 +109,7 @@ pip install pyaudio
 One person in your group runs this. Everyone else connects to their IP.
 
 ```bash
-chmod +x chatify-server   # first time only
-./chatify-server
+./target/release/clicord-server
 ```
 
 You'll be prompted to set a password. Share it with your group over a secure channel (Signal, in person, etc.). It's never written to disk — memory only, gone when the server stops.
@@ -110,12 +117,13 @@ You'll be prompted to set a password. Share it with your group over a secure cha
 **Options:**
 
 ```bash
-./chatify-server --host 0.0.0.0 --port 8765    # default: all interfaces
-./chatify-server --host 127.0.0.1              # localhost only (for Tor)
-./chatify-server --port 9000                   # custom port
+./target/release/clicord-server --host 0.0.0.0 --port 8765    # default: all interfaces
+./target/release/clicord-server --host 127.0.0.1              # localhost only (for Tor)
+./target/release/clicord-server --port 9000                   # custom port
 ```
 
 **Example output:**
+
 ```
 server password:
 chatify running on ws://0.0.0.0:8765
@@ -135,20 +143,22 @@ The server logs joins and leaves only. No messages, no IPs, nothing else.
 ## Connecting as a Client
 
 ```bash
-python client.py
+./target/release/clicord-client
 ```
 
 Enter your username and the server password. If the username is taken, the server appends a number (`alice_1`, etc.).
 
 **Remote server:**
+
 ```bash
-python client.py --host 192.168.1.50              # LAN
-python client.py --host 12.34.56.78               # internet
-python client.py --host 12.34.56.78 --port 9000   # custom port
-python client.py --host example.com --tls         # with TLS
+./target/release/clicord-client --host 192.168.1.50              # LAN
+./target/release/clicord-client --host 12.34.56.78               # internet
+./target/release/clicord-client --host 12.34.56.78 --port 9000   # custom port
+./target/release/clicord-client --host example.com --tls         # with TLS
 ```
 
 **After connecting:**
+
 ```
 chatify  logged in as alice  │  #general  │  3 online
 type /help for commands
@@ -174,7 +184,7 @@ Type to chat. Use `/` to run commands.
 | `/me <action>` | Emote. Shows as `* alice does something`. |
 | `/users` | List everyone currently online. |
 | `/channels` | List all channels on the server. |
-| `/voice` | Toggle voice chat for your current channel. Run again to leave. Requires pyaudio. |
+| `/voice` | Toggle voice chat for your current channel. Run again to leave. |
 | `/clear` | Clear the terminal. |
 | `/help` | Show command reference. |
 | `/edit <new_text>` | Edit your last sent message in the current channel. |
@@ -210,14 +220,14 @@ password + channel name
    32-byte symmetric key
         │
         ▼
-  ChaCha20-Poly1305
-  + random 12-byte nonce (per message)
+   ChaCha20-Poly1305
+   + random 12-byte nonce (per message)
         │
         ▼
-  base64(nonce + ciphertext)
+   base64(nonce + ciphertext)
         │
         ▼
-  server relays  ──►  all channel members decrypt locally
+   server relays  ──►  all channel members decrypt locally
 ```
 
 Key points:
@@ -249,7 +259,7 @@ Keypairs are regenerated every session for session-level forward secrecy.
 ### What the Server Can and Cannot See
 
 | Data | Server can read it? |
-|---|---|
+|------|---------------------|
 | Usernames | ✅ Yes — routing requires it |
 | Channel names | ✅ Yes — routing requires it |
 | Message content | ❌ No — ciphertext only |
@@ -269,19 +279,19 @@ The server never includes remote addresses in any relayed payload. Other users o
 Chat history is a `VecDeque` in RAM, stored as ciphertext. No database, no log files, no persistence layer of any kind. When the server stops, everything is gone.
 
 **No telemetry.**
-The server binary makes zero outbound connections after startup. No analytics, no pinging an update server, no phoning home. Verify with `strace -e network ./chatify-server` or `ss -tp` if you want to be sure.
+The server binary makes zero outbound connections after startup. No analytics, no pinging an update server, no phoning home. Verify with `strace -e network ./target/release/clicord-server` or `ss -tp` if you want to be sure.
 
 **No accounts.**
 No email, no phone number, no registration. Username + shared password — that's the entire auth model.
 
 **Fully auditable.**
-All source code is included. The server is 383 lines of Rust, the client is 408 lines of Python, and the crypto helpers are 70 lines. Read every line yourself.
+All source code is included. The server and client are Rust programs. Read every line yourself.
 
 ---
 
 ## Voice Chat
 
-```bash
+```
 /voice    # join voice in current channel
 /voice    # run again to leave
 ```
@@ -302,13 +312,13 @@ Voice is channel-scoped. Each channel has its own voice room. You can be in `#ge
 
 ## Sending Images
 
-```bash
+```
 /image /absolute/path/to/photo.jpg
 /image ~/Desktop/meme.png
 /image "./folder with spaces/image.gif"
 ```
 
-**Supported formats:** JPEG, PNG, GIF, BMP, WEBP, and anything else Pillow can open.
+**Supported formats:** JPEG, PNG, GIF, BMP, WEBP, and anything else `image` crate can open.
 
 **Conversion pipeline:**
 1. Alpha transparency composited over a black background
@@ -324,13 +334,13 @@ Displays inline framed with box-drawing characters. Looks best at 100+ terminal 
 
 ## Performance
 
-| Metric | chatify (Rust) | Python server |
-|---|---|---|
-| Binary size | 1.5 MB stripped | ~30 MB (Python + deps) |
-| RAM at idle | ~2 MB | ~30 MB |
-| Startup time | <10 ms | ~150 ms |
-| Message relay latency | <1 ms (LAN) | 1–5 ms (LAN) |
-| GC pauses | None | Occasional |
+| Metric | chatify (Rust) |
+|--------|----------------|
+| Binary size | ~3-5 MB stripped (server and client similar) |
+| RAM at idle | ~2-5 MB |
+| Startup time | <10 ms |
+| Message relay latency | <1 ms (LAN) |
+| GC pauses | None |
 
 **Why it's fast:**
 
@@ -344,7 +354,7 @@ Run as a Tor hidden service so neither side learns the other's real IP. The serv
 
 **1. Bind to localhost only:**
 ```bash
-./chatify-server --host 127.0.0.1 --port 8765
+./target/release/clicord-server --host 127.0.0.1 --port 8765
 ```
 
 **2. Add to `/etc/tor/torrc`:**
@@ -366,7 +376,7 @@ sudo cat /var/lib/tor/chatify/hostname
 
 **5. Clients connect with torsocks:**
 ```bash
-torsocks python client.py --host ab3cde4fgh567ijk.onion --port 8765
+torsocks ./target/release/clicord-client --host ab3cde4fgh567ijk.onion --port 8765
 ```
 
 Combined with chatify's E2E encryption, this is about as private as CLI chat gets.
@@ -385,48 +395,15 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
 
 **Start server with TLS:**
 ```bash
-./chatify-server --tls --cert cert.pem --key key.pem
+./target/release/clicord-server --tls --cert cert.pem --key key.pem
 ```
 
 **Clients connect with `--tls`:**
 ```bash
-python client.py --host yourserver.com --tls
+./target/release/clicord-client --host yourserver.com --tls
 ```
 
 For a browser-trusted cert, use Let's Encrypt with a real domain name.
-
----
-
-## Building from Source
-
-The included binary targets Linux x86-64. For macOS, Windows, ARM, or if you'd rather not run pre-built binaries:
-
-**Install Rust:**
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-```
-
-**Build:**
-```bash
-cargo build --release
-# binary ends up at: target/release/chatify-server
-```
-
-`Cargo.lock` is included so you get the exact same dependency versions.
-
-**Dependencies:**
-
-| Crate | Purpose |
-|---|---|
-| `tokio` | Async runtime, TCP listener, sync primitives |
-| `tokio-tungstenite` | Async WebSocket server |
-| `futures-util` | Async stream and sink utilities |
-| `serde` + `serde_json` | JSON serialisation |
-| `dashmap` | Lock-free concurrent hash maps |
-| `sha2` | SHA-256 for password hashing |
-| `hex` | Hex encoding of hash output |
-| `clap` | CLI argument parsing |
 
 ---
 
@@ -434,23 +411,19 @@ cargo build --release
 
 ```
 chatify/
-├── chatify-server        Pre-built Linux x86-64 server binary (1.5 MB, stripped)
 ├── src/
-│   └── main.rs           Rust server source (383 lines)
+│   ├── main.rs           Rust server source
+│   └── client.rs         Rust client source
 ├── Cargo.toml            Rust dependency manifest
 ├── Cargo.lock            Pinned dependency versions
-├── client.py             Python client (408 lines)
-├── utils.py              Crypto + ASCII art helpers (70 lines)
-├── requirements.txt      Python dependencies
 ├── LICENSE               GPL v3
 ├── .gitattributes        Git line ending normalisation
 └── .prettierrc           Code formatter config
 ```
 
 **Who runs what:**
-- **Host:** `./chatify-server`
-- **Everyone else:** `python client.py --host <server-ip>`
-- `utils.py` must be in the same directory as `client.py`
+- **Host:** `./target/release/clicord-server`
+- **Everyone else:** `./target/release/clicord-client --host <server-ip>`
 
 ---
 
@@ -468,27 +441,22 @@ That name is already taken. Pick a different one or wait for the other session t
 **Messages show `[can't decrypt]`**
 Password mismatch somewhere. Everyone must use the exact same password — channel keys are derived from it deterministically.
 
-**`voice needs pyaudio`**
-Install pyaudio. See [Installation](#installation). Everything else works without it.
-
 **Voice is choppy or cuts out**
 Usually packet loss on a bad connection. The buffer holds ~2.4s but heavy loss still causes gaps. Make sure your mic is set as the default input device (`arecord -l` on Linux, System Preferences on macOS).
 
 **Image looks squished or stretched**
 The 0.45 aspect correction is calibrated for typical monospace fonts. Unusual terminal fonts with very different character proportions will skew the output. Terminal limitation, not a bug.
 
-**`ModuleNotFoundError`**
-Run `pip install -r requirements.txt` from inside the chatify directory.
-
-**`Permission denied` on the binary**
+**Permission denied on the binary**
 ```bash
-chmod +x chatify-server
+chmod +x target/release/clicord-server
+chmod +x target/release/clicord-client
 ```
 
 **Port already in use**
 ```bash
-./chatify-server --port 8766
-python client.py --host <ip> --port 8766
+./target/release/clicord-server --port 8766
+./target/release/clicord-client --host <ip> --port 8766
 ```
 
 **ALSA warnings on Linux during voice chat**
@@ -499,17 +467,14 @@ Lines starting with `ALSA lib pcm.c:` are harmless warnings from the audio libra
 ## License
 
 GPL v3 — see [LICENSE](LICENSE).
+
 ---
+
 ## Logging and Testing
 
-### Python Client
-- Enable runtime logging: `python client.py --log`
-- Quick log test: `python client.py --log-test` (prints sample logs and exits)
-- Environment variables: set CHATIFY_LOG=1 or LOGGING=1
-
-### Rust Server
-- Enable logging: `./chatify-server --log`
-- Logs show connection events (+username when joining, -username when leaving)
-- Logs are opt-in to avoid noisy output by default
+### Client and Server
+- Enable runtime logging: `./target/release/clicord-client --log` or `./target/release/clicord-server --log`
+- Quick log test: `./target/release/clicord-client --log-test` (prints sample logs and exits)
+- Environment variables: set `CHATIFY_LOG=1` or `LOGGING=1`
 
 Both logging systems provide timestamped output with levels (INFO, DEBUG) to help diagnose issues and verify functionality.

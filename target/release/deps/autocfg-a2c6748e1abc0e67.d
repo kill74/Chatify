@@ -1,0 +1,10 @@
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\autocfg-a2c6748e1abc0e67.d: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\error.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\rustc.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\version.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\libautocfg-a2c6748e1abc0e67.rlib: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\error.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\rustc.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\version.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\libautocfg-a2c6748e1abc0e67.rmeta: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\error.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\rustc.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\version.rs
+
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\lib.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\error.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\rustc.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\autocfg-1.5.0\src\version.rs:

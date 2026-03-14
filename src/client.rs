@@ -11,7 +11,11 @@ use hex::{self, FromHex};
 use pbkdf2::pbkdf2;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use rodio::{self, OutputStream, OutputStreamHandle, Sink};
 use sha2::Sha256;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -20,7 +24,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, DisableLineWrap, EnableLineWrap, SetSize},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, DisableLineWrap, EnableLineWrap},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -47,24 +51,23 @@ fn dh_key(priv: &StaticSecret, pubkey_b64: &str) -> Vec<u8> {
     secret.as_bytes().to_vec()
 }
 
-fn enc(key: &[u8], plaintext: &str) -> String {
+fn enc_bytes(key: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let nonce = chaCha20_nonce();
     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("Key length must be 32 bytes");
-    let ciphertext = cipher.encrypt(nonce.as_ref(), plaintext.as_bytes()).expect("Encryption failure");
+    let ciphertext = cipher.encrypt(nonce.as_ref(), plaintext).expect("Encryption failure");
     let mut combined = nonce.to_vec();
     combined.extend_from_slice(&ciphertext);
-    general_purpose::STANDARD.encode(combined)
+    combined
 }
 
-fn dec(key: &[u8], ciphertext_b64: &str) -> String {
-    let combined = general_purpose::STANDARD.decode(ciphertext_b64).expect("Invalid base64");
-    if combined.len() < 12 {
+fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    if ciphertext.len() < 12 {
         panic!("Ciphertext too short");
     }
-    let (nonce, ciphertext) = combined.split_at(12);
+    let (nonce, ciphertext) = ciphertext.split_at(12);
     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("Key length must be 32 bytes");
     let plaintext = cipher.decrypt(nonce, ciphertext).expect("Decryption failure");
-    String::from_utf8(plaintext).expect("Invalid UTF-8")
+    plaintext.to_vec()
 }
 
 fn chaCha20_nonce() -> [u8; 12] {
@@ -126,7 +129,7 @@ struct ClientState {
     priv_key: StaticSecret,
     running: bool,
     voice_active: bool,
-    theme: Theme,
+    theme: String, // Simple theme name for now
     file_transfers: HashMap<String, FileTransfer>,
     message_history: Vec<DisplayedMessage>,
     status: Status,
@@ -157,31 +160,6 @@ struct Status {
     emoji: char,
 }
 
-#[derive(Debug, Clone)]
-struct Theme {
-    prompt: Color,
-    user: Color,
-    system: Color,
-    info: Color,
-    error: Color,
-    timestamp: Color,
-    highlight: Color,
-}
-
-impl Theme {
-    fn default() -> Self {
-        Self {
-            prompt: Color::Blue,
-            user: Color::Cyan,
-            system: Color::Yellow,
-            info: Color::Green,
-            error: Color::Red,
-            timestamp: Color::DarkGrey,
-            highlight: Color::White,
-        }
-    }
-}
-
 impl ClientState {
     fn new(ws_tx: mpsc::UnboundedSender<Message>, password: String, log_enabled: bool) -> Self {
         let priv_key = StaticSecret::new(OsRng);
@@ -199,7 +177,7 @@ impl ClientState {
             priv_key,
             running: true,
             voice_active: false,
-            theme: Theme::default(),
+            theme: "default".to_string(),
             file_transfers: HashMap::new(),
             message_history: Vec::new(),
             status: Status {
@@ -247,8 +225,13 @@ fn format_time(ts: u64) -> String {
     datetime.format("%H:%M").to_string()
 }
 
+// Simple image to ASCII conversion (placeholder)
+fn img_to_ascii(_: &[u8], _: u16) -> String {
+    "[Image sending not yet implemented in Rust client]".to_string()
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let matches = clap::Command::new("clicord-client")
         .arg(
@@ -295,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::error::Error>> {
         input.trim().to_string()
     };
 
-    let password = rpassword::prompt_password_stdout("password: ").unwrap();
+    let password = rpassword::prompt_password("password: ").unwrap();
 
     // Set up logging
     if log_enabled {
@@ -348,7 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::error::Error>> {
             priv_key: new_keypair(),
             running: true,
             voice_active: false,
-            theme: Theme::default(),
+            theme: "default".to_string(),
             file_transfers: HashMap::new(),
             message_history: Vec::new(),
             status: Status {
@@ -360,105 +343,14 @@ async fn main() -> Result<(), Box<dyn std::error::error::Error>> {
         }));
         state.lock().await.me = me;
 
-        // Set up terminal for TUI
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
-        // Clone state for UI task
+        // Spawn tasks for reading from WebSocket and from stdin
         let state_clone = state.clone();
-        let ui_task = tokio::spawn(async move {
-            loop {
-                // Draw UI
-                let state = state_clone.lock().unwrap();
-                terminal.draw(|f| {
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .margin(1)
-                        .constraints([
-                            Constraint::Length(3), // Header
-                            Constraint::Min(0),    // Message list
-                            Constraint::Length(3), // Input
-                        ])
-                        .split(f.size());
-
-                    // Header
-                    let header = Paragraph::new(format!(
-                        "{} [{}] ({} online)",
-                        state.me,
-                        state.ch,
-                        state.users.len()
-                    ))
-                    .style(Style::default().fg(state.theme.prompt))
-                    .block(Block::default().borders(Borders::ALL).title("Chatify"));
-                    f.render_widget(header, chunks[0]);
-
-                    // Message list
-                    let messages: Vec<ListItem> = state
-                        .message_history
-                        .iter()
-                        .map(|msg| {
-                            let time = &msg.time;
-                            let user = msg.user.as_deref().unwrap_or("?");
-                            let text = &msg.text;
-                            let style = match msg.msg_type {
-                                MessageType::Msg => Style::default().fg(state.theme.user),
-                                MessageType::Sys => Style::default().fg(state.theme.system),
-                                MessageType::Err => Style::default().fg(state.theme.error),
-                                _ => Style::default(),
-                            };
-                            let content = Line::from(vec![
-                                Span::styled(format!("[{}] ", time), Style::default().fg(state.theme.timestamp)),
-                                Span::styled(user.to_string(), style),
-                                Span::raw(": "),
-                                Span::styled(text.to_string(), Style::default()),
-                            ]);
-                            ListItem::new(content)
-                        })
-                        .collect();
-                    let messages_list = List::new(messages)
-                        .block(Block::default().borders(Borders::ALL).title("Messages"));
-                    f.render_widget(messages_list, chunks[1]);
-
-                    // Input
-                    let input = Paragraph::new("> ")
-                        .style(Style::default().fg(state.theme.prompt))
-                        .block(Block::default().borders(Borders::ALL).title("Input"));
-                    f.render_widget(input, chunks[2]);
-                })
-                .unwrap();
-
-                // Handle events
-                if event::poll(std::time::Duration::from_millis(16)).unwrap() {
-                    if let Event::Key(key) = event::read().unwrap() {
-                        match key.code {
-                            KeyCode::Enter => {
-                                // We'll handle input submission later
-                                // For now, just break on Enter for testing
-                                break;
-                            }
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                // Ctrl+C to quit
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        });
-
-        // Task to read from WebSocket and update state
-        let state_clone2 = state.clone();
         let rx_task = tokio::spawn(async move {
             while let Some(Ok(msg)) = ws_rx.next().await {
                 match msg {
                     Message::Text(text) => {
                         if let Ok(data) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&text) {
                             // Process message and update state
-                            // We'll implement a simplified version
                             let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
                             let ts = data.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
                             match t {
@@ -466,12 +358,43 @@ async fn main() -> Result<(), Box<dyn std::error::error::Error>> {
                                     let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
                                     let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
                                     let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                                    if let Ok(content) = dec(&state_clone2.lock().unwrap().ckey(ch), c) {
-                                        let mut state = state_clone2.lock().unwrap();
+                                    let encrypted = match general_purpose::STANDARD.decode(c) {
+                                        Ok(bytes) => bytes,
+                                        Err(_) => continue,
+                                    };
+                                    if let Ok(content) = dec_bytes(&state_clone.lock().await.ckey(ch), &encrypted) {
+                                        let mut state = state_clone.lock().await;
                                         state.message_history.push(DisplayedMessage {
                                             time: format_time(ts),
-                                            text: content,
+                                            text: String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string()),
                                             msg_type: MessageType::Msg,
+                                            user: Some(u.to_string()),
+                                            channel: Some(ch.to_string()),
+                                        });
+                                        // Keep only last 100 messages
+                                        if state.message_history.len() > 100 {
+                                            state.message_history.remove(0);
+                                        }
+                                    }
+                                }
+                                "img" => {
+                                    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+                                    let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let a = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
+                                    let encrypted = match general_purpose::STANDARD.decode(a) {
+                                        Ok(bytes) => bytes,
+                                        Err(_) => continue,
+                                    };
+                                    if let Ok(ascii_art) = img_to_ascii(&encrypted, 70) {
+                                        let mut state = state_clone.lock().await;
+                                        state.message_history.push(DisplayedMessage {
+                                            time: format_time(ts),
+                                            text: format!(
+                                                "{} sent an image:\n{}",
+                                                data.get("u").and_then(|v| v.as_str()).unwrap_or("?"),
+                                                ascii_art
+                                            ),
+                                            msg_type: MessageType::Img,
                                             user: Some(u.to_string()),
                                             channel: Some(ch.to_string()),
                                         });
@@ -483,10 +406,90 @@ async fn main() -> Result<(), Box<dyn std::error::error::Error>> {
                                 }
                                 "sys" => {
                                     let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
-                                    let mut state = state_clone2.lock().unwrap();
+                                    let mut state = state_clone.lock().await;
                                     state.message_history.push(DisplayedMessage {
                                         time: format_time(ts),
                                         text: m.to_string(),
+                                        msg_type: MessageType::Sys,
+                                        user: None,
+                                        channel: None,
+                                    });
+                                    if state.message_history.len() > 100 {
+                                        state.message_history.remove(0);
+                                    }
+                                }
+                                "dm" => {
+                                    let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                                    let encrypted = match general_purpose::STANDARD.decode(c) {
+                                        Ok(bytes) => bytes,
+                                        Err(_) => continue,
+                                    };
+                                    if let Ok(content) = dec_bytes(&state_clone.lock().await.dmkey(if frm == state_clone.lock().await.me { &to } else { &frm }), &encrypted) {
+                                        let mut state = state_clone.lock().await;
+                                        let arrow = if frm == state_clone.lock().await.me { "→" } else { "←" };
+                                        state.message_history.push(DisplayedMessage {
+                                            time: format_time(ts),
+                                            text: format!("{} {} {}", frm, arrow, content),
+                                            msg_type: MessageType::Dm,
+                                            user: Some(frm.to_string()),
+                                            channel: None,
+                                        });
+                                        if state.message_history.len() > 100 {
+                                            state.message_history.remove(0);
+                                        }
+                                    }
+                                }
+                                "users" => {
+                                    let mut state = state_clone.lock().await;
+                                    let names: Vec<String> = serde_json::from_value(data.get("users").unwrap_or(&serde_json::json!([])).clone())?;
+                                    state.message_history.push(DisplayedMessage {
+                                        time: format_time(ts),
+                                        text: format!("Online users: {}", names.join(", ")),
+                                        msg_type: MessageType::Sys,
+                                        user: None,
+                                        channel: None,
+                                    });
+                                    if state.message_history.len() > 100 {
+                                        state.message_history.remove(0);
+                                    }
+                                }
+                                "joined" => {
+                                    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+                                    let mut state = state_clone.lock().await;
+                                    state.ch = ch.clone();
+                                    state.chs.insert(ch.clone(), true);
+                                    state.message_history.push(DisplayedMessage {
+                                        time: format_time(ts),
+                                        text: format!("→ #{}", ch),
+                                        msg_type: MessageType::Sys,
+                                        user: None,
+                                        channel: None,
+                                    });
+                                    if state.message_history.len() > 100 {
+                                        state.message_history.remove(0);
+                                    }
+                                    // Send request for history
+                                    let _ = state.ws_tx.send(Message::Text(
+                                        serde_json::json!({
+                                            "t": "join",
+                                            "ch": ch,
+                                            "ts": SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs()
+                                        })
+                                        .to_string(),
+                                    ));
+                                }
+                                "info" => {
+                                    let mut state = state_clone.lock().await;
+                                    let chs: Vec<String> = serde_json::from_value(data.get("chs").unwrap_or(&serde_json::json!([])).clone())?;
+                                    let online = data.get("online").as_u64().unwrap_or(0);
+                                    state.message_history.push(DisplayedMessage {
+                                        time: format_time(ts),
+                                        text: format!("Channels: {} | Online: {}", chs.join(", "), online),
                                         msg_type: MessageType::Sys,
                                         user: None,
                                         channel: None,
@@ -504,53 +507,159 @@ async fn main() -> Result<(), Box<dyn std::error::error::Error>> {
             }
         });
 
-        // Task to read from stdin and send messages
-        let state_clone3 = state.clone();
+        let state_clone2 = state.clone();
         let stdin_task = tokio::spawn(async move {
-            let mut input = String::new();
-            loop {
-                input.clear();
-                if io::stdin().read_line(&mut input).unwrap() == 0 {
-                    break;
-                }
-                let input = input.trim();
-                if input.is_empty() {
+            let stdin = tokio_io::BufReader::new(tokio_io::stdin());
+            let mut lines = stdin.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim();
+                if line.is_empty() {
                     continue;
                 }
-                if input.starts_with('/') {
+                if line.starts_with('/') {
                     // Handle commands
-                    // For simplicity, we'll just send as a regular message for now
-                    // In a full implementation, we'd parse commands
+                    let mut parts = line.splitn(2, ' ');
+                    let cmd = parts.next().unwrap_or("");
+                    let args = parts.next().unwrap_or("");
+
+                    let mut state = state_clone2.lock().await;
+                    match cmd {
+                        "/join" => {
+                            let ch = args.trim().trim_start_matches('#');
+                            if !ch.is_empty() {
+                                state.ch = ch.to_string();
+                                state.chs.insert(ch.to_string(), true);
+                                // Request history for the channel
+                                let _ = state.ws_tx.send(Message::Text(
+                                    serde_json::json!({
+                                        "t": "join",
+                                        "ch": ch,
+                                        "ts": SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    })
+                                    .to_string(),
+                                ));
+                            }
+                        }
+                        "/dm" => {
+                            let mut parts = args.splitn(2, ' ');
+                            let target = parts.next().unwrap_or("");
+                            let msg = parts.next().unwrap_or("");
+                            if !target.is_empty() && !msg.is_empty() {
+                                let encrypted = enc_bytes(&state.dmkey(target), msg.as_bytes());
+                                let encoded = general_purpose::STANDARD.encode(&encrypted);
+                                let _ = state.ws_tx.send(Message::Text(
+                                    serde_json::json!({
+                                        "t": "dm",
+                                        "to": target,
+                                        "c": encoded,
+                                        "ts": SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    })
+                                    .to_string(),
+                                ));
+                            }
+                        }
+                        "/me" => {
+                            let action = args;
+                            if !action.is_empty() {
+                                let msg = format!("* {} {}", state.me, action);
+                                let encrypted = enc_bytes(&state.ckey(&state.ch), msg.as_bytes());
+                                let encoded = general_purpose::STANDARD.encode(&encrypted);
+                                let _ = state.ws_tx.send(Message::Text(
+                                    serde_json::json!({
+                                        "t": "msg",
+                                        "ch": state.ch,
+                                        "c": encoded,
+                                        "ts": SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    })
+                                    .to_string(),
+                                ));
+                            }
+                        }
+                        "/users" => {
+                            let _ = state.ws_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "t": "users",
+                                    "ts": SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                })
+                                .to_string(),
+                            ));
+                        }
+                        "/channels" => {
+                            let _ = state.ws_tx.send(Message::Text(
+                                serde_json::json!({
+                                    "t": "info",
+                                    "ts": SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                })
+                                .to_string(),
+                            ));
+                        }
+                        "/voice" => {
+                            // Placeholder for voice toggle
+                            state.log("INFO", "Voice command not yet implemented in Rust client");
+                        }
+                        "/clear" => {
+                            // Clear the terminal by printing many newlines
+                            for _ in 0..50 {
+                                println!();
+                            }
+                        }
+                        "/help" => {
+                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice, /clear, /edit, /help, /quit");
+                        }
+                        "/edit" => {
+                            // Placeholder for edit
+                            state.log("INFO", "Edit command not yet implemented in Rust client");
+                        }
+                        "/quit" | "/exit" | "/q" => {
+                            state.running = false;
+                            break;
+                        }
+                        _ => {
+                            state.log("INFO", &format!("Unknown command: {}", cmd));
+                        }
+                    }
+                } else {
+                    // Send as a regular message
+                    let encrypted = enc_bytes(&state.ckey(&state.ch), line.as_bytes());
+                    let encoded = general_purpose::STANDARD.encode(&encrypted);
+                    let _ = state.ws_tx.send(Message::Text(
+                        serde_json::json!({
+                            "t": "msg",
+                            "ch": state.ch,
+                            "c": encoded,
+                            "ts": SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                            .as_secs()
+                        })
+                        .to_string(),
+                    ));
                 }
-                // Encrypt and send message
-                let state = state_clone3.lock().unwrap();
-                if let Ok(encrypted) = enc(&state.ckey(&state.ch), input) {
-                    let msg = serde_json::json!({
-                        "t": "msg",
-                        "ch": state.ch,
-                        "c": encrypted,
-                        "ts": SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    });
-                    let _ = state.ws_tx.send(Message::Text(msg.to_string()));
-                }
-                // Clear input for next iteration
             }
         });
 
-        // Wait for tasks to complete (they will break on Ctrl+C or Enter in UI)
-        let _ = ui_task.await;
+        // Wait for tasks to complete
         let _ = rx_task.await;
         let _ = stdin_task.await;
 
-        // Restore terminal
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
+        // Clean up
+        let mut state = state.lock().await;
+        state.running = false;
     }
 
     Ok(())

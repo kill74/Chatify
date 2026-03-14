@@ -1,0 +1,9 @@
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\futures_macro-b8411b9372ca26c5.d: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\executor.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\join.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\select.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\stream_select.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\futures_macro-b8411b9372ca26c5.dll: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\executor.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\join.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\select.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\stream_select.rs
+
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\lib.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\executor.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\join.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\select.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.32\src\stream_select.rs:

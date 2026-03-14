@@ -1,0 +1,10 @@
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\dasp_sample-fee8fc159ca50cd8.d: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\conv.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\ops.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\types.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\libdasp_sample-fee8fc159ca50cd8.rlib: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\conv.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\ops.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\types.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\libdasp_sample-fee8fc159ca50cd8.rmeta: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\conv.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\ops.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\types.rs
+
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\lib.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\conv.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\ops.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\dasp_sample-0.11.0\src\types.rs:

@@ -1,7 +1,0 @@
-websockets>=12.0
-cryptography>=42.0
-Pillow>=10.0
-
-# voice (optional):
-# ubuntu: sudo apt install portaudio19-dev && pip install pyaudio
-# mac:    brew install portaudio && pip install pyaudio
