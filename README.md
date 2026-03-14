@@ -177,6 +177,7 @@ Type to chat. Use `/` to run commands.
 | `/voice` | Toggle voice chat for your current channel. Run again to leave. Requires pyaudio. |
 | `/clear` | Clear the terminal. |
 | `/help` | Show command reference. |
+| `/edit <new_text>` | Edit your last sent message in the current channel. |
 | `/quit` | Disconnect and exit. Also: `/exit`, `/q`. |
 
 **Examples:**
@@ -501,7 +502,14 @@ GPL v3 — see [LICENSE](LICENSE).
 ---
 ## Logging and Testing
 
-- Python client now supports runtime logging via the --log flag. Example: `python client.py --log`.
-- Quick log sanity check: `python client.py --log-test` to print sample log lines to stdout.
-- You can also enable logging via environment variables: set CHATIFY_LOG=1 or LOGGING=1.
-- Rust server logging is not wired in this repo yet; we can enable similar on the Rust side if you want.
+### Python Client
+- Enable runtime logging: `python client.py --log`
+- Quick log test: `python client.py --log-test` (prints sample logs and exits)
+- Environment variables: set CHATIFY_LOG=1 or LOGGING=1
+
+### Rust Server
+- Enable logging: `./chatify-server --log`
+- Logs show connection events (+username when joining, -username when leaving)
+- Logs are opt-in to avoid noisy output by default
+
+Both logging systems provide timestamped output with levels (INFO, DEBUG) to help diagnose issues and verify functionality.

@@ -20,7 +20,7 @@ CYN = "\033[96m"
 WHT = "\033[97m"
 
 # colour per username (deterministic)
-_UCOLORS = [CYN, GRN, MAG, YLW, BLU, RED, WHT, "\033[36m", "\033[32m", "\033[35m"]
+_UCOLORS = [BOLD + CYN, BOLD + GRN, BOLD + MAG, BOLD + YLW, BOLD + BLU, BOLD + RED, BOLD + WHT, BOLD + "\033[36m", BOLD + "\033[32m", BOLD + "\033[35m"]
 def ucol(name): return _UCOLORS[sum(ord(c) for c in name) % len(_UCOLORS)]
 
 def ts(): return datetime.now().strftime("%H:%M")
@@ -41,10 +41,51 @@ def pline(text=""):
 # ── themes ───────────────────────────────────────────────────────────────────
 
 THEMES = {
-    "default": {"prompt": BLU, "user": CYN, "system": YLW},
-    "matrix": {"prompt": GRN, "user": GRN, "system": DIM + GRN},
-    "ocean": {"prompt": CYN, "user": BLU, "system": MAG},
-    "fire": {"prompt": RED, "user": YLW, "system": RED}
+    "default": {
+        "prompt": BOLD + BLU,      # Prompt brackets, @, #, channel, and › symbol
+        "user": BOLD + CYN,        # Username in prompt and message username color
+        "system": YLW,             # System messages
+        "info": BOLD + GRN,        # Info messages (join/leave, etc.)
+        "error": BOLD + RED,       # Error messages
+        "timestamp": DIM,          # Timestamp color
+        "highlight": BOLD + WHT    # Highlighted text
+    },
+    "matrix": {
+        "prompt": BOLD + GRN,
+        "user": BOLD + GRN,
+        "system": DIM + GRN,
+        "info": BOLD + GRN,
+        "error": BOLD + RED,
+        "timestamp": DIM + GRN,
+        "highlight": BOLD + WHT
+    },
+    "ocean": {
+        "prompt": BOLD + CYN,
+        "user": BOLD + BLU,
+        "system": MAG,
+        "info": BOLD + GRN,
+        "error": BOLD + RED,
+        "timestamp": DIM + CYN,
+        "highlight": BOLD + WHT
+    },
+    "fire": {
+        "prompt": BOLD + RED,
+        "user": BOLD + YLW,
+        "system": BOLD + RED,
+        "info": BOLD + GRN,
+        "error": BOLD + RED,
+        "timestamp": DIM + RED,
+        "highlight": BOLD + WHT
+    },
+    "dark": {
+        "prompt": BOLD + BLU,
+        "user": BOLD + CYN,
+        "system": YLW,
+        "info": BOLD + GRN,
+        "error": BOLD + RED,
+        "timestamp": DIM + WHT,
+        "highlight": BOLD + WHT
+    }
 }
 
 # ── client ───────────────────────────────────────────────────────────────────
@@ -67,8 +108,6 @@ class Client:
         self.file_transfers = {}  # track ongoing file transfers
         self.message_history = [] # store recent messages for search
         self.status = {"text": "Online", "emoji": "🟢"}
-        self.status = {"text": "Away", "emoji": "🟡"}
-        self.status = {"text": "Offline", "emoji": "🔴"}
         self.reactions = {}       # message_id → {emoji: count}
 
     def ckey(self, ch):
@@ -106,9 +145,9 @@ class Client:
             if m.get("t") == "msg":
                 try:
                     content = dec(self.ckey(m.get("ch", self.ch)), m["c"])
-                    self.show(f"{ucol(u)}{u}{R}  {content}", t)
+                    self.show(f"{ucol(u)}{u}{R}  {content}", t, "user")
                 except:
-                    self.show(f"{ucol(u)}{u}{R}  {DIM}[encrypted]{R}", t)
+                    self.show(f"{ucol(u)}{u}{R}  {DIM}[encrypted]{R}", t, "system")
         pline()
 
     def prompt_str(self):
@@ -159,13 +198,13 @@ class Client:
                 content = dec(self.ckey(ch), d["c"])
                 tag = f"{DIM}#{ch}{R} " if ch != self.ch else ""
                 me_tag = f"{DIM} (you){R}" if u == self.me else ""
-                self.show(f"{ucol(u)}{BOLD}{u}{R}{me_tag} {tag}{content}", now_ts)
+                self.show(f"{ucol(u)}{BOLD}{u}{R}{me_tag} {tag}{content}", now_ts, "user")
                 
                 # Desktop notification for mentions
                 if self.me.lower() in content.lower() and u != self.me:
                     self.notify("Mention", f"{u}: {content}")
             except:
-                self.show(f"{RED}[can't decrypt from {u}]{R}", now_ts)
+                self.show(f"{RED}[can't decrypt from {u}]{R}", now_ts, "error")
 
         elif t == "img":
             ch, u = d.get("ch","?"), d.get("u","?")
@@ -177,27 +216,27 @@ class Client:
                     p(f"{DIM}│{R} {line}")
                 p(f"{DIM}└────────────────────────────────{R}")
             except:
-                self.show(f"{RED}[can't decrypt image from {u}]{R}", now_ts)
+                self.show(f"{RED}[can't decrypt image from {u}]{R}", now_ts, "error")
 
-        elif t == "dm":
-            log_line("DEBUG", f"recv dm t={t} from {d.get('from','?')} to {d.get('to','?')}")
-            frm, to = d.get("from","?"), d.get("to","?")
-            outgoing = frm == self.me
-            peer = to if outgoing else frm
-            try:
-                content = dec(self.dmkey(peer), d["c"])
-                arrow = f"{DIM}→{R}" if outgoing else f"{MAG}←{R}"
-                self.show(f"{MAG}{BOLD}dm{R} {arrow} {BOLD}{peer}{R}: {content}", now_ts)
-                
-                # Desktop notification for DMs
-                if not outgoing:
-                    self.notify("Direct Message", f"From {frm}: {content}")
-            except:
-                self.show(f"{RED}[can't decrypt dm]{R}", now_ts)
-
-        elif t == "sys":
-            log_line("DEBUG", f"sys message: {d.get('m','')}")
-            self.show(f"{YLW}{d.get('m','')}{R}", now_ts)
+         elif t == "dm":
+             log_line("DEBUG", f"recv dm t={t} from {d.get('from','?')} to {d.get('to','?')}")
+             frm, to = d.get("from","?"), d.get("to","?")
+             outgoing = frm == self.me
+             peer = to if outgoing else frm
+             try:
+                 content = dec(self.dmkey(peer), d["c"])
+                 arrow = f"{DIM}→{R}" if outgoing else f"{MAG}←{R}"
+                 self.show(f"{MAG}{BOLD}dm{R} {arrow} {BOLD}{peer}{R}: {content}", now_ts, "system")
+                 
+                 # Desktop notification for DMs
+                 if not outgoing:
+                     self.notify("Direct Message", f"From {frm}: {content}")
+             except:
+                 self.show(f"{RED}[can't decrypt dm]{R}", now_ts, "error")
+        
+         elif t == "sys":
+             log_line("DEBUG", f"sys message: {d.get('m','')}")
+             self.show(d.get('m',''), now_ts)
 
         elif t == "users":
             for u in d.get("users", []):
