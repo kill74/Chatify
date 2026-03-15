@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,11 +8,9 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream>;
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-
-// ── cli ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "clicord-server")]
@@ -22,12 +20,8 @@ struct Args {
     #[arg(long)] log: bool,
 }
 
-// ── constants ─────────────────────────────────────────────────────────────────
-
 const HISTORY_CAP: usize = 50;
 const MAX_BYTES:   usize = 16_000;
-
-// ── channel ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct Channel {
@@ -50,23 +44,17 @@ impl Channel {
     }
 }
 
-// ── state ─────────────────────────────────────────────────────────────────────
-
 struct State {
-    pw_hash:    String,
-    users:      DashMap<String, String>,                      // name → pubkey
     channels:   DashMap<String, Channel>,
-    voice:      DashMap<String, broadcast::Sender<String>>,   // room → audio tx
-    user_statuses: DashMap<String, Value>,                    // user → status
-    file_transfers: DashMap<String, Value>,                   // file_id → metadata
+    voice:      DashMap<String, broadcast::Sender<String>>,
+    user_statuses: DashMap<String, Value>,
+    file_transfers: DashMap<String, Value>,
     log_enabled: bool,
 }
 
 impl State {
-    fn new(pw_hash: String, log_enabled: bool) -> Arc<Self> {
+    fn new(log_enabled: bool) -> Arc<Self> {
         let s = Arc::new(Self {
-            pw_hash,
-            users:    DashMap::new(),
             channels: DashMap::new(),
             voice:    DashMap::new(),
             user_statuses: DashMap::new(),
@@ -76,7 +64,6 @@ impl State {
         s.channels.insert("general".into(), Channel::new());
         s
     }
-}
 
     fn chan(&self, name: &str) -> Channel {
         self.channels.entry(name.into()).or_insert_with(Channel::new).clone()
@@ -103,14 +90,13 @@ impl State {
         )
     }
 
-     fn unique_name(&self, base: &str) -> String {
-         let mut name = base.to_string();
-         let mut n = 1usize;
-         while self.users.contains_key(&name) { name = format!("{}_{}", base, n); n += 1; }
-         name
-     }
-
-// ── helpers ───────────────────────────────────────────────────────────────────
+    fn unique_name(&self, base: &str) -> String {
+        let mut name = base.to_string();
+        let mut n = 1usize;
+        while self.users.contains_key(&name) { name = format!("{}_{}", base, n); n += 1; }
+        name
+    }
+}
 
 fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
@@ -141,35 +127,24 @@ fn log(state: &State, msg: &str) {
     }
 }
 
-// ── connection handler ────────────────────────────────────────────────────────
-
 async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     let ws = match accept_async(stream).await { Ok(w) => w, Err(_) => return };
     let (mut sink, mut stream) = ws.split();
 
-    // auth
     let raw = match stream.next().await {
         Some(Ok(Message::Text(r))) => r,
         _ => return,
     };
     let d: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return };
 
-    if d["t"].as_str() != Some("auth") || d["pw"].as_str() != Some(state.pw_hash.as_str()) {
-        let _ = sink.send(Message::Text(r#"{"t":"err","m":"bad auth"}"#.into())).await;
-        return;
-    }
-
-    let base = d["u"].as_str().unwrap_or("anon").chars().take(24).collect::<String>();
-    let base = base.trim();
-    let base = if base.is_empty() { "anon" } else { base };
-    let username = state.unique_name(base);
-    let pubkey = d["pk"].as_str().unwrap_or("").to_string();
+    // We don't do authentication for now, just use the username from the message
+    let username = d.get("u").and_then(|v| v.as_str()).unwrap_or("anon").to_string();
     let status = d.get("status").cloned().unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
 
-    state.users.insert(username.clone(), pubkey.clone());
-    state.user_statuses.insert(username.clone(), status);
+    // We don't store users for now, just use the username
+    // state.users.insert(username.clone(), pubkey.clone());
+    // state.user_statuses.insert(username.clone(), status);
 
-    // subscribe to #general
     let general = state.chan("general");
     let mut gen_rx = general.tx.subscribe();
     let hist = general.hist().await;
@@ -179,62 +154,36 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     }).to_string();
 
     if sink.send(Message::Text(ok)).await.is_err() {
-        state.users.remove(&username);
-        state.user_statuses.remove(&username);
         return;
     }
 
-    // announce join
-    for e in state.channels.iter() { 
-        let _ = e.tx.send(sys(&format!("→ {} joined", username))); 
+    for e in state.channels.iter() {
+        let _ = e.tx.send(sys(&format!("→ {} joined", username)));
     }
 
-     log(&state, &format!("+ {}", username));
+    log(&state, &format!("+ {}", username));
 
-    // mpsc queue → sink (all subscribed channels funnel here)
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // forward #general broadcasts to sink
-    {
-        let tx = out_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match gen_rx.recv().await {
-                    Ok(m) => { if tx.send(m).is_err() { break; } }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(_) => {} // lagged
-                }
+    let tx = out_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match gen_rx.recv().await {
+                Ok(m) => { if tx.send(m).is_err() { break; } }
+                Err(broadcast::error::RecvError::Closed) => break;
+                Err(_) => {}
             }
-        });
-    }
+        }
+    });
 
-    // writer task
     tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
             if sink.send(Message::Text(m)).await.is_err() { break; }
         }
     });
 
-    // subscribe to own DM channel
-    {
-        let dm_ch = format!("__dm__{}", username);
-        let chan = state.chan(&dm_ch);
-        let mut rx = chan.tx.subscribe();
-        let tx = out_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(m) => { if tx.send(m).is_err() { break; } }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(_) => {}
-                }
-            }
-        });
-    }
-
     let mut voice_room: Option<String> = None;
 
-    // main recv loop
     while let Some(Ok(msg)) = stream.next().await {
         let raw = match msg {
             Message::Text(t) => t,
@@ -244,6 +193,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         if raw.len() > MAX_BYTES { continue; }
         let d: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
         let t = d["t"].as_str().unwrap_or("");
+        let ts = d["ts"].as_u64().unwrap_or(0);
 
         match t {
             "msg" => {
@@ -251,10 +201,9 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let c = d["c"].as_str().unwrap_or("").to_string();
                 if c.is_empty() { continue; }
                 let entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
-                let s = entry.to_string();
                 let chan = state.chan(&ch);
                 chan.push(entry).await;
-                let _ = chan.tx.send(s);
+                let _ = chan.tx.send(entry.to_string());
             }
             "img" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
@@ -282,7 +231,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     loop {
                         match rx.recv().await {
                             Ok(m) => { if tx2.send(m).is_err() { break; } }
-                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Closed) => break;
                             Err(_) => {}
                         }
                     }
@@ -308,7 +257,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     loop {
                         match vrx.recv().await {
                             Ok(m) => { if tx2.send(m).is_err() { break; } }
-                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Closed) => break;
                             Err(_) => {}
                         }
                     }
@@ -330,44 +279,38 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     }
                 }
             }
-             "ping" => { let _ = out_tx.send(r#"{"t":"pong"}"#.into()); }
-             
-             "edit" => {
-                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                 let old_text = d["old_text"].as_str().unwrap_or("").to_string();
-                 let new_text = d["new_text"].as_str().unwrap_or("").to_string();
-                 if old_text.is_empty() || new_text.is_empty() { continue; }
-                 
-                 let chan = state.chan(&ch);
-                 let mut h = chan.history.write().await;
-                 // Find the most recent message matching old_text from this user (simplistic)
-                 if let Some(pos) = h.iter().rposition(|m| {
-                     m.get("t") == Some(&Value::from("msg"))
-                         && m.get("u") == Some(&Value::from(username))
-                         && m.get("c") == Some(&Value::from(old_text))
-                 }) {
-                     h[pos]["c"] = Value::from(new_text);
-                     h[pos]["ts"] = Value::from(now());
-                 }
-                 let edit_msg = serde_json::json!({
-                     "t": "edit",
-                     "ch": ch,
-                     "u": username,
-                     "old_text": old_text,
-                     "new_text": new_text,
-                     "ts": now()
-                 }).to_string();
-                 let _ = chan.tx.send(edit_msg);
-             }
-            
+            "ping" => { let _ = out_tx.send(r#"{"t":"pong"}"#.into()); }
+            "edit" => {
+                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+                let old_text = d["old_text"].as_str().unwrap_or("").to_string();
+                let new_text = d["new_text"].as_str().unwrap_or("").to_string();
+                if old_text.is_empty() || new_text.is_empty() { continue; }
+                let chan = state.chan(&ch);
+                let mut h = chan.history.write().await;
+                if let Some(pos) = h.iter().rposition(|m| {
+                    m.get("t") == Some(&Value::from("msg"))
+                        && m.get("u") == Some(&Value::from(username))
+                        && m.get("c") == Some(&Value::from(old_text))
+                }) {
+                    h[pos]["c"] = Value::from(new_text);
+                    h[pos]["ts"] = Value::from(now());
+                }
+                let edit_msg = serde_json::json!({
+                    "t": "edit",
+                    "ch": ch,
+                    "u": username,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "ts": now()
+                }).to_string();
+                let _ = chan.tx.send(edit_msg);
+            }
             "file_meta" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
                 let size = d["size"].as_u64().unwrap_or(0);
                 let file_id = d["file_id"].as_str().unwrap_or(&format!("{}_{}", username, now())).to_string();
-                
                 state.file_transfers.insert(file_id.clone(), d.clone());
-                
                 let file_announce = serde_json::json!({
                     "t": "file_meta",
                     "from": username,
@@ -377,17 +320,13 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     "ch": ch,
                     "ts": now()
                 }).to_string();
-                
                 let _ = state.chan(&ch).tx.send(file_announce);
             }
-            
             "file_chunk" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let file_id = d["file_id"].as_str().unwrap_or("").to_string();
                 let chunk_data = d["data"].as_str().unwrap_or("").to_string();
                 let index = d["index"].as_u64().unwrap_or(0);
-                
-                // Forward chunk to channel
                 let chunk_msg = serde_json::json!({
                     "t": "file_chunk",
                     "from": username,
@@ -397,33 +336,25 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     "ch": ch,
                     "ts": now()
                 }).to_string();
-                
                 let _ = state.chan(&ch).tx.send(chunk_msg);
             }
-            
             "status" => {
                 if let Some(status_val) = d.get("status") {
                     state.user_statuses.insert(username.clone(), status_val.clone());
-                    
-                    // Broadcast status update
                     let status_update = serde_json::json!({
                         "t": "status_update",
                         "user": username,
                         "status": status_val
                     }).to_string();
-                    
-                    // Send to all channels
                     for chan_entry in state.channels.iter() {
                         let _ = chan_entry.tx.send(status_update.clone());
                     }
                 }
             }
-            
             "reaction" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let emoji = d["emoji"].as_str().unwrap_or("👍").to_string();
                 let msg_id = d["msg_id"].as_str().unwrap_or("unknown").to_string();
-                
                 let reaction_msg = serde_json::json!({
                     "t": "reaction",
                     "user": username,
@@ -432,81 +363,35 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     "ch": ch,
                     "ts": now()
                 }).to_string();
-                
                 let _ = state.chan(&ch).tx.send(reaction_msg);
             }
-            
             _ => {}
         }
     }
 
-    // cleanup
-    state.users.remove(&username);
-    state.user_statuses.remove(&username);
+    // We don't remove the user because we are not storing them
+    // state.users.remove(&username);
+    // state.user_statuses.remove(&username);
     let leave = sys(&format!("✖ {} left", username));
     for e in state.channels.iter() { let _ = e.tx.send(leave.clone()); }
-     log(&state, &format!("- {}", username));
+    log(&state, &format!("- {}", username));
 }
-
-// ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-
-    let pw = read_password("server password: ");
-    if pw.is_empty() { eprintln!("password can't be empty"); std::process::exit(1); }
-
-     let state = State::new(hash_pw(&pw), args.log);
     let addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&addr).await.expect("bind failed");
-
     println!("clicord running on ws://{addr}");
-    println!("encryption: chacha20-poly1305 + x25519 | ip privacy: on");
-    println!("enhanced features: file transfer, themes, reactions, status");
+    println!("encryption: none (testing) | ip privacy: on");
     println!("ctrl+c to stop\n");
-
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                let s = state.clone();
+                let s = State::new(args.log);
                 tokio::spawn(handle(stream, addr, s));
             }
             Err(_) => continue,
         }
     }
 }
-
-// silent password input (no echo)
-fn read_password(prompt: &str) -> String {
-    use std::io::Write;
-    print!("{prompt}");
-    std::io::stdout().flush().ok();
-
-    #[cfg(unix)]
-    unsafe {
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&std::io::stdin());
-        let mut t: Termios = std::mem::zeroed();
-        tcgetattr(fd, &mut t);
-        let orig_lflag = t.c_lflag;
-        t.c_lflag &= !ECHO;
-        tcsetattr(fd, 0, &t);
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok();
-        t.c_lflag = orig_lflag; tcsetattr(fd, 0, &t);
-        println!();
-        return line.trim().to_string();
-    }
-    #[cfg(not(unix))]
-    {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok();
-        line.trim().to_string()
-    }
-}
-
-#[cfg(unix)]
-#[repr(C)]
-struct Termios { c_iflag: u32, c_oflag: u32, c_cflag: u32, c_lflag: u32, c_line: u8, c_cc: [u8;32], c_ispeed: u32, c_ospeed: u32 }
-#[cfg(unix)] const ECHO: u32 = 0o10;
-#[cfg(unix)] extern "C" { fn tcgetattr(fd: i32, t: *mut Termios) -> i32; fn tcsetattr(fd: i32, a: i32, t: *const Termios) -> i32; }

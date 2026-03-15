@@ -13,7 +13,6 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rodio::{self, OutputStream, OutputStreamHandle, Sink};
 use sha2::Sha256;
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -44,10 +43,10 @@ fn channel_key(password: &str, channel: &str) -> Vec<u8> {
     key.to_vec()
 }
 
-fn dh_key(priv: &StaticSecret, pubkey_b64: &str) -> Vec<u8> {
+fn dh_key(priv_key: &StaticSecret, pubkey_b64: &str) -> Vec<u8> {
     let pubkey_bytes = general_purpose::STANDARD.decode(pubkey_b64).expect("Invalid base64");
     let pubkey = PublicKey::from(pubkey_bytes.as_slice());
-    let secret = priv.diffie_hellman(&pubkey);
+    let secret = priv_key.diffie_hellman(&pubkey);
     secret.as_bytes().to_vec()
 }
 
@@ -86,8 +85,8 @@ fn new_keypair() -> StaticSecret {
     StaticSecret::new(OsRng)
 }
 
-fn pub_b64(priv: &StaticSecret) -> String {
-    let pubkey = PublicKey::from(priv);
+fn pub_b64(priv_key: &StaticSecret) -> String {
+    let pubkey = PublicKey::from(priv_key);
     general_purpose::STANDARD.encode(pubkey.as_bytes())
 }
 
