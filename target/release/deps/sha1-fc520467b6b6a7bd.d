@@ -1,0 +1,10 @@
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\sha1-fc520467b6b6a7bd.d: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\soft.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\x86.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\libsha1-fc520467b6b6a7bd.rlib: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\soft.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\x86.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\libsha1-fc520467b6b6a7bd.rmeta: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\soft.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\x86.rs
+
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\lib.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\soft.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha-1-0.10.1\src\compress\x86.rs:

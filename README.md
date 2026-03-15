@@ -469,7 +469,53 @@ Lines starting with `ALSA lib pcm.c:` are harmless warnings from the audio libra
 GPL v3 — see [LICENSE](LICENSE).
 
 ---
+## Discord Bot Bridge
 
+The Discord bot acts as a bridge between a Discord server and your chatify server. It allows you to chat from your terminal (via chatify) and see messages from Discord, and vice versa.
+
+### How it works
+- The bot listens to messages in a Discord channel and forwards them to your chatify server (as encrypted messages).
+- It also listens for messages from your chatify server (via WebSocket) and posts them to the same Discord channel.
+- Note: The bot sees plaintext messages when bridging, so you must trust the environment where the bot runs.
+
+### Setup
+1. **Create a Discord bot**:
+   - Go to the [Discord Developer Portal](https://discord.com/developers/applications)
+   - Create a new application, then go to the "Bot" tab and click "Add Bot"
+   - Under "Privileged Gateway Intents", enable "Message Content Intent" (required to read message content)
+   - Copy the bot token (you'll need it for the environment variable below)
+2. **Invite the bot to your server**:
+   - In the Discord Developer Portal, go to "OAuth2" → "URL Generator"
+   - Select scopes: `bot` and `applications.commands`
+   - Select bot permissions: `Send Messages`, `Read Message History`, `View Channel`
+   - Copy the generated URL and open it in a browser to invite the bot to your Discord server
+3. **Set environment variables** (create a `.env` file or export them):
+   - `DISCORD_TOKEN`: The bot token from step 1
+   - `CHATIFY_HOST`: The host where your chatify server is running (default: `127.0.0.1`)
+   - `CHATIFY_PORT`: The port where your chatify server is running (default: `8765`)
+   - `CHATIFY_PASSWORD`: The password set when starting the chatify server
+   - `CHATIFY_CHANNEL`: The chatify channel to bridge to (default: `general`)
+   - `CHATIFY_LOG` (optional): Set to `1` to enable logging
+
+### Running the bot
+After setting the environment variables, build and run the bot:
+```bash
+cargo build --release
+./target/release/discord_bot
+```
+
+### Example
+```bash
+export DISCORD_TOKEN="your_bot_token_here"
+export CHATIFY_HOST="127.0.0.1"
+export CHATIFY_PORT="8765"
+export CHATIFY_PASSWORD="your_chatify_password"
+export CHATIFY_CHANNEL="general"
+export CHATIFY_LOG=1
+./target/release/discord_bot
+```
+
+---
 ## Logging and Testing
 
 ### Client and Server

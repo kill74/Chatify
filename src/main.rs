@@ -103,13 +103,12 @@ impl State {
         )
     }
 
-    fn unique_name(&self, base: &str) -> String {
-        let mut name = base.to_string();
-        let mut n = 1usize;
-        while self.users.contains_key(&name) { name = format!("{}_{}", base, n); n += 1; }
-        name
-    }
-}
+     fn unique_name(&self, base: &str) -> String {
+         let mut name = base.to_string();
+         let mut n = 1usize;
+         while self.users.contains_key(&name) { name = format!("{}_{}", base, n); n += 1; }
+         name
+     }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,9 @@
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\command_attr-e318e822339300c5.d: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\attributes.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\consts.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\structures.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\util.rs
+
+C:\Users\Guilherme Sales\Documents\Projects\Chatify\target\release\deps\command_attr-e318e822339300c5.dll: C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\lib.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\attributes.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\consts.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\structures.rs C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\util.rs
+
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\lib.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\attributes.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\consts.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\structures.rs:
+C:\Users\Guilherme\ Sales\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\command_attr-0.4.2\src\util.rs:
