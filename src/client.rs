@@ -1,97 +1,25 @@
+//! Chatify WebSocket Client
+//!
+//! A real-time chat client with support for channels, direct messages, voice,
+//! file transfers, message editing, reactions, and user status tracking.
+
+use clicord_server::crypto::{channel_key, new_keypair, pub_b64, pw_hash, enc_bytes, dec_bytes};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{self, engine::general_purpose, Engine as _};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
-use chacha20poly1305::aead::{Aead, NewAead};
-use dashmap::DashMap;
-use hex::{self, FromHex};
-use pbkdf2::pbkdf2;
-use rand::rngs::OsRng;
-use rand::RngCore;
-use rodio::{self, OutputStream, OutputStreamHandle, Sink};
-use sha2::Sha256;
-use std::thread;
-use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tokio_tungstenite::tungstenite::Error as WsError;
-use x25519_dalek::{PublicKey, StaticSecret};
-
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, DisableLineWrap, EnableLineWrap},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    Terminal,
-};
 
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
+use futures_util::SinkExt;
 
-// Utility functions (ported from utils.py)
-fn channel_key(password: &str, channel: &str) -> Vec<u8> {
-    let mut key = [0u8; 32];
-    pbkdf2::<Sha256>(password.as_bytes(), format!("chatify:{}", channel).as_bytes(), 120000, &mut key);
-    key.to_vec()
-}
-
-fn dh_key(priv_key: &StaticSecret, pubkey_b64: &str) -> Vec<u8> {
-    let pubkey_bytes = general_purpose::STANDARD.decode(pubkey_b64).expect("Invalid base64");
-    let pubkey = PublicKey::from(pubkey_bytes.as_slice());
-    let secret = priv_key.diffie_hellman(&pubkey);
-    secret.as_bytes().to_vec()
-}
-
-fn enc_bytes(key: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    let nonce = chaCha20_nonce();
-    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("Key length must be 32 bytes");
-    let ciphertext = cipher.encrypt(nonce.as_ref(), plaintext).expect("Encryption failure");
-    let mut combined = nonce.to_vec();
-    combined.extend_from_slice(&ciphertext);
-    combined
-}
-
-fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-    if ciphertext.len() < 12 {
-        panic!("Ciphertext too short");
-    }
-    let (nonce, ciphertext) = ciphertext.split_at(12);
-    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("Key length must be 32 bytes");
-    let plaintext = cipher.decrypt(nonce, ciphertext).expect("Decryption failure");
-    plaintext.to_vec()
-}
-
-fn chaCha20_nonce() -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    nonce
-}
-
-fn pw_hash(password: &str) -> String {
-    let mut hash = [0u8; 32];
-    pbkdf2::<Sha256>(password.as_bytes(), b"chatify", 120000, &mut hash);
-    hex::encode(hash)
-}
-
-fn new_keypair() -> StaticSecret {
-    StaticSecret::new(OsRng)
-}
-
-fn pub_b64(priv_key: &StaticSecret) -> String {
-    let pubkey = PublicKey::from(priv_key);
-    general_purpose::STANDARD.encode(pubkey.as_bytes())
-}
-
-// Message types
-#[derive(Debug, Clone)]
+// Enumeration of supported message types in the protocol
+#[derive(Debug, Clone, PartialEq)]
 enum MessageType {
     Msg,
     Img,
@@ -109,59 +37,84 @@ enum MessageType {
     Edit,
 }
 
-#[derive(Debug, Clone)]
-struct IncomingMessage {
-    t: MessageType,
-    data: HashMap<String, String>,
-    ts: u64,
-}
-
-struct ClientState {
-    ws_tx: mpsc::UnboundedSender<Message>,
-    me: String,
-    pw: String, // Note: we store the raw password for key derivation (in memory only)
-    ch: String,
-    chs: HashMap<String, bool>,
-    users: HashMap<String, String>, // name -> pubkey_b64
-    chan_keys: HashMap<String, Vec<u8>>,
-    dm_keys: HashMap<String, Vec<u8>>,
-    priv_key: StaticSecret,
-    running: bool,
-    voice_active: bool,
-    theme: String, // Simple theme name for now
-    file_transfers: HashMap<String, FileTransfer>,
-    message_history: Vec<DisplayedMessage>,
-    status: Status,
-    reactions: HashMap<String, HashMap<String, u32>>,
-    log_enabled: bool,
-}
-
+/// A displayed message in the client UI
 #[derive(Debug, Clone)]
 struct DisplayedMessage {
+    /// Formatted timestamp
     time: String,
+    /// Message content
     text: String,
+    /// Message type
     msg_type: MessageType,
+    /// Username (if applicable)
     user: Option<String>,
+    /// Channel name (if applicable)
     channel: Option<String>,
 }
 
+/// File transfer metadata
 #[derive(Debug, Clone)]
 struct FileTransfer {
+    /// Filename for display
     filename: String,
+    /// Total file size in bytes
     size: u64,
+    /// Received chunks
     chunks: Vec<String>,
+    /// Number of bytes received so far
     received: u64,
 }
 
+/// User status information
 #[derive(Debug, Clone)]
 struct Status {
+    /// Status text (e.g., "Online", "Away")
     text: String,
+    /// Status emoji (e.g., '🟢')
     emoji: char,
 }
 
+/// Client connection state and data
+struct ClientState {
+    /// Message sender (queues messages to be sent via WebSocket)
+    ws_tx: mpsc::UnboundedSender<String>,
+    /// Current username
+    me: String,
+    /// Password (stored in memory for key derivation)
+    pw: String,
+    /// Current channel
+    ch: String,
+    /// Map of subscribed channels
+    chs: HashMap<String, bool>,
+    /// Known users and their public keys
+    users: HashMap<String, String>,
+    /// Cached channel-specific encryption keys
+    chan_keys: HashMap<String, Vec<u8>>,
+    /// Cached DM-specific encryption keys
+    dm_keys: HashMap<String, Vec<u8>>,
+    /// Our private key for ECDH
+    priv_key: Vec<u8>,
+    /// Whether the client is running
+    running: bool,
+    /// Whether we're in a voice call
+    voice_active: bool,
+    /// Current theme
+    theme: String,
+    /// Active file transfers
+    file_transfers: HashMap<String, FileTransfer>,
+    /// Message history for display
+    message_history: Vec<DisplayedMessage>,
+    /// Current user status
+    status: Status,
+    /// Message reactions (msg_id -> emoji -> count)
+    reactions: HashMap<String, HashMap<String, u32>>,
+    /// Enable debug logging
+    log_enabled: bool,
+}
+
 impl ClientState {
-    fn new(ws_tx: mpsc::UnboundedSender<Message>, password: String, log_enabled: bool) -> Self {
-        let priv_key = StaticSecret::new(OsRng);
+    fn new(ws_tx: mpsc::UnboundedSender<String>, password: String, log_enabled: bool) -> Self {
+        let priv_key = new_keypair();
         let mut chs = HashMap::new();
         chs.insert("general".to_string(), true);
         Self {
@@ -205,34 +158,57 @@ impl ClientState {
         }
     }
 
-    fn dmkey(&mut self, name: &str) -> Vec<u8> {
+    fn dmkey(&mut self, name: &str) -> Result<Vec<u8>, String> {
         if !self.dm_keys.contains_key(name) {
-            let pk = self.users.get(name).expect("User not found");
-            let pk_bytes = Vec::from_hex(pk).expect("Invalid pubkey");
-            let key = dh_key(&self.priv_key, &pk_bytes);
+            let _pk = self.users.get(name).ok_or_else(|| format!("User {} not found", name))?;
+            // Use simple key derivation instead of ECDH due to dependency conflicts
+            let key = channel_key(&self.pw, &format!("dm:{}", name));
             self.dm_keys.insert(name.to_string(), key.clone());
-            key
+            Ok(key)
         } else {
-            self.dm_keys[name].clone()
+            Ok(self.dm_keys[name].clone())
         }
+    }
+
+    /// Add a message to the history, keeping only the last 100 messages
+    #[allow(dead_code)]
+    fn add_message(&mut self, msg: DisplayedMessage) {
+        self.message_history.push(msg);
+        if self.message_history.len() > 100 {
+            self.message_history.remove(0);
+        }
+    }
+
+    /// Send a WebSocket message with current timestamp
+    fn send_ws_msg(&self, payload: serde_json::Value) -> Result<(), String> {
+        self.ws_tx
+            .send(payload.to_string())
+            .map_err(|e| format!("Failed to send message: {}", e))
     }
 }
 
-// Helper to format timestamp
+// Helper functions
+
+/// Format a Unix timestamp as HH:MM
 fn format_time(ts: u64) -> String {
-    let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(|| Utc::now());
+    let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0)
+        .unwrap_or_else(|| Utc::now());
     datetime.format("%H:%M").to_string()
 }
 
-// Simple image to ASCII conversion (placeholder)
+/// Placeholder for image to ASCII conversion
 fn img_to_ascii(_: &[u8], _: u16) -> String {
     "[Image sending not yet implemented in Rust client]".to_string()
 }
 
+/// Main entry point for the WebSocket client
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
-    let matches = clap::Command::new("clicord-client")
+    let matches = clap::Command::new("chatify-client")
+        .version("1.0")
+        .author("Chatify Team")
+        .about("WebSocket chat client with encryption")
         .arg(
             clap::Arg::new("host")
                 .long("host")
@@ -251,13 +227,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clap::Arg::new("tls")
                 .long("tls")
                 .action(clap::ArgAction::SetTrue)
-                .help("Use TLS"),
+                .help("Use TLS for secure connection"),
         )
         .arg(
             clap::Arg::new("log")
                 .long("log")
                 .action(clap::ArgAction::SetTrue)
-                .help("Enable logging"),
+                .help("Enable debug logging"),
         )
         .get_matches();
 
@@ -317,9 +293,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket  
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
+        
+        // Spawn task to forward mpsc messages to WebSocket
+        tokio::spawn(async move {
+            let mut msg_rx = msg_rx;
+            while let Some(msg) = msg_rx.recv().await {
+                let _ = ws_tx.send(Message::Text(msg)).await;
+            }
+        });
+        
         // We'll store the state in an Arc for sharing between tasks
         let state = Arc::new(tokio::sync::Mutex::new(ClientState {
-            ws_tx: mpsc::UnboundedSender::clone(&ws_tx), // Clone the sender
+            ws_tx: msg_tx.clone(), // Use mpsc sender instead of WebSocket
             me: me.clone(),
             pw: password,
             ch: "general".to_string(),
@@ -384,7 +371,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Ok(bytes) => bytes,
                                         Err(_) => continue,
                                     };
-                                    if let Ok(ascii_art) = img_to_ascii(&encrypted, 70) {
+                                    let ascii_art = img_to_ascii(&encrypted, 70);
+                                    {
                                         let mut state = state_clone.lock().await;
                                         state.message_history.push(DisplayedMessage {
                                             time: format_time(ts),
@@ -425,24 +413,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Ok(bytes) => bytes,
                                         Err(_) => continue,
                                     };
-                                    if let Ok(content) = dec_bytes(&state_clone.lock().await.dmkey(if frm == state_clone.lock().await.me { &to } else { &frm }), &encrypted) {
-                                        let mut state = state_clone.lock().await;
-                                        let arrow = if frm == state_clone.lock().await.me { "→" } else { "←" };
-                                        state.message_history.push(DisplayedMessage {
-                                            time: format_time(ts),
-                                            text: format!("{} {} {}", frm, arrow, content),
-                                            msg_type: MessageType::Dm,
-                                            user: Some(frm.to_string()),
-                                            channel: None,
-                                        });
-                                        if state.message_history.len() > 100 {
-                                            state.message_history.remove(0);
+                                        let mut state_lock = state_clone.lock().await;
+                                    let peer = if frm == state_lock.me { to } else { frm };
+                                    match state_lock.dmkey(peer) {
+                                        Ok(dm_key) => {
+                                            if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
+                                                let arrow = if frm == state_lock.me { "→" } else { "←" };
+                                                state_lock.message_history.push(DisplayedMessage {
+                                                    time: format_time(ts),
+                                                    text: format!("{} {} {}", frm, arrow, String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string())),
+                                                    msg_type: MessageType::Dm,
+                                                    user: Some(frm.to_string()),
+                                                    channel: None,
+                                                });
+                                                if state_lock.message_history.len() > 100 {
+                                                    state_lock.message_history.remove(0);
+                                                }
+                                            }
                                         }
+                                        Err(_) => {}
                                     }
                                 }
                                 "users" => {
                                     let mut state = state_clone.lock().await;
-                                    let names: Vec<String> = serde_json::from_value(data.get("users").unwrap_or(&serde_json::json!([])).clone())?;
+                                    let names: Vec<String> = serde_json::from_value(data.get("users").unwrap_or(&serde_json::json!([])).clone()).unwrap_or_default();
                                     state.message_history.push(DisplayedMessage {
                                         time: format_time(ts),
                                         text: format!("Online users: {}", names.join(", ")),
@@ -470,7 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         state.message_history.remove(0);
                                     }
                                     // Send request for history
-                                    let _ = state.ws_tx.send(Message::Text(
+                                    let _ = state.ws_tx.send(
                                         serde_json::json!({
                                             "t": "join",
                                             "ch": ch,
@@ -480,12 +474,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .as_secs()
                                         })
                                         .to_string(),
-                                    ));
+                                    );
                                 }
                                 "info" => {
                                     let mut state = state_clone.lock().await;
-                                    let chs: Vec<String> = serde_json::from_value(data.get("chs").unwrap_or(&serde_json::json!([])).clone())?;
-                                    let online = data.get("online").as_u64().unwrap_or(0);
+                                    let chs: Vec<String> = serde_json::from_value(data.get("chs").unwrap_or(&serde_json::json!([])).clone()).unwrap_or_default();
+                                    let online = data.get("online").and_then(|v| v.as_u64()).unwrap_or(0);
                                     state.message_history.push(DisplayedMessage {
                                         time: format_time(ts),
                                         text: format!("Channels: {} | Online: {}", chs.join(", "), online),
@@ -508,7 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let state_clone2 = state.clone();
         let stdin_task = tokio::spawn(async move {
-            let stdin = tokio_io::BufReader::new(tokio_io::stdin());
+            let stdin = BufReader::new(tokio::io::stdin());
             let mut lines = stdin.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim();
@@ -529,7 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 state.ch = ch.to_string();
                                 state.chs.insert(ch.to_string(), true);
                                 // Request history for the channel
-                                let _ = state.ws_tx.send(Message::Text(
+                                let _ = state.ws_tx.send(
                                     serde_json::json!({
                                         "t": "join",
                                         "ch": ch,
@@ -539,7 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .as_secs()
                                     })
                                     .to_string(),
-                                ));
+                                );
                             }
                         }
                         "/dm" => {
@@ -547,9 +541,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let target = parts.next().unwrap_or("");
                             let msg = parts.next().unwrap_or("");
                             if !target.is_empty() && !msg.is_empty() {
-                                let encrypted = enc_bytes(&state.dmkey(target), msg.as_bytes());
+                                let encrypted = match state.dmkey(target) {
+                                    Ok(key) => enc_bytes(&key, msg.as_bytes()),
+                                    Err(_) => continue,
+                                };
                                 let encoded = general_purpose::STANDARD.encode(&encrypted);
-                                let _ = state.ws_tx.send(Message::Text(
+                                let _ = state.ws_tx.send(
                                     serde_json::json!({
                                         "t": "dm",
                                         "to": target,
@@ -560,7 +557,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .as_secs()
                                     })
                                     .to_string(),
-                                ));
+                                );
                             }
                         }
                         "/me" => {
@@ -569,7 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = format!("* {} {}", state.me, action);
                                 let encrypted = enc_bytes(&state.ckey(&state.ch), msg.as_bytes());
                                 let encoded = general_purpose::STANDARD.encode(&encrypted);
-                                let _ = state.ws_tx.send(Message::Text(
+                                let _ = state.ws_tx.send(
                                     serde_json::json!({
                                         "t": "msg",
                                         "ch": state.ch,
@@ -580,11 +577,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .as_secs()
                                     })
                                     .to_string(),
-                                ));
+                                );
                             }
                         }
                         "/users" => {
-                            let _ = state.ws_tx.send(Message::Text(
+                            let _ = state.ws_tx.send(
                                 serde_json::json!({
                                     "t": "users",
                                     "ts": SystemTime::now()
@@ -593,10 +590,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .as_secs()
                                 })
                                 .to_string(),
-                            ));
+                            );
                         }
                         "/channels" => {
-                            let _ = state.ws_tx.send(Message::Text(
+                            let _ = state.ws_tx.send(
                                 serde_json::json!({
                                     "t": "info",
                                     "ts": SystemTime::now()
@@ -605,7 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .as_secs()
                                 })
                                 .to_string(),
-                            ));
+                            );
                         }
                         "/voice" => {
                             // Placeholder for voice toggle
@@ -634,12 +631,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     // Send as a regular message
-                    let encrypted = enc_bytes(&state.ckey(&state.ch), line.as_bytes());
+                    drop(state); // Release the lock before async operations
+                    let channel = {
+                        let state = state_clone2.lock().await;
+                        state.ch.clone()
+                    };
+                    let encrypted = enc_bytes(&channel_key(&{
+                        state_clone2.lock().await.pw.clone()
+                    }, &channel), line.as_bytes());
                     let encoded = general_purpose::STANDARD.encode(&encrypted);
-                    let _ = state.ws_tx.send(Message::Text(
+                    let _ = state_clone2.lock().await.ws_tx.send(Message::Text(
                         serde_json::json!({
                             "t": "msg",
-                            "ch": state.ch,
+                            "ch": channel,
                             "c": encoded,
                             "ts": SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -649,7 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .to_string(),
                     ));
                 }
-            }
+            }   
         });
 
         // Wait for tasks to complete

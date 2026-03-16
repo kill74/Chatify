@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::net::{TcpListener, TcpStream>;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -76,125 +76,187 @@ impl State {
         }).clone()
     }
 
-    fn users_json(&self) -> Value {
+    /// Get the count of online users
+    fn online_count(&self) -> usize {
+        self.user_statuses.len()
+    }
+
+    /// Get all channels as JSON array (excluding DM channels)
+    fn channels_json(&self) -> Value {
         Value::Array(
-            self.users.iter()
-                .map(|e| {
-                    let mut user_obj = serde_json::json!({"u": e.key(), "pk": e.value()});
-                    if let Some(status) = self.user_statuses.get(e.key()) {
-                        user_obj["status"] = status.clone();
-                    }
-                    user_obj
-                })
-                .collect()
+            self.channels
+                .iter()
+                .filter(|e| !e.key().starts_with("__dm__"))
+                .map(|e| Value::String(e.key().clone()))
+                .collect(),
         )
     }
-
-    fn unique_name(&self, base: &str) -> String {
-        let mut name = base.to_string();
-        let mut n = 1usize;
-        while self.users.contains_key(&name) { name = format!("{}_{}", base, n); n += 1; }
-        name
-    }
 }
 
+/// Get current Unix timestamp as f64
 fn now() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
+/// Hash a password using SHA256
+#[allow(dead_code)]
 fn hash_pw(pw: &str) -> String {
     hex::encode(Sha256::digest(pw.as_bytes()))
 }
 
+/// Sanitize a channel name: lowercase, remove special chars, limit to 32 chars
 fn safe_ch(raw: &str) -> String {
-    let s: String = raw.to_lowercase().trim_start_matches('#')
-        .chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').take(32).collect();
+    let s: String = raw
+        .to_lowercase()
+        .trim_start_matches('#')
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
     if s.is_empty() { "general".into() } else { s }
 }
 
+/// Create a system message JSON string
 fn sys(text: &str) -> String {
     serde_json::json!({"t":"sys","m":text,"ts":now()}).to_string()
 }
 
+/// Get current time formatted as HH:MM:SS
 fn hms() -> String {
-    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    format!("{:02}:{:02}:{:02}", (s%86400)/3600, (s%3600)/60, s%60)
+    let s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{:02}:{:02}:{:02}", (s % 86400) / 3600, (s % 3600) / 60, s % 60)
 }
 
+/// Log a message with timestamp if logging is enabled
 fn log(state: &State, msg: &str) {
     if state.log_enabled {
         println!("[{}] {}", hms(), msg);
     }
 }
 
+/// Send a system message to all channels
+async fn broadcast_system_msg(state: &Arc<State>, msg: &str) {
+    let sys_msg = sys(msg);
+    for e in state.channels.iter() {
+        let _ = e.tx.send(sys_msg.clone());
+    }
+}
+
+/// Create JSON response for successful connection
+fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>) -> String {
+    serde_json::json!({
+        "t": "ok",
+        "u": username,
+        "channels": state.channels_json(),
+        "hist": hist
+    })
+    .to_string()
+}
+
+/// Main client connection handler
 async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
-    let ws = match accept_async(stream).await { Ok(w) => w, Err(_) => return };
+    // Accept WebSocket connection
+    let ws = match accept_async(stream).await {
+        Ok(w) => w,
+        Err(_) => return,
+    };
     let (mut sink, mut stream) = ws.split();
 
+    // Read initial authentication message
     let raw = match stream.next().await {
         Some(Ok(Message::Text(r))) => r,
         _ => return,
     };
-    let d: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return };
+    let d: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
 
-    // We don't do authentication for now, just use the username from the message
-    let username = d.get("u").and_then(|v| v.as_str()).unwrap_or("anon").to_string();
-    let status = d.get("status").cloned().unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
+    // Extract username from message
+    let username = d.get("u")
+        .and_then(|v| v.as_str())
+        .unwrap_or("anon")
+        .to_string();
+    
+    // Track user status
+    let status = d
+        .get("status")
+        .cloned()
+        .unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
+    state.user_statuses.insert(username.clone(), status);
 
-    // We don't store users for now, just use the username
-    // state.users.insert(username.clone(), pubkey.clone());
-    // state.user_statuses.insert(username.clone(), status);
-
+    // Get general channel and send welcome response
     let general = state.chan("general");
     let mut gen_rx = general.tx.subscribe();
     let hist = general.hist().await;
 
-    let ok = serde_json::json!({
-        "t":"ok","u":username,"users":state.users_json(),"hist":hist
-    }).to_string();
-
+    let ok = create_ok_response(&username, &state, hist);
     if sink.send(Message::Text(ok)).await.is_err() {
         return;
     }
 
-    for e in state.channels.iter() {
-        let _ = e.tx.send(sys(&format!("→ {} joined", username)));
-    }
-
+    // Announce user join
+    broadcast_system_msg(&state, &format!("→ {} joined", username)).await;
     log(&state, &format!("+ {}", username));
 
+    // Create channel for sending messages to client
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
+    // Spawn task to forward general channel messages to output channel
     let tx = out_tx.clone();
     tokio::spawn(async move {
         loop {
             match gen_rx.recv().await {
-                Ok(m) => { if tx.send(m).is_err() { break; } }
-                Err(broadcast::error::RecvError::Closed) => break;
+                Ok(m) => {
+                    if tx.send(m).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
                 Err(_) => {}
             }
         }
     });
 
+    // Spawn task to send queued messages to WebSocket
     tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
-            if sink.send(Message::Text(m)).await.is_err() { break; }
+            if sink.send(Message::Text(m)).await.is_err() {
+                break;
+            }
         }
     });
 
     let mut voice_room: Option<String> = None;
 
+    // Main message handling loop
     while let Some(Ok(msg)) = stream.next().await {
         let raw = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
             _ => continue,
         };
-        if raw.len() > MAX_BYTES { continue; }
-        let d: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
-        let t = d["t"].as_str().unwrap_or("");
-        let ts = d["ts"].as_u64().unwrap_or(0);
 
+        // Validate message size
+        if raw.len() > MAX_BYTES {
+            continue;
+        }
+
+        // Parse message
+        let d: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let t = d["t"].as_str().unwrap_or("");
+
+        // Route message to appropriate handlers
         match t {
             "msg" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
@@ -202,7 +264,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 if c.is_empty() { continue; }
                 let entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
                 let chan = state.chan(&ch);
-                chan.push(entry).await;
+                chan.push(entry.clone()).await;
                 let _ = chan.tx.send(entry.to_string());
             }
             "img" => {
@@ -210,7 +272,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let a = d["a"].as_str().unwrap_or("").to_string();
                 if a.is_empty() { continue; }
                 let _ = state.chan(&ch).tx.send(
-                    serde_json::json!({"t":"img","ch":ch,"u":username,"a":a,"ts":now()}).to_string()
+                    serde_json::json!({"t":"img","ch":ch,"u":username,"a":a,"ts":now()}).to_string(),
                 );
             }
             "dm" => {
@@ -230,8 +292,12 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 tokio::spawn(async move {
                     loop {
                         match rx.recv().await {
-                            Ok(m) => { if tx2.send(m).is_err() { break; } }
-                            Err(broadcast::error::RecvError::Closed) => break;
+                            Ok(m) => {
+                                if tx2.send(m).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
                             Err(_) => {}
                         }
                     }
@@ -240,13 +306,14 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let _ = chan.tx.send(sys(&format!("→ {} joined #{}", username, ch)));
             }
             "users" => {
-                let _ = out_tx.send(serde_json::json!({"t":"users","users":state.users_json()}).to_string());
+                let users: Vec<String> = state.user_statuses.iter().map(|e| e.key().clone()).collect();
+                let _ = out_tx.send(serde_json::json!({"t":"users","users":users}).to_string());
             }
             "info" => {
                 let chs: Vec<String> = state.channels.iter()
                     .filter(|e| !e.key().starts_with("__dm__"))
                     .map(|e| e.key().clone()).collect();
-                let _ = out_tx.send(serde_json::json!({"t":"info","chs":chs,"online":state.users.len()}).to_string());
+                let _ = out_tx.send(serde_json::json!({"t":"info","chs":chs,"online":state.online_count()}).to_string());
             }
             "vjoin" => {
                 let room = safe_ch(d["r"].as_str().unwrap_or("general"));
@@ -256,8 +323,12 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 tokio::spawn(async move {
                     loop {
                         match vrx.recv().await {
-                            Ok(m) => { if tx2.send(m).is_err() { break; } }
-                            Err(broadcast::error::RecvError::Closed) => break;
+                            Ok(m) => {
+                                if tx2.send(m).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
                             Err(_) => {}
                         }
                     }
@@ -279,7 +350,9 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     }
                 }
             }
-            "ping" => { let _ = out_tx.send(r#"{"t":"pong"}"#.into()); }
+            "ping" => {
+                let _ = out_tx.send(r#"{"t":"pong"}"#.into());
+            }
             "edit" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let old_text = d["old_text"].as_str().unwrap_or("").to_string();
@@ -287,12 +360,14 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 if old_text.is_empty() || new_text.is_empty() { continue; }
                 let chan = state.chan(&ch);
                 let mut h = chan.history.write().await;
+                let username_clone = username.clone();
+                let old_text_clone = old_text.clone();
                 if let Some(pos) = h.iter().rposition(|m| {
                     m.get("t") == Some(&Value::from("msg"))
-                        && m.get("u") == Some(&Value::from(username))
-                        && m.get("c") == Some(&Value::from(old_text))
+                        && m.get("u") == Some(&Value::from(username_clone.clone()))
+                        && m.get("c") == Some(&Value::from(old_text_clone.clone()))
                 }) {
-                    h[pos]["c"] = Value::from(new_text);
+                    h[pos]["c"] = Value::from(new_text.clone());
                     h[pos]["ts"] = Value::from(now());
                 }
                 let edit_msg = serde_json::json!({
@@ -369,26 +444,32 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         }
     }
 
-    // We don't remove the user because we are not storing them
-    // state.users.remove(&username);
-    // state.user_statuses.remove(&username);
-    let leave = sys(&format!("✖ {} left", username));
-    for e in state.channels.iter() { let _ = e.tx.send(leave.clone()); }
+    // User disconnected - cleanup
+    state.user_statuses.remove(&username);
+    broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     log(&state, &format!("- {}", username));
 }
 
+/// Main entry point
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port);
-    let listener = TcpListener::bind(&addr).await.expect("bind failed");
-    println!("clicord running on ws://{addr}");
-    println!("encryption: none (testing) | ip privacy: on");
-    println!("ctrl+c to stop\n");
+    
+    let listener = TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind to address");
+    
+    let state = State::new(args.log);
+
+    println!("📡 Chatify running on ws://{}", addr);
+    println!("🔒 Encryption: None (testing) | 🛡️  IP Privacy: On");
+    println!("⏹️  Press Ctrl+C to stop\n");
+
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                let s = State::new(args.log);
+                let s = state.clone();
                 tokio::spawn(handle(stream, addr, s));
             }
             Err(_) => continue,
