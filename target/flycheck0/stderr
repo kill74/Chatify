@@ -1,5 +1,0 @@
-error: can't find bin `discord_bot` at path `C:\Users\Guilherme Sales\Documents\Projects\Chatify\src\discord_bot.rs`
- --> C:\Users\Guilherme Sales\Documents\Projects\Chatify\Cargo.toml
-error: can't find bin `discord_bot` at path `C:\Users\Guilherme Sales\Documents\Projects\Chatify\src\discord_bot.rs`
- --> C:\Users\Guilherme Sales\Documents\Projects\Chatify\Cargo.toml
-error: could not compile due to 2 previous target resolution errors
