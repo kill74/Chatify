@@ -413,12 +413,17 @@ For a browser-trusted cert, use Let's Encrypt with a real domain name.
 chatify/
 ├── src/
 │   ├── main.rs           Rust server source
-│   └── client.rs         Rust client source
+│   ├── client.rs         Rust client source
+│   ├── crypto.rs         Encryption utilities
+│   ├── discord_bot.rs    Discord bridge (currently disabled)
+│   └── lib.rs            Shared utilities
 ├── Cargo.toml            Rust dependency manifest
 ├── Cargo.lock            Pinned dependency versions
 ├── LICENSE               GPL v3
 ├── .gitattributes        Git line ending normalisation
-└── .prettierrc           Code formatter config
+├── .gitignore            Git ignore rules
+├── .prettierrc           Code formatter config
+└── README.md             This file
 ```
 
 **Who runs what:**
@@ -471,14 +476,21 @@ GPL v3 — see [LICENSE](LICENSE).
 ---
 ## Discord Bot Bridge
 
-The Discord bot acts as a bridge between a Discord server and your chatify server. It allows you to chat from your terminal (via chatify) and see messages from Discord, and vice versa.
+**⚠️ Currently Disabled**
 
-### How it works
+The Discord bot bridge is currently disabled due to dependency conflicts with the Serenity library. This feature would allow bridging between a Discord server and your chatify server, enabling cross-platform chat.
+
+### Status
+- **Current State**: Disabled in Cargo.toml
+- **Issue**: Serenity dependency conflicts with other crates
+- **Impact**: Bot binary cannot be built until conflicts are resolved
+
+### How it would work (when re-enabled)
 - The bot listens to messages in a Discord channel and forwards them to your chatify server (as encrypted messages).
 - It also listens for messages from your chatify server (via WebSocket) and posts them to the same Discord channel.
 - Note: The bot sees plaintext messages when bridging, so you must trust the environment where the bot runs.
 
-### Setup
+### Setup (for when re-enabled)
 1. **Create a Discord bot**:
    - Go to the [Discord Developer Portal](https://discord.com/developers/applications)
    - Create a new application, then go to the "Bot" tab and click "Add Bot"
@@ -497,14 +509,14 @@ The Discord bot acts as a bridge between a Discord server and your chatify serve
    - `CHATIFY_CHANNEL`: The chatify channel to bridge to (default: `general`)
    - `CHATIFY_LOG` (optional): Set to `1` to enable logging
 
-### Running the bot
+### Running the bot (when re-enabled)
 After setting the environment variables, build and run the bot:
 ```bash
 cargo build --release
 ./target/release/discord_bot
 ```
 
-### Example
+### Example (when re-enabled)
 ```bash
 export DISCORD_TOKEN="your_bot_token_here"
 export CHATIFY_HOST="127.0.0.1"

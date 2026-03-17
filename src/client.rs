@@ -20,6 +20,7 @@ use futures_util::SinkExt;
 
 // Enumeration of supported message types in the protocol
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum MessageType {
     Msg,
     Img,
@@ -39,6 +40,7 @@ enum MessageType {
 
 /// A displayed message in the client UI
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DisplayedMessage {
     /// Formatted timestamp
     time: String,
@@ -54,6 +56,7 @@ struct DisplayedMessage {
 
 /// File transfer metadata
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct FileTransfer {
     /// Filename for display
     filename: String,
@@ -67,6 +70,7 @@ struct FileTransfer {
 
 /// User status information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct Status {
     /// Status text (e.g., "Online", "Away")
     text: String,
@@ -75,6 +79,7 @@ struct Status {
 }
 
 /// Client connection state and data
+#[allow(dead_code)]
 struct ClientState {
     /// Message sender (queues messages to be sent via WebSocket)
     ws_tx: mpsc::UnboundedSender<String>,
@@ -113,34 +118,6 @@ struct ClientState {
 }
 
 impl ClientState {
-    fn new(ws_tx: mpsc::UnboundedSender<String>, password: String, log_enabled: bool) -> Self {
-        let priv_key = new_keypair();
-        let mut chs = HashMap::new();
-        chs.insert("general".to_string(), true);
-        Self {
-            ws_tx,
-            me: String::new(),
-            pw: password,
-            ch: "general".to_string(),
-            chs,
-            users: HashMap::new(),
-            chan_keys: HashMap::new(),
-            dm_keys: HashMap::new(),
-            priv_key,
-            running: true,
-            voice_active: false,
-            theme: "default".to_string(),
-            file_transfers: HashMap::new(),
-            message_history: Vec::new(),
-            status: Status {
-                text: "Online".to_string(),
-                emoji: '🟢',
-            },
-            reactions: HashMap::new(),
-            log_enabled,
-        }
-    }
-
     fn log(&self, level: &str, msg: &str) {
         if self.log_enabled {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -177,13 +154,6 @@ impl ClientState {
         if self.message_history.len() > 100 {
             self.message_history.remove(0);
         }
-    }
-
-    /// Send a WebSocket message with current timestamp
-    fn send_ws_msg(&self, payload: serde_json::Value) -> Result<(), String> {
-        self.ws_tx
-            .send(payload.to_string())
-            .map_err(|e| format!("Failed to send message: {}", e))
     }
 }
 
@@ -451,8 +421,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "joined" => {
                                     let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
                                     let mut state = state_clone.lock().await;
-                                    state.ch = ch.clone();
-                                    state.chs.insert(ch.clone(), true);
+                                    state.ch = ch.to_string();
+                                    state.chs.insert(ch.to_string(), true);
                                     state.message_history.push(DisplayedMessage {
                                         time: format_time(ts),
                                         text: format!("→ #{}", ch),
@@ -563,13 +533,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "/me" => {
                             let action = args;
                             if !action.is_empty() {
+                                let ch = state.ch.clone();
                                 let msg = format!("* {} {}", state.me, action);
-                                let encrypted = enc_bytes(&state.ckey(&state.ch), msg.as_bytes());
+                                let encrypted = enc_bytes(&state.ckey(&ch), msg.as_bytes());
                                 let encoded = general_purpose::STANDARD.encode(&encrypted);
                                 let _ = state.ws_tx.send(
                                     serde_json::json!({
                                         "t": "msg",
-                                        "ch": state.ch,
+                                        "ch": ch,
                                         "c": encoded,
                                         "ts": SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
@@ -631,27 +602,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     // Send as a regular message
-                    drop(state); // Release the lock before async operations
-                    let channel = {
+                    let (channel, pw) = {
                         let state = state_clone2.lock().await;
-                        state.ch.clone()
+                        (state.ch.clone(), state.pw.clone())
                     };
-                    let encrypted = enc_bytes(&channel_key(&{
-                        state_clone2.lock().await.pw.clone()
-                    }, &channel), line.as_bytes());
+                    let key = channel_key(&pw, &channel);
+                    let encrypted = enc_bytes(&key, line.as_bytes());
                     let encoded = general_purpose::STANDARD.encode(&encrypted);
-                    let _ = state_clone2.lock().await.ws_tx.send(Message::Text(
-                        serde_json::json!({
-                            "t": "msg",
-                            "ch": channel,
-                            "c": encoded,
-                            "ts": SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                            .as_secs()
-                        })
-                        .to_string(),
-                    ));
+                    let msg = serde_json::json!({
+                        "t": "msg",
+                        "ch": channel,
+                        "c": encoded,
+                        "ts": SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                                        .as_secs()
+                    }).to_string();
+                    let _ = state_clone2.lock().await.ws_tx.send(msg);
                 }
             }   
         });
