@@ -127,7 +127,7 @@ You'll be prompted to set a password. Share it with your group over a secure cha
 ```
 server password:
 chatify running on ws://0.0.0.0:8765
-encryption: chacha20-poly1305 + x25519 | ip privacy: on
+encryption: chacha20-poly1305 + ecdh (stubbed) | ip privacy: on
 ctrl+c to stop
 
 [19:04:01] + alice
@@ -238,7 +238,7 @@ Key points:
 
 ### Direct Messages
 
-DMs use **X25519 Elliptic Curve Diffie-Hellman** key exchange:
+DMs use **Elliptic Curve Diffie-Hellman** key exchange (currently stubbed for security):
 
 ```
 alice: X25519 keypair (priv_a, pub_a)

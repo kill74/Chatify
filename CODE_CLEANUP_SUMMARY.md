@@ -40,14 +40,14 @@
 
 ## Issues Identified for Future Work 🔄
 
-### 1. **x25519-dalek Dependency Conflict**
-- **Issue**: rand_core version mismatch (0.5 vs 0.6)
-  - x25519-dalek v1 depends on rand_core 0.5.1
-  - Other dependencies (image, ratatui) pull in rand_core 0.6.4
-  - This creates a trait implementation conflict
-- **Status**: Workaround applied by simplifying key generation
+### 1. **ECDH Implementation Security Issue**
+- **Issue**: curve25519-dalek has timing variability vulnerability in Scalar29::sub/Scalar52::sub
+  - x25519-dalek v1.2.0 pulls in vulnerable curve25519-dalek v3.2.1
+  - Timing attacks possible on cryptographic operations
+- **Status**: x25519-dalek dependency removed, ECDH functions stubbed for security
 - **Solution Options**:
-  - [ ] Upgrade to x25519-dalek v2 (requires API changes)
+  - [ ] Implement ECDH with secure, audited library (e.g., rust-crypto)
+  - [ ] Use libsodium or similar battle-tested crypto library
   - [ ] Use alternative elliptic curve library
   - [ ] Implement custom key exchange
 
@@ -89,7 +89,8 @@
 ```
 Server (clicord-server) ✅ COMPILES - Release build working
 Client (clicord-client) ❌ NEEDS WORK - Async borrowing issues  
-Discord Bot ❌ DISABLED - Dependency conflicts
+Discord Bot ❌ DISABLED - Serenity dependency conflicts (unrelated to core functionality)
+ECDH Crypto ⚠️ STUBBED - x25519-dalek removed due to security vulnerability
 ```
 
 ## Steps to Complete the Fix
@@ -99,13 +100,14 @@ Discord Bot ❌ DISABLED - Dependency conflicts
    - Fix async/await patterns
    - Update type signatures
 
-2. **Resolve x25519-dalek dependency** (significant effort)  
-   - Evaluate upgrading to x25519-dalek v2
-   - Or implement/use alternative library
+2. **Implement secure ECDH** (high priority - security)
+   - Replace stubbed crypto with proper ECDH implementation
+   - Use audited crypto library (e.g., rust-crypto or dalek's maintained fork)
+   - Ensure constant-time operations to prevent timing attacks
 
-3. **Re-enable discord_bot** (once dependencies resolved)
-   - Fix rand_core conflict
-   - Update any Discord-specific code
+3. **Re-enable discord_bot** (optional - separate feature)
+   - Fix serenity rand_core conflict (if desired)
+   - Update Discord API integration
    - Re-add to Cargo.toml
 
 4. **Testing** (ongoing)

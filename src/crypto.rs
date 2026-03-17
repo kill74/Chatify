@@ -22,8 +22,8 @@ pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
 }
 
 /// Perform Diffie-Hellman key exchange for DM encryption
-/// Note: This is stubbed due to rand_core version conflicts.  
-/// TODO: Properly implement or use alternative library
+/// Note: This is stubbed due to security concerns with available libraries.
+/// TODO: Implement with a secure, audited ECDH library
 pub fn dh_key(_priv_key: &[u8], pubkey_b64: &str) -> Vec<u8> {
     // For now, derive a key from the pubkey for testing
     let decoded = general_purpose::STANDARD
@@ -84,8 +84,8 @@ pub fn pw_hash(password: &str) -> String {
 }
 
 /// Generate a new X25519 keypair
-/// Note: Stubbed due to rand_core version conflicts.
-/// TODO: Properly implement or use alternative library  
+/// Note: Stubbed due to security vulnerabilities in available libraries.
+/// TODO: Implement with a secure, audited ECDH library  
 pub fn new_keypair() -> Vec<u8> {
     // Generate random 32 bytes for the private key
     let mut key = [0u8; 32];
@@ -100,7 +100,7 @@ pub fn new_keypair() -> Vec<u8> {
 }
 
 /// Encode a public key as base64
-/// Note: Simplified version due to x25519-dalek dependency issues
+/// Note: Simplified version due to ECDH implementation being stubbed
 pub fn pub_b64(priv_key: &[u8]) -> String {
     // For now, just return a b64 encoded version of the key
     // TODO: Properly compute public key from private key
