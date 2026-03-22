@@ -1,8 +1,8 @@
 //! Shared cryptographic utilities for Chatify
 
 use base64::{engine::general_purpose, Engine as _};
-use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, NewAead};
+use chacha20poly1305::ChaCha20Poly1305;
 use hex;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
@@ -61,7 +61,9 @@ pub fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     }
     let (nonce_bytes, ciphertext_data) = ciphertext.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    let key_arr: &[u8; 32] = key.try_into().map_err(|_| "Key must be 32 bytes".to_string())?;
+    let key_arr: &[u8; 32] = key
+        .try_into()
+        .map_err(|_| "Key must be 32 bytes".to_string())?;
     let key_ga = GenericArray::from(*key_arr);
     let cipher = ChaCha20Poly1305::new(&key_ga);
     cipher
@@ -85,17 +87,11 @@ pub fn pw_hash(password: &str) -> String {
 
 /// Generate a new X25519 keypair
 /// Note: Stubbed due to security vulnerabilities in available libraries.
-/// TODO: Implement with a secure, audited ECDH library  
+/// TODO: Implement with a secure, audited ECDH library
 pub fn new_keypair() -> Vec<u8> {
     // Generate random 32 bytes for the private key
     let mut key = [0u8; 32];
-    for i in 0..32 {
-        key[i] = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u8
-            + i as u8;
-    }
+    rand::thread_rng().fill(&mut key);
     key.to_vec()
 }
 

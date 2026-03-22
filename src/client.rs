@@ -3,7 +3,7 @@
 //! A real-time chat client with support for channels, direct messages, voice,
 //! file transfers, message editing, reactions, and user status tracking.
 
-use clicord_server::crypto::{channel_key, new_keypair, pub_b64, pw_hash, enc_bytes, dec_bytes};
+use clicord_server::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -12,11 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{self, engine::general_purpose, Engine as _};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
 use futures_util::SinkExt;
+use futures_util::StreamExt;
 
 // Enumeration of supported message types in the protocol
 #[derive(Debug, Clone, PartialEq)]
@@ -137,7 +138,10 @@ impl ClientState {
 
     fn dmkey(&mut self, name: &str) -> Result<Vec<u8>, String> {
         if !self.dm_keys.contains_key(name) {
-            let _pk = self.users.get(name).ok_or_else(|| format!("User {} not found", name))?;
+            let _pk = self
+                .users
+                .get(name)
+                .ok_or_else(|| format!("User {} not found", name))?;
             // Use simple key derivation instead of ECDH due to dependency conflicts
             let key = channel_key(&self.pw, &format!("dm:{}", name));
             self.dm_keys.insert(name.to_string(), key.clone());
@@ -161,14 +165,29 @@ impl ClientState {
 
 /// Format a Unix timestamp as HH:MM
 fn format_time(ts: u64) -> String {
-    let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0)
-        .unwrap_or_else(|| Utc::now());
+    let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(Utc::now);
     datetime.format("%H:%M").to_string()
 }
 
 /// Placeholder for image to ASCII conversion
 fn img_to_ascii(_: &[u8], _: u16) -> String {
     "[Image sending not yet implemented in Rust client]".to_string()
+}
+
+/// Normalize channel name to match server rules.
+fn normalize_channel(raw: &str) -> Option<String> {
+    let s: String = raw
+        .to_lowercase()
+        .trim_start_matches('#')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Main entry point for the WebSocket client
@@ -220,7 +239,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdout().flush().unwrap();
         let mut input = String::new();
         io::stdin().read_line(&mut input).unwrap();
-        input.trim().to_string()
+        let u = input.trim().to_string();
+        if u.is_empty() {
+            println!("Empty username provided, using 'anon'.");
+            "anon".to_string()
+        } else {
+            u
+        }
     };
 
     let password = rpassword::prompt_password("password: ").unwrap();
@@ -245,16 +270,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     ws_tx.send(Message::Text(auth_msg.to_string())).await?;
 
-    // Wait for auth response
-    if let Some(Ok(Message::Text(resp))) = ws_rx.next().await {
-        let resp_val: serde_json::Value = serde_json::from_str(&resp)?;
+    // Wait for auth response with timeout
+    let auth_reply = timeout(Duration::from_secs(10), ws_rx.next()).await;
+    let resp = match auth_reply {
+        Ok(Some(Ok(Message::Text(resp)))) => resp,
+        Ok(Some(Ok(_))) => {
+            eprintln!("Authentication failed: server sent unexpected frame");
+            return Ok(());
+        }
+        Ok(Some(Err(e))) => {
+            eprintln!("Authentication failed: websocket error: {}", e);
+            return Ok(());
+        }
+        Ok(None) => {
+            eprintln!("Authentication failed: connection closed by server");
+            return Ok(());
+        }
+        Err(_) => {
+            eprintln!("Authentication failed: timeout waiting for server response");
+            return Ok(());
+        }
+    };
+
+    {
+        let resp_val: serde_json::Value = match serde_json::from_str(&resp) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Authentication failed: invalid JSON from server: {}", e);
+                return Ok(());
+            }
+        };
         if resp_val["t"] == "err" {
             eprintln!("Authentication failed: {}", resp_val["m"]);
             return Ok(());
         }
         // Update state with server response
         let me = resp_val["u"].as_str().unwrap_or(&username).to_string();
-        let users: Vec<serde_json::Value> = serde_json::from_value(resp_val["users"].clone())?;
+        let users: Vec<serde_json::Value> =
+            serde_json::from_value(resp_val["users"].clone()).unwrap_or_default();
         let mut user_map = HashMap::new();
         for u in users {
             if let Some(name) = u["u"].as_str() {
@@ -263,9 +316,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket  
+        // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
-        
+
         // Spawn task to forward mpsc messages to WebSocket
         tokio::spawn(async move {
             let mut msg_rx = msg_rx;
@@ -273,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = ws_tx.send(Message::Text(msg)).await;
             }
         });
-        
+
         // We'll store the state in an Arc for sharing between tasks
         let state = Arc::new(tokio::sync::Mutex::new(ClientState {
             ws_tx: msg_tx.clone(), // Use mpsc sender instead of WebSocket
@@ -302,170 +355,208 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Spawn tasks for reading from WebSocket and from stdin
         let state_clone = state.clone();
         let rx_task = tokio::spawn(async move {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Text(text) => {
-                        if let Ok(data) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&text) {
-                            // Process message and update state
-                            let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
-                            let ts = data.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
-                            match t {
-                                "msg" => {
-                                    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
-                                    let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                                    let encrypted = match general_purpose::STANDARD.decode(c) {
-                                        Ok(bytes) => bytes,
-                                        Err(_) => continue,
-                                    };
-                                    if let Ok(content) = dec_bytes(&state_clone.lock().await.ckey(ch), &encrypted) {
-                                        let mut state = state_clone.lock().await;
-                                        state.message_history.push(DisplayedMessage {
-                                            time: format_time(ts),
-                                            text: String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string()),
-                                            msg_type: MessageType::Msg,
-                                            user: Some(u.to_string()),
-                                            channel: Some(ch.to_string()),
-                                        });
-                                        // Keep only last 100 messages
-                                        if state.message_history.len() > 100 {
-                                            state.message_history.remove(0);
-                                        }
+            loop {
+                let msg = match ws_rx.next().await {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(e)) => {
+                        let state = state_clone.lock().await;
+                        state.log("WARN", &format!("WebSocket receive error: {}", e));
+                        break;
+                    }
+                    None => {
+                        let state = state_clone.lock().await;
+                        state.log("INFO", "Disconnected: server closed connection");
+                        break;
+                    }
+                };
+
+                if let Message::Text(text) = msg {
+                    if let Ok(data) =
+                        serde_json::from_str::<HashMap<String, serde_json::Value>>(&text)
+                    {
+                        // Process message and update state
+                        let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
+                        let ts = data.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+                        match t {
+                            "msg" => {
+                                let ch =
+                                    data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+                                let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+                                let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                                let encrypted = match general_purpose::STANDARD.decode(c) {
+                                    Ok(bytes) => bytes,
+                                    Err(_) => continue,
+                                };
+                                if let Ok(content) =
+                                    dec_bytes(&state_clone.lock().await.ckey(ch), &encrypted)
+                                {
+                                    let mut state = state_clone.lock().await;
+                                    state.message_history.push(DisplayedMessage {
+                                        time: format_time(ts),
+                                        text: String::from_utf8(content)
+                                            .unwrap_or_else(|_| "[Invalid UTF-8]".to_string()),
+                                        msg_type: MessageType::Msg,
+                                        user: Some(u.to_string()),
+                                        channel: Some(ch.to_string()),
+                                    });
+                                    // Keep only last 100 messages
+                                    if state.message_history.len() > 100 {
+                                        state.message_history.remove(0);
                                     }
                                 }
-                                "img" => {
-                                    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
-                                    let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let a = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
-                                    let encrypted = match general_purpose::STANDARD.decode(a) {
-                                        Ok(bytes) => bytes,
-                                        Err(_) => continue,
-                                    };
-                                    let ascii_art = img_to_ascii(&encrypted, 70);
-                                    {
-                                        let mut state = state_clone.lock().await;
-                                        state.message_history.push(DisplayedMessage {
+                            }
+                            "img" => {
+                                let ch =
+                                    data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+                                let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+                                let a = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
+                                let encrypted = match general_purpose::STANDARD.decode(a) {
+                                    Ok(bytes) => bytes,
+                                    Err(_) => continue,
+                                };
+                                let ascii_art = img_to_ascii(&encrypted, 70);
+                                {
+                                    let mut state = state_clone.lock().await;
+                                    state.message_history.push(DisplayedMessage {
+                                        time: format_time(ts),
+                                        text: format!(
+                                            "{} sent an image:\n{}",
+                                            data.get("u").and_then(|v| v.as_str()).unwrap_or("?"),
+                                            ascii_art
+                                        ),
+                                        msg_type: MessageType::Img,
+                                        user: Some(u.to_string()),
+                                        channel: Some(ch.to_string()),
+                                    });
+                                    // Keep only last 100 messages
+                                    if state.message_history.len() > 100 {
+                                        state.message_history.remove(0);
+                                    }
+                                }
+                            }
+                            "sys" => {
+                                let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
+                                let mut state = state_clone.lock().await;
+                                state.message_history.push(DisplayedMessage {
+                                    time: format_time(ts),
+                                    text: m.to_string(),
+                                    msg_type: MessageType::Sys,
+                                    user: None,
+                                    channel: None,
+                                });
+                                if state.message_history.len() > 100 {
+                                    state.message_history.remove(0);
+                                }
+                            }
+                            "dm" => {
+                                let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+                                let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+                                let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                                let encrypted = match general_purpose::STANDARD.decode(c) {
+                                    Ok(bytes) => bytes,
+                                    Err(_) => continue,
+                                };
+                                let mut state_lock = state_clone.lock().await;
+                                let peer = if frm == state_lock.me { to } else { frm };
+                                if let Ok(dm_key) = state_lock.dmkey(peer) {
+                                    if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
+                                        let arrow =
+                                            if frm == state_lock.me { "→" } else { "←" };
+                                        state_lock.message_history.push(DisplayedMessage {
                                             time: format_time(ts),
                                             text: format!(
-                                                "{} sent an image:\n{}",
-                                                data.get("u").and_then(|v| v.as_str()).unwrap_or("?"),
-                                                ascii_art
+                                                "{} {} {}",
+                                                frm,
+                                                arrow,
+                                                String::from_utf8(content).unwrap_or_else(|_| {
+                                                    "[Invalid UTF-8]".to_string()
+                                                })
                                             ),
-                                            msg_type: MessageType::Img,
-                                            user: Some(u.to_string()),
-                                            channel: Some(ch.to_string()),
+                                            msg_type: MessageType::Dm,
+                                            user: Some(frm.to_string()),
+                                            channel: None,
                                         });
-                                        // Keep only last 100 messages
-                                        if state.message_history.len() > 100 {
-                                            state.message_history.remove(0);
+                                        if state_lock.message_history.len() > 100 {
+                                            state_lock.message_history.remove(0);
                                         }
                                     }
                                 }
-                                "sys" => {
-                                    let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
-                                    let mut state = state_clone.lock().await;
-                                    state.message_history.push(DisplayedMessage {
-                                        time: format_time(ts),
-                                        text: m.to_string(),
-                                        msg_type: MessageType::Sys,
-                                        user: None,
-                                        channel: None,
-                                    });
-                                    if state.message_history.len() > 100 {
-                                        state.message_history.remove(0);
-                                    }
-                                }
-                                "dm" => {
-                                    let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                                    let encrypted = match general_purpose::STANDARD.decode(c) {
-                                        Ok(bytes) => bytes,
-                                        Err(_) => continue,
-                                    };
-                                        let mut state_lock = state_clone.lock().await;
-                                    let peer = if frm == state_lock.me { to } else { frm };
-                                    match state_lock.dmkey(peer) {
-                                        Ok(dm_key) => {
-                                            if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
-                                                let arrow = if frm == state_lock.me { "→" } else { "←" };
-                                                state_lock.message_history.push(DisplayedMessage {
-                                                    time: format_time(ts),
-                                                    text: format!("{} {} {}", frm, arrow, String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string())),
-                                                    msg_type: MessageType::Dm,
-                                                    user: Some(frm.to_string()),
-                                                    channel: None,
-                                                });
-                                                if state_lock.message_history.len() > 100 {
-                                                    state_lock.message_history.remove(0);
-                                                }
-                                            }
-                                        }
-                                        Err(_) => {}
-                                    }
-                                }
-                                "users" => {
-                                    let mut state = state_clone.lock().await;
-                                    let names: Vec<String> = serde_json::from_value(data.get("users").unwrap_or(&serde_json::json!([])).clone()).unwrap_or_default();
-                                    state.message_history.push(DisplayedMessage {
-                                        time: format_time(ts),
-                                        text: format!("Online users: {}", names.join(", ")),
-                                        msg_type: MessageType::Sys,
-                                        user: None,
-                                        channel: None,
-                                    });
-                                    if state.message_history.len() > 100 {
-                                        state.message_history.remove(0);
-                                    }
-                                }
-                                "joined" => {
-                                    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
-                                    let mut state = state_clone.lock().await;
-                                    state.ch = ch.to_string();
-                                    state.chs.insert(ch.to_string(), true);
-                                    state.message_history.push(DisplayedMessage {
-                                        time: format_time(ts),
-                                        text: format!("→ #{}", ch),
-                                        msg_type: MessageType::Sys,
-                                        user: None,
-                                        channel: None,
-                                    });
-                                    if state.message_history.len() > 100 {
-                                        state.message_history.remove(0);
-                                    }
-                                    // Send request for history
-                                    let _ = state.ws_tx.send(
-                                        serde_json::json!({
-                                            "t": "join",
-                                            "ch": ch,
-                                            "ts": SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs()
-                                        })
-                                        .to_string(),
-                                    );
-                                }
-                                "info" => {
-                                    let mut state = state_clone.lock().await;
-                                    let chs: Vec<String> = serde_json::from_value(data.get("chs").unwrap_or(&serde_json::json!([])).clone()).unwrap_or_default();
-                                    let online = data.get("online").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    state.message_history.push(DisplayedMessage {
-                                        time: format_time(ts),
-                                        text: format!("Channels: {} | Online: {}", chs.join(", "), online),
-                                        msg_type: MessageType::Sys,
-                                        user: None,
-                                        channel: None,
-                                    });
-                                    if state.message_history.len() > 100 {
-                                        state.message_history.remove(0);
-                                    }
-                                }
-                                _ => {}
                             }
+                            "users" => {
+                                let mut state = state_clone.lock().await;
+                                let names: Vec<String> = serde_json::from_value(
+                                    data.get("users").unwrap_or(&serde_json::json!([])).clone(),
+                                )
+                                .unwrap_or_default();
+                                state.message_history.push(DisplayedMessage {
+                                    time: format_time(ts),
+                                    text: format!("Online users: {}", names.join(", ")),
+                                    msg_type: MessageType::Sys,
+                                    user: None,
+                                    channel: None,
+                                });
+                                if state.message_history.len() > 100 {
+                                    state.message_history.remove(0);
+                                }
+                            }
+                            "joined" => {
+                                let ch =
+                                    data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+                                let mut state = state_clone.lock().await;
+                                state.ch = ch.to_string();
+                                state.chs.insert(ch.to_string(), true);
+                                state.message_history.push(DisplayedMessage {
+                                    time: format_time(ts),
+                                    text: format!("→ #{}", ch),
+                                    msg_type: MessageType::Sys,
+                                    user: None,
+                                    channel: None,
+                                });
+                                if state.message_history.len() > 100 {
+                                    state.message_history.remove(0);
+                                }
+                                // Send request for history
+                                let _ = state.ws_tx.send(
+                                    serde_json::json!({
+                                        "t": "join",
+                                        "ch": ch,
+                                        "ts": SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                            "info" => {
+                                let mut state = state_clone.lock().await;
+                                let chs: Vec<String> = serde_json::from_value(
+                                    data.get("chs").unwrap_or(&serde_json::json!([])).clone(),
+                                )
+                                .unwrap_or_default();
+                                let online =
+                                    data.get("online").and_then(|v| v.as_u64()).unwrap_or(0);
+                                state.message_history.push(DisplayedMessage {
+                                    time: format_time(ts),
+                                    text: format!(
+                                        "Channels: {} | Online: {}",
+                                        chs.join(", "),
+                                        online
+                                    ),
+                                    msg_type: MessageType::Sys,
+                                    user: None,
+                                    channel: None,
+                                });
+                                if state.message_history.len() > 100 {
+                                    state.message_history.remove(0);
+                                }
+                            }
+                            _ => {}
                         }
+                    } else {
+                        let state = state_clone.lock().await;
+                        state.log("WARN", "Dropped malformed JSON payload from server");
                     }
-                    _ => {}
                 }
             }
         });
@@ -474,7 +565,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stdin_task = tokio::spawn(async move {
             let stdin = BufReader::new(tokio::io::stdin());
             let mut lines = stdin.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(e) => {
+                        let state = state_clone2.lock().await;
+                        state.log("WARN", &format!("stdin read error: {}", e));
+                        break;
+                    }
+                };
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -488,8 +588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut state = state_clone2.lock().await;
                     match cmd {
                         "/join" => {
-                            let ch = args.trim().trim_start_matches('#');
-                            if !ch.is_empty() {
+                            if let Some(ch) = normalize_channel(args.trim()) {
                                 state.ch = ch.to_string();
                                 state.chs.insert(ch.to_string(), true);
                                 // Request history for the channel
@@ -504,16 +603,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     })
                                     .to_string(),
                                 );
+                            } else {
+                                state.log(
+                                    "INFO",
+                                    "Usage: /join <channel>. Allowed: letters, digits, -, _",
+                                );
                             }
                         }
                         "/dm" => {
                             let mut parts = args.splitn(2, ' ');
                             let target = parts.next().unwrap_or("");
                             let msg = parts.next().unwrap_or("");
-                            if !target.is_empty() && !msg.is_empty() {
+                            if target.is_empty() || msg.is_empty() {
+                                state.log("INFO", "Usage: /dm <user> <message>");
+                                continue;
+                            }
+                            if target == state.me {
+                                state.log("INFO", "Cannot DM yourself.");
+                                continue;
+                            }
+                            {
                                 let encrypted = match state.dmkey(target) {
                                     Ok(key) => enc_bytes(&key, msg.as_bytes()),
-                                    Err(_) => continue,
+                                    Err(e) => {
+                                        state.log("WARN", &format!("DM failed: {}", e));
+                                        continue;
+                                    }
                                 };
                                 let encoded = general_purpose::STANDARD.encode(&encrypted);
                                 let _ = state.ws_tx.send(
@@ -617,10 +732,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                                         .as_secs()
-                    }).to_string();
+                    })
+                    .to_string();
                     let _ = state_clone2.lock().await.ws_tx.send(msg);
                 }
-            }   
+            }
         });
 
         // Wait for tasks to complete

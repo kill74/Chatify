@@ -15,13 +15,16 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 #[derive(Parser)]
 #[command(name = "clicord-server")]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0")] host: String,
-    #[arg(long, default_value_t = 8765)]    port: u16,
-    #[arg(long)] log: bool,
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+    #[arg(long, default_value_t = 8765)]
+    port: u16,
+    #[arg(long)]
+    log: bool,
 }
 
 const HISTORY_CAP: usize = 50;
-const MAX_BYTES:   usize = 16_000;
+const MAX_BYTES: usize = 16_000;
 
 #[derive(Clone)]
 struct Channel {
@@ -32,11 +35,16 @@ struct Channel {
 impl Channel {
     fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
-        Self { history: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAP))), tx }
+        Self {
+            history: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAP))),
+            tx,
+        }
     }
     async fn push(&self, entry: Value) {
         let mut h = self.history.write().await;
-        if h.len() >= HISTORY_CAP { h.pop_front(); }
+        if h.len() >= HISTORY_CAP {
+            h.pop_front();
+        }
         h.push_back(entry);
     }
     async fn hist(&self) -> Vec<Value> {
@@ -45,8 +53,8 @@ impl Channel {
 }
 
 struct State {
-    channels:   DashMap<String, Channel>,
-    voice:      DashMap<String, broadcast::Sender<String>>,
+    channels: DashMap<String, Channel>,
+    voice: DashMap<String, broadcast::Sender<String>>,
     user_statuses: DashMap<String, Value>,
     file_transfers: DashMap<String, Value>,
     log_enabled: bool,
@@ -56,7 +64,7 @@ impl State {
     fn new(log_enabled: bool) -> Arc<Self> {
         let s = Arc::new(Self {
             channels: DashMap::new(),
-            voice:    DashMap::new(),
+            voice: DashMap::new(),
             user_statuses: DashMap::new(),
             file_transfers: DashMap::new(),
             log_enabled,
@@ -66,14 +74,20 @@ impl State {
     }
 
     fn chan(&self, name: &str) -> Channel {
-        self.channels.entry(name.into()).or_insert_with(Channel::new).clone()
+        self.channels
+            .entry(name.into())
+            .or_insert_with(Channel::new)
+            .clone()
     }
 
     fn voice_tx(&self, room: &str) -> broadcast::Sender<String> {
-        self.voice.entry(room.into()).or_insert_with(|| {
-            let (tx, _) = broadcast::channel(128);
-            tx
-        }).clone()
+        self.voice
+            .entry(room.into())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(128);
+                tx
+            })
+            .clone()
     }
 
     /// Get the count of online users
@@ -116,7 +130,11 @@ fn safe_ch(raw: &str) -> String {
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
-    if s.is_empty() { "general".into() } else { s }
+    if s.is_empty() {
+        "general".into()
+    } else {
+        s
+    }
 }
 
 /// Create a system message JSON string
@@ -130,7 +148,12 @@ fn hms() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("{:02}:{:02}:{:02}", (s % 86400) / 3600, (s % 3600) / 60, s % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        (s % 86400) / 3600,
+        (s % 3600) / 60,
+        s % 60
+    )
 }
 
 /// Log a message with timestamp if logging is enabled
@@ -179,11 +202,12 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     };
 
     // Extract username from message
-    let username = d.get("u")
+    let username = d
+        .get("u")
         .and_then(|v| v.as_str())
         .unwrap_or("anon")
         .to_string();
-    
+
     // Track user status
     let status = d
         .get("status")
@@ -236,7 +260,15 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     let mut voice_room: Option<String> = None;
 
     // Main message handling loop
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let msg = match stream.next().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => {
+                log(&state, &format!("ws recv error for {}: {}", username, e));
+                break;
+            }
+            None => break,
+        };
         let raw = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
@@ -261,7 +293,9 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             "msg" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let c = d["c"].as_str().unwrap_or("").to_string();
-                if c.is_empty() { continue; }
+                if c.is_empty() {
+                    continue;
+                }
                 let entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
                 let chan = state.chan(&ch);
                 chan.push(entry.clone()).await;
@@ -270,16 +304,22 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             "img" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let a = d["a"].as_str().unwrap_or("").to_string();
-                if a.is_empty() { continue; }
+                if a.is_empty() {
+                    continue;
+                }
                 let _ = state.chan(&ch).tx.send(
-                    serde_json::json!({"t":"img","ch":ch,"u":username,"a":a,"ts":now()}).to_string(),
+                    serde_json::json!({"t":"img","ch":ch,"u":username,"a":a,"ts":now()})
+                        .to_string(),
                 );
             }
             "dm" => {
                 let target = d["to"].as_str().unwrap_or("").to_string();
                 let c = d["c"].as_str().unwrap_or("").to_string();
-                if c.is_empty() || target.is_empty() { continue; }
-                let p = serde_json::json!({"t":"dm","from":username,"to":target,"c":c,"ts":now()}).to_string();
+                if c.is_empty() || target.is_empty() {
+                    continue;
+                }
+                let p = serde_json::json!({"t":"dm","from":username,"to":target,"c":c,"ts":now()})
+                    .to_string();
                 let _ = state.chan(&format!("__dm__{}", target)).tx.send(p.clone());
                 let _ = state.chan(&format!("__dm__{}", username)).tx.send(p);
             }
@@ -302,18 +342,29 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                         }
                     }
                 });
-                let _ = out_tx.send(serde_json::json!({"t":"joined","ch":ch,"hist":hist}).to_string());
+                let _ =
+                    out_tx.send(serde_json::json!({"t":"joined","ch":ch,"hist":hist}).to_string());
                 let _ = chan.tx.send(sys(&format!("→ {} joined #{}", username, ch)));
             }
             "users" => {
-                let users: Vec<String> = state.user_statuses.iter().map(|e| e.key().clone()).collect();
+                let users: Vec<String> = state
+                    .user_statuses
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
                 let _ = out_tx.send(serde_json::json!({"t":"users","users":users}).to_string());
             }
             "info" => {
-                let chs: Vec<String> = state.channels.iter()
+                let chs: Vec<String> = state
+                    .channels
+                    .iter()
                     .filter(|e| !e.key().starts_with("__dm__"))
-                    .map(|e| e.key().clone()).collect();
-                let _ = out_tx.send(serde_json::json!({"t":"info","chs":chs,"online":state.online_count()}).to_string());
+                    .map(|e| e.key().clone())
+                    .collect();
+                let _ = out_tx.send(
+                    serde_json::json!({"t":"info","chs":chs,"online":state.online_count()})
+                        .to_string(),
+                );
             }
             "vjoin" => {
                 let room = safe_ch(d["r"].as_str().unwrap_or("general"));
@@ -334,19 +385,29 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     }
                 });
                 voice_room = Some(room.clone());
-                let _ = state.chan(&room).tx.send(sys(&format!("🎙 {} joined voice #{}", username, room)));
+                let _ = state
+                    .chan(&room)
+                    .tx
+                    .send(sys(&format!("🎙 {} joined voice #{}", username, room)));
             }
             "vleave" => {
                 if let Some(ref room) = voice_room.take() {
-                    let _ = state.chan(room).tx.send(sys(&format!("🎙 {} left voice #{}", username, room)));
+                    let _ = state
+                        .chan(room)
+                        .tx
+                        .send(sys(&format!("🎙 {} left voice #{}", username, room)));
                 }
             }
             "vdata" => {
                 let a = d["a"].as_str().unwrap_or("").to_string();
-                if a.is_empty() { continue; }
+                if a.is_empty() {
+                    continue;
+                }
                 if let Some(ref room) = voice_room {
                     if let Some(vtx) = state.voice.get(room) {
-                        let _ = vtx.send(serde_json::json!({"t":"vdata","from":username,"a":a}).to_string());
+                        let _ = vtx.send(
+                            serde_json::json!({"t":"vdata","from":username,"a":a}).to_string(),
+                        );
                     }
                 }
             }
@@ -357,7 +418,9 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let old_text = d["old_text"].as_str().unwrap_or("").to_string();
                 let new_text = d["new_text"].as_str().unwrap_or("").to_string();
-                if old_text.is_empty() || new_text.is_empty() { continue; }
+                if old_text.is_empty() || new_text.is_empty() {
+                    continue;
+                }
                 let chan = state.chan(&ch);
                 let mut h = chan.history.write().await;
                 let username_clone = username.clone();
@@ -377,14 +440,18 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     "old_text": old_text,
                     "new_text": new_text,
                     "ts": now()
-                }).to_string();
+                })
+                .to_string();
                 let _ = chan.tx.send(edit_msg);
             }
             "file_meta" => {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
                 let size = d["size"].as_u64().unwrap_or(0);
-                let file_id = d["file_id"].as_str().unwrap_or(&format!("{}_{}", username, now())).to_string();
+                let file_id = d["file_id"]
+                    .as_str()
+                    .unwrap_or(&format!("{}_{}", username, now()))
+                    .to_string();
                 state.file_transfers.insert(file_id.clone(), d.clone());
                 let file_announce = serde_json::json!({
                     "t": "file_meta",
@@ -394,7 +461,8 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     "file_id": file_id,
                     "ch": ch,
                     "ts": now()
-                }).to_string();
+                })
+                .to_string();
                 let _ = state.chan(&ch).tx.send(file_announce);
             }
             "file_chunk" => {
@@ -410,17 +478,21 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     "index": index,
                     "ch": ch,
                     "ts": now()
-                }).to_string();
+                })
+                .to_string();
                 let _ = state.chan(&ch).tx.send(chunk_msg);
             }
             "status" => {
                 if let Some(status_val) = d.get("status") {
-                    state.user_statuses.insert(username.clone(), status_val.clone());
+                    state
+                        .user_statuses
+                        .insert(username.clone(), status_val.clone());
                     let status_update = serde_json::json!({
                         "t": "status_update",
                         "user": username,
                         "status": status_val
-                    }).to_string();
+                    })
+                    .to_string();
                     for chan_entry in state.channels.iter() {
                         let _ = chan_entry.tx.send(status_update.clone());
                     }
@@ -437,7 +509,8 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     "msg_id": msg_id,
                     "ch": ch,
                     "ts": now()
-                }).to_string();
+                })
+                .to_string();
                 let _ = state.chan(&ch).tx.send(reaction_msg);
             }
             _ => {}
@@ -455,11 +528,15 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 async fn main() {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port);
-    
-    let listener = TcpListener::bind(&addr)
-        .await
-        .expect("Failed to bind to address");
-    
+
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Failed to bind {}: {}", addr, e);
+            return;
+        }
+    };
+
     let state = State::new(args.log);
 
     println!("📡 Chatify running on ws://{}", addr);
