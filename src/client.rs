@@ -3,7 +3,9 @@
 //! A real-time chat client with support for channels, direct messages, voice,
 //! file transfers, message editing, reactions, and user status tracking.
 
-use clicord_server::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash};
+use clicord_server::crypto::{
+    channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash,
+};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
@@ -166,12 +168,14 @@ impl ClientState {
 
     fn dmkey(&mut self, name: &str) -> Result<Vec<u8>, String> {
         if !self.dm_keys.contains_key(name) {
-            let _pk = self
+            let pk = self
                 .users
                 .get(name)
                 .ok_or_else(|| format!("User {} not found", name))?;
-            // Use simple key derivation instead of ECDH due to dependency conflicts
-            let key = channel_key(&self.pw, &format!("dm:{}", name));
+            let key = dh_key(&self.priv_key, pk);
+            if key.len() != 32 {
+                return Err(format!("Invalid public key for user {}", name));
+            }
             self.dm_keys.insert(name.to_string(), key.clone());
             Ok(key)
         } else {
@@ -548,6 +552,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let password = rpassword::prompt_password("password: ").unwrap();
+    let client_priv_key = new_keypair();
+    let client_pub_key = pub_b64(&client_priv_key);
 
     // Set up logging
     if log_enabled {
@@ -564,7 +570,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "t": "auth",
         "u": username,
         "pw": pw_hash(&password),
-        "pk": pub_b64(&new_keypair()),
+        "pk": client_pub_key,
         "status": {"text": "Online", "emoji": "🟢"}
     });
     ws_tx.send(Message::Text(auth_msg.to_string())).await?;
@@ -636,7 +642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             users: user_map,
             chan_keys: HashMap::new(),
             dm_keys: HashMap::new(),
-            priv_key: new_keypair(),
+            priv_key: client_priv_key,
             running: true,
             voice_active: false,
             voice_session: None,
@@ -751,6 +757,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "dm" => {
                                 let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
                                 let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+                                if let Some(pk) = data.get("pk").and_then(|v| v.as_str()) {
+                                    if !pk.is_empty() {
+                                        state_clone
+                                            .lock()
+                                            .await
+                                            .users
+                                            .insert(frm.to_string(), pk.to_string());
+                                    }
+                                }
                                 let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
                                 let encrypted = match general_purpose::STANDARD.decode(c) {
                                     Ok(bytes) => bytes,
@@ -784,10 +799,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             "users" => {
                                 let mut state = state_clone.lock().await;
-                                let names: Vec<String> = serde_json::from_value(
-                                    data.get("users").unwrap_or(&serde_json::json!([])).clone(),
-                                )
-                                .unwrap_or_default();
+                                let users_val =
+                                    data.get("users").unwrap_or(&serde_json::json!([])).clone();
+                                let users: Vec<serde_json::Value> =
+                                    serde_json::from_value(users_val).unwrap_or_default();
+                                let mut names: Vec<String> = Vec::new();
+                                for user in users {
+                                    if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
+                                        names.push(name.to_string());
+                                        if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
+                                            if !pk.is_empty() {
+                                                state
+                                                    .users
+                                                    .insert(name.to_string(), pk.to_string());
+                                            }
+                                        }
+                                    }
+                                }
                                 state.message_history.push(DisplayedMessage {
                                     time: format_time(ts),
                                     text: format!("Online users: {}", names.join(", ")),

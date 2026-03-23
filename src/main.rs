@@ -56,6 +56,7 @@ struct State {
     channels: DashMap<String, Channel>,
     voice: DashMap<String, broadcast::Sender<String>>,
     user_statuses: DashMap<String, Value>,
+    user_pubkeys: DashMap<String, String>,
     file_transfers: DashMap<String, Value>,
     log_enabled: bool,
 }
@@ -66,6 +67,7 @@ impl State {
             channels: DashMap::new(),
             voice: DashMap::new(),
             user_statuses: DashMap::new(),
+            user_pubkeys: DashMap::new(),
             file_transfers: DashMap::new(),
             log_enabled,
         });
@@ -102,6 +104,16 @@ impl State {
                 .iter()
                 .filter(|e| !e.key().starts_with("__dm__"))
                 .map(|e| Value::String(e.key().clone()))
+                .collect(),
+        )
+    }
+
+    /// Get online users and their public keys as JSON array.
+    fn users_with_keys_json(&self) -> Value {
+        Value::Array(
+            self.user_pubkeys
+                .iter()
+                .map(|e| serde_json::json!({"u": e.key().clone(), "pk": e.value().clone()}))
                 .collect(),
         )
     }
@@ -176,6 +188,7 @@ fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>) -> S
     serde_json::json!({
         "t": "ok",
         "u": username,
+        "users": state.users_with_keys_json(),
         "channels": state.channels_json(),
         "hist": hist
     })
@@ -214,6 +227,11 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         .cloned()
         .unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
     state.user_statuses.insert(username.clone(), status);
+    if let Some(pk) = d.get("pk").and_then(|v| v.as_str()) {
+        if !pk.is_empty() {
+            state.user_pubkeys.insert(username.clone(), pk.to_string());
+        }
+    }
 
     // Get general channel and send welcome response
     let general = state.chan("general");
@@ -318,7 +336,12 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 if c.is_empty() || target.is_empty() {
                     continue;
                 }
-                let p = serde_json::json!({"t":"dm","from":username,"to":target,"c":c,"ts":now()})
+                let sender_pk = state
+                    .user_pubkeys
+                    .get(&username)
+                    .map(|v| v.value().clone())
+                    .unwrap_or_default();
+                let p = serde_json::json!({"t":"dm","from":username,"to":target,"c":c,"pk":sender_pk,"ts":now()})
                     .to_string();
                 let _ = state.chan(&format!("__dm__{}", target)).tx.send(p.clone());
                 let _ = state.chan(&format!("__dm__{}", username)).tx.send(p);
@@ -347,12 +370,10 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let _ = chan.tx.send(sys(&format!("→ {} joined #{}", username, ch)));
             }
             "users" => {
-                let users: Vec<String> = state
-                    .user_statuses
-                    .iter()
-                    .map(|e| e.key().clone())
-                    .collect();
-                let _ = out_tx.send(serde_json::json!({"t":"users","users":users}).to_string());
+                let _ = out_tx.send(
+                    serde_json::json!({"t":"users","users":state.users_with_keys_json()})
+                        .to_string(),
+                );
             }
             "info" => {
                 let chs: Vec<String> = state
@@ -519,6 +540,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 
     // User disconnected - cleanup
     state.user_statuses.remove(&username);
+    state.user_pubkeys.remove(&username);
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     log(&state, &format!("- {}", username));
 }

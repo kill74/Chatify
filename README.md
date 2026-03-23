@@ -28,7 +28,6 @@ Encryption helpers exist in the codebase, but the current implementation is not 
 Reasons:
 
 - Authentication is minimal.
-- Some cryptographic/key-exchange paths are stubbed/simplified.
 - Protocol hardening is still in progress.
 
 Use this project for development, learning, and controlled environments unless you complete a dedicated security hardening pass.
@@ -164,7 +163,7 @@ Voice stopped
 ## Known Limitations
 
 - The current protocol is functional but not yet hardened for hostile public environments.
-- Some crypto and key-exchange paths are simplified/stubbed and need full replacement before production use.
+- Security hardening is still required before production use.
 - There is no persistent storage layer yet; state is memory-first.
 - Test coverage is light and mostly build/lint-driven; integration coverage is planned.
 - The Discord bridge source exists, but the binary target is disabled due to dependency conflicts.
