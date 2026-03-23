@@ -11,17 +11,20 @@ Build the best terminal-first, self-hosted team chat for developer workflows.
 Goal: move from memory-first chat to a queryable event stream.
 
 Deliverables:
+
 - Add SQLite persistence for message events (chat, DM, system, joins, edits).
 - Add command: `/history [channel] [window]` (examples: `#general 24h`, `dm:alice 7d`).
 - Add command: `/search <query>` for full-text event search.
 - Add command: `/replay <timestamp>` to reconstruct state from events.
 
 Implementation notes:
+
 - Keep write path append-only.
 - Use channel + ts indexes.
 - Define versioned schema migration flow.
 
 Exit criteria:
+
 - Restarting server preserves history.
 - History and search latency stays low on 100k local events.
 
@@ -30,16 +33,19 @@ Exit criteria:
 Goal: practical trust model without heavy enterprise complexity.
 
 Deliverables:
+
 - Persist public key fingerprints per user.
 - Add command: `/fingerprint [user]`.
 - Add command: `/trust <user> <fingerprint>`.
 - Show key-change warnings on reconnect.
 
 Implementation notes:
+
 - Use explicit trust states: `unknown`, `trusted`, `changed`.
 - Block silent key rotation.
 
 Exit criteria:
+
 - User can verify and trust peers from CLI.
 - Key changes are obvious and auditable.
 
@@ -48,16 +54,19 @@ Exit criteria:
 Goal: support mixed communities without forcing migration.
 
 Deliverables:
+
 - Re-enable bridge target with pinned dependency strategy.
 - Add channel map config file for bridge routes.
 - Add loop prevention using source IDs and relay markers.
 - Add bridge health command: `/bridge status`.
 
 Implementation notes:
+
 - Keep bridge optional behind feature flag.
 - Add structured logs for bridge events.
 
 Exit criteria:
+
 - Bidirectional message relay works in mapped channels.
 - No relay loops under normal operation.
 
@@ -66,15 +75,18 @@ Exit criteria:
 Goal: richer experience while preserving terminal identity.
 
 Deliverables:
+
 - ANSI image preview in client for supported payloads.
 - Better code block rendering with language hint labels.
 - Audio note payload support (short voice clips in channel timeline).
 
 Implementation notes:
+
 - Make media rendering optional (`--no-media`).
 - Keep graceful fallback for simple terminals.
 
 Exit criteria:
+
 - Rich payloads are readable in default terminal without UI breakage.
 
 ## Phase 5: Plugin Runtime (3-4 weeks)
@@ -82,15 +94,18 @@ Exit criteria:
 Goal: make Chatify extensible and community-driven.
 
 Deliverables:
+
 - Plugin API for slash command registration.
 - Message hook API for moderation/automation.
 - Ship 3 built-in plugins: poll, standup, deploy notifier.
 
 Implementation notes:
+
 - Start with process-isolated plugin execution.
 - Freeze API v1 before publishing examples.
 
 Exit criteria:
+
 - Plugins can be installed, listed, and disabled without restart.
 
 ## Baseline Quality Gates (Apply to every phase)
