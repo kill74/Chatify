@@ -433,6 +433,7 @@ dependencies = [
  "hex",
  "hmac",
  "image",
+ "log",
  "once_cell",
  "pbkdf2",
  "rand",

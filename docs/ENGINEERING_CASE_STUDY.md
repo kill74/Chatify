@@ -42,6 +42,15 @@ The goal of Chatify is to build a smaller system where behavior is explicit, tes
 3. Expanded protocol contract tests for malformed and adversarial payloads.
 4. Operational observability improvements for bridge and reconnect paths.
 
+## How I Would Scale This System
+
+1. Split connection handling from event durability so read/write pressure can scale independently.
+2. Introduce a broker-backed fan-out layer for high-concurrency channel delivery while keeping protocol contracts stable.
+3. Move from single-node SQLite to a replicated storage strategy once write amplification and retention policy justify the complexity.
+4. Add bounded backpressure controls and queue observability to protect latency under burst traffic.
+5. Keep compatibility gates for protocol versioning so client upgrades remain safe during rolling deployments.
+6. Scale in stages with SLO-driven thresholds instead of early over-architecture.
+
 ## Lessons Learned
 
 1. Feature flags are essential for keeping optional integrations from destabilizing core builds.

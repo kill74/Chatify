@@ -204,6 +204,30 @@ async fn auth_contract_returns_expected_fields() {
 }
 
 #[tokio::test]
+async fn auth_contract_rejects_invalid_username() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url).await.expect("connect websocket");
+
+    let bad_auth = json!({
+        "t": "auth",
+        "u": "invalid user",
+        "pw": "test-password-hash",
+        "pk": pub_b64(&new_keypair()),
+        "status": {"text":"Online","emoji":"🟢"}
+    });
+
+    ws.send(Message::Text(bad_auth.to_string()))
+        .await
+        .expect("send invalid auth payload");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("validation error: invalid username")
+    );
+}
+
+#[tokio::test]
 async fn users_contract_returns_user_objects_with_public_keys() {
     let server = start_server().await;
     let mut alice = connect_and_auth(&server.url, "alice").await;

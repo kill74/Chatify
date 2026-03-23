@@ -6,6 +6,7 @@
 use clicord_server::crypto::{
     channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash,
 };
+use clicord_server::error::{ChatifyError, ChatifyResult};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
@@ -26,12 +27,18 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use chrono::{DateTime, Utc};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use log::{debug, error, info, warn};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
 const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [limit], /search <query>, /rewind <Ns|Nm|Nh|Nd> [limit], /clear, /edit, /help, /quit";
 type SharedState = Arc<tokio::sync::Mutex<ClientState>>;
 type JsonMap = HashMap<String, serde_json::Value>;
+
+struct AuthContext {
+    me: String,
+    users: HashMap<String, String>,
+}
 
 // Enumeration of supported message types in the protocol
 #[derive(Debug, Clone, PartialEq)]
@@ -157,9 +164,15 @@ struct ClientState {
 
 impl ClientState {
     fn log(&self, level: &str, msg: &str) {
-        if self.log_enabled {
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            println!("[{}] {}: {}", timestamp, level, msg);
+        if !self.log_enabled {
+            return;
+        }
+
+        match level {
+            "ERROR" => error!("{}", msg),
+            "WARN" => warn!("{}", msg),
+            "DEBUG" => debug!("{}", msg),
+            _ => info!("{}", msg),
         }
     }
 
@@ -173,15 +186,18 @@ impl ClientState {
         }
     }
 
-    fn dmkey(&mut self, name: &str) -> Result<Vec<u8>, String> {
+    fn dmkey(&mut self, name: &str) -> ChatifyResult<Vec<u8>> {
         if !self.dm_keys.contains_key(name) {
             let pk = self
                 .users
                 .get(name)
-                .ok_or_else(|| format!("User {} not found", name))?;
+                .ok_or_else(|| ChatifyError::Validation(format!("user '{}' not found", name)))?;
             let key = dh_key(&self.priv_key, pk);
             if key.len() != 32 {
-                return Err(format!("Invalid public key for user {}", name));
+                return Err(ChatifyError::Crypto(format!(
+                    "invalid public key for user '{}'",
+                    name
+                )));
             }
             self.dm_keys.insert(name.to_string(), key.clone());
             Ok(key)
@@ -273,6 +289,98 @@ fn fresh_nonce_hex() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+fn read_username() -> ChatifyResult<String> {
+    print!("username: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let username = input.trim();
+    if username.is_empty() {
+        println!("Empty username provided, using 'anon'.");
+        Ok("anon".to_string())
+    } else {
+        Ok(username.to_string())
+    }
+}
+
+fn extract_auth_text(
+    auth_reply: Result<
+        Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+        tokio::time::error::Elapsed,
+    >,
+) -> ChatifyResult<String> {
+    match auth_reply {
+        Ok(Some(Ok(Message::Text(resp)))) => Ok(resp),
+        Ok(Some(Ok(_))) => Err(ChatifyError::Validation(
+            "authentication failed: server sent unexpected frame".to_string(),
+        )),
+        Ok(Some(Err(e))) => Err(ChatifyError::WebSocket(e)),
+        Ok(None) => Err(ChatifyError::Validation(
+            "authentication failed: connection closed by server".to_string(),
+        )),
+        Err(_) => Err(ChatifyError::Validation(
+            "authentication failed: timeout waiting for server response".to_string(),
+        )),
+    }
+}
+
+fn parse_auth_payload(resp: &str, fallback_username: &str) -> ChatifyResult<AuthContext> {
+    let resp_val: serde_json::Value = serde_json::from_str(resp)?;
+    let typ = resp_val.get("t").and_then(|v| v.as_str()).unwrap_or("");
+    if typ == "err" {
+        let msg = resp_val
+            .get("m")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown server error")
+            .to_string();
+        return Err(ChatifyError::Validation(format!(
+            "authentication failed: {}",
+            msg
+        )));
+    }
+    if typ != "ok" {
+        return Err(ChatifyError::Validation(format!(
+            "authentication failed: unexpected handshake type '{}'",
+            typ
+        )));
+    }
+    if !resp_val.get("users").map(|v| v.is_array()).unwrap_or(false) {
+        return Err(ChatifyError::Validation(
+            "authentication failed: malformed users payload".to_string(),
+        ));
+    }
+    if !resp_val
+        .get("channels")
+        .map(|v| v.is_array())
+        .unwrap_or(false)
+    {
+        return Err(ChatifyError::Validation(
+            "authentication failed: malformed channels payload".to_string(),
+        ));
+    }
+
+    let me = resp_val["u"]
+        .as_str()
+        .unwrap_or(fallback_username)
+        .to_string();
+
+    let users: Vec<serde_json::Value> =
+        serde_json::from_value(resp_val["users"].clone()).unwrap_or_default();
+    let mut user_map: HashMap<String, String> = HashMap::new();
+    for user in users {
+        if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
+            if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
+                user_map.insert(name.to_string(), pk.to_string());
+            }
+        }
+    }
+
+    Ok(AuthContext {
+        me,
+        users: user_map,
+    })
 }
 
 fn enqueue_json(ws_tx: &mpsc::UnboundedSender<String>, payload: serde_json::Value) {
@@ -641,9 +749,9 @@ fn build_input_stream(
     sample_rate: u32,
     channels: u16,
     chunk_samples: usize,
-) -> Result<Stream, String> {
+) -> ChatifyResult<Stream> {
     let pending = Arc::new(Mutex::new(VecDeque::<i16>::new()));
-    let err_fn = |e| eprintln!("voice input error: {}", e);
+    let err_fn = |e| warn!("voice input error: {}", e);
     match format {
         SampleFormat::I16 => {
             let pending_i16 = pending.clone();
@@ -663,7 +771,9 @@ fn build_input_stream(
                     },
                     err_fn,
                 )
-                .map_err(|e| format!("failed to build i16 input stream: {}", e))
+                .map_err(|e| {
+                    ChatifyError::Audio(format!("failed to build i16 input stream: {}", e))
+                })
         }
         SampleFormat::U16 => {
             let pending_u16 = pending.clone();
@@ -689,7 +799,9 @@ fn build_input_stream(
                     },
                     err_fn,
                 )
-                .map_err(|e| format!("failed to build u16 input stream: {}", e))
+                .map_err(|e| {
+                    ChatifyError::Audio(format!("failed to build u16 input stream: {}", e))
+                })
         }
         SampleFormat::F32 => {
             let pending_f32 = pending;
@@ -715,7 +827,9 @@ fn build_input_stream(
                     },
                     err_fn,
                 )
-                .map_err(|e| format!("failed to build f32 input stream: {}", e))
+                .map_err(|e| {
+                    ChatifyError::Audio(format!("failed to build f32 input stream: {}", e))
+                })
         }
     }
 }
@@ -723,9 +837,9 @@ fn build_input_stream(
 fn start_voice_session(
     room: String,
     ws_tx: mpsc::UnboundedSender<String>,
-) -> Result<VoiceSession, String> {
+) -> ChatifyResult<VoiceSession> {
     let (event_tx, event_rx) = std_mpsc::channel::<VoiceEvent>();
-    let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
+    let (ready_tx, ready_rx) = std_mpsc::channel::<ChatifyResult<()>>();
     let ws_tx_task = ws_tx;
     let room_task = room.clone();
     let event_tx_thread = event_tx.clone();
@@ -735,14 +849,19 @@ fn start_voice_session(
         let input_device = match host.default_input_device() {
             Some(d) => d,
             None => {
-                let _ = ready_tx.send(Err("no default input device available".to_string()));
+                let _ = ready_tx.send(Err(ChatifyError::Audio(
+                    "no default input device available".to_string(),
+                )));
                 return;
             }
         };
         let input_supported = match input_device.default_input_config() {
             Ok(cfg) => cfg,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("failed to fetch default input config: {}", e)));
+                let _ = ready_tx.send(Err(ChatifyError::Audio(format!(
+                    "failed to fetch default input config: {}",
+                    e
+                ))));
                 return;
             }
         };
@@ -758,14 +877,20 @@ fn start_voice_session(
         let (_output_stream, output_handle) = match OutputStream::try_default() {
             Ok(v) => v,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("audio output init failed: {}", e)));
+                let _ = ready_tx.send(Err(ChatifyError::Audio(format!(
+                    "audio output init failed: {}",
+                    e
+                ))));
                 return;
             }
         };
         let sink = match Sink::try_new(&output_handle) {
             Ok(s) => s,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("audio output sink init failed: {}", e)));
+                let _ = ready_tx.send(Err(ChatifyError::Audio(format!(
+                    "audio output sink init failed: {}",
+                    e
+                ))));
                 return;
             }
         };
@@ -786,7 +911,10 @@ fn start_voice_session(
             }
         };
         if let Err(e) = input_stream.play() {
-            let _ = ready_tx.send(Err(format!("failed to start microphone stream: {}", e)));
+            let _ = ready_tx.send(Err(ChatifyError::Audio(format!(
+                "failed to start microphone stream: {}",
+                e
+            ))));
             return;
         }
         let _ = ready_tx.send(Ok(()));
@@ -829,14 +957,16 @@ fn start_voice_session(
         }
         Err(_) => {
             let _ = task.join();
-            Err("voice runtime failed to initialize".to_string())
+            Err(ChatifyError::Audio(
+                "voice runtime failed to initialize".to_string(),
+            ))
         }
     }
 }
 
 /// Main entry point for the WebSocket client
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ChatifyResult<()> {
     // Parse command line arguments
     let matches = clap::Command::new("chatify-client")
         .version("1.0")
@@ -878,27 +1008,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheme = if tls { "wss" } else { "ws" };
     let uri = format!("{}://{}:{}", scheme, host, port);
 
-    let username = {
-        print!("username: ");
-        io::stdout().flush().unwrap();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let u = input.trim().to_string();
-        if u.is_empty() {
-            println!("Empty username provided, using 'anon'.");
-            "anon".to_string()
-        } else {
-            u
-        }
-    };
+    let username = read_username()?;
 
-    let password = rpassword::prompt_password("password: ").unwrap();
+    let password = rpassword::prompt_password("password: ")?;
     let client_priv_key = new_keypair();
     let client_pub_key = pub_b64(&client_priv_key);
 
     // Set up logging
     if log_enabled {
-        env_logger::init();
+        let _ = env_logger::Builder::from_default_env()
+            .format_timestamp_secs()
+            .try_init();
     }
 
     // Connect to WebSocket
@@ -918,73 +1038,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for auth response with timeout
     let auth_reply = timeout(Duration::from_secs(10), ws_rx.next()).await;
-    let resp = match auth_reply {
-        Ok(Some(Ok(Message::Text(resp)))) => resp,
-        Ok(Some(Ok(_))) => {
-            eprintln!("Authentication failed: server sent unexpected frame");
-            return Ok(());
-        }
-        Ok(Some(Err(e))) => {
-            eprintln!("Authentication failed: websocket error: {}", e);
-            return Ok(());
-        }
-        Ok(None) => {
-            eprintln!("Authentication failed: connection closed by server");
-            return Ok(());
-        }
-        Err(_) => {
-            eprintln!("Authentication failed: timeout waiting for server response");
+    let resp = match extract_auth_text(auth_reply) {
+        Ok(payload) => payload,
+        Err(err) => {
+            error!("{}", err);
             return Ok(());
         }
     };
 
     {
-        let resp_val: serde_json::Value = match serde_json::from_str(&resp) {
+        let auth = match parse_auth_payload(&resp, &username) {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("Authentication failed: invalid JSON from server: {}", e);
+            Err(err) => {
+                error!("{}", err);
                 return Ok(());
             }
         };
-        let typ = resp_val.get("t").and_then(|v| v.as_str()).unwrap_or("");
-        if typ == "err" {
-            eprintln!(
-                "Authentication failed: {}",
-                resp_val
-                    .get("m")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown server error")
-            );
-            return Ok(());
-        }
-        if typ != "ok" {
-            eprintln!("Authentication failed: unexpected handshake type '{}'", typ);
-            return Ok(());
-        }
-        if !resp_val.get("users").map(|v| v.is_array()).unwrap_or(false) {
-            eprintln!("Authentication failed: malformed users payload");
-            return Ok(());
-        }
-        if !resp_val
-            .get("channels")
-            .map(|v| v.is_array())
-            .unwrap_or(false)
-        {
-            eprintln!("Authentication failed: malformed channels payload");
-            return Ok(());
-        }
-        // Update state with server response
-        let me = resp_val["u"].as_str().unwrap_or(&username).to_string();
-        let users: Vec<serde_json::Value> =
-            serde_json::from_value(resp_val["users"].clone()).unwrap_or_default();
-        let mut user_map = HashMap::new();
-        for u in users {
-            if let Some(name) = u["u"].as_str() {
-                if let Some(pk) = u["pk"].as_str() {
-                    user_map.insert(name.to_string(), pk.to_string());
-                }
-            }
-        }
         // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
 
@@ -999,11 +1068,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // We'll store the state in an Arc for sharing between tasks
         let state = Arc::new(tokio::sync::Mutex::new(ClientState {
             ws_tx: msg_tx.clone(), // Use mpsc sender instead of WebSocket
-            me: me.clone(),
+            me: auth.me.clone(),
             pw: password,
             ch: "general".to_string(),
             chs: HashMap::from([("general".to_string(), true)]),
-            users: user_map,
+            users: auth.users,
             chan_keys: HashMap::new(),
             dm_keys: HashMap::new(),
             priv_key: client_priv_key,
@@ -1020,7 +1089,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reactions: HashMap::new(),
             log_enabled,
         }));
-        state.lock().await.me = me;
+        state.lock().await.me = auth.me;
 
         // Spawn tasks for reading from WebSocket and from stdin
         let state_clone = state.clone();
@@ -1168,8 +1237,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         state.log("INFO", "Voice session started");
                                     }
                                     Err(e) => {
-                                        eprintln!("Voice start failed: {}", e);
-                                        eprintln!("Check that your microphone/speakers are available and not in use by another app.");
+                                        error!("Voice start failed: {}", e);
+                                        info!("Check that your microphone/speakers are available and not in use by another app.");
                                         state.log("WARN", &format!("Voice start failed: {}", e));
                                     }
                                 }

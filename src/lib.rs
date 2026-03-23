@@ -4,5 +4,7 @@
 //! server/client binaries and integration tests.
 //! Current shared surface:
 //! - `crypto`: key derivation and encryption helpers used by runtime components.
+//! - `error`: shared error/result types used by binaries.
 
 pub mod crypto;
+pub mod error;

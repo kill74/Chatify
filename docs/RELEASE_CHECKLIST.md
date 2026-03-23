@@ -69,3 +69,42 @@ git push origin v0.1.0
 1. Clone fresh and run server/client quick start.
 2. Verify release links in README and CHANGELOG.
 3. Save benchmark numbers to docs/BENCHMARKS.md after first measured run.
+
+## 10. Vulnerability Triage and Remediation
+
+Use this process when GitHub reports security alerts for the default branch.
+
+### 10.1 Inspect Current Advisories
+
+1. Open the Security tab in GitHub and list all Dependabot alerts by severity.
+2. Classify each alert by exploitability in this project context: reachable, conditionally reachable, or not reachable.
+
+### 10.2 Verify Affected Dependency Path
+
+```bash
+cargo tree -i <crate_name>
+```
+
+Confirm whether the vulnerable crate is direct or transitive.
+
+### 10.3 Apply Safe Updates
+
+```bash
+cargo update -p <crate_name>
+```
+
+If a major version upgrade is required, update `Cargo.toml` intentionally and document the compatibility impact.
+
+### 10.4 Re-Run Quality Gates
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+cargo check --features discord-bridge --bin discord_bot
+```
+
+### 10.5 Record and Communicate
+
+1. Add a brief summary of fixes in CHANGELOG under Unreleased.
+2. If risk is high, publish a patch release and call out security impact in release notes.

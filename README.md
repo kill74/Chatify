@@ -1,5 +1,10 @@
 # Chatify
 
+[![CI](https://github.com/kill74/Chatify/actions/workflows/ci.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/ci.yml)
+[![Windows Release Package](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml)
+[![Release](https://img.shields.io/github/v/release/kill74/Chatify)](https://github.com/kill74/Chatify/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Terminal-first, self-hosted chat built with Rust.
 
 Chatify provides a lightweight WebSocket server, a fast terminal client, and an optional Discord bridge. The project is designed for local teams, controlled environments, and developers who want clear behavior, low runtime overhead, and readable code paths.
@@ -23,6 +28,16 @@ This project is intended to demonstrate engineering judgment, not just feature o
 - Release posture: automated Windows release packaging with checksums.
 - Documentation posture: architecture, roadmap, security notes, benchmark methodology, and case study.
 
+## Results Snapshot
+
+This section is intentionally short so reviewers can validate outcomes quickly.
+
+- Latest release: `v0.1.0`
+- CI posture: passing checks required for merge on `main`
+- Delivery artifacts: Windows ZIP package with SHA256 checksum on published releases
+- Performance baseline: benchmark process documented in [docs/BENCHMARKS.md](docs/BENCHMARKS.md); measured values to be published in next benchmark pass
+- Test posture: protocol contracts, bridge reconnection regressions, and full workspace test suite in CI
+
 See supporting evidence:
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
@@ -36,6 +51,7 @@ See supporting evidence:
 - [Core Capabilities](#core-capabilities)
 - [Why This Project Exists](#why-this-project-exists)
 - [Recruiter Snapshot](#recruiter-snapshot)
+- [Results Snapshot](#results-snapshot)
 - [Project Status](#project-status)
 - [Quick Start](#quick-start)
 - [Shipping Binaries](#shipping-binaries)

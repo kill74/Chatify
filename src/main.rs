@@ -1,17 +1,21 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
+use clicord_server::error::{ChatifyError, ChatifyResult};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use log::{info, warn};
 use rusqlite::{params, Connection, Error as SqlError};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Notify, RwLock};
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[derive(Parser)]
@@ -58,7 +62,7 @@ impl EventStore {
     fn new(path: String) -> Self {
         let store = Self { path };
         if let Err(e) = store.init() {
-            eprintln!("Failed to initialize event store: {}", e);
+            warn!("failed to initialize event store: {}", e);
         }
         store
     }
@@ -127,7 +131,7 @@ impl EventStore {
         }
 
         if version > CURRENT_SCHEMA_VERSION {
-            eprintln!(
+            warn!(
                 "Database schema version {} is newer than supported version {}",
                 version, CURRENT_SCHEMA_VERSION
             );
@@ -140,7 +144,7 @@ impl EventStore {
         match Connection::open(&self.path) {
             Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("Event store open failed: {}", e);
+                warn!("event store open failed: {}", e);
                 None
             }
         }
@@ -162,7 +166,7 @@ impl EventStore {
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Event query prepare failed: {}", e);
+                warn!("event query prepare failed: {}", e);
                 return Vec::new();
             }
         };
@@ -170,7 +174,7 @@ impl EventStore {
         let rows = match stmt.query_map(params, |row| row.get::<_, String>(0)) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Event query execute failed: {}", e);
+                warn!("event query execute failed: {}", e);
                 return Vec::new();
             }
         };
@@ -206,7 +210,7 @@ impl EventStore {
                 search_text.to_lowercase()
             ],
         ) {
-            eprintln!("Event persist failed: {}", e);
+            warn!("event persist failed: {}", e);
         }
     }
 
@@ -276,6 +280,8 @@ struct State {
     user_pubkeys: DashMap<String, String>,
     recent_nonces: DashMap<String, VecDeque<String>>,
     file_transfers: DashMap<String, Value>,
+    active_connections: AtomicUsize,
+    drained_notify: Notify,
     store: EventStore,
     log_enabled: bool,
 }
@@ -289,6 +295,8 @@ impl State {
             user_pubkeys: DashMap::new(),
             recent_nonces: DashMap::new(),
             file_transfers: DashMap::new(),
+            active_connections: AtomicUsize::new(0),
+            drained_notify: Notify::new(),
             store: EventStore::new(db_path),
             log_enabled,
         });
@@ -338,6 +346,38 @@ impl State {
                 .collect(),
         )
     }
+
+    fn connection_opened(&self) {
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn connection_closed(&self) {
+        let prev = self.active_connections.fetch_sub(1, Ordering::SeqCst);
+        if prev <= 1 {
+            self.drained_notify.notify_waiters();
+        }
+    }
+
+    fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::SeqCst)
+    }
+}
+
+struct ConnectionGuard {
+    state: Arc<State>,
+}
+
+impl ConnectionGuard {
+    fn new(state: Arc<State>) -> Self {
+        state.connection_opened();
+        Self { state }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.state.connection_closed();
+    }
 }
 
 fn clamp_limit(raw: Option<u64>, default: usize, max: usize) -> usize {
@@ -375,8 +415,28 @@ async fn handle_event(
     voice_room: &mut Option<String>,
 ) {
     let t = d["t"].as_str().unwrap_or("");
+    let event_channel = d
+        .get("ch")
+        .or_else(|| d.get("r"))
+        .and_then(|v| v.as_str())
+        .map(safe_ch);
+
+    if state.log_enabled {
+        if let Some(ch) = event_channel.as_deref() {
+            info!("event user={} type={} channel={}", username, t, ch);
+        } else {
+            info!("event user={} type={}", username, t);
+        }
+    }
+
     if requires_fresh_protection(t) {
         if let Err(e) = validate_timestamp_skew(d) {
+            if state.log_enabled {
+                warn!(
+                    "protocol validation failed user={} type={} reason={}",
+                    username, t, e
+                );
+            }
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"err","m":format!("protocol validation failed: {}", e)}),
@@ -384,6 +444,12 @@ async fn handle_event(
             return;
         }
         if let Err(e) = validate_and_register_nonce(state, username, d) {
+            if state.log_enabled {
+                warn!(
+                    "protocol validation failed user={} type={} reason={}",
+                    username, t, e
+                );
+            }
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"err","m":format!("protocol validation failed: {}", e)}),
@@ -728,24 +794,10 @@ fn sys(text: &str) -> String {
     serde_json::json!({"t":"sys","m":text,"ts":now()}).to_string()
 }
 
-/// Get current time formatted as HH:MM:SS
-fn hms() -> String {
-    let s = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!(
-        "{:02}:{:02}:{:02}",
-        (s % 86400) / 3600,
-        (s % 3600) / 60,
-        s % 60
-    )
-}
-
 /// Log a message with timestamp if logging is enabled
 fn log(state: &State, msg: &str) {
     if state.log_enabled {
-        println!("[{}] {}", hms(), msg);
+        info!("{}", msg);
     }
 }
 
@@ -791,38 +843,42 @@ fn is_valid_pubkey_b64(pk: &str) -> bool {
     }
 }
 
-fn validate_auth_payload(d: &Value) -> Result<AuthInfo, String> {
+fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
     if !d.is_object() {
-        return Err("invalid auth frame".to_string());
+        return Err(ChatifyError::Validation("invalid auth frame".to_string()));
     }
     if d.get("t").and_then(|v| v.as_str()) != Some("auth") {
-        return Err("first frame must be auth".to_string());
+        return Err(ChatifyError::Validation(
+            "first frame must be auth".to_string(),
+        ));
     }
 
     let username = d
         .get("u")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing username".to_string())?
+        .ok_or_else(|| ChatifyError::Validation("missing username".to_string()))?
         .to_string();
     if !is_valid_username(&username) {
-        return Err("invalid username".to_string());
+        return Err(ChatifyError::Validation("invalid username".to_string()));
     }
 
     let pw = d
         .get("pw")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing password hash".to_string())?;
+        .ok_or_else(|| ChatifyError::Validation("missing password hash".to_string()))?;
     if pw.is_empty() || pw.len() > MAX_PASSWORD_FIELD_LEN {
-        return Err("invalid password hash".to_string());
+        return Err(ChatifyError::Validation(
+            "invalid password hash".to_string(),
+        ));
     }
 
     let pubkey = d
         .get("pk")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing public key".to_string())?
+        .ok_or_else(|| ChatifyError::Validation("missing public key".to_string()))?
         .to_string();
     if !is_valid_pubkey_b64(&pubkey) {
-        return Err("invalid public key".to_string());
+        return Err(ChatifyError::Validation("invalid public key".to_string()));
     }
 
     let status = d
@@ -852,7 +908,7 @@ fn requires_fresh_protection(event_type: &str) -> bool {
     )
 }
 
-fn validate_timestamp_skew(d: &Value) -> Result<(), String> {
+fn validate_timestamp_skew(d: &Value) -> ChatifyResult<()> {
     if d.get("n").and_then(|v| v.as_str()).is_none() {
         // Backward-compatible: only enforce timestamp freshness when nonce-based replay
         // protection is used by the client.
@@ -863,37 +919,39 @@ fn validate_timestamp_skew(d: &Value) -> Result<(), String> {
         .get("ts")
         .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|u| u as f64)))
     else {
-        return Err("missing timestamp".to_string());
+        return Err(ChatifyError::Validation("missing timestamp".to_string()));
     };
 
     if !ts.is_finite() || ts < 0.0 {
-        return Err("invalid timestamp".to_string());
+        return Err(ChatifyError::Validation("invalid timestamp".to_string()));
     }
 
     if (now() - ts).abs() > MAX_CLOCK_SKEW_SECS {
-        return Err("timestamp outside allowed clock skew".to_string());
+        return Err(ChatifyError::Validation(
+            "timestamp outside allowed clock skew".to_string(),
+        ));
     }
 
     Ok(())
 }
 
-fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Result<(), String> {
+fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> ChatifyResult<()> {
     let Some(nonce) = d.get("n").and_then(|v| v.as_str()) else {
         // Backward-compatible: accept events without nonce.
         return Ok(());
     };
 
     if nonce.is_empty() || nonce.len() > MAX_NONCE_LEN {
-        return Err("invalid nonce".to_string());
+        return Err(ChatifyError::Validation("invalid nonce".to_string()));
     }
     if !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("invalid nonce format".to_string());
+        return Err(ChatifyError::Validation("invalid nonce format".to_string()));
     }
 
     let mut user_nonces = state.recent_nonces.entry(username.to_string()).or_default();
 
     if user_nonces.iter().any(|n| n == nonce) {
-        return Err("replayed nonce".to_string());
+        return Err(ChatifyError::Validation("replayed nonce".to_string()));
     }
 
     user_nonces.push_back(nonce.to_string());
@@ -906,6 +964,8 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Resu
 
 /// Main client connection handler
 async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
+    let _conn_guard = ConnectionGuard::new(state.clone());
+
     // Accept WebSocket connection
     let ws = match accept_async(stream).await {
         Ok(w) => w,
@@ -948,10 +1008,10 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 
     let auth = match validate_auth_payload(&d) {
         Ok(a) => a,
-        Err(msg) => {
+        Err(err) => {
             let _ = sink
                 .send(Message::Text(
-                    serde_json::json!({"t":"err","m":msg}).to_string(),
+                    serde_json::json!({"t":"err","m":err.to_string()}).to_string(),
                 ))
                 .await;
             return;
@@ -1055,17 +1115,17 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 
 /// Main entry point
 #[tokio::main]
-async fn main() {
+async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port);
 
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("Failed to bind {}: {}", addr, e);
-            return;
-        }
-    };
+    if args.log {
+        let _ = env_logger::Builder::from_default_env()
+            .format_timestamp_secs()
+            .try_init();
+    }
+
+    let listener = TcpListener::bind(&addr).await?;
 
     let state = State::new(args.log, args.db.clone());
 
@@ -1073,14 +1133,110 @@ async fn main() {
     println!(" Encryption: None (testing) |   IP Privacy: On");
     println!(" Event store: {}", args.db);
     println!("⏹  Press Ctrl+C to stop\n");
+    if args.log {
+        info!("server started addr=ws://{} db={}", addr, args.db);
+    }
 
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let s = state.clone();
-                tokio::spawn(handle(stream, addr, s));
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                broadcast_system_msg(&state, "Server is shutting down").await;
+                println!("\nShutdown signal received. Stopping server loop...");
+                if state.log_enabled {
+                    info!("shutdown signal received; stopping accept loop");
+                }
+                break;
             }
-            Err(_) => continue,
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        let s = state.clone();
+                        tokio::spawn(handle(stream, addr, s));
+                    }
+                    Err(_) => continue,
+                }
+            }
         }
+    }
+
+    // Wait for active connections to drain with a bounded timeout.
+    let drain_timeout = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    loop {
+        let active = state.active_connection_count();
+        if active == 0 {
+            break;
+        }
+        if start.elapsed() >= drain_timeout {
+            println!(
+                "Shutdown timeout reached with {} active connection(s)",
+                active
+            );
+            if state.log_enabled {
+                warn!(
+                    "shutdown timeout reached with {} active connection(s)",
+                    active
+                );
+            }
+            break;
+        }
+        println!("Waiting for {} active connection(s) to close...", active);
+        if state.log_enabled {
+            info!("waiting for active connections to drain count={}", active);
+        }
+        tokio::select! {
+            _ = state.drained_notify.notified() => {}
+            _ = sleep(Duration::from_millis(250)) => {}
+        }
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_payload_rejects_invalid_username_with_typed_error() {
+        let payload = serde_json::json!({
+            "t": "auth",
+            "u": "bad user",
+            "pw": "abc123",
+            "pk": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+        });
+
+        let err = match validate_auth_payload(&payload) {
+            Ok(_) => panic!("expected validation error"),
+            Err(e) => e,
+        };
+        match err {
+            ChatifyError::Validation(msg) => assert_eq!(msg, "invalid username"),
+            other => panic!("unexpected error type: {}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_counter_tracks_open_and_close() {
+        let state = State::new(false, ":memory:".to_string());
+        assert_eq!(state.active_connection_count(), 0);
+
+        {
+            let _g1 = ConnectionGuard::new(state.clone());
+            let _g2 = ConnectionGuard::new(state.clone());
+            assert_eq!(state.active_connection_count(), 2);
+        }
+
+        let start = std::time::Instant::now();
+        while state.active_connection_count() != 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "active connections did not drain in time"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(state.active_connection_count(), 0);
     }
 }
