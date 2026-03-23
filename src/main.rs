@@ -848,7 +848,7 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
         return Err(ChatifyError::Validation("invalid auth frame".to_string()));
     }
     if d.get("t").and_then(|v| v.as_str()) != Some("auth") {
-        return Err(ChatifyError::Validation(
+        return Err(ChatifyError::Message(
             "first frame must be auth".to_string(),
         ));
     }
@@ -878,7 +878,7 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
         .ok_or_else(|| ChatifyError::Validation("missing public key".to_string()))?
         .to_string();
     if !is_valid_pubkey_b64(&pubkey) {
-        return Err(ChatifyError::Validation("invalid public key".to_string()));
+        return Err(ChatifyError::Message("invalid public key".to_string()));
     }
 
     let status = d
