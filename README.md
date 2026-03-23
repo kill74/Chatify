@@ -10,6 +10,7 @@ Chatify provides a lightweight WebSocket server and a terminal client focused on
 - [Project Status](#project-status)
 - [Quick Start](#quick-start)
 - [Binaries](#binaries)
+- [Windows Executable Package](#windows-executable-package)
 - [Configuration](#configuration)
 - [Client Commands](#client-commands)
 - [Persistence and History](#persistence-and-history)
@@ -95,6 +96,28 @@ Configured Cargo binaries:
 - `clicord-server`
 - `clicord-client`
 - `discord_bot` (feature-gated)
+
+## Windows Executable Package
+
+Build a shareable ZIP that includes executable files and click-to-run launchers:
+
+```powershell
+.\build-windows-package.ps1
+```
+
+Output:
+
+- `dist/chatify-windows-x64.zip`
+- `dist/chatify-windows-x64/start-server.bat`
+- `dist/chatify-windows-x64/start-client.bat`
+
+This package can be used on Windows machines without installing Rust.
+
+GitHub Releases automation:
+
+- On every published GitHub Release, workflow `.github/workflows/windows-release-package.yml`
+  builds this package on `windows-latest` and uploads `dist/chatify-windows-x64.zip`
+  as a release asset automatically.
 
 ## Configuration
 

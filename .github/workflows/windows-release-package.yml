@@ -1,0 +1,30 @@
+name: Windows Release Package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-attach-windows-zip:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows package
+        shell: pwsh
+        run: .\build-windows-package.ps1
+
+      - name: Upload package as release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/chatify-windows-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
