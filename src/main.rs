@@ -853,12 +853,17 @@ fn requires_fresh_protection(event_type: &str) -> bool {
 }
 
 fn validate_timestamp_skew(d: &Value) -> Result<(), String> {
+    if d.get("n").and_then(|v| v.as_str()).is_none() {
+        // Backward-compatible: only enforce timestamp freshness when nonce-based replay
+        // protection is used by the client.
+        return Ok(());
+    }
+
     let Some(ts) = d
         .get("ts")
         .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|u| u as f64)))
     else {
-        // Backward-compatible: accept events from clients that don't send ts.
-        return Ok(());
+        return Err("missing timestamp".to_string());
     };
 
     if !ts.is_finite() || ts < 0.0 {
