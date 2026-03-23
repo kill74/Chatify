@@ -183,6 +183,25 @@ async fn broadcast_system_msg(state: &Arc<State>, msg: &str) {
     }
 }
 
+fn spawn_broadcast_forwarder(
+    mut rx: broadcast::Receiver<String>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(m) => {
+                    if out_tx.send(m).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(_) => {}
+            }
+        }
+    });
+}
+
 /// Create JSON response for successful connection
 fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>) -> String {
     serde_json::json!({
@@ -235,7 +254,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 
     // Get general channel and send welcome response
     let general = state.chan("general");
-    let mut gen_rx = general.tx.subscribe();
+    let gen_rx = general.tx.subscribe();
     let hist = general.hist().await;
 
     let ok = create_ok_response(&username, &state, hist);
@@ -251,20 +270,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Spawn task to forward general channel messages to output channel
-    let tx = out_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            match gen_rx.recv().await {
-                Ok(m) => {
-                    if tx.send(m).is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(_) => {}
-            }
-        }
-    });
+    spawn_broadcast_forwarder(gen_rx, out_tx.clone());
 
     // Spawn task to send queued messages to WebSocket
     tokio::spawn(async move {
@@ -350,21 +356,8 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let chan = state.chan(&ch);
                 let hist = chan.hist().await;
-                let mut rx = chan.tx.subscribe();
-                let tx2 = out_tx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok(m) => {
-                                if tx2.send(m).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(_) => {}
-                        }
-                    }
-                });
+                let rx = chan.tx.subscribe();
+                spawn_broadcast_forwarder(rx, out_tx.clone());
                 let _ =
                     out_tx.send(serde_json::json!({"t":"joined","ch":ch,"hist":hist}).to_string());
                 let _ = chan.tx.send(sys(&format!("→ {} joined #{}", username, ch)));
@@ -390,21 +383,8 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             "vjoin" => {
                 let room = safe_ch(d["r"].as_str().unwrap_or("general"));
                 let vtx = state.voice_tx(&room);
-                let mut vrx = vtx.subscribe();
-                let tx2 = out_tx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        match vrx.recv().await {
-                            Ok(m) => {
-                                if tx2.send(m).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(_) => {}
-                        }
-                    }
-                });
+                let vrx = vtx.subscribe();
+                spawn_broadcast_forwarder(vrx, out_tx.clone());
                 voice_room = Some(room.clone());
                 let _ = state
                     .chan(&room)

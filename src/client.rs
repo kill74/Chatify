@@ -222,6 +222,27 @@ fn normalize_channel(raw: &str) -> Option<String> {
     }
 }
 
+fn parse_users_payload(users_val: &serde_json::Value) -> (Vec<String>, HashMap<String, String>) {
+    let users: Vec<serde_json::Value> =
+        serde_json::from_value(users_val.clone()).unwrap_or_default();
+    let mut names = Vec::new();
+    let mut keys = HashMap::new();
+
+    for user in users {
+        if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
+            let name = name.to_string();
+            names.push(name.clone());
+            if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
+                if !pk.is_empty() {
+                    keys.insert(name, pk.to_string());
+                }
+            }
+        }
+    }
+
+    (names, keys)
+}
+
 fn encode_voice_frame(frame: &VoiceFrame) -> String {
     let mut out = Vec::with_capacity(6 + frame.samples.len() * 2);
     out.extend_from_slice(&frame.sample_rate.to_le_bytes());
@@ -611,16 +632,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // Update state with server response
         let me = resp_val["u"].as_str().unwrap_or(&username).to_string();
-        let users: Vec<serde_json::Value> =
-            serde_json::from_value(resp_val["users"].clone()).unwrap_or_default();
-        let mut user_map = HashMap::new();
-        for u in users {
-            if let Some(name) = u["u"].as_str() {
-                if let Some(pk) = u["pk"].as_str() {
-                    user_map.insert(name.to_string(), pk.to_string());
-                }
-            }
-        }
+        let (_, user_map) = parse_users_payload(&resp_val["users"]);
         // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
 
@@ -757,21 +769,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "dm" => {
                                 let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
                                 let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
-                                if let Some(pk) = data.get("pk").and_then(|v| v.as_str()) {
-                                    if !pk.is_empty() {
-                                        state_clone
-                                            .lock()
-                                            .await
-                                            .users
-                                            .insert(frm.to_string(), pk.to_string());
-                                    }
-                                }
                                 let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
                                 let encrypted = match general_purpose::STANDARD.decode(c) {
                                     Ok(bytes) => bytes,
                                     Err(_) => continue,
                                 };
                                 let mut state_lock = state_clone.lock().await;
+
+                                if let Some(pk) = data.get("pk").and_then(|v| v.as_str()) {
+                                    if !pk.is_empty() {
+                                        state_lock.users.insert(frm.to_string(), pk.to_string());
+                                        // Invalidate cached key to avoid decrypting with a stale peer key.
+                                        state_lock.dm_keys.remove(frm);
+                                    }
+                                }
+
                                 let peer = if frm == state_lock.me { to } else { frm };
                                 if let Ok(dm_key) = state_lock.dmkey(peer) {
                                     if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
@@ -799,22 +811,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             "users" => {
                                 let mut state = state_clone.lock().await;
-                                let users_val =
-                                    data.get("users").unwrap_or(&serde_json::json!([])).clone();
-                                let users: Vec<serde_json::Value> =
-                                    serde_json::from_value(users_val).unwrap_or_default();
-                                let mut names: Vec<String> = Vec::new();
-                                for user in users {
-                                    if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
-                                        names.push(name.to_string());
-                                        if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
-                                            if !pk.is_empty() {
-                                                state
-                                                    .users
-                                                    .insert(name.to_string(), pk.to_string());
-                                            }
-                                        }
-                                    }
+                                let empty_users = serde_json::json!([]);
+                                let users_val = data.get("users").unwrap_or(&empty_users);
+                                let (names, key_map) = parse_users_payload(users_val);
+                                for (name, pk) in key_map {
+                                    state.users.insert(name, pk);
                                 }
                                 state.message_history.push(DisplayedMessage {
                                     time: format_time(ts),
