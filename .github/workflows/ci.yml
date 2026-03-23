@@ -1,13 +1,32 @@
-name: ci
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   rust:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -16,7 +35,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev
+          sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -24,23 +43,32 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Pre-fetch dependencies
+        run: cargo fetch --locked
+
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --all
+        run: cargo test --workspace --all-targets --locked
 
       - name: Bridge feature compile check
-        run: cargo check --features discord-bridge --bin discord_bot
+        run: cargo check --features discord-bridge --bin discord_bot --locked
 
-      - name: Bridge reconnect regression test
-        run: cargo test --features discord-bridge --bin discord_bot bridge_supervisor_reconnects_after_disconnect
-
-      - name: Bridge mapping and loop-filter unit tests
+      - name: Bridge regression tests
         run: |
-          cargo test --features discord-bridge --bin discord_bot parse_channel_map_filters_and_normalizes_entries
-          cargo test --features discord-bridge --bin discord_bot self_source_filter_matches_only_non_empty_identical_source
-          cargo test --features discord-bridge --bin discord_bot self_source_filter_ignores_non_string_src_values
+          set -euo pipefail
+
+          bridge_tests=(
+            bridge_supervisor_reconnects_after_disconnect
+            parse_channel_map_filters_and_normalizes_entries
+            self_source_filter_matches_only_non_empty_identical_source
+            self_source_filter_ignores_non_string_src_values
+          )
+
+          for test_name in "${bridge_tests[@]}"; do
+            cargo test --features discord-bridge --bin discord_bot --locked "${test_name}"
+          done
