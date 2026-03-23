@@ -1,85 +1,80 @@
 # Chatify
 
-Terminal-first group chat built in Rust.
+Terminal-first, self-hosted chat built with Rust.
 
-Chatify is a self-hosted WebSocket chat system with a Rust server and client.
-It focuses on fast setup, lightweight runtime behavior, and a clean CLI workflow.
+Chatify provides a lightweight WebSocket server and a terminal client focused on fast startup, low overhead, and practical team workflows.
 
-## Status
+## Table of Contents
 
-This project is actively evolving and should currently be treated as experimental.
+- [Highlights](#highlights)
+- [Project Status](#project-status)
+- [Quick Start](#quick-start)
+- [Binaries](#binaries)
+- [Configuration](#configuration)
+- [Client Commands](#client-commands)
+- [Persistence and History](#persistence-and-history)
+- [Discord Bridge (Optional)](#discord-bridge-optional)
+- [Architecture](#architecture)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [Security Notes](#security-notes)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
 
-- Core chat flow works.
-- Runtime hardening and input validation are in place.
-- Some features are placeholders and documented below.
+## Highlights
 
-## What It Does Today
+- Multi-channel chat and direct messages
+- Presence/status updates and user/channel listing
+- SQLite-backed event persistence (`history`, `search`, `rewind`)
+- Terminal-friendly command workflow
+- Optional Discord bridge behind a Cargo feature flag
 
-- Multi-channel messaging
-- Direct messages
-- Basic presence/status propagation
-- Join/channel info/user listing commands
-- In-memory channel history relay
-- SQLite-backed event persistence
-- History replay, rewind, and channel search commands
+## Project Status
 
-## Important Security Note
+Chatify is actively evolving and should be considered experimental.
 
-Encryption helpers exist in the codebase, but the current implementation is not production-grade end-to-end security.
-
-Reasons:
-
-- Authentication is minimal.
-- Protocol hardening is still in progress.
-
-Use this project for development, learning, and controlled environments unless you complete a dedicated security hardening pass.
-
-## Binaries
-
-Current binaries configured in Cargo:
-
-- clicord-server
-- clicord-client
-
-Discord bridge code exists in the repository, but is disabled as a build target.
+- Core chat flow is stable for local and controlled environments.
+- Runtime validation and baseline hardening are in place.
+- Some features are intentionally incomplete (for example, `/edit`).
 
 ## Quick Start
 
-### Build release binaries
+### 1. Build
 
 ```bash
 cargo build --release
 ```
 
-### Windows (PowerShell)
+### 2. Run server
 
-Server:
+Windows (PowerShell):
 
 ```powershell
 .\target\release\clicord-server.exe --host 0.0.0.0 --port 8765
 ```
 
-Client:
-
-```powershell
-.\target\release\clicord-client.exe --host 127.0.0.1 --port 8765
-```
-
-### Linux/macOS
-
-Server:
+Linux/macOS:
 
 ```bash
 ./target/release/clicord-server --host 0.0.0.0 --port 8765
 ```
 
-Client:
+### 3. Run client
+
+Windows (PowerShell):
+
+```powershell
+.\target\release\clicord-client.exe --host 127.0.0.1 --port 8765
+```
+
+Linux/macOS:
 
 ```bash
 ./target/release/clicord-client --host 127.0.0.1 --port 8765
 ```
 
-### Local development run
+### Dev mode (no release build)
 
 Terminal 1:
 
@@ -93,84 +88,84 @@ Terminal 2:
 cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 ```
 
-## CLI Commands (Current)
+## Binaries
 
-| Command              | Description                                            |
-| -------------------- | ------------------------------------------------------ |
-| /join <channel>      | Join or create a channel                               |
-| /dm <user> <message> | Send a direct message                                  |
-| /me <action>         | Send action-style message                              |
-| /users               | List online users                                      |
-| /channels            | List channels                                          |
-| /voice [room]        | Toggle voice in room                                   |
-| /history [limit]     | Load persisted channel history                         |
-| /search <query>      | Search persisted events in current channel             |
-| /rewind <time> [n]   | Replay events from the last time window (e.g. 15m, 2h) |
-| /edit <text>         | Placeholder command                                    |
-| /clear               | Clear terminal output                                  |
-| /help                | Show command help                                      |
-| /quit, /exit, /q     | Disconnect and exit                                    |
+Configured Cargo binaries:
 
-## UI Example (Terminal)
+- `clicord-server`
+- `clicord-client`
+- `discord_bot` (feature-gated)
 
-This is an example of how Chatify looks to a user in a normal terminal session.
+## Configuration
 
-Server window:
+### Server (`clicord-server`)
 
-```text
-$ cargo run --bin clicord-server
-📡 Chatify running on ws://0.0.0.0:8765
-🔒 Encryption: None (testing) | 🛡️  IP Privacy: On
-⏹️  Press Ctrl+C to stop
+| Flag     | Default      | Description          |
+| -------- | ------------ | -------------------- |
+| `--host` | `0.0.0.0`    | Bind address         |
+| `--port` | `8765`       | Bind port            |
+| `--db`   | `chatify.db` | SQLite database path |
+| `--log`  | `false`      | Enable logging       |
+
+### Client (`clicord-client`)
+
+| Flag     | Default     | Description          |
+| -------- | ----------- | -------------------- |
+| `--host` | `127.0.0.1` | Server host          |
+| `--port` | `8765`      | Server port          |
+| `--tls`  | `false`     | Use `wss://`         |
+| `--log`  | `false`     | Enable debug logging |
+
+## Client Commands
+
+| Command                | Description                                             |
+| ---------------------- | ------------------------------------------------------- |
+| `/join <channel>`      | Join or create a channel                                |
+| `/dm <user> <message>` | Send direct message                                     |
+| `/me <action>`         | Send action-style message                               |
+| `/users`               | List online users                                       |
+| `/channels`            | List channels                                           |
+| `/voice [room]`        | Toggle voice in room                                    |
+| `/history [limit]`     | Load persisted channel history                          |
+| `/search <query>`      | Search persisted events in current channel              |
+| `/rewind <time> [n]`   | Replay events from a time window (example: `15m`, `2h`) |
+| `/edit <text>`         | Placeholder command                                     |
+| `/clear`               | Clear terminal output                                   |
+| `/help`                | Show command help                                       |
+| `/quit`, `/exit`, `/q` | Disconnect and exit                                     |
+
+## Persistence and History
+
+Chatify persists events in SQLite using the server `--db` path (default: `chatify.db`).
+
+Supported persisted/replayed flows include:
+
+- Channel messages and system events
+- Search within current channel (`/search`)
+- History replay with cap (`/history`)
+- Time-window rewind (`/rewind`)
+
+Schema metadata and migrations are built into the server startup path.
+
+## Discord Bridge (Optional)
+
+The bridge is opt-in to keep default builds lean.
+
+Run with feature:
+
+```bash
+cargo run --features discord-bridge --bin discord_bot
 ```
 
-Client window (user Alice):
+Bridge environment variables:
 
-```text
-$ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
-username: alice
-password:
-Connected to server
-
-/join dev
-→ #dev
-
-Hello team, build passed on my side.
-
-/users
-Online users: alice, bob, carol
-
-/dm bob Can you review the auth patch?
-
-/voice
-Voice started in #dev
-
-/voice
-Voice stopped
-
-/quit
-```
-
-## Feature Maturity
-
-### Stable for local use
-
-- Channel chat flow
-- DM flow
-- Basic command routing
-- Join/leave and system messaging
-
-### Present but incomplete
-
-- Edit command behavior
-- Full protocol-level security hardening
-
-## Known Limitations
-
-- The current protocol is functional but not yet hardened for hostile public environments.
-- Security hardening is still required before production use.
-- Test coverage is light and mostly build/lint-driven; integration coverage is planned.
-- The Discord bridge source exists, but the binary target is disabled due to dependency conflicts.
+- `DISCORD_TOKEN` (required)
+- `CHATIFY_PASSWORD` (required)
+- `CHATIFY_HOST` (default: `127.0.0.1`)
+- `CHATIFY_PORT` (default: `8765`)
+- `CHATIFY_CHANNEL` (default: `general`)
+- `CHATIFY_BOT_USERNAME` (default: `DiscordBot`)
+- `CHATIFY_LOG` (set to `1` to enable logging)
 
 ## Architecture
 
@@ -179,25 +174,31 @@ Voice stopped
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs        # server
-│   ├── client.rs      # client
+│   ├── client.rs      # terminal client
 │   ├── crypto.rs      # crypto helpers
-│   ├── lib.rs
-│   └── discord_bot.rs # bridge source (disabled binary)
-├── discord-bot/
-└── README.md
+│   ├── discord_bot.rs # optional bridge binary source
+│   └── lib.rs
+├── tests/
+└── docs/
 ```
+
+Detailed docs:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/UNIQUE_ROADMAP.md](docs/UNIQUE_ROADMAP.md)
 
 ## Development
 
-Build and checks:
+Quality checks:
 
 ```bash
 cargo check --bins
+cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
-Formatting:
+Auto-format:
 
 ```bash
 cargo fmt
@@ -208,71 +209,49 @@ cargo fmt
 ### Connection refused
 
 - Verify server is running.
-- Verify host and port match.
-- Verify local firewall rules.
+- Verify host and port values match.
+- Verify firewall rules on the target machine.
 
-### Auth or handshake issues
+### Auth or handshake problems
 
-- Ensure server/client are from the same commit range.
-- Rebuild both binaries after changes.
+- Ensure server and client are built from compatible commits.
+- Rebuild binaries after protocol changes.
 
-### Messages not decrypting as expected
+### Commands appear inactive
 
-- Confirm both sides use the same runtime assumptions and channel context.
+- `/edit` is currently a placeholder.
+
+### Crypto/decryption confusion
+
 - Treat current crypto paths as experimental.
+- Validate that both peers share the same runtime expectations.
 
-### Command appears inactive
+## Security Notes
 
-- /edit is currently a placeholder.
+Encryption helpers exist, but the project is not production-grade end-to-end secure yet.
+
+Current gaps include:
+
+- Minimal authentication model
+- Ongoing protocol hardening
+
+Use Chatify for development, learning, and controlled environments unless you complete a dedicated security review and hardening pass.
+
+## Roadmap
+
+Near-term priorities:
+
+- Complete `/edit` end-to-end behavior
+- Continue auth and protocol hardening
+- Expand integration and contract-level testing
+- Improve bridge operational readiness
 
 ## Contributing
 
-PRs are welcome.
+Contributions are welcome.
 
-Recommended process:
-
-1. Create a focused branch from main.
-2. Keep changes scoped to one concern.
-3. Run check, clippy, and tests before opening PR.
-4. Document behavior changes in PR description.
-
-## Changelog and Release Notes
-
-This repository currently uses git history and PR descriptions as the source of truth.
-
-Suggested release notes format:
-
-```text
-## vX.Y.Z - YYYY-MM-DD
-
-### Added
-- ...
-
-### Changed
-- ...
-
-### Fixed
-- ...
-
-### Security
-- ...
-```
-
-If release cadence becomes regular, add a dedicated CHANGELOG.md using this format.
-
-## Roadmap (Near Term)
-
-- Complete edit path end-to-end
-- Strengthen auth and protocol validation
-- Replace/complete stubbed cryptographic flows
-- Add integration tests for client/server message contracts
-
-## Uniqueness Roadmap
-
-To execute a distinct product direction, see:
-
-- docs/UNIQUE_ROADMAP.md
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality gates, and PR checklist.
 
 ## License
 
-GPL v3. See LICENSE.
+GPL v3. See [LICENSE](LICENSE).

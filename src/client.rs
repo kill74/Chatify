@@ -295,10 +295,8 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 Err(_) => return false,
             };
             let content = match dec_bytes(&state.ckey(ch), &encrypted) {
-                Ok(content) => {
-                    String::from_utf8(content)
-                        .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string())
-                }
+                Ok(content) => String::from_utf8(content)
+                    .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string()),
                 Err(_) => return false,
             };
             state.add_message(DisplayedMessage {
@@ -355,8 +353,8 @@ async fn handle_msg_event(state: &SharedState, data: &JsonMap, ts: u64) {
     if let Ok(content) = dec_bytes(&key, &encrypted) {
         state_lock.add_message(DisplayedMessage {
             time: format_time(ts),
-                text: String::from_utf8(content)
-                    .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string()),
+            text: String::from_utf8(content)
+                .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string()),
             msg_type: MessageType::Msg,
             user: Some(u.to_string()),
             channel: Some(ch.to_string()),
@@ -508,10 +506,9 @@ async fn handle_history_or_search_event(state: &SharedState, data: &JsonMap, t: 
 }
 
 async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
-    let chs: Vec<String> = serde_json::from_value(
-        data.get("chs").cloned().unwrap_or(serde_json::json!([])),
-    )
-    .unwrap_or_default();
+    let chs: Vec<String> =
+        serde_json::from_value(data.get("chs").cloned().unwrap_or(serde_json::json!([])))
+            .unwrap_or_default();
     let online = data.get("online").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let mut state_lock = state.lock().await;

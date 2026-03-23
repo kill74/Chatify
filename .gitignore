@@ -1,37 +1,36 @@
-# Rust
-/target/
-Cargo.lock
-**/*.rs.bk
-*.pdb
-.md
+# Build artifacts
+target/
 
-# IDE and Editor
+# Local runtime artifacts
+chatify.db
+chatify-*.db
+*.sqlite
+*.sqlite3
+build.log
+
+# IDE and editor
 .vscode/
 .idea/
+*.iml
 *.swp
 *.swo
 *~
-.DS_Store
-*.iml
 
-# Environment
+# Environment and local overrides
 .env
 .env.local
 
-# OS
+# Platform files
 Thumbs.db
 .DS_Store
 
 # Backup files
 *.bak
 *.backup
+*.rs.bk
 
-# Python
+# Python leftovers
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 .Python
-
-#Folders
-/target/

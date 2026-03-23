@@ -3,6 +3,10 @@ name = "clicord-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+discord-bridge = ["dep:serenity"]
+
 [[bin]]
 name = "clicord-server"
 path = "src/main.rs"
@@ -11,10 +15,10 @@ path = "src/main.rs"
 name = "clicord-client"
 path = "src/client.rs"
 
-# Discord bot removed due to serenity dependency conflicts
-# [[bin]]
-# name = "discord_bot"
-# path = "src/discord_bot.rs"
+[[bin]]
+name = "discord_bot"
+path = "src/discord_bot.rs"
+required-features = ["discord-bridge"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -41,7 +45,7 @@ rpassword = "7"
 cpal = "0.14"
 rodio = "0.18"
 image = "0.24"
-# serenity = { version = "0.11", features = ["client", "gateway", "standard_framework", "model"] }
+serenity = { version = "0.11", features = ["client", "gateway", "standard_framework", "model", "rustls_backend"], optional = true }
 base64 = "0.21"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

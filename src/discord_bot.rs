@@ -13,6 +13,7 @@
 //! - `CHATIFY_BOT_USERNAME`: Username for the bot (default: DiscordBot)
 //! - `CHATIFY_LOG`: Set to "1" to enable logging
 
+use clicord_server::crypto::dh_key;
 use clicord_server::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash};
 
 use std::collections::HashMap;
@@ -20,38 +21,56 @@ use std::env;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose;
+use base64::{engine::general_purpose, Engine as _};
 use dashmap::DashMap;
+use futures_util::{SinkExt, StreamExt};
 use serenity::{
     async_trait,
-    model::{channel::Message, gateway::Ready, gateway::GatewayIntents},
+    model::{channel::Message, gateway::GatewayIntents, gateway::Ready},
     prelude::*,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
-use x25519_dalek::StaticSecret;
-use futures_util::StreamExt;
+
+type WsSender = mpsc::UnboundedSender<WsMessage>;
+type PayloadMap = HashMap<String, serde_json::Value>;
 
 /// Get current Unix timestamp
-fn get_timestamp() -> u64 {
+fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
+fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
+    let _ = tx.send(WsMessage::Text(payload.to_string()));
+}
+
+fn load_users(users_value: &serde_json::Value, users_map: &DashMap<String, String>) {
+    let users: Vec<serde_json::Value> =
+        serde_json::from_value(users_value.clone()).unwrap_or_default();
+    for user in users {
+        if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
+            if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
+                users_map.insert(name.to_string(), pk.to_string());
+            }
+        }
+    }
+}
+
 /// Bot state for managing Chatify connection and credentials
 struct BotState {
     /// WebSocket sender for Chatify communication
-    ws_tx: Option<mpsc::UnboundedSender<WsMessage>>,
+    ws_tx: Option<WsSender>,
     /// Bot's username on Chatify
     username: String,
     /// Password for Chatify authentication
     password: String,
     /// Current Chatify channel
     channel: String,
-    /// Bot's private key for Diffie-Hellman exchanges
-    priv_key: StaticSecret,
+    /// Bot's private key bytes for Diffie-Hellman exchanges
+    priv_key: Vec<u8>,
     /// Known users and their public keys (name -> pubkey_b64)
     users: DashMap<String, String>,
     /// Cached channel-specific encryption keys
@@ -68,7 +87,7 @@ impl BotState {
             username: String::new(),
             password: String::new(),
             channel: "general".to_string(),
-            priv_key: StaticSecret::new(OsRng),
+            priv_key: new_keypair(),
             users: DashMap::new(),
             chan_keys: DashMap::new(),
             dm_keys: DashMap::new(),
@@ -95,8 +114,10 @@ impl BotState {
             .users
             .get(username)
             .ok_or_else(|| format!("User '{}' not found", username))?;
-        let pk_bytes = Vec::from_hex(pk).map_err(|e| format!("Invalid pubkey: {}", e))?;
-        let key = dh_key(&self.priv_key, &pk_bytes);
+        let key = dh_key(&self.priv_key, pk.value().as_str());
+        if key.len() != 32 {
+            return Err(format!("Invalid derived key for '{}'", username));
+        }
         self.dm_keys.insert(username.to_string(), key.clone());
         Ok(key)
     }
@@ -116,7 +137,7 @@ impl EventHandler for DiscordHandler {
         if msg.author.id == ctx.cache.current_user_id() {
             return;
         }
-        let mut state = self.state.lock().await;
+        let state = self.state.lock().await;
 
         let content = msg.content.clone();
         let author = msg.author.name.clone();
@@ -125,15 +146,18 @@ impl EventHandler for DiscordHandler {
         // Encrypt and send to Chatify
         let key = state.get_channel_key(&state.channel);
         let encrypted = enc_bytes(&key, formatted_msg.as_bytes());
+        if encrypted.is_empty() {
+            return;
+        }
         let encoded = general_purpose::STANDARD.encode(&encrypted);
         let chatify_msg = serde_json::json!({
             "t": "msg",
             "ch": state.channel,
             "c": encoded,
-            "ts": get_timestamp()
+            "ts": now_secs()
         });
         if let Some(ref tx) = state.ws_tx {
-            let _ = tx.send(WsMessage::Text(chatify_msg.to_string()));
+            send_ws_json(tx, chatify_msg);
         }
     }
 
@@ -146,76 +170,93 @@ impl EventHandler for DiscordHandler {
 }
 
 /// Handle Chatify channel messages
-async fn handle_chatify_msg(
-    data: &HashMap<String, serde_json::Value>,
-    state: &Arc<Mutex<BotState>>,
-) {
-    let ch = data
-        .get("ch")
-        .and_then(|v| v.as_str())
-        .unwrap_or("general");
+async fn handle_chatify_msg(data: &PayloadMap, state: &Arc<Mutex<BotState>>) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
     let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
     let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
-    
+
     let encrypted = match general_purpose::STANDARD.decode(c) {
         Ok(bytes) => bytes,
         Err(_) => return,
     };
-    
-    let channel_key = {
+
+    let key = {
         let bot_state = state.lock().await;
         bot_state.get_channel_key(ch)
     };
-    
-    if let Ok(content) = dec_bytes(&channel_key, &encrypted) {
-        let content_str = String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
+
+    if let Ok(content) = dec_bytes(&key, &encrypted) {
+        let content_str =
+            String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
         println!("[Chatify → Discord] {}: {}", u, content_str);
     }
 }
 
 /// Handle Chatify system messages
-fn handle_system_msg(data: &HashMap<String, serde_json::Value>) {
+fn handle_system_msg(data: &PayloadMap) {
     let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
     println!("[Chatify → Discord] System: {}", m);
 }
 
 /// Handle Chatify direct messages between users
-async fn handle_dm_msg(
-    data: &HashMap<String, serde_json::Value>,
-    state: &Arc<Mutex<BotState>>,
-) {
+async fn handle_dm_msg(data: &PayloadMap, state: &Arc<Mutex<BotState>>) {
     let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
     let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
     let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
-    
+
     let encrypted = match general_purpose::STANDARD.decode(c) {
         Ok(bytes) => bytes,
         Err(_) => return,
     };
-    
+
     let dm_key = {
         let bot_state = state.lock().await;
         let peer = if frm == bot_state.username { to } else { frm };
         bot_state.get_dm_key(peer)
     };
-    
+
+    let Ok(dm_key) = dm_key else {
+        return;
+    };
+
     if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
-        let content_str = String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
-        println!("[Chatify → Discord] DM from {} to {}: {}", frm, to, content_str);
+        let content_str =
+            String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
+        println!(
+            "[Chatify → Discord] DM from {} to {}: {}",
+            frm, to, content_str
+        );
+    }
+}
+
+async fn handle_users_update(data: &PayloadMap, state: &Arc<Mutex<BotState>>) {
+    let users_value = data.get("users").cloned().unwrap_or(serde_json::json!([]));
+    let bot_state = state.lock().await;
+    load_users(&users_value, &bot_state.users);
+}
+
+async fn dispatch_chatify_event(data: &PayloadMap, state: &Arc<Mutex<BotState>>) {
+    let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
+    match t {
+        "msg" => handle_chatify_msg(data, state).await,
+        "sys" => handle_system_msg(data),
+        "dm" => handle_dm_msg(data, state).await,
+        "users" | "ok" => handle_users_update(data, state).await,
+        _ => {}
     }
 }
 
 #[tokio::main]
 async fn main() {
     // Load environment variables
-    let discord_token = env::var("DISCORD_TOKEN")
-        .expect("Expected DISCORD_TOKEN in environment");
+    let discord_token = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in environment");
     let chatify_host = env::var("CHATIFY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let chatify_port = env::var("CHATIFY_PORT").unwrap_or_else(|_| "8765".to_string());
-    let chatify_password = env::var("CHATIFY_PASSWORD")
-        .expect("Expected CHATIFY_PASSWORD in environment");
+    let chatify_password =
+        env::var("CHATIFY_PASSWORD").expect("Expected CHATIFY_PASSWORD in environment");
     let chatify_channel = env::var("CHATIFY_CHANNEL").unwrap_or_else(|_| "general".to_string());
-    let chatify_bot_username = env::var("CHATIFY_BOT_USERNAME").unwrap_or_else(|_| "DiscordBot".to_string());
+    let chatify_bot_username =
+        env::var("CHATIFY_BOT_USERNAME").unwrap_or_else(|_| "DiscordBot".to_string());
 
     // Set up logging
     if env::var("CHATIFY_LOG").unwrap_or_default() == "1" {
@@ -235,9 +276,18 @@ async fn main() {
     let scheme = "ws";
     let uri = format!("{}://{}:{}", scheme, chatify_host, chatify_port);
     println!("Connecting to chatify server at {}", uri);
-    let (ws_stream, _) = connect_async(&uri).await.expect("Failed to connect to chatify");
+    let (ws_stream, _) = connect_async(&uri)
+        .await
+        .expect("Failed to connect to chatify");
     println!("Connected to chatify server");
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel::<WsMessage>();
+    tokio::spawn(async move {
+        while let Some(msg) = bridge_rx.recv().await {
+            let _ = ws_write.send(msg).await;
+        }
+    });
 
     // Authenticate with chatify
     {
@@ -246,14 +296,14 @@ async fn main() {
             "t": "auth",
             "u": bot_state.username,
             "pw": pw_hash(&bot_state.password),
-            "pk": pub_b64(&new_keypair()),
+            "pk": pub_b64(&bot_state.priv_key),
             "status": {"text": "Online", "emoji": "🟢"}
         });
-        ws_tx.send(WsMessage::Text(auth_msg.to_string())).await.expect("Failed to send auth");
+        send_ws_json(&bridge_tx, auth_msg);
     }
 
     // Wait for auth response to get server's OK and user list
-    if let Some(Ok(WsMessage::Text(resp))) = ws_rx.next().await {
+    if let Some(Ok(WsMessage::Text(resp))) = ws_read.next().await {
         let resp_val: serde_json::Value = serde_json::from_str(&resp).expect("Invalid JSON");
         if resp_val["t"] == "err" {
             eprintln!("Authentication failed: {}", resp_val["m"]);
@@ -261,37 +311,25 @@ async fn main() {
         }
         // Update bot state with server response
         let mut bot_state = state.lock().await;
-        bot_state.username = resp_val["u"].as_str().unwrap_or(&bot_state.username).to_string();
-        let users: Vec<serde_json::Value> = serde_json::from_value(resp_val["users"].clone()).expect("Invalid users");
-        for u in users {
-            if let Some(name) = u["u"].as_str() {
-                if let Some(pk) = u["pk"].as_str() {
-                    bot_state.users.insert(name.to_string(), pk.to_string());
-                }
-            }
-        }
-        // Set the WS tx in bot for sending messages
-        bot_state.ws_tx = Some(mpsc::UnboundedSender::clone(&ws_tx));
+        bot_state.username = resp_val["u"]
+            .as_str()
+            .unwrap_or(&bot_state.username)
+            .to_string();
+        load_users(&resp_val["users"], &bot_state.users);
+        bot_state.ws_tx = Some(bridge_tx.clone());
+    } else {
+        eprintln!("Authentication failed: no response from chatify server");
+        return;
     }
 
     // Clone state for the WebSocket reading task
     let state_clone = state.clone();
     let ws_rx_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                WsMessage::Text(text) => {
-                    if let Ok(data) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&text) {
-                        let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
-                        let _ts = data.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
-                        match t {
-                            "msg" => handle_chatify_msg(&data, &state_clone).await,
-                            "sys" => handle_system_msg(&data),
-                            "dm" => handle_dm_msg(&data, &state_clone).await,
-                            _ => {}
-                        }
-                    }
+        while let Some(Ok(msg)) = ws_read.next().await {
+            if let WsMessage::Text(text) = msg {
+                if let Ok(data) = serde_json::from_str::<PayloadMap>(&text) {
+                    dispatch_chatify_event(&data, &state_clone).await;
                 }
-                _ => {}
             }
         }
     });
