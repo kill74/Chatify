@@ -4,9 +4,38 @@ Terminal-first, self-hosted chat built with Rust.
 
 Chatify provides a lightweight WebSocket server, a fast terminal client, and an optional Discord bridge. The project is designed for local teams, controlled environments, and developers who want clear behavior, low runtime overhead, and readable code paths.
 
+## Why This Project Exists
+
+Most chat projects optimize for UI layers first and protocol clarity second.
+Chatify intentionally does the opposite:
+
+- Protocol and message contracts are explicit and testable.
+- Runtime behavior is easy to trace in server/client code paths.
+- Feature growth is controlled by quality gates and release discipline.
+
+This project is intended to demonstrate engineering judgment, not just feature output.
+
+## Recruiter Snapshot
+
+- Language and stack: Rust, WebSocket transport, SQLite persistence.
+- Delivery model: command-line binaries for server and client, optional Discord bridge.
+- Reliability posture: CI with formatting, lint, tests, and feature-specific regressions.
+- Release posture: automated Windows release packaging with checksums.
+- Documentation posture: architecture, roadmap, security notes, benchmark methodology, and case study.
+
+See supporting evidence:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/UNIQUE_ROADMAP.md](docs/UNIQUE_ROADMAP.md)
+- [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md)
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+- [docs/ENGINEERING_CASE_STUDY.md](docs/ENGINEERING_CASE_STUDY.md)
+
 ## Table of Contents
 
 - [Core Capabilities](#core-capabilities)
+- [Why This Project Exists](#why-this-project-exists)
+- [Recruiter Snapshot](#recruiter-snapshot)
 - [Project Status](#project-status)
 - [Quick Start](#quick-start)
 - [Shipping Binaries](#shipping-binaries)
@@ -18,6 +47,8 @@ Chatify provides a lightweight WebSocket server, a fast terminal client, and an 
 - [Development Workflow](#development-workflow)
 - [Troubleshooting](#troubleshooting)
 - [Security Posture](#security-posture)
+- [Recruiter Ready Checklist](#recruiter-ready-checklist)
+- [Changelog](#changelog)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
@@ -282,6 +313,25 @@ Known limitations include:
 - Pending full security review
 
 Use in development, learning, or controlled environments unless you complete independent threat modeling and hardening.
+
+Security design details and scope boundaries:
+
+- [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md)
+
+## Recruiter Ready Checklist
+
+This list is intentionally concrete so reviewers can verify engineering maturity quickly.
+
+- [x] CI checks for format, lint, tests, and bridge feature compile path.
+- [x] Release automation for Windows binary package with SHA256 artifact.
+- [x] Architecture and roadmap docs linked from README.
+- [x] Security scope and limitations documented.
+- [x] Benchmark methodology and reporting template documented.
+- [x] Engineering case study with trade-off analysis documented.
+
+## Changelog
+
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## Roadmap
 
