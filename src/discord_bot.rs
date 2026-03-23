@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(parsed.get("123"), Some(&"override".to_string()));
         assert_eq!(parsed.get("456"), Some(&"team-42".to_string()));
         assert_eq!(parsed.get("abc"), Some(&"alpha_beta".to_string()));
-        assert!(parsed.get("789").is_none());
+        assert!(!parsed.contains_key("789"));
         assert_eq!(parsed.len(), 3);
     }
 

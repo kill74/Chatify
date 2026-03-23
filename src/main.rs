@@ -885,10 +885,7 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Resu
         return Err("invalid nonce format".to_string());
     }
 
-    let mut user_nonces = state
-        .recent_nonces
-        .entry(username.to_string())
-        .or_insert_with(VecDeque::new);
+    let mut user_nonces = state.recent_nonces.entry(username.to_string()).or_default();
 
     if user_nonces.iter().any(|n| n == nonce) {
         return Err("replayed nonce".to_string());
