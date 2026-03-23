@@ -26,6 +26,12 @@ use chrono::{DateTime, Utc};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 
+const MAX_HISTORY: usize = 100;
+const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
+const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [limit], /search <query>, /rewind <Ns|Nm|Nh|Nd> [limit], /clear, /edit, /help, /quit";
+type SharedState = Arc<tokio::sync::Mutex<ClientState>>;
+type JsonMap = HashMap<String, serde_json::Value>;
+
 // Enumeration of supported message types in the protocol
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
@@ -187,7 +193,7 @@ impl ClientState {
     #[allow(dead_code)]
     fn add_message(&mut self, msg: DisplayedMessage) {
         self.message_history.push(msg);
-        if self.message_history.len() > 100 {
+        if self.message_history.len() > MAX_HISTORY {
             self.message_history.remove(0);
         }
     }
@@ -219,6 +225,338 @@ fn normalize_channel(raw: &str) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+fn parse_limit(input: &str, default: usize, max: usize) -> usize {
+    input
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .unwrap_or(default)
+        .clamp(1, max)
+}
+
+fn parse_duration_secs(spec: &str) -> Option<u64> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mul) = match s.chars().last()? {
+        's' | 'S' => (&s[..s.len().saturating_sub(1)], 1u64),
+        'm' | 'M' => (&s[..s.len().saturating_sub(1)], 60u64),
+        'h' | 'H' => (&s[..s.len().saturating_sub(1)], 3600u64),
+        'd' | 'D' => (&s[..s.len().saturating_sub(1)], 86400u64),
+        _ => (s, 1u64),
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|v| v.saturating_mul(mul))
+}
+
+fn ts_value(v: &serde_json::Value) -> u64 {
+    v.as_u64()
+        .or_else(|| v.as_f64().map(|f| f as u64))
+        .unwrap_or(0)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn enqueue_json(ws_tx: &mpsc::UnboundedSender<String>, payload: serde_json::Value) {
+    let _ = ws_tx.send(payload.to_string());
+}
+
+fn enqueue_timed(ws_tx: &mpsc::UnboundedSender<String>, mut payload: serde_json::Value) {
+    if payload.get("ts").is_none() {
+        payload["ts"] = serde_json::json!(now_secs());
+    }
+    enqueue_json(ws_tx, payload);
+}
+
+fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -> bool {
+    let t = event.get("t").and_then(|v| v.as_str()).unwrap_or("");
+    let ts = event.get("ts").map(ts_value).unwrap_or(0);
+    match t {
+        "msg" => {
+            let ch = event
+                .get("ch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let u = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+            let c = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
+            let encrypted = match general_purpose::STANDARD.decode(c) {
+                Ok(bytes) => bytes,
+                Err(_) => return false,
+            };
+            let content = match dec_bytes(&state.ckey(ch), &encrypted) {
+                Ok(content) => {
+                    String::from_utf8(content)
+                        .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string())
+                }
+                Err(_) => return false,
+            };
+            state.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: content,
+                msg_type: MessageType::Msg,
+                user: Some(u.to_string()),
+                channel: Some(ch.to_string()),
+            });
+            true
+        }
+        "sys" => {
+            let m = event.get("m").and_then(|v| v.as_str()).unwrap_or("");
+            state.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: m.to_string(),
+                msg_type: MessageType::Sys,
+                user: None,
+                channel: None,
+            });
+            true
+        }
+        "edit" => {
+            let user = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+            let old_text = event.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
+            let new_text = event.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
+            state.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: format!("{} edited: '{}' -> '{}'", user, old_text, new_text),
+                msg_type: MessageType::Edit,
+                user: Some(user.to_string()),
+                channel: event
+                    .get("ch")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn handle_msg_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+    let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+    let encrypted = match general_purpose::STANDARD.decode(c) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+
+    let mut state_lock = state.lock().await;
+    let key = state_lock.ckey(ch);
+    if let Ok(content) = dec_bytes(&key, &encrypted) {
+        state_lock.add_message(DisplayedMessage {
+            time: format_time(ts),
+                text: String::from_utf8(content)
+                    .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string()),
+            msg_type: MessageType::Msg,
+            user: Some(u.to_string()),
+            channel: Some(ch.to_string()),
+        });
+    }
+}
+
+async fn handle_img_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+    let a = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
+    let encrypted = match general_purpose::STANDARD.decode(a) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let ascii_art = img_to_ascii(&encrypted, 70);
+
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("{} sent an image:\n{}", u, ascii_art),
+        msg_type: MessageType::Img,
+        user: Some(u.to_string()),
+        channel: Some(ch.to_string()),
+    });
+}
+
+async fn handle_sys_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: m.to_string(),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+    });
+}
+
+async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+    let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+    if let Some(pk) = data.get("pk").and_then(|v| v.as_str()) {
+        if !pk.is_empty() {
+            state
+                .lock()
+                .await
+                .users
+                .insert(frm.to_string(), pk.to_string());
+        }
+    }
+    let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+    let encrypted = match general_purpose::STANDARD.decode(c) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let mut state_lock = state.lock().await;
+    let peer = if frm == state_lock.me { to } else { frm };
+    if let Ok(dm_key) = state_lock.dmkey(peer) {
+        if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
+            let arrow = if frm == state_lock.me { "→" } else { "←" };
+            state_lock.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: format!(
+                    "{} {} {}",
+                    frm,
+                    arrow,
+                    String::from_utf8(content)
+                        .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string())
+                ),
+                msg_type: MessageType::Dm,
+                user: Some(frm.to_string()),
+                channel: None,
+            });
+        }
+    }
+}
+
+async fn handle_users_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let users_val = data.get("users").cloned().unwrap_or(serde_json::json!([]));
+    let users: Vec<serde_json::Value> = serde_json::from_value(users_val).unwrap_or_default();
+    let mut names: Vec<String> = Vec::new();
+
+    let mut state_lock = state.lock().await;
+    for user in users {
+        if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
+            names.push(name.to_string());
+            if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
+                if !pk.is_empty() {
+                    state_lock.users.insert(name.to_string(), pk.to_string());
+                }
+            }
+        }
+    }
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("Online users: {}", names.join(", ")),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+    });
+}
+
+async fn handle_joined_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let hist_val = data.get("hist").cloned().unwrap_or(serde_json::json!([]));
+    let hist: Vec<serde_json::Value> = serde_json::from_value(hist_val).unwrap_or_default();
+
+    let mut state_lock = state.lock().await;
+    state_lock.ch = ch.to_string();
+    state_lock.chs.insert(ch.to_string(), true);
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("→ #{}", ch),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+    });
+    for event in hist {
+        let _ = append_event_to_history(&mut state_lock, &event);
+    }
+}
+
+async fn handle_history_or_search_event(state: &SharedState, data: &JsonMap, t: &str, ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let ev_val = data.get("events").cloned().unwrap_or(serde_json::json!([]));
+    let events: Vec<serde_json::Value> = serde_json::from_value(ev_val).unwrap_or_default();
+
+    let mut state_lock = state.lock().await;
+    let mut count = 0usize;
+    for event in events {
+        if append_event_to_history(&mut state_lock, &event) {
+            count += 1;
+        }
+    }
+    let summary = if t == "search" {
+        let q = data.get("q").and_then(|v| v.as_str()).unwrap_or("");
+        format!("Search '{}' in #{}: {} event(s)", q, ch, count)
+    } else {
+        format!("History for #{}: {} event(s)", ch, count)
+    };
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: summary,
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+    });
+}
+
+async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let chs: Vec<String> = serde_json::from_value(
+        data.get("chs").cloned().unwrap_or(serde_json::json!([])),
+    )
+    .unwrap_or_default();
+    let online = data.get("online").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("Channels: {} | Online: {}", chs.join(", "), online),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+    });
+}
+
+async fn handle_vdata_event(state: &SharedState, data: &JsonMap) {
+    let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
+    let payload = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
+    let playback_tx = {
+        let state_lock = state.lock().await;
+        if from == state_lock.me {
+            None
+        } else {
+            state_lock
+                .voice_session
+                .as_ref()
+                .map(|session| session.event_tx.clone())
+        }
+    };
+    if let (Some(tx), Some(frame)) = (playback_tx, decode_voice_frame(payload)) {
+        let _ = tx.send(VoiceEvent::Playback(frame));
+    }
+}
+
+async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
+    let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
+    let ts = data.get("ts").map(ts_value).unwrap_or(0);
+    match t {
+        "msg" => handle_msg_event(state, data, ts).await,
+        "img" => handle_img_event(state, data, ts).await,
+        "sys" => handle_sys_event(state, data, ts).await,
+        "dm" => handle_dm_event(state, data, ts).await,
+        "users" => handle_users_event(state, data, ts).await,
+        "joined" => handle_joined_event(state, data, ts).await,
+        "history" | "search" => handle_history_or_search_event(state, data, t, ts).await,
+        "info" => handle_info_event(state, data, ts).await,
+        "vdata" => handle_vdata_event(state, data).await,
+        _ => {}
     }
 }
 
@@ -450,17 +788,13 @@ fn start_voice_session(
             match event {
                 VoiceEvent::Captured(frame) => {
                     let payload = encode_voice_frame(&frame);
-                    let _ = ws_tx_task.send(
+                    enqueue_timed(
+                        &ws_tx_task,
                         serde_json::json!({
                             "t": "vdata",
                             "r": room_task.clone(),
-                            "a": payload,
-                            "ts": SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                        })
-                        .to_string(),
+                            "a": payload
+                        }),
                     );
                 }
                 VoiceEvent::Playback(frame) => {
@@ -677,230 +1011,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if let Message::Text(text) = msg {
-                    if let Ok(data) =
-                        serde_json::from_str::<HashMap<String, serde_json::Value>>(&text)
-                    {
-                        // Process message and update state
-                        let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
-                        let ts = data.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
-                        match t {
-                            "msg" => {
-                                let ch =
-                                    data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
-                                let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
-                                let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                                let encrypted = match general_purpose::STANDARD.decode(c) {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => continue,
-                                };
-                                if let Ok(content) =
-                                    dec_bytes(&state_clone.lock().await.ckey(ch), &encrypted)
-                                {
-                                    let mut state = state_clone.lock().await;
-                                    state.message_history.push(DisplayedMessage {
-                                        time: format_time(ts),
-                                        text: String::from_utf8(content)
-                                            .unwrap_or_else(|_| "[Invalid UTF-8]".to_string()),
-                                        msg_type: MessageType::Msg,
-                                        user: Some(u.to_string()),
-                                        channel: Some(ch.to_string()),
-                                    });
-                                    // Keep only last 100 messages
-                                    if state.message_history.len() > 100 {
-                                        state.message_history.remove(0);
-                                    }
-                                }
-                            }
-                            "img" => {
-                                let ch =
-                                    data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
-                                let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
-                                let a = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
-                                let encrypted = match general_purpose::STANDARD.decode(a) {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => continue,
-                                };
-                                let ascii_art = img_to_ascii(&encrypted, 70);
-                                {
-                                    let mut state = state_clone.lock().await;
-                                    state.message_history.push(DisplayedMessage {
-                                        time: format_time(ts),
-                                        text: format!(
-                                            "{} sent an image:\n{}",
-                                            data.get("u").and_then(|v| v.as_str()).unwrap_or("?"),
-                                            ascii_art
-                                        ),
-                                        msg_type: MessageType::Img,
-                                        user: Some(u.to_string()),
-                                        channel: Some(ch.to_string()),
-                                    });
-                                    // Keep only last 100 messages
-                                    if state.message_history.len() > 100 {
-                                        state.message_history.remove(0);
-                                    }
-                                }
-                            }
-                            "sys" => {
-                                let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
-                                let mut state = state_clone.lock().await;
-                                state.message_history.push(DisplayedMessage {
-                                    time: format_time(ts),
-                                    text: m.to_string(),
-                                    msg_type: MessageType::Sys,
-                                    user: None,
-                                    channel: None,
-                                });
-                                if state.message_history.len() > 100 {
-                                    state.message_history.remove(0);
-                                }
-                            }
-                            "dm" => {
-                                let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
-                                let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
-                                if let Some(pk) = data.get("pk").and_then(|v| v.as_str()) {
-                                    if !pk.is_empty() {
-                                        state_clone
-                                            .lock()
-                                            .await
-                                            .users
-                                            .insert(frm.to_string(), pk.to_string());
-                                    }
-                                }
-                                let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                                let encrypted = match general_purpose::STANDARD.decode(c) {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => continue,
-                                };
-                                let mut state_lock = state_clone.lock().await;
-                                let peer = if frm == state_lock.me { to } else { frm };
-                                if let Ok(dm_key) = state_lock.dmkey(peer) {
-                                    if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
-                                        let arrow =
-                                            if frm == state_lock.me { "→" } else { "←" };
-                                        state_lock.message_history.push(DisplayedMessage {
-                                            time: format_time(ts),
-                                            text: format!(
-                                                "{} {} {}",
-                                                frm,
-                                                arrow,
-                                                String::from_utf8(content).unwrap_or_else(|_| {
-                                                    "[Invalid UTF-8]".to_string()
-                                                })
-                                            ),
-                                            msg_type: MessageType::Dm,
-                                            user: Some(frm.to_string()),
-                                            channel: None,
-                                        });
-                                        if state_lock.message_history.len() > 100 {
-                                            state_lock.message_history.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            "users" => {
-                                let mut state = state_clone.lock().await;
-                                let users_val =
-                                    data.get("users").unwrap_or(&serde_json::json!([])).clone();
-                                let users: Vec<serde_json::Value> =
-                                    serde_json::from_value(users_val).unwrap_or_default();
-                                let mut names: Vec<String> = Vec::new();
-                                for user in users {
-                                    if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
-                                        names.push(name.to_string());
-                                        if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
-                                            if !pk.is_empty() {
-                                                state
-                                                    .users
-                                                    .insert(name.to_string(), pk.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                                state.message_history.push(DisplayedMessage {
-                                    time: format_time(ts),
-                                    text: format!("Online users: {}", names.join(", ")),
-                                    msg_type: MessageType::Sys,
-                                    user: None,
-                                    channel: None,
-                                });
-                                if state.message_history.len() > 100 {
-                                    state.message_history.remove(0);
-                                }
-                            }
-                            "joined" => {
-                                let ch =
-                                    data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
-                                let mut state = state_clone.lock().await;
-                                state.ch = ch.to_string();
-                                state.chs.insert(ch.to_string(), true);
-                                state.message_history.push(DisplayedMessage {
-                                    time: format_time(ts),
-                                    text: format!("→ #{}", ch),
-                                    msg_type: MessageType::Sys,
-                                    user: None,
-                                    channel: None,
-                                });
-                                if state.message_history.len() > 100 {
-                                    state.message_history.remove(0);
-                                }
-                                // Send request for history
-                                let _ = state.ws_tx.send(
-                                    serde_json::json!({
-                                        "t": "join",
-                                        "ch": ch,
-                                        "ts": SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                    })
-                                    .to_string(),
-                                );
-                            }
-                            "info" => {
-                                let mut state = state_clone.lock().await;
-                                let chs: Vec<String> = serde_json::from_value(
-                                    data.get("chs").unwrap_or(&serde_json::json!([])).clone(),
-                                )
-                                .unwrap_or_default();
-                                let online =
-                                    data.get("online").and_then(|v| v.as_u64()).unwrap_or(0);
-                                state.message_history.push(DisplayedMessage {
-                                    time: format_time(ts),
-                                    text: format!(
-                                        "Channels: {} | Online: {}",
-                                        chs.join(", "),
-                                        online
-                                    ),
-                                    msg_type: MessageType::Sys,
-                                    user: None,
-                                    channel: None,
-                                });
-                                if state.message_history.len() > 100 {
-                                    state.message_history.remove(0);
-                                }
-                            }
-                            "vdata" => {
-                                let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
-                                let payload = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
-                                let playback_tx = {
-                                    let state = state_clone.lock().await;
-                                    if from == state.me {
-                                        None
-                                    } else {
-                                        state
-                                            .voice_session
-                                            .as_ref()
-                                            .map(|session| session.event_tx.clone())
-                                    }
-                                };
-                                if let (Some(tx), Some(frame)) =
-                                    (playback_tx, decode_voice_frame(payload))
-                                {
-                                    let _ = tx.send(VoiceEvent::Playback(frame));
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Ok(data) = serde_json::from_str::<JsonMap>(&text) {
+                        dispatch_incoming_event(&state_clone, &data).await;
                     } else {
                         let state = state_clone.lock().await;
                         state.log("WARN", "Dropped malformed JSON payload from server");
@@ -940,16 +1052,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 state.ch = ch.to_string();
                                 state.chs.insert(ch.to_string(), true);
                                 // Request history for the channel
-                                let _ = state.ws_tx.send(
-                                    serde_json::json!({
-                                        "t": "join",
-                                        "ch": ch,
-                                        "ts": SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                    })
-                                    .to_string(),
+                                enqueue_timed(
+                                    &state.ws_tx,
+                                    serde_json::json!({"t": "join", "ch": ch}),
                                 );
                             } else {
                                 state.log(
@@ -979,17 +1084,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 };
                                 let encoded = general_purpose::STANDARD.encode(&encrypted);
-                                let _ = state.ws_tx.send(
-                                    serde_json::json!({
-                                        "t": "dm",
-                                        "to": target,
-                                        "c": encoded,
-                                        "ts": SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                    })
-                                    .to_string(),
+                                enqueue_timed(
+                                    &state.ws_tx,
+                                    serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
                                 );
                             }
                         }
@@ -1000,58 +1097,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = format!("* {} {}", state.me, action);
                                 let encrypted = enc_bytes(&state.ckey(&ch), msg.as_bytes());
                                 let encoded = general_purpose::STANDARD.encode(&encrypted);
-                                let _ = state.ws_tx.send(
-                                    serde_json::json!({
-                                        "t": "msg",
-                                        "ch": ch,
-                                        "c": encoded,
-                                        "ts": SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                    })
-                                    .to_string(),
+                                enqueue_timed(
+                                    &state.ws_tx,
+                                    serde_json::json!({"t": "msg", "ch": ch, "c": encoded, "p": msg}),
                                 );
                             }
                         }
                         "/users" => {
-                            let _ = state.ws_tx.send(
-                                serde_json::json!({
-                                    "t": "users",
-                                    "ts": SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs()
-                                })
-                                .to_string(),
-                            );
+                            enqueue_timed(&state.ws_tx, serde_json::json!({"t": "users"}));
                         }
                         "/channels" => {
-                            let _ = state.ws_tx.send(
-                                serde_json::json!({
-                                    "t": "info",
-                                    "ts": SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs()
-                                })
-                                .to_string(),
-                            );
+                            enqueue_timed(&state.ws_tx, serde_json::json!({"t": "info"}));
                         }
                         "/voice" => {
                             if state.voice_session.is_some() {
                                 if let Some(session) = state.voice_session.take() {
                                     state.voice_active = false;
-                                    let _ = state.ws_tx.send(
-                                        serde_json::json!({
-                                            "t": "vleave",
-                                            "r": session.room,
-                                            "ts": SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs()
-                                        })
-                                        .to_string(),
+                                    enqueue_timed(
+                                        &state.ws_tx,
+                                        serde_json::json!({"t": "vleave", "r": session.room}),
                                     );
                                     let _ = session.event_tx.send(VoiceEvent::Stop);
                                     let _ = session.task.join();
@@ -1066,16 +1130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(session) => {
                                         state.voice_active = true;
                                         state.voice_session = Some(session);
-                                        let _ = ws_tx.send(
-                                            serde_json::json!({
-                                                "t": "vjoin",
-                                                "r": room,
-                                                "ts": SystemTime::now()
-                                                    .duration_since(UNIX_EPOCH)
-                                                    .unwrap_or_default()
-                                                    .as_secs()
-                                            })
-                                            .to_string(),
+                                        enqueue_timed(
+                                            &ws_tx,
+                                            serde_json::json!({"t": "vjoin", "r": room}),
                                         );
                                         println!("Voice started in #{}", room);
                                         state.log("INFO", "Voice session started");
@@ -1095,24 +1152,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         "/help" => {
-                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /clear, /edit, /help, /quit");
+                            state.log("INFO", HELP_TEXT);
                         }
                         "/edit" => {
                             // Placeholder for edit
                             state.log("INFO", "Edit command not yet implemented in Rust client");
                         }
+                        "/history" => {
+                            let limit = parse_limit(args, 50, 200);
+                            let ch = state.ch.clone();
+                            enqueue_timed(
+                                &state.ws_tx,
+                                serde_json::json!({"t": "history", "ch": ch, "limit": limit}),
+                            );
+                        }
+                        "/search" => {
+                            let q = args.trim();
+                            if q.is_empty() {
+                                state.log("INFO", "Usage: /search <query>");
+                                continue;
+                            }
+                            let ch = state.ch.clone();
+                            enqueue_timed(
+                                &state.ws_tx,
+                                serde_json::json!({"t": "search", "ch": ch, "q": q, "limit": 50}),
+                            );
+                        }
+                        "/rewind" => {
+                            let mut p = args.split_whitespace();
+                            let window = p.next().unwrap_or("");
+                            if window.is_empty() {
+                                state.log("INFO", "Usage: /rewind <Ns|Nm|Nh|Nd> [limit]");
+                                continue;
+                            }
+                            let Some(seconds) = parse_duration_secs(window) else {
+                                state.log(
+                                    "INFO",
+                                    "Invalid duration. Use formats like 90s, 15m, 2h, 1d.",
+                                );
+                                continue;
+                            };
+                            let limit = parse_limit(p.next().unwrap_or(""), 100, 500);
+                            let ch = state.ch.clone();
+                            enqueue_timed(
+                                &state.ws_tx,
+                                serde_json::json!({"t": "rewind", "ch": ch, "seconds": seconds, "limit": limit}),
+                            );
+                        }
                         "/quit" | "/exit" | "/q" => {
                             if let Some(session) = state.voice_session.take() {
-                                let _ = state.ws_tx.send(
-                                    serde_json::json!({
-                                        "t": "vleave",
-                                        "r": session.room,
-                                        "ts": SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                    })
-                                    .to_string(),
+                                enqueue_timed(
+                                    &state.ws_tx,
+                                    serde_json::json!({"t": "vleave", "r": session.room}),
                                 );
                                 let _ = session.event_tx.send(VoiceEvent::Stop);
                                 let _ = session.task.join();
@@ -1134,17 +1225,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let key = channel_key(&pw, &channel);
                     let encrypted = enc_bytes(&key, line.as_bytes());
                     let encoded = general_purpose::STANDARD.encode(&encrypted);
-                    let msg = serde_json::json!({
-                        "t": "msg",
-                        "ch": channel,
-                        "c": encoded,
-                        "ts": SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                                        .as_secs()
-                    })
-                    .to_string();
-                    let _ = state_clone2.lock().await.ws_tx.send(msg);
+                    let state = state_clone2.lock().await;
+                    enqueue_timed(
+                        &state.ws_tx,
+                        serde_json::json!({"t": "msg", "ch": channel, "c": encoded, "p": line}),
+                    );
                 }
             }
         });

@@ -20,6 +20,8 @@ This project is actively evolving and should currently be treated as experimenta
 - Basic presence/status propagation
 - Join/channel info/user listing commands
 - In-memory channel history relay
+- SQLite-backed event persistence
+- History replay, rewind, and channel search commands
 
 ## Important Security Note
 
@@ -93,18 +95,21 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ## CLI Commands (Current)
 
-| Command              | Description               |
-| -------------------- | ------------------------- |
-| /join <channel>      | Join or create a channel  |
-| /dm <user> <message> | Send a direct message     |
-| /me <action>         | Send action-style message |
-| /users               | List online users         |
-| /channels            | List channels             |
-| /voice [room]        | Toggle voice in room      |
-| /edit <text>         | Placeholder command       |
-| /clear               | Clear terminal output     |
-| /help                | Show command help         |
-| /quit, /exit, /q     | Disconnect and exit       |
+| Command              | Description                                            |
+| -------------------- | ------------------------------------------------------ |
+| /join <channel>      | Join or create a channel                               |
+| /dm <user> <message> | Send a direct message                                  |
+| /me <action>         | Send action-style message                              |
+| /users               | List online users                                      |
+| /channels            | List channels                                          |
+| /voice [room]        | Toggle voice in room                                   |
+| /history [limit]     | Load persisted channel history                         |
+| /search <query>      | Search persisted events in current channel             |
+| /rewind <time> [n]   | Replay events from the last time window (e.g. 15m, 2h) |
+| /edit <text>         | Placeholder command                                    |
+| /clear               | Clear terminal output                                  |
+| /help                | Show command help                                      |
+| /quit, /exit, /q     | Disconnect and exit                                    |
 
 ## UI Example (Terminal)
 
@@ -164,7 +169,6 @@ Voice stopped
 
 - The current protocol is functional but not yet hardened for hostile public environments.
 - Security hardening is still required before production use.
-- There is no persistent storage layer yet; state is memory-first.
 - Test coverage is light and mostly build/lint-driven; integration coverage is planned.
 - The Discord bridge source exists, but the binary target is disabled due to dependency conflicts.
 
@@ -262,6 +266,12 @@ If release cadence becomes regular, add a dedicated CHANGELOG.md using this form
 - Strengthen auth and protocol validation
 - Replace/complete stubbed cryptographic flows
 - Add integration tests for client/server message contracts
+
+## Uniqueness Roadmap
+
+To execute a distinct product direction, see:
+
+- docs/UNIQUE_ROADMAP.md
 
 ## License
 

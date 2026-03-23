@@ -3,22 +3,29 @@
 use base64::{engine::general_purpose, Engine as _};
 use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::ChaCha20Poly1305;
-use hex;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
-use rand::{rngs::OsRng, Rng, RngCore};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
+
+fn cipher_from_key(key: &[u8]) -> Option<ChaCha20Poly1305> {
+    use generic_array::GenericArray;
+    let key_arr: [u8; 32] = key.try_into().ok()?;
+    let key_ga = GenericArray::from(key_arr);
+    Some(ChaCha20Poly1305::new(&key_ga))
+}
 
 /// Derive a channel-specific encryption key using PBKDF2
 pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
     let mut key = [0u8; 32];
-    let _ = pbkdf2::<Hmac<Sha256>>(
+    pbkdf2::<Hmac<Sha256>>(
         password.as_bytes(),
         format!("chatify:{}", channel).as_bytes(),
         120000,
         &mut key,
-    );
+    )
+    .expect("PBKDF2 output size must be valid");
     key.to_vec()
 }
 
@@ -51,15 +58,15 @@ pub fn dh_key(priv_key: &[u8], pubkey_b64: &str) -> Vec<u8> {
 /// Encrypt data using ChaCha20Poly1305 with a random nonce
 pub fn enc_bytes(key: &[u8], plaintext: &[u8]) -> Vec<u8> {
     use chacha20poly1305::Nonce;
-    use generic_array::GenericArray;
-    let nonce_bytes = cha_cha20_nonce();
+    let nonce_bytes = chacha20_nonce();
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let key_arr: &[u8; 32] = key.try_into().expect("Key must be 32 bytes");
-    let key_ga = GenericArray::from(*key_arr);
-    let cipher = ChaCha20Poly1305::new(&key_ga);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .expect("Encryption failure");
+    let Some(cipher) = cipher_from_key(key) else {
+        return Vec::new();
+    };
+    let ciphertext = match cipher.encrypt(nonce, plaintext) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
     let mut combined = nonce_bytes.to_vec();
     combined.extend_from_slice(&ciphertext);
     combined
@@ -68,33 +75,34 @@ pub fn enc_bytes(key: &[u8], plaintext: &[u8]) -> Vec<u8> {
 /// Decrypt data using ChaCha20Poly1305
 pub fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     use chacha20poly1305::Nonce;
-    use generic_array::GenericArray;
     if ciphertext.len() < 12 {
         return Err("Ciphertext too short".to_string());
     }
     let (nonce_bytes, ciphertext_data) = ciphertext.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    let key_arr: &[u8; 32] = key
-        .try_into()
-        .map_err(|_| "Key must be 32 bytes".to_string())?;
-    let key_ga = GenericArray::from(*key_arr);
-    let cipher = ChaCha20Poly1305::new(&key_ga);
+    let cipher = cipher_from_key(key).ok_or_else(|| "Key must be 32 bytes".to_string())?;
     cipher
         .decrypt(nonce, ciphertext_data)
         .map_err(|e| format!("Decryption failure: {}", e))
 }
 
-/// Generate a random 12-byte nonce for ChaCha20
-pub fn cha_cha20_nonce() -> [u8; 12] {
+/// Generate a random 12-byte nonce for ChaCha20.
+pub fn chacha20_nonce() -> [u8; 12] {
     let mut nonce = [0u8; 12];
-    rand::thread_rng().fill(&mut nonce);
+    OsRng.fill_bytes(&mut nonce);
     nonce
+}
+
+/// Backward-compatible alias for previous nonce helper name.
+pub fn cha_cha20_nonce() -> [u8; 12] {
+    chacha20_nonce()
 }
 
 /// Hash a password using PBKDF2 with SHA256
 pub fn pw_hash(password: &str) -> String {
     let mut hash = [0u8; 32];
-    let _ = pbkdf2::<Hmac<Sha256>>(password.as_bytes(), b"chatify", 120000, &mut hash);
+    pbkdf2::<Hmac<Sha256>>(password.as_bytes(), b"chatify", 120000, &mut hash)
+        .expect("PBKDF2 output size must be valid");
     hex::encode(hash)
 }
 

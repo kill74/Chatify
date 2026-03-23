@@ -6,10 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use rusqlite::{params, Connection, Error as SqlError};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[derive(Parser)]
@@ -21,10 +22,211 @@ struct Args {
     port: u16,
     #[arg(long)]
     log: bool,
+    #[arg(long, default_value = "chatify.db")]
+    db: String,
 }
 
 const HISTORY_CAP: usize = 50;
 const MAX_BYTES: usize = 16_000;
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+const DEFAULT_HISTORY_LIMIT: usize = 50;
+const DEFAULT_SEARCH_LIMIT: usize = 30;
+const DEFAULT_REWIND_SECONDS: u64 = 3600;
+const DEFAULT_REWIND_LIMIT: usize = 100;
+
+#[derive(Clone)]
+struct EventStore {
+    path: String,
+}
+
+impl EventStore {
+    fn new(path: String) -> Self {
+        let store = Self { path };
+        if let Err(e) = store.init() {
+            eprintln!("Failed to initialize event store: {}", e);
+        }
+        store
+    }
+
+    fn init(&self) -> rusqlite::Result<()> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        let version = Self::schema_version(&conn)?;
+        self.migrate(&conn, version)?;
+        Ok(())
+    }
+
+    fn schema_version(conn: &Connection) -> rusqlite::Result<i64> {
+        let value: rusqlite::Result<String> = conn.query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        );
+        match value {
+            Ok(v) => Ok(v.parse::<i64>().unwrap_or(0)),
+            Err(SqlError::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn set_schema_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO schema_meta(key, value)
+             VALUES('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![version.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn migrate(&self, conn: &Connection, from_version: i64) -> rusqlite::Result<()> {
+        let mut version = from_version;
+
+        if version < 1 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    event_type TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    sender TEXT,
+                    target TEXT,
+                    payload TEXT NOT NULL,
+                    search_text TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_channel_ts ON events(channel, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_search ON events(search_text);
+                ",
+            )?;
+            version = 1;
+            Self::set_schema_version(conn, version)?;
+        }
+
+        if version > CURRENT_SCHEMA_VERSION {
+            eprintln!(
+                "Database schema version {} is newer than supported version {}",
+                version, CURRENT_SCHEMA_VERSION
+            );
+        }
+
+        Ok(())
+    }
+
+    fn open_conn(&self) -> Option<Connection> {
+        match Connection::open(&self.path) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("Event store open failed: {}", e);
+                None
+            }
+        }
+    }
+
+    fn decode_rows(rows: Vec<String>) -> Vec<Value> {
+        rows.into_iter()
+            .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
+            .collect()
+    }
+
+    fn query_events<P>(&self, sql: &str, params: P) -> Vec<Value>
+    where
+        P: rusqlite::Params,
+    {
+        let Some(conn) = self.open_conn() else {
+            return Vec::new();
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Event query prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let rows = match stmt.query_map(params, |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Event query execute failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let mut out = Self::decode_rows(rows.filter_map(|r| r.ok()).collect());
+        out.reverse();
+        out
+    }
+
+    fn persist(
+        &self,
+        event_type: &str,
+        channel: &str,
+        sender: &str,
+        target: Option<&str>,
+        payload: &Value,
+        search_text: &str,
+    ) {
+        let Some(conn) = self.open_conn() else {
+            return;
+        };
+        let payload_json = payload.to_string();
+        if let Err(e) = conn.execute(
+            "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                now(),
+                event_type,
+                channel,
+                sender,
+                target,
+                payload_json,
+                search_text.to_lowercase()
+            ],
+        ) {
+            eprintln!("Event persist failed: {}", e);
+        }
+    }
+
+    fn history(&self, channel: &str, limit: usize) -> Vec<Value> {
+        self.query_events(
+            "SELECT payload FROM events
+             WHERE channel = ?1
+             ORDER BY ts DESC
+             LIMIT ?2",
+            params![channel, limit as i64],
+        )
+    }
+
+    fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
+        let like = format!("%{}%", query.to_lowercase());
+        self.query_events(
+            "SELECT payload FROM events
+             WHERE channel = ?1 AND search_text LIKE ?2
+             ORDER BY ts DESC
+             LIMIT ?3",
+            params![channel, like, limit as i64],
+        )
+    }
+
+    fn rewind(&self, channel: &str, seconds: u64, limit: usize) -> Vec<Value> {
+        let cutoff = (now() - seconds as f64).max(0.0);
+        self.query_events(
+            "SELECT payload FROM events
+             WHERE channel = ?1 AND ts >= ?2
+             ORDER BY ts DESC
+             LIMIT ?3",
+            params![channel, cutoff, limit as i64],
+        )
+    }
+}
 
 #[derive(Clone)]
 struct Channel {
@@ -58,17 +260,19 @@ struct State {
     user_statuses: DashMap<String, Value>,
     user_pubkeys: DashMap<String, String>,
     file_transfers: DashMap<String, Value>,
+    store: EventStore,
     log_enabled: bool,
 }
 
 impl State {
-    fn new(log_enabled: bool) -> Arc<Self> {
+    fn new(log_enabled: bool, db_path: String) -> Arc<Self> {
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
             file_transfers: DashMap::new(),
+            store: EventStore::new(db_path),
             log_enabled,
         });
         s.channels.insert("general".into(), Channel::new());
@@ -116,6 +320,343 @@ impl State {
                 .map(|e| serde_json::json!({"u": e.key().clone(), "pk": e.value().clone()}))
                 .collect(),
         )
+    }
+}
+
+fn clamp_limit(raw: Option<u64>, default: usize, max: usize) -> usize {
+    raw.map(|v| v as usize).unwrap_or(default).clamp(1, max)
+}
+
+fn send_out_json(out_tx: &mpsc::UnboundedSender<String>, payload: Value) {
+    let _ = out_tx.send(payload.to_string());
+}
+
+fn spawn_broadcast_forwarder(
+    mut rx: broadcast::Receiver<String>,
+    out_tx: mpsc::UnboundedSender<String>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(m) => {
+                    if out_tx.send(m).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(_) => {}
+            }
+        }
+    });
+}
+
+async fn handle_event(
+    d: &Value,
+    state: &Arc<State>,
+    username: &str,
+    out_tx: &mpsc::UnboundedSender<String>,
+    voice_room: &mut Option<String>,
+) {
+    let t = d["t"].as_str().unwrap_or("");
+    match t {
+        "msg" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let c = d["c"].as_str().unwrap_or("").to_string();
+            let p = d["p"].as_str().unwrap_or("").to_string();
+            if c.is_empty() {
+                return;
+            }
+            let entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
+            let chan = state.chan(&ch);
+            chan.push(entry.clone()).await;
+            let searchable = if p.is_empty() { c.clone() } else { p };
+            state
+                .store
+                .persist("msg", &ch, username, None, &entry, &searchable);
+            let _ = chan.tx.send(entry.to_string());
+        }
+        "img" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let a = d["a"].as_str().unwrap_or("").to_string();
+            if a.is_empty() {
+                return;
+            }
+            let _ = state.chan(&ch).tx.send(
+                serde_json::json!({"t":"img","ch":ch,"u":username,"a":a,"ts":now()}).to_string(),
+            );
+        }
+        "dm" => {
+            let target = d["to"].as_str().unwrap_or("").to_string();
+            let c = d["c"].as_str().unwrap_or("").to_string();
+            let ptxt = d["p"].as_str().unwrap_or("").to_string();
+            if c.is_empty() || target.is_empty() {
+                return;
+            }
+            let sender_pk = state
+                .user_pubkeys
+                .get(username)
+                .map(|v| v.value().clone())
+                .unwrap_or_default();
+            let event = serde_json::json!({"t":"dm","from":username,"to":target,"c":c,"pk":sender_pk,"ts":now()});
+            let p = event.to_string();
+            state.store.persist(
+                "dm",
+                &format!("__dm__{}", target),
+                username,
+                Some(&target),
+                &event,
+                &ptxt,
+            );
+            let _ = state.chan(&format!("__dm__{}", target)).tx.send(p.clone());
+            let _ = state.chan(&format!("__dm__{}", username)).tx.send(p);
+        }
+        "join" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let chan = state.chan(&ch);
+            let mut hist = state.store.history(&ch, HISTORY_CAP);
+            if hist.is_empty() {
+                hist = chan.hist().await;
+            }
+            spawn_broadcast_forwarder(chan.tx.subscribe(), out_tx.clone());
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"joined","ch":ch,"hist":hist}),
+            );
+            let join_msg = serde_json::json!({"t":"sys","m":format!("→ {} joined #{}", username, ch),"ts":now()});
+            state.store.persist(
+                "sys",
+                &ch,
+                username,
+                None,
+                &join_msg,
+                &format!("{} joined", username),
+            );
+            let _ = chan.tx.send(join_msg.to_string());
+        }
+        "history" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let limit = clamp_limit(
+                d.get("limit").and_then(|v| v.as_u64()),
+                DEFAULT_HISTORY_LIMIT,
+                200,
+            );
+            let events = state.store.history(&ch, limit);
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"history","ch":ch,"events":events,"ts":now()}),
+            );
+        }
+        "search" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let q = d["q"].as_str().unwrap_or("").trim().to_string();
+            let limit = clamp_limit(
+                d.get("limit").and_then(|v| v.as_u64()),
+                DEFAULT_SEARCH_LIMIT,
+                200,
+            );
+            let events = if q.is_empty() {
+                Vec::new()
+            } else {
+                state.store.search(&ch, &q, limit)
+            };
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"search","ch":ch,"q":q,"events":events,"ts":now()}),
+            );
+        }
+        "rewind" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let seconds = d
+                .get("seconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(DEFAULT_REWIND_SECONDS)
+                .clamp(1, 31 * 24 * 3600);
+            let limit = clamp_limit(
+                d.get("limit").and_then(|v| v.as_u64()),
+                DEFAULT_REWIND_LIMIT,
+                500,
+            );
+            let events = state.store.rewind(&ch, seconds, limit);
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"history","ch":ch,"events":events,"ts":now()}),
+            );
+        }
+        "users" => {
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"users","users":state.users_with_keys_json()}),
+            );
+        }
+        "info" => {
+            let chs: Vec<String> = state
+                .channels
+                .iter()
+                .filter(|e| !e.key().starts_with("__dm__"))
+                .map(|e| e.key().clone())
+                .collect();
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"info","chs":chs,"online":state.online_count()}),
+            );
+        }
+        "vjoin" => {
+            let room = safe_ch(d["r"].as_str().unwrap_or("general"));
+            let vtx = state.voice_tx(&room);
+            spawn_broadcast_forwarder(vtx.subscribe(), out_tx.clone());
+            *voice_room = Some(room.clone());
+            let join_voice = serde_json::json!({"t":"sys","m":format!("🎙 {} joined voice #{}", username, room),"ts":now()});
+            state.store.persist(
+                "sys",
+                &room,
+                username,
+                None,
+                &join_voice,
+                &format!("{} voice joined", username),
+            );
+            let _ = state.chan(&room).tx.send(join_voice.to_string());
+        }
+        "vleave" => {
+            if let Some(ref room) = voice_room.take() {
+                let leave_voice = serde_json::json!({"t":"sys","m":format!("🎙 {} left voice #{}", username, room),"ts":now()});
+                state.store.persist(
+                    "sys",
+                    room,
+                    username,
+                    None,
+                    &leave_voice,
+                    &format!("{} voice left", username),
+                );
+                let _ = state.chan(room).tx.send(leave_voice.to_string());
+            }
+        }
+        "vdata" => {
+            let a = d["a"].as_str().unwrap_or("").to_string();
+            if a.is_empty() {
+                return;
+            }
+            if let Some(ref room) = voice_room {
+                if let Some(vtx) = state.voice.get(room) {
+                    let _ = vtx
+                        .send(serde_json::json!({"t":"vdata","from":username,"a":a}).to_string());
+                }
+            }
+        }
+        "ping" => {
+            let _ = out_tx.send(r#"{"t":"pong"}"#.into());
+        }
+        "edit" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let old_text = d["old_text"].as_str().unwrap_or("").to_string();
+            let new_text = d["new_text"].as_str().unwrap_or("").to_string();
+            if old_text.is_empty() || new_text.is_empty() {
+                return;
+            }
+            let chan = state.chan(&ch);
+            let mut h = chan.history.write().await;
+            if let Some(pos) = h.iter().rposition(|m| {
+                m.get("t") == Some(&Value::from("msg"))
+                    && m.get("u") == Some(&Value::from(username.to_string()))
+                    && m.get("c") == Some(&Value::from(old_text.clone()))
+            }) {
+                h[pos]["c"] = Value::from(new_text.clone());
+                h[pos]["ts"] = Value::from(now());
+            }
+            let edit_msg = serde_json::json!({
+                "t": "edit",
+                "ch": ch,
+                "u": username,
+                "old_text": old_text,
+                "new_text": new_text,
+                "ts": now()
+            });
+            state
+                .store
+                .persist("edit", &ch, username, None, &edit_msg, &new_text);
+            let _ = chan.tx.send(edit_msg.to_string());
+        }
+        "file_meta" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
+            let size = d["size"].as_u64().unwrap_or(0);
+            let file_id = d["file_id"]
+                .as_str()
+                .unwrap_or(&format!("{}_{}", username, now()))
+                .to_string();
+            state.file_transfers.insert(file_id.clone(), d.clone());
+            let file_announce = serde_json::json!({
+                "t": "file_meta",
+                "from": username,
+                "filename": filename,
+                "size": size,
+                "file_id": file_id,
+                "ch": ch,
+                "ts": now()
+            });
+            state.store.persist(
+                "file_meta",
+                &ch,
+                username,
+                None,
+                &file_announce,
+                file_announce
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            );
+            let _ = state.chan(&ch).tx.send(file_announce.to_string());
+        }
+        "file_chunk" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let file_id = d["file_id"].as_str().unwrap_or("").to_string();
+            let chunk_data = d["data"].as_str().unwrap_or("").to_string();
+            let index = d["index"].as_u64().unwrap_or(0);
+            let chunk_msg = serde_json::json!({
+                "t": "file_chunk",
+                "from": username,
+                "file_id": file_id,
+                "data": chunk_data,
+                "index": index,
+                "ch": ch,
+                "ts": now()
+            })
+            .to_string();
+            let _ = state.chan(&ch).tx.send(chunk_msg);
+        }
+        "status" => {
+            if let Some(status_val) = d.get("status") {
+                state
+                    .user_statuses
+                    .insert(username.to_string(), status_val.clone());
+                let status_update = serde_json::json!({
+                    "t": "status_update",
+                    "user": username,
+                    "status": status_val
+                })
+                .to_string();
+                for chan_entry in state.channels.iter() {
+                    let _ = chan_entry.tx.send(status_update.clone());
+                }
+            }
+        }
+        "reaction" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let emoji = d["emoji"].as_str().unwrap_or("👍").to_string();
+            let msg_id = d["msg_id"].as_str().unwrap_or("unknown").to_string();
+            let reaction_msg = serde_json::json!({
+                "t": "reaction",
+                "user": username,
+                "emoji": emoji,
+                "msg_id": msg_id,
+                "ch": ch,
+                "ts": now()
+            });
+            state
+                .store
+                .persist("reaction", &ch, username, None, &reaction_msg, &emoji);
+            let _ = state.chan(&ch).tx.send(reaction_msg.to_string());
+        }
+        _ => {}
     }
 }
 
@@ -235,8 +776,11 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 
     // Get general channel and send welcome response
     let general = state.chan("general");
-    let mut gen_rx = general.tx.subscribe();
-    let hist = general.hist().await;
+    let gen_rx = general.tx.subscribe();
+    let mut hist = state.store.history("general", HISTORY_CAP);
+    if hist.is_empty() {
+        hist = general.hist().await;
+    }
 
     let ok = create_ok_response(&username, &state, hist);
     if sink.send(Message::Text(ok)).await.is_err() {
@@ -251,20 +795,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Spawn task to forward general channel messages to output channel
-    let tx = out_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            match gen_rx.recv().await {
-                Ok(m) => {
-                    if tx.send(m).is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(_) => {}
-            }
-        }
-    });
+    spawn_broadcast_forwarder(gen_rx, out_tx.clone());
 
     // Spawn task to send queued messages to WebSocket
     tokio::spawn(async move {
@@ -304,238 +835,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             Err(_) => continue,
         };
 
-        let t = d["t"].as_str().unwrap_or("");
-
-        // Route message to appropriate handlers
-        match t {
-            "msg" => {
-                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                let c = d["c"].as_str().unwrap_or("").to_string();
-                if c.is_empty() {
-                    continue;
-                }
-                let entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
-                let chan = state.chan(&ch);
-                chan.push(entry.clone()).await;
-                let _ = chan.tx.send(entry.to_string());
-            }
-            "img" => {
-                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                let a = d["a"].as_str().unwrap_or("").to_string();
-                if a.is_empty() {
-                    continue;
-                }
-                let _ = state.chan(&ch).tx.send(
-                    serde_json::json!({"t":"img","ch":ch,"u":username,"a":a,"ts":now()})
-                        .to_string(),
-                );
-            }
-            "dm" => {
-                let target = d["to"].as_str().unwrap_or("").to_string();
-                let c = d["c"].as_str().unwrap_or("").to_string();
-                if c.is_empty() || target.is_empty() {
-                    continue;
-                }
-                let sender_pk = state
-                    .user_pubkeys
-                    .get(&username)
-                    .map(|v| v.value().clone())
-                    .unwrap_or_default();
-                let p = serde_json::json!({"t":"dm","from":username,"to":target,"c":c,"pk":sender_pk,"ts":now()})
-                    .to_string();
-                let _ = state.chan(&format!("__dm__{}", target)).tx.send(p.clone());
-                let _ = state.chan(&format!("__dm__{}", username)).tx.send(p);
-            }
-            "join" => {
-                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                let chan = state.chan(&ch);
-                let hist = chan.hist().await;
-                let mut rx = chan.tx.subscribe();
-                let tx2 = out_tx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok(m) => {
-                                if tx2.send(m).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(_) => {}
-                        }
-                    }
-                });
-                let _ =
-                    out_tx.send(serde_json::json!({"t":"joined","ch":ch,"hist":hist}).to_string());
-                let _ = chan.tx.send(sys(&format!("→ {} joined #{}", username, ch)));
-            }
-            "users" => {
-                let _ = out_tx.send(
-                    serde_json::json!({"t":"users","users":state.users_with_keys_json()})
-                        .to_string(),
-                );
-            }
-            "info" => {
-                let chs: Vec<String> = state
-                    .channels
-                    .iter()
-                    .filter(|e| !e.key().starts_with("__dm__"))
-                    .map(|e| e.key().clone())
-                    .collect();
-                let _ = out_tx.send(
-                    serde_json::json!({"t":"info","chs":chs,"online":state.online_count()})
-                        .to_string(),
-                );
-            }
-            "vjoin" => {
-                let room = safe_ch(d["r"].as_str().unwrap_or("general"));
-                let vtx = state.voice_tx(&room);
-                let mut vrx = vtx.subscribe();
-                let tx2 = out_tx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        match vrx.recv().await {
-                            Ok(m) => {
-                                if tx2.send(m).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(_) => {}
-                        }
-                    }
-                });
-                voice_room = Some(room.clone());
-                let _ = state
-                    .chan(&room)
-                    .tx
-                    .send(sys(&format!("🎙 {} joined voice #{}", username, room)));
-            }
-            "vleave" => {
-                if let Some(ref room) = voice_room.take() {
-                    let _ = state
-                        .chan(room)
-                        .tx
-                        .send(sys(&format!("🎙 {} left voice #{}", username, room)));
-                }
-            }
-            "vdata" => {
-                let a = d["a"].as_str().unwrap_or("").to_string();
-                if a.is_empty() {
-                    continue;
-                }
-                if let Some(ref room) = voice_room {
-                    if let Some(vtx) = state.voice.get(room) {
-                        let _ = vtx.send(
-                            serde_json::json!({"t":"vdata","from":username,"a":a}).to_string(),
-                        );
-                    }
-                }
-            }
-            "ping" => {
-                let _ = out_tx.send(r#"{"t":"pong"}"#.into());
-            }
-            "edit" => {
-                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                let old_text = d["old_text"].as_str().unwrap_or("").to_string();
-                let new_text = d["new_text"].as_str().unwrap_or("").to_string();
-                if old_text.is_empty() || new_text.is_empty() {
-                    continue;
-                }
-                let chan = state.chan(&ch);
-                let mut h = chan.history.write().await;
-                let username_clone = username.clone();
-                let old_text_clone = old_text.clone();
-                if let Some(pos) = h.iter().rposition(|m| {
-                    m.get("t") == Some(&Value::from("msg"))
-                        && m.get("u") == Some(&Value::from(username_clone.clone()))
-                        && m.get("c") == Some(&Value::from(old_text_clone.clone()))
-                }) {
-                    h[pos]["c"] = Value::from(new_text.clone());
-                    h[pos]["ts"] = Value::from(now());
-                }
-                let edit_msg = serde_json::json!({
-                    "t": "edit",
-                    "ch": ch,
-                    "u": username,
-                    "old_text": old_text,
-                    "new_text": new_text,
-                    "ts": now()
-                })
-                .to_string();
-                let _ = chan.tx.send(edit_msg);
-            }
-            "file_meta" => {
-                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
-                let size = d["size"].as_u64().unwrap_or(0);
-                let file_id = d["file_id"]
-                    .as_str()
-                    .unwrap_or(&format!("{}_{}", username, now()))
-                    .to_string();
-                state.file_transfers.insert(file_id.clone(), d.clone());
-                let file_announce = serde_json::json!({
-                    "t": "file_meta",
-                    "from": username,
-                    "filename": filename,
-                    "size": size,
-                    "file_id": file_id,
-                    "ch": ch,
-                    "ts": now()
-                })
-                .to_string();
-                let _ = state.chan(&ch).tx.send(file_announce);
-            }
-            "file_chunk" => {
-                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                let file_id = d["file_id"].as_str().unwrap_or("").to_string();
-                let chunk_data = d["data"].as_str().unwrap_or("").to_string();
-                let index = d["index"].as_u64().unwrap_or(0);
-                let chunk_msg = serde_json::json!({
-                    "t": "file_chunk",
-                    "from": username,
-                    "file_id": file_id,
-                    "data": chunk_data,
-                    "index": index,
-                    "ch": ch,
-                    "ts": now()
-                })
-                .to_string();
-                let _ = state.chan(&ch).tx.send(chunk_msg);
-            }
-            "status" => {
-                if let Some(status_val) = d.get("status") {
-                    state
-                        .user_statuses
-                        .insert(username.clone(), status_val.clone());
-                    let status_update = serde_json::json!({
-                        "t": "status_update",
-                        "user": username,
-                        "status": status_val
-                    })
-                    .to_string();
-                    for chan_entry in state.channels.iter() {
-                        let _ = chan_entry.tx.send(status_update.clone());
-                    }
-                }
-            }
-            "reaction" => {
-                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-                let emoji = d["emoji"].as_str().unwrap_or("👍").to_string();
-                let msg_id = d["msg_id"].as_str().unwrap_or("unknown").to_string();
-                let reaction_msg = serde_json::json!({
-                    "t": "reaction",
-                    "user": username,
-                    "emoji": emoji,
-                    "msg_id": msg_id,
-                    "ch": ch,
-                    "ts": now()
-                })
-                .to_string();
-                let _ = state.chan(&ch).tx.send(reaction_msg);
-            }
-            _ => {}
-        }
+        handle_event(&d, &state, &username, &out_tx, &mut voice_room).await;
     }
 
     // User disconnected - cleanup
@@ -559,11 +859,12 @@ async fn main() {
         }
     };
 
-    let state = State::new(args.log);
+    let state = State::new(args.log, args.db.clone());
 
-    println!("📡 Chatify running on ws://{}", addr);
-    println!("🔒 Encryption: None (testing) | 🛡️  IP Privacy: On");
-    println!("⏹️  Press Ctrl+C to stop\n");
+    println!(" Chatify running on ws://{}", addr);
+    println!(" Encryption: None (testing) |   IP Privacy: On");
+    println!(" Event store: {}", args.db);
+    println!("⏹  Press Ctrl+C to stop\n");
 
     loop {
         match listener.accept().await {
