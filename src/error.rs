@@ -8,9 +8,9 @@ pub type ChatifyResult<T> = Result<T, ChatifyError>;
 
 #[derive(Debug)]
 pub enum ChatifyError {
-    Io(std::io::Error),
-    WebSocket(tokio_tungstenite::tungstenite::Error),
-    Json(serde_json::Error),
+    Io(Box<std::io::Error>),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
+    Json(Box<serde_json::Error>),
     Crypto(String),
     Validation(String),
     Audio(String),
@@ -35,18 +35,18 @@ impl Error for ChatifyError {}
 
 impl From<std::io::Error> for ChatifyError {
     fn from(value: std::io::Error) -> Self {
-        ChatifyError::Io(value)
+        ChatifyError::Io(Box::new(value))
     }
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ChatifyError {
     fn from(value: tokio_tungstenite::tungstenite::Error) -> Self {
-        ChatifyError::WebSocket(value)
+        ChatifyError::WebSocket(Box::new(value))
     }
 }
 
 impl From<serde_json::Error> for ChatifyError {
     fn from(value: serde_json::Error) -> Self {
-        ChatifyError::Json(value)
+        ChatifyError::Json(Box::new(value))
     }
 }

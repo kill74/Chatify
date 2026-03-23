@@ -316,7 +316,7 @@ fn extract_auth_text(
         Ok(Some(Ok(_))) => Err(ChatifyError::Validation(
             "authentication failed: server sent unexpected frame".to_string(),
         )),
-        Ok(Some(Err(e))) => Err(ChatifyError::WebSocket(e)),
+        Ok(Some(Err(e))) => Err(ChatifyError::WebSocket(Box::new(e))),
         Ok(None) => Err(ChatifyError::Validation(
             "authentication failed: connection closed by server".to_string(),
         )),
