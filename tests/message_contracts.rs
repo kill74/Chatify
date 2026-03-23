@@ -491,3 +491,118 @@ async fn schema_newer_version_is_not_downgraded_and_server_auth_still_works() {
 
     drop(server);
 }
+
+#[tokio::test]
+async fn auth_contract_rejects_non_auth_first_frame() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for invalid auth test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "ping",
+            "u": "alice"
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send invalid first frame");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("first frame must be auth")
+    );
+}
+
+#[tokio::test]
+async fn auth_contract_rejects_invalid_public_key() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for invalid key test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "auth",
+            "u": "alice",
+            "pw": "test-password-hash",
+            "pk": "not-base64",
+            "status": {"text":"Online","emoji":"🟢"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send invalid public key");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("invalid public key")
+    );
+}
+
+#[tokio::test]
+async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg",
+                "ch": "general",
+                "c": "stale-cipher",
+                "ts": 1,
+                "n": "11111111111111111111111111111111"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send stale timestamp message");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("timestamp outside allowed clock skew"),
+        "expected timestamp skew rejection, got: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn protocol_contract_rejects_replayed_nonce() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let payload = json!({
+        "t": "msg",
+        "ch": "general",
+        "c": "replay-cipher",
+        "ts": now,
+        "n": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+
+    alice
+        .send(Message::Text(payload.to_string()))
+        .await
+        .expect("send first message with nonce");
+    let _ = recv_by_type(&mut alice, "msg").await;
+
+    alice
+        .send(Message::Text(payload.to_string()))
+        .await
+        .expect("send replayed nonce message");
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("replayed nonce"),
+        "expected replay nonce rejection, got: {}",
+        msg
+    );
+}

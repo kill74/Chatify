@@ -35,3 +35,12 @@ jobs:
 
       - name: Bridge feature compile check
         run: cargo check --features discord-bridge --bin discord_bot
+
+      - name: Bridge reconnect regression test
+        run: cargo test --features discord-bridge --bin discord_bot bridge_supervisor_reconnects_after_disconnect
+
+      - name: Bridge mapping and loop-filter unit tests
+        run: |
+          cargo test --features discord-bridge --bin discord_bot parse_channel_map_filters_and_normalizes_entries
+          cargo test --features discord-bridge --bin discord_bot self_source_filter_matches_only_non_empty_identical_source
+          cargo test --features discord-bridge --bin discord_bot self_source_filter_ignores_non_string_src_values

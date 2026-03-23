@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -28,11 +29,25 @@ struct Args {
 
 const HISTORY_CAP: usize = 50;
 const MAX_BYTES: usize = 16_000;
+const MAX_AUTH_BYTES: usize = 4_096;
 const CURRENT_SCHEMA_VERSION: i64 = 1;
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const DEFAULT_SEARCH_LIMIT: usize = 30;
 const DEFAULT_REWIND_SECONDS: u64 = 3600;
 const DEFAULT_REWIND_LIMIT: usize = 100;
+const PROTOCOL_VERSION: u64 = 1;
+const MAX_USERNAME_LEN: usize = 32;
+const MAX_PASSWORD_FIELD_LEN: usize = 256;
+const MAX_PUBLIC_KEY_FIELD_LEN: usize = 256;
+const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
+const MAX_NONCE_LEN: usize = 64;
+const NONCE_CACHE_CAP: usize = 256;
+
+struct AuthInfo {
+    username: String,
+    status: Value,
+    pubkey: String,
+}
 
 #[derive(Clone)]
 struct EventStore {
@@ -259,6 +274,7 @@ struct State {
     voice: DashMap<String, broadcast::Sender<String>>,
     user_statuses: DashMap<String, Value>,
     user_pubkeys: DashMap<String, String>,
+    recent_nonces: DashMap<String, VecDeque<String>>,
     file_transfers: DashMap<String, Value>,
     store: EventStore,
     log_enabled: bool,
@@ -271,6 +287,7 @@ impl State {
             voice: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
+            recent_nonces: DashMap::new(),
             file_transfers: DashMap::new(),
             store: EventStore::new(db_path),
             log_enabled,
@@ -358,6 +375,22 @@ async fn handle_event(
     voice_room: &mut Option<String>,
 ) {
     let t = d["t"].as_str().unwrap_or("");
+    if requires_fresh_protection(t) {
+        if let Err(e) = validate_timestamp_skew(d) {
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"err","m":format!("protocol validation failed: {}", e)}),
+            );
+            return;
+        }
+        if let Err(e) = validate_and_register_nonce(state, username, d) {
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"err","m":format!("protocol validation failed: {}", e)}),
+            );
+            return;
+        }
+    }
     match t {
         "msg" => {
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
@@ -680,7 +713,7 @@ fn safe_ch(raw: &str) -> String {
         .to_lowercase()
         .trim_start_matches('#')
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
     if s.is_empty() {
@@ -731,9 +764,142 @@ fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>) -> S
         "u": username,
         "users": state.users_with_keys_json(),
         "channels": state.channels_json(),
-        "hist": hist
+        "hist": hist,
+        "proto": {
+            "v": PROTOCOL_VERSION,
+            "max_payload_bytes": MAX_BYTES
+        }
     })
     .to_string()
+}
+
+fn is_valid_username(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_USERNAME_LEN {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_valid_pubkey_b64(pk: &str) -> bool {
+    if pk.is_empty() || pk.len() > MAX_PUBLIC_KEY_FIELD_LEN {
+        return false;
+    }
+    match general_purpose::STANDARD.decode(pk) {
+        Ok(bytes) => bytes.len() == 32,
+        Err(_) => false,
+    }
+}
+
+fn validate_auth_payload(d: &Value) -> Result<AuthInfo, String> {
+    if !d.is_object() {
+        return Err("invalid auth frame".to_string());
+    }
+    if d.get("t").and_then(|v| v.as_str()) != Some("auth") {
+        return Err("first frame must be auth".to_string());
+    }
+
+    let username = d
+        .get("u")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing username".to_string())?
+        .to_string();
+    if !is_valid_username(&username) {
+        return Err("invalid username".to_string());
+    }
+
+    let pw = d
+        .get("pw")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing password hash".to_string())?;
+    if pw.is_empty() || pw.len() > MAX_PASSWORD_FIELD_LEN {
+        return Err("invalid password hash".to_string());
+    }
+
+    let pubkey = d
+        .get("pk")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing public key".to_string())?
+        .to_string();
+    if !is_valid_pubkey_b64(&pubkey) {
+        return Err("invalid public key".to_string());
+    }
+
+    let status = d
+        .get("status")
+        .cloned()
+        .unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
+
+    Ok(AuthInfo {
+        username,
+        status,
+        pubkey,
+    })
+}
+
+fn requires_fresh_protection(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "msg"
+            | "img"
+            | "dm"
+            | "vdata"
+            | "edit"
+            | "file_meta"
+            | "file_chunk"
+            | "status"
+            | "reaction"
+    )
+}
+
+fn validate_timestamp_skew(d: &Value) -> Result<(), String> {
+    let Some(ts) = d
+        .get("ts")
+        .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|u| u as f64)))
+    else {
+        // Backward-compatible: accept events from clients that don't send ts.
+        return Ok(());
+    };
+
+    if !ts.is_finite() || ts < 0.0 {
+        return Err("invalid timestamp".to_string());
+    }
+
+    if (now() - ts).abs() > MAX_CLOCK_SKEW_SECS {
+        return Err("timestamp outside allowed clock skew".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Result<(), String> {
+    let Some(nonce) = d.get("n").and_then(|v| v.as_str()) else {
+        // Backward-compatible: accept events without nonce.
+        return Ok(());
+    };
+
+    if nonce.is_empty() || nonce.len() > MAX_NONCE_LEN {
+        return Err("invalid nonce".to_string());
+    }
+    if !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid nonce format".to_string());
+    }
+
+    let mut user_nonces = state
+        .recent_nonces
+        .entry(username.to_string())
+        .or_insert_with(VecDeque::new);
+
+    if user_nonces.iter().any(|n| n == nonce) {
+        return Err("replayed nonce".to_string());
+    }
+
+    user_nonces.push_back(nonce.to_string());
+    if user_nonces.len() > NONCE_CACHE_CAP {
+        let _ = user_nonces.pop_front();
+    }
+
+    Ok(())
 }
 
 /// Main client connection handler
@@ -748,31 +914,53 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     // Read initial authentication message
     let raw = match stream.next().await {
         Some(Ok(Message::Text(r))) => r,
+        Some(Ok(_)) => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t":"err","m":"first frame must be text auth"}).to_string(),
+                ))
+                .await;
+            return;
+        }
         _ => return,
     };
+    if raw.len() > MAX_AUTH_BYTES {
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({"t":"err","m":"auth frame too large"}).to_string(),
+            ))
+            .await;
+        return;
+    }
     let d: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t":"err","m":"invalid auth JSON"}).to_string(),
+                ))
+                .await;
+            return;
+        }
     };
 
-    // Extract username from message
-    let username = d
-        .get("u")
-        .and_then(|v| v.as_str())
-        .unwrap_or("anon")
-        .to_string();
+    let auth = match validate_auth_payload(&d) {
+        Ok(a) => a,
+        Err(msg) => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t":"err","m":msg}).to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    let username = auth.username;
 
     // Track user status
-    let status = d
-        .get("status")
-        .cloned()
-        .unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
-    state.user_statuses.insert(username.clone(), status);
-    if let Some(pk) = d.get("pk").and_then(|v| v.as_str()) {
-        if !pk.is_empty() {
-            state.user_pubkeys.insert(username.clone(), pk.to_string());
-        }
-    }
+    state.user_statuses.insert(username.clone(), auth.status);
+    state.user_pubkeys.insert(username.clone(), auth.pubkey);
 
     // Get general channel and send welcome response
     let general = state.chan("general");
@@ -826,14 +1014,31 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
 
         // Validate message size
         if raw.len() > MAX_BYTES {
+            send_out_json(
+                &out_tx,
+                serde_json::json!({"t":"err","m":"payload exceeds max size"}),
+            );
             continue;
         }
 
         // Parse message
         let d: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                send_out_json(
+                    &out_tx,
+                    serde_json::json!({"t":"err","m":"invalid JSON payload"}),
+                );
+                continue;
+            }
         };
+        if !d.is_object() {
+            send_out_json(
+                &out_tx,
+                serde_json::json!({"t":"err","m":"payload must be a JSON object"}),
+            );
+            continue;
+        }
 
         handle_event(&d, &state, &username, &out_tx, &mut voice_room).await;
     }
@@ -841,6 +1046,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     // User disconnected - cleanup
     state.user_statuses.remove(&username);
     state.user_pubkeys.remove(&username);
+    state.recent_nonces.remove(&username);
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     log(&state, &format!("- {}", username));
 }

@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{self, engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use rand::RngCore;
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -268,6 +269,12 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn fresh_nonce_hex() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 fn enqueue_json(ws_tx: &mpsc::UnboundedSender<String>, payload: serde_json::Value) {
     let _ = ws_tx.send(payload.to_string());
 }
@@ -275,6 +282,9 @@ fn enqueue_json(ws_tx: &mpsc::UnboundedSender<String>, payload: serde_json::Valu
 fn enqueue_timed(ws_tx: &mpsc::UnboundedSender<String>, mut payload: serde_json::Value) {
     if payload.get("ts").is_none() {
         payload["ts"] = serde_json::json!(now_secs());
+    }
+    if payload.get("n").is_none() {
+        payload["n"] = serde_json::json!(fresh_nonce_hex());
     }
     enqueue_json(ws_tx, payload);
 }
@@ -936,8 +946,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         };
-        if resp_val["t"] == "err" {
-            eprintln!("Authentication failed: {}", resp_val["m"]);
+        let typ = resp_val.get("t").and_then(|v| v.as_str()).unwrap_or("");
+        if typ == "err" {
+            eprintln!(
+                "Authentication failed: {}",
+                resp_val
+                    .get("m")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown server error")
+            );
+            return Ok(());
+        }
+        if typ != "ok" {
+            eprintln!("Authentication failed: unexpected handshake type '{}'", typ);
+            return Ok(());
+        }
+        if !resp_val.get("users").map(|v| v.is_array()).unwrap_or(false) {
+            eprintln!("Authentication failed: malformed users payload");
+            return Ok(());
+        }
+        if !resp_val
+            .get("channels")
+            .map(|v| v.is_array())
+            .unwrap_or(false)
+        {
+            eprintln!("Authentication failed: malformed channels payload");
             return Ok(());
         }
         // Update state with server response

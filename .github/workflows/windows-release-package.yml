@@ -25,6 +25,8 @@ jobs:
       - name: Upload package as release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/chatify-windows-x64.zip
+          files: |
+            dist/chatify-windows-x64.zip
+            dist/chatify-windows-x64.zip.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

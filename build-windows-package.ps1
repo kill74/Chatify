@@ -64,6 +64,24 @@ echo Starting Chatify client to %HOST%:%PORT%
 clicord-client.exe --host %HOST% --port %PORT%
 "@
 
+$StartAllBat = @"
+@echo off
+setlocal
+
+cd /d "%~dp0"
+
+set HOST=127.0.0.1
+set PORT=8765
+
+if not "%~1"=="" set HOST=%~1
+if not "%~2"=="" set PORT=%~2
+
+echo Launching Chatify server and client...
+start "Chatify Server" cmd /k "cd /d %~dp0 && clicord-server.exe --host 0.0.0.0 --port %PORT%"
+timeout /t 1 /nobreak >nul
+start "Chatify Client" cmd /k "cd /d %~dp0 && clicord-client.exe --host %HOST% --port %PORT%"
+"@
+
 $ReadmeTxt = @"
 Chatify Windows Package
 =======================
@@ -71,27 +89,41 @@ Chatify Windows Package
 Files:
 - clicord-server.exe
 - clicord-client.exe
+- start-chatify.bat
 - start-server.bat
 - start-client.bat
 
 Quick Start:
+1) Run start-chatify.bat
+
+Manual mode:
 1) Run start-server.bat
 2) Run start-client.bat
 
 Optional parameters:
 - start-server.bat [host] [port]
 - start-client.bat [host] [port]
+- start-chatify.bat [host] [port]
 
 Examples:
 - start-server.bat 0.0.0.0 8765
 - start-client.bat 127.0.0.1 8765
+
+Integrity:
+- chatify-windows-x64.zip.sha256 contains SHA256 for the ZIP.
 "@
 
 Set-Content -Path (Join-Path $PackageDir "start-server.bat") -Value $ServerBat -Encoding ASCII
 Set-Content -Path (Join-Path $PackageDir "start-client.bat") -Value $ClientBat -Encoding ASCII
+Set-Content -Path (Join-Path $PackageDir "start-chatify.bat") -Value $StartAllBat -Encoding ASCII
 Set-Content -Path (Join-Path $PackageDir "README.txt") -Value $ReadmeTxt -Encoding ASCII
 
 Compress-Archive -Path $PackageDir -DestinationPath $ZipPath -CompressionLevel Optimal
 
+$ZipHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$HashFilePath = "$ZipPath.sha256"
+"$ZipHash  $([System.IO.Path]::GetFileName($ZipPath))" | Set-Content -Path $HashFilePath -Encoding ASCII
+
 Write-Host "Package created: $ZipPath"
+Write-Host "Checksum created: $HashFilePath"
 Write-Host "Contents ready in: $PackageDir"
