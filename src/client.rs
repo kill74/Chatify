@@ -4,12 +4,17 @@
 //! file transfers, message editing, reactions, and user status tracking.
 
 use clicord_server::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{self, engine::general_purpose, Engine as _};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{SampleFormat, Stream, StreamConfig};
+use rodio::buffer::SamplesBuffer;
+use rodio::{OutputStream, Sink};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -79,6 +84,27 @@ struct Status {
     emoji: char,
 }
 
+/// Voice frame transferred over WebSocket.
+#[derive(Debug, Clone)]
+struct VoiceFrame {
+    sample_rate: u32,
+    channels: u16,
+    samples: Vec<i16>,
+}
+
+/// Runtime state for an active voice session.
+struct VoiceSession {
+    room: String,
+    event_tx: std_mpsc::Sender<VoiceEvent>,
+    task: thread::JoinHandle<()>,
+}
+
+enum VoiceEvent {
+    Captured(VoiceFrame),
+    Playback(VoiceFrame),
+    Stop,
+}
+
 /// Client connection state and data
 #[allow(dead_code)]
 struct ClientState {
@@ -104,6 +130,8 @@ struct ClientState {
     running: bool,
     /// Whether we're in a voice call
     voice_active: bool,
+    /// Active voice session runtime (if any)
+    voice_session: Option<VoiceSession>,
     /// Current theme
     theme: String,
     /// Active file transfers
@@ -187,6 +215,277 @@ fn normalize_channel(raw: &str) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+fn encode_voice_frame(frame: &VoiceFrame) -> String {
+    let mut out = Vec::with_capacity(6 + frame.samples.len() * 2);
+    out.extend_from_slice(&frame.sample_rate.to_le_bytes());
+    out.extend_from_slice(&frame.channels.to_le_bytes());
+    for s in &frame.samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    general_purpose::STANDARD.encode(out)
+}
+
+fn decode_voice_frame(payload_b64: &str) -> Option<VoiceFrame> {
+    let raw = general_purpose::STANDARD.decode(payload_b64).ok()?;
+    if raw.len() < 6 {
+        return None;
+    }
+    let sample_rate = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let channels = u16::from_le_bytes([raw[4], raw[5]]);
+    if channels == 0 {
+        return None;
+    }
+    let samples_raw = &raw[6..];
+    if samples_raw.len() % 2 != 0 {
+        return None;
+    }
+    let mut samples = Vec::with_capacity(samples_raw.len() / 2);
+    for chunk in samples_raw.chunks_exact(2) {
+        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    Some(VoiceFrame {
+        sample_rate,
+        channels,
+        samples,
+    })
+}
+
+fn push_pcm_to_chunks(
+    pending: &Arc<Mutex<VecDeque<i16>>>,
+    pcm: &[i16],
+    chunk_samples: usize,
+    sample_rate: u32,
+    channels: u16,
+    tx: &std_mpsc::Sender<VoiceEvent>,
+) {
+    if chunk_samples == 0 {
+        return;
+    }
+    if let Ok(mut q) = pending.lock() {
+        for sample in pcm {
+            q.push_back(*sample);
+        }
+        while q.len() >= chunk_samples {
+            let mut chunk = Vec::with_capacity(chunk_samples);
+            for _ in 0..chunk_samples {
+                if let Some(v) = q.pop_front() {
+                    chunk.push(v);
+                }
+            }
+            let _ = tx.send(VoiceEvent::Captured(VoiceFrame {
+                sample_rate,
+                channels,
+                samples: chunk,
+            }));
+        }
+    }
+}
+
+fn build_input_stream(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    format: SampleFormat,
+    tx: std_mpsc::Sender<VoiceEvent>,
+    sample_rate: u32,
+    channels: u16,
+    chunk_samples: usize,
+) -> Result<Stream, String> {
+    let pending = Arc::new(Mutex::new(VecDeque::<i16>::new()));
+    let err_fn = |e| eprintln!("voice input error: {}", e);
+    match format {
+        SampleFormat::I16 => {
+            let pending_i16 = pending.clone();
+            let tx_i16 = tx.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[i16], _| {
+                        push_pcm_to_chunks(
+                            &pending_i16,
+                            data,
+                            chunk_samples,
+                            sample_rate,
+                            channels,
+                            &tx_i16,
+                        )
+                    },
+                    err_fn,
+                )
+                .map_err(|e| format!("failed to build i16 input stream: {}", e))
+        }
+        SampleFormat::U16 => {
+            let pending_u16 = pending.clone();
+            let tx_u16 = tx.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[u16], _| {
+                        let converted: Vec<i16> = data
+                            .iter()
+                            .map(|v| {
+                                (*v as i32 - 32768).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                            })
+                            .collect();
+                        push_pcm_to_chunks(
+                            &pending_u16,
+                            &converted,
+                            chunk_samples,
+                            sample_rate,
+                            channels,
+                            &tx_u16,
+                        )
+                    },
+                    err_fn,
+                )
+                .map_err(|e| format!("failed to build u16 input stream: {}", e))
+        }
+        SampleFormat::F32 => {
+            let pending_f32 = pending;
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[f32], _| {
+                        let converted: Vec<i16> = data
+                            .iter()
+                            .map(|v| {
+                                let clamped = v.clamp(-1.0, 1.0);
+                                (clamped * i16::MAX as f32) as i16
+                            })
+                            .collect();
+                        push_pcm_to_chunks(
+                            &pending_f32,
+                            &converted,
+                            chunk_samples,
+                            sample_rate,
+                            channels,
+                            &tx,
+                        )
+                    },
+                    err_fn,
+                )
+                .map_err(|e| format!("failed to build f32 input stream: {}", e))
+        }
+    }
+}
+
+fn start_voice_session(
+    room: String,
+    ws_tx: mpsc::UnboundedSender<String>,
+) -> Result<VoiceSession, String> {
+    let (event_tx, event_rx) = std_mpsc::channel::<VoiceEvent>();
+    let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
+    let ws_tx_task = ws_tx;
+    let room_task = room.clone();
+    let event_tx_thread = event_tx.clone();
+
+    let task = thread::spawn(move || {
+        let host = cpal::default_host();
+        let input_device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                let _ = ready_tx.send(Err("no default input device available".to_string()));
+                return;
+            }
+        };
+        let input_supported = match input_device.default_input_config() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("failed to fetch default input config: {}", e)));
+                return;
+            }
+        };
+
+        let input_format = input_supported.sample_format();
+        let input_config: StreamConfig = input_supported.into();
+        let sample_rate = input_config.sample_rate.0;
+        let channels = input_config.channels;
+        let chunk_samples = 320usize
+            .saturating_mul(channels as usize)
+            .max(channels as usize);
+
+        let (_output_stream, output_handle) = match OutputStream::try_default() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("audio output init failed: {}", e)));
+                return;
+            }
+        };
+        let sink = match Sink::try_new(&output_handle) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("audio output sink init failed: {}", e)));
+                return;
+            }
+        };
+
+        let input_stream = match build_input_stream(
+            &input_device,
+            &input_config,
+            input_format,
+            event_tx_thread,
+            sample_rate,
+            channels,
+            chunk_samples,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+        if let Err(e) = input_stream.play() {
+            let _ = ready_tx.send(Err(format!("failed to start microphone stream: {}", e)));
+            return;
+        }
+        let _ = ready_tx.send(Ok(()));
+
+        while let Ok(event) = event_rx.recv() {
+            match event {
+                VoiceEvent::Captured(frame) => {
+                    let payload = encode_voice_frame(&frame);
+                    let _ = ws_tx_task.send(
+                        serde_json::json!({
+                            "t": "vdata",
+                            "r": room_task.clone(),
+                            "a": payload,
+                            "ts": SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        })
+                        .to_string(),
+                    );
+                }
+                VoiceEvent::Playback(frame) => {
+                    sink.append(SamplesBuffer::new(
+                        frame.channels,
+                        frame.sample_rate,
+                        frame.samples,
+                    ));
+                }
+                VoiceEvent::Stop => break,
+            }
+        }
+        sink.stop();
+    });
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(VoiceSession {
+            room,
+            event_tx,
+            task,
+        }),
+        Ok(Err(e)) => {
+            let _ = task.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = task.join();
+            Err("voice runtime failed to initialize".to_string())
+        }
     }
 }
 
@@ -340,6 +639,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             priv_key: new_keypair(),
             running: true,
             voice_active: false,
+            voice_session: None,
             theme: "default".to_string(),
             file_transfers: HashMap::new(),
             message_history: Vec::new(),
@@ -551,6 +851,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     state.message_history.remove(0);
                                 }
                             }
+                            "vdata" => {
+                                let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                                let payload = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
+                                let playback_tx = {
+                                    let state = state_clone.lock().await;
+                                    if from == state.me {
+                                        None
+                                    } else {
+                                        state
+                                            .voice_session
+                                            .as_ref()
+                                            .map(|session| session.event_tx.clone())
+                                    }
+                                };
+                                if let (Some(tx), Some(frame)) =
+                                    (playback_tx, decode_voice_frame(payload))
+                                {
+                                    let _ = tx.send(VoiceEvent::Playback(frame));
+                                }
+                            }
                             _ => {}
                         }
                     } else {
@@ -691,8 +1011,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         "/voice" => {
-                            // Placeholder for voice toggle
-                            state.log("INFO", "Voice command not yet implemented in Rust client");
+                            if state.voice_session.is_some() {
+                                if let Some(session) = state.voice_session.take() {
+                                    state.voice_active = false;
+                                    let _ = state.ws_tx.send(
+                                        serde_json::json!({
+                                            "t": "vleave",
+                                            "r": session.room,
+                                            "ts": SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs()
+                                        })
+                                        .to_string(),
+                                    );
+                                    let _ = session.event_tx.send(VoiceEvent::Stop);
+                                    let _ = session.task.join();
+                                    println!("Voice stopped");
+                                    state.log("INFO", "Voice session stopped");
+                                }
+                            } else {
+                                let room = normalize_channel(args.trim())
+                                    .unwrap_or_else(|| state.ch.clone());
+                                let ws_tx = state.ws_tx.clone();
+                                match start_voice_session(room.clone(), ws_tx.clone()) {
+                                    Ok(session) => {
+                                        state.voice_active = true;
+                                        state.voice_session = Some(session);
+                                        let _ = ws_tx.send(
+                                            serde_json::json!({
+                                                "t": "vjoin",
+                                                "r": room,
+                                                "ts": SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs()
+                                            })
+                                            .to_string(),
+                                        );
+                                        println!("Voice started in #{}", room);
+                                        state.log("INFO", "Voice session started");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Voice start failed: {}", e);
+                                        eprintln!("Check that your microphone/speakers are available and not in use by another app.");
+                                        state.log("WARN", &format!("Voice start failed: {}", e));
+                                    }
+                                }
+                            }
                         }
                         "/clear" => {
                             // Clear the terminal by printing many newlines
@@ -701,13 +1067,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         "/help" => {
-                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice, /clear, /edit, /help, /quit");
+                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /clear, /edit, /help, /quit");
                         }
                         "/edit" => {
                             // Placeholder for edit
                             state.log("INFO", "Edit command not yet implemented in Rust client");
                         }
                         "/quit" | "/exit" | "/q" => {
+                            if let Some(session) = state.voice_session.take() {
+                                let _ = state.ws_tx.send(
+                                    serde_json::json!({
+                                        "t": "vleave",
+                                        "r": session.room,
+                                        "ts": SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    })
+                                    .to_string(),
+                                );
+                                let _ = session.event_tx.send(VoiceEvent::Stop);
+                                let _ = session.task.join();
+                            }
+                            state.voice_active = false;
                             state.running = false;
                             break;
                         }

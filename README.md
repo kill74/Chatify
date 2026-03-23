@@ -101,7 +101,7 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 | /me <action>         | Send action-style message |
 | /users               | List online users         |
 | /channels            | List channels             |
-| /voice               | Placeholder command       |
+| /voice [room]        | Toggle voice in room      |
 | /edit <text>         | Placeholder command       |
 | /clear               | Clear terminal output     |
 | /help                | Show command help         |
@@ -118,7 +118,6 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ### Present but incomplete
 
-- Voice command path
 - Edit command behavior
 - Full protocol-level security hardening
 
@@ -181,7 +180,7 @@ cargo fmt
 
 ### Command appears inactive
 
-- /voice and /edit are currently placeholders.
+- /edit is currently a placeholder.
 
 ## Contributing
 
@@ -220,7 +219,6 @@ If release cadence becomes regular, add a dedicated CHANGELOG.md using this form
 
 ## Roadmap (Near Term)
 
-- Complete voice path end-to-end
 - Complete edit path end-to-end
 - Strengthen auth and protocol validation
 - Replace/complete stubbed cryptographic flows
