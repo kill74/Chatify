@@ -6,8 +6,9 @@ use chacha20poly1305::ChaCha20Poly1305;
 use hex;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
-use rand::Rng;
-use sha2::Sha256;
+use rand::{rngs::OsRng, Rng, RngCore};
+use sha2::{Digest, Sha256};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Derive a channel-specific encryption key using PBKDF2
 pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
@@ -21,18 +22,30 @@ pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
     key.to_vec()
 }
 
-/// Perform Diffie-Hellman key exchange for DM encryption
-/// Note: This is stubbed due to security concerns with available libraries.
-/// TODO: Implement with a secure, audited ECDH library
-pub fn dh_key(_priv_key: &[u8], pubkey_b64: &str) -> Vec<u8> {
-    // For now, derive a key from the pubkey for testing
-    let decoded = general_purpose::STANDARD
-        .decode(pubkey_b64)
-        .unwrap_or_default();
-    let mut key = [0u8; 32];
-    let n = decoded.len().min(32);
-    key[..n].copy_from_slice(&decoded[..n]);
-    key.to_vec()
+/// Perform X25519 Diffie-Hellman and derive a 32-byte symmetric key.
+pub fn dh_key(priv_key: &[u8], pubkey_b64: &str) -> Vec<u8> {
+    let priv_arr: [u8; 32] = match priv_key.try_into() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let peer_pub_raw = match general_purpose::STANDARD.decode(pubkey_b64) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let peer_pub_arr: [u8; 32] = match peer_pub_raw.as_slice().try_into() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let secret = StaticSecret::from(priv_arr);
+    let peer_public = PublicKey::from(peer_pub_arr);
+    let shared = secret.diffie_hellman(&peer_public);
+
+    // Domain-separated hash to convert shared secret into a ChaCha20 key.
+    let mut hasher = Sha256::new();
+    hasher.update(b"chatify:dm:v1");
+    hasher.update(shared.as_bytes());
+    hasher.finalize().to_vec()
 }
 
 /// Encrypt data using ChaCha20Poly1305 with a random nonce
@@ -85,20 +98,20 @@ pub fn pw_hash(password: &str) -> String {
     hex::encode(hash)
 }
 
-/// Generate a new X25519 keypair
-/// Note: Stubbed due to security vulnerabilities in available libraries.
-/// TODO: Implement with a secure, audited ECDH library
+/// Generate a new X25519 private key (32 bytes).
 pub fn new_keypair() -> Vec<u8> {
-    // Generate random 32 bytes for the private key
     let mut key = [0u8; 32];
-    rand::thread_rng().fill(&mut key);
+    OsRng.fill_bytes(&mut key);
     key.to_vec()
 }
 
-/// Encode a public key as base64
-/// Note: Simplified version due to ECDH implementation being stubbed
+/// Encode an X25519 public key as base64.
 pub fn pub_b64(priv_key: &[u8]) -> String {
-    // For now, just return a b64 encoded version of the key
-    // TODO: Properly compute public key from private key
-    general_purpose::STANDARD.encode(priv_key)
+    let priv_arr: [u8; 32] = match priv_key.try_into() {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let secret = StaticSecret::from(priv_arr);
+    let public = PublicKey::from(&secret);
+    general_purpose::STANDARD.encode(public.as_bytes())
 }

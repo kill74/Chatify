@@ -43,6 +43,7 @@ rodio = "0.18"
 image = "0.24"
 # serenity = { version = "0.11", features = ["client", "gateway", "standard_framework", "model"] }
 base64 = "0.21"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [profile.release]
 opt-level = 3
