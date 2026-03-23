@@ -107,6 +107,46 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 | /help                | Show command help         |
 | /quit, /exit, /q     | Disconnect and exit       |
 
+## UI Example (Terminal)
+
+This is an example of how Chatify looks to a user in a normal terminal session.
+
+Server window:
+
+```text
+$ cargo run --bin clicord-server
+📡 Chatify running on ws://0.0.0.0:8765
+🔒 Encryption: None (testing) | 🛡️  IP Privacy: On
+⏹️  Press Ctrl+C to stop
+```
+
+Client window (user Alice):
+
+```text
+$ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
+username: alice
+password:
+Connected to server
+
+/join dev
+→ #dev
+
+Hello team, build passed on my side.
+
+/users
+Online users: alice, bob, carol
+
+/dm bob Can you review the auth patch?
+
+/voice
+Voice started in #dev
+
+/voice
+Voice stopped
+
+/quit
+```
+
 ## Feature Maturity
 
 ### Stable for local use
