@@ -5,6 +5,8 @@
 //! Current shared surface:
 //! - `crypto`: key derivation and encryption helpers used by runtime components.
 //! - `error`: shared error/result types used by binaries.
+//! - `totp`: two-factor authentication implementation.
 
 pub mod crypto;
 pub mod error;
+pub mod totp;

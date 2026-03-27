@@ -1,3 +1,73 @@
+//! # `clicord-server` — WebSocket Chat Server
+//!
+//! A single-binary, async WebSocket server built on [Tokio] and
+//! [tokio-tungstenite]. It provides:
+//!
+//! * **Authentication** — first-frame auth with username/password-hash and an
+//!   Ed25519 public key for E2E-encrypted DMs.
+//! * **2-Factor Authentication** — TOTP (RFC 6238) and single-use backup codes,
+//!   stored in SQLite.
+//! * **Channel messaging** — broadcast channels with a bounded in-memory ring
+//!   buffer and a durable SQLite event store.
+//! * **Direct messages** — per-user DM channels keyed `__dm__<username>`.
+//! * **Voice rooms** — low-latency audio relay via per-room broadcast channels.
+//! * **Search & history** — full-text LIKE search and time-window ("rewind")
+//!   queries backed by SQLite.
+//! * **Protocol safety** — payload size gates, timestamp-skew validation, and
+//!   nonce-based replay protection on mutating events.
+//! * **Graceful shutdown** — Ctrl+C drains active connections before exiting,
+//!   with a bounded timeout.
+//!
+//! ## Architecture Overview
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────┐
+//! │                   Tokio Runtime                      │
+//! │                                                      │
+//! │  TcpListener::accept()                               │
+//! │       │                                              │
+//! │       └─► tokio::spawn( handle(stream, addr, state) )│
+//! │                 │                                    │
+//! │        ┌────────▼─────────┐                          │
+//! │        │  WebSocket auth  │  ← validates first frame  │
+//! │        └────────┬─────────┘                          │
+//! │                 │                                    │
+//! │       ┌─────────▼──────────┐                         │
+//! │       │  Message recv loop  │                        │
+//! │       │  handle_event(...)  │                        │
+//! │       └─────────┬──────────┘                         │
+//! │                 │                                    │
+//! │   mpsc::unbounded ──► sink writer task               │
+//! └─────────────────────────────────────────────────────┘
+//!
+//! Shared State (Arc<State>)
+//!   ├── channels   : DashMap<String, Channel>
+//!   ├── voice      : DashMap<String, broadcast::Sender>
+//!   ├── user_statuses / user_pubkeys  : DashMap
+//!   ├── recent_nonces : DashMap<String, VecDeque<String>>
+//!   └── store      : EventStore  ──► SQLite file
+//! ```
+//!
+//! ## Configuration
+//!
+//! All options are CLI flags (see [`Args`]):
+//!
+//! | Flag     | Default          | Description                       |
+//! |----------|------------------|-----------------------------------|
+//! | `--host` | `0.0.0.0`        | Bind address                       |
+//! | `--port` | `8765`           | TCP port                           |
+//! | `--log`  | off              | Enable structured logging          |
+//! | `--db`   | `chatify.db`     | SQLite database file path          |
+//!
+//! ## Protocol
+//!
+//! All frames are UTF-8 JSON objects with a mandatory `"t"` (type) field.
+//! Binary frames are silently ignored. The first frame **must** be an `auth`
+//! frame; any other type causes an immediate `err` response and disconnection.
+//!
+//! See [`validate_auth_payload`] for the full auth contract and
+//! [`handle_event`] for the complete set of post-auth event types.
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,10 +77,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
 use clicord_server::error::{ChatifyError, ChatifyResult};
+use clicord_server::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
-use rusqlite::{params, Connection, Error as SqlError};
+use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,47 +89,156 @@ use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+// ---------------------------------------------------------------------------
+// CLI configuration
+// ---------------------------------------------------------------------------
+
+/// Command-line arguments for `clicord-server`.
+///
+/// Parsed once at startup by [clap]; the fields are consumed into [`State`]
+/// and the bind address, and are not referenced again after `main` returns
+/// from its setup phase.
 #[derive(Parser)]
 #[command(name = "clicord-server")]
 struct Args {
+    /// IP address the server will bind to. Use `127.0.0.1` to restrict to
+    /// loopback (useful for testing behind a reverse proxy).
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
+
+    /// TCP port to listen on.
     #[arg(long, default_value_t = 8765)]
     port: u16,
+
+    /// Enable structured logging via `env_logger`. When off, the server is
+    /// completely silent except for the startup banner.
     #[arg(long)]
     log: bool,
+
+    /// Path to the SQLite database file. The file is created automatically on
+    /// first run and migrated to the current schema. Use `:memory:` for
+    /// ephemeral in-process storage in tests.
     #[arg(long, default_value = "chatify.db")]
     db: String,
 }
 
+// ---------------------------------------------------------------------------
+// Protocol constants
+// ---------------------------------------------------------------------------
+
+/// Maximum number of messages kept in the per-channel in-memory ring buffer.
+/// Older entries are evicted when the buffer is full. Persistent history is
+/// unbounded in SQLite; this cap only affects the in-process hot cache.
 const HISTORY_CAP: usize = 50;
+
+/// Maximum byte length for any post-auth WebSocket frame.
+/// Frames exceeding this are rejected before JSON parsing to limit memory
+/// pressure from a single misbehaving or malicious client.
 const MAX_BYTES: usize = 16_000;
+
+/// Maximum byte length for the initial auth frame.
+/// Tighter than [`MAX_BYTES`] because the auth payload is parsed before the
+/// client is known/trusted, making it a potential amplification target.
 const MAX_AUTH_BYTES: usize = 4_096;
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+/// SQLite schema version this binary was built against.
+/// The migration path in [`EventStore::migrate`] upgrades from any lower
+/// version to this one. If the stored version is *higher*, the server logs a
+/// warning and continues without modifying the schema (no downgrade).
+const CURRENT_SCHEMA_VERSION: i64 = 2;
+
+/// Default number of events returned by a `history` request.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
+
+/// Default number of events returned by a `search` request.
 const DEFAULT_SEARCH_LIMIT: usize = 30;
+
+/// Default look-back window in seconds for a `rewind` request (1 hour).
 const DEFAULT_REWIND_SECONDS: u64 = 3600;
+
+/// Default number of events returned by a `rewind` request.
 const DEFAULT_REWIND_LIMIT: usize = 100;
+
+/// WebSocket sub-protocol version advertised in the `"ok"` auth response.
+/// Clients can use this to detect incompatible server versions.
 const PROTOCOL_VERSION: u64 = 1;
+
+/// Maximum allowed username length in characters (ASCII only).
 const MAX_USERNAME_LEN: usize = 32;
+
+/// Maximum allowed length for the `"pw"` (password hash) field in the auth
+/// frame. This covers SHA-256 hex strings (64 chars) with generous headroom
+/// for other hash schemes.
 const MAX_PASSWORD_FIELD_LEN: usize = 256;
+
+/// Maximum allowed length for the `"pk"` (public key) base64 field.
 const MAX_PUBLIC_KEY_FIELD_LEN: usize = 256;
+
+/// Allowed clock skew in seconds between the client-supplied `"ts"` timestamp
+/// and the server's wall clock. A window of ±300 s accommodates clients with
+/// moderately drifted clocks while still preventing stale-message replay.
 const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
+
+/// Maximum length of a nonce string in the `"n"` field. This bounds the
+/// nonce-cache entry size and prevents artificially long strings from being
+/// used as a timing oracle.
 const MAX_NONCE_LEN: usize = 64;
+
+/// Maximum number of recently seen nonces remembered per user.
+/// Once the deque is full the oldest entry is evicted. Choosing a cap large
+/// enough to cover the clock-skew window prevents replay within that window
+/// while bounding per-user memory to `NONCE_CACHE_CAP * MAX_NONCE_LEN` bytes.
 const NONCE_CACHE_CAP: usize = 256;
 
+// ---------------------------------------------------------------------------
+// Data structures
+// ---------------------------------------------------------------------------
+
+/// Validated, strongly-typed representation of a successful auth frame parse.
+///
+/// Created by [`validate_auth_payload`] after all field-level validation
+/// passes. Using a typed struct here — rather than passing `&Value` through
+/// downstream functions — makes it impossible to accidentally skip validation
+/// or misread a field name.
 struct AuthInfo {
+    /// Validated username (ASCII alphanumeric / `-` / `_`, ≤ 32 chars).
     username: String,
+
+    /// Arbitrary JSON status blob supplied by the client
+    /// (e.g. `{"text":"Online","emoji":"🟢"}`). Defaults to a standard
+    /// "Online" status if the field is absent.
     status: Value,
+
+    /// Base64-encoded 32-byte Ed25519 public key used for E2E DM encryption.
     pubkey: String,
+
+    /// Optional TOTP or backup code. Present only when the client suspects
+    /// or knows that 2-FA is enabled for this account.
+    otp_code: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// EventStore — SQLite persistence layer
+// ---------------------------------------------------------------------------
+
+/// Thin wrapper around a SQLite file that handles schema migration, event
+/// persistence, and read queries.
+///
+/// All methods open a *new* connection for each call (`open_conn`). This
+/// avoids holding a connection across `await` points, which is unsound with
+/// the single-threaded `rusqlite` connection type. The trade-off is connection
+/// overhead; for a chat server at this scale the overhead is negligible.
+///
+/// Cloning an `EventStore` is cheap — it only duplicates the path string.
 #[derive(Clone)]
 struct EventStore {
+    /// Absolute or relative path to the SQLite file (or `":memory:"`).
     path: String,
 }
 
 impl EventStore {
+    /// Creates a new `EventStore` pointing at `path` and immediately runs
+    /// [`init`](Self::init) to ensure the schema is current.
     fn new(path: String) -> Self {
         let store = Self { path };
         if let Err(e) = store.init() {
@@ -67,12 +247,15 @@ impl EventStore {
         store
     }
 
+    /// Opens a connection, creates `schema_meta` if it does not exist, reads
+    /// the current schema version, and drives migrations to
+    /// [`CURRENT_SCHEMA_VERSION`].
     fn init(&self) -> rusqlite::Result<()> {
         let conn = Connection::open(&self.path)?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS schema_meta (
-                key TEXT PRIMARY KEY,
+                key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
             ",
@@ -83,6 +266,10 @@ impl EventStore {
         Ok(())
     }
 
+    /// Reads `schema_meta.schema_version` as an `i64`.
+    ///
+    /// Returns `0` if the row does not exist (fresh database), or propagates
+    /// any other SQLite error to the caller.
     fn schema_version(conn: &Connection) -> rusqlite::Result<i64> {
         let value: rusqlite::Result<String> = conn.query_row(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'",
@@ -96,6 +283,7 @@ impl EventStore {
         }
     }
 
+    /// Upserts `schema_meta.schema_version` to `version`.
     fn set_schema_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT INTO schema_meta(key, value)
@@ -106,6 +294,21 @@ impl EventStore {
         Ok(())
     }
 
+    /// Applies all pending migrations in sequential order starting from
+    /// `from_version`.
+    ///
+    /// Each migration step:
+    /// 1. Is guarded by `IF NOT EXISTS` DDL so re-running it is idempotent.
+    /// 2. Updates `schema_version` immediately after its DDL, before the next
+    ///    step runs, so a crash mid-migration leaves a consistent partial state
+    ///    that can be resumed on restart.
+    ///
+    /// # Migration history
+    ///
+    /// | Version | Tables / Indexes Added                              |
+    /// |---------|-----------------------------------------------------|
+    /// | 0 → 1   | `events`, `idx_events_channel_ts`, `idx_events_search` |
+    /// | 1 → 2   | `user_2fa`                                          |
     fn migrate(&self, conn: &Connection, from_version: i64) -> rusqlite::Result<()> {
         let mut version = from_version;
 
@@ -113,23 +316,45 @@ impl EventStore {
             conn.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    event_type TEXT NOT NULL,
-                    channel TEXT NOT NULL,
-                    sender TEXT,
-                    target TEXT,
-                    payload TEXT NOT NULL,
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          REAL    NOT NULL,
+                    event_type  TEXT    NOT NULL,
+                    channel     TEXT    NOT NULL,
+                    sender      TEXT,
+                    target      TEXT,
+                    payload     TEXT    NOT NULL,
                     search_text TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_events_channel_ts ON events(channel, ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_search ON events(search_text);
+                CREATE INDEX IF NOT EXISTS idx_events_channel_ts
+                    ON events(channel, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_search
+                    ON events(search_text);
                 ",
             )?;
             version = 1;
             Self::set_schema_version(conn, version)?;
         }
 
+        if version < 2 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS user_2fa (
+                    username      TEXT    PRIMARY KEY,
+                    enabled       BOOLEAN NOT NULL DEFAULT FALSE,
+                    secret        TEXT,
+                    backup_codes  TEXT,
+                    enabled_at    REAL,
+                    last_verified REAL
+                );
+                ",
+            )?;
+            version = 2;
+            Self::set_schema_version(conn, version)?;
+        }
+
+        // A version higher than CURRENT_SCHEMA_VERSION means this binary was
+        // deployed against a database written by a newer server. Log a warning
+        // but leave the schema intact — we must never silently downgrade.
         if version > CURRENT_SCHEMA_VERSION {
             warn!(
                 "Database schema version {} is newer than supported version {}",
@@ -140,6 +365,12 @@ impl EventStore {
         Ok(())
     }
 
+    /// Opens a connection to the database, returning `None` and logging a
+    /// warning on failure.
+    ///
+    /// Callers use the `?` operator or early-return pattern on `None` so that
+    /// a transient I/O error degrades gracefully (the operation is skipped)
+    /// rather than crashing the connection handler.
     fn open_conn(&self) -> Option<Connection> {
         match Connection::open(&self.path) {
             Ok(c) => Some(c),
@@ -150,12 +381,18 @@ impl EventStore {
         }
     }
 
+    /// Deserialises a list of raw JSON strings into [`Value`]s, silently
+    /// dropping any entries that fail to parse.
     fn decode_rows(rows: Vec<String>) -> Vec<Value> {
         rows.into_iter()
             .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
             .collect()
     }
 
+    /// Generic helper that prepares `sql`, executes it with `params`, and
+    /// returns the results in **chronological** order (the query uses
+    /// `ORDER BY ts DESC` for efficient index use; this method reverses the
+    /// results before returning).
     fn query_events<P>(&self, sql: &str, params: P) -> Vec<Value>
     where
         P: rusqlite::Params,
@@ -179,11 +416,24 @@ impl EventStore {
             }
         };
 
+        // Reverse: SQLite returns newest-first for index efficiency; callers
+        // expect oldest-first (chronological) order.
         let mut out = Self::decode_rows(rows.filter_map(|r| r.ok()).collect());
         out.reverse();
         out
     }
 
+    /// Inserts a new event row into `events`.
+    ///
+    /// # Parameters
+    ///
+    /// * `event_type`  — `"msg"`, `"dm"`, `"sys"`, etc.
+    /// * `channel`     — Target channel name (or `__dm__<user>` for DMs).
+    /// * `sender`      — Username of the originating client.
+    /// * `target`      — Recipient username, used only for DMs.
+    /// * `payload`     — The full JSON event value to store and replay.
+    /// * `search_text` — Plaintext index field (stored lowercased for
+    ///                   case-insensitive LIKE queries).
     fn persist(
         &self,
         event_type: &str,
@@ -214,6 +464,7 @@ impl EventStore {
         }
     }
 
+    /// Returns up to `limit` most-recent events for `channel`, oldest first.
     fn history(&self, channel: &str, limit: usize) -> Vec<Value> {
         self.query_events(
             "SELECT payload FROM events
@@ -224,6 +475,8 @@ impl EventStore {
         )
     }
 
+    /// Returns up to `limit` events for `channel` whose `search_text` column
+    /// contains `query` (case-insensitive LIKE match), oldest first.
     fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
         let like = format!("%{}%", query.to_lowercase());
         self.query_events(
@@ -235,6 +488,11 @@ impl EventStore {
         )
     }
 
+    /// Returns up to `limit` events for `channel` that occurred within the
+    /// last `seconds` seconds, oldest first.
+    ///
+    /// The `cutoff` is clamped to `0.0` so that an absurdly large `seconds`
+    /// value does not produce a negative timestamp.
     fn rewind(&self, channel: &str, seconds: u64, limit: usize) -> Vec<Value> {
         let cutoff = (now() - seconds as f64).max(0.0);
         self.query_events(
@@ -245,15 +503,114 @@ impl EventStore {
             params![channel, cutoff, limit as i64],
         )
     }
+
+    /// Loads the [`User2FA`] record for `username` from `user_2fa`, or returns
+    /// `None` if no record exists (2-FA never configured for this user).
+    fn load_user_2fa(&self, username: &str) -> Option<User2FA> {
+        let conn = self.open_conn()?;
+        let row = conn
+            .query_row(
+                "SELECT enabled, secret, backup_codes, enabled_at, last_verified
+                 FROM user_2fa
+                 WHERE username = ?1",
+                params![username],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<f64>>(3)?,
+                        row.get::<_, Option<f64>>(4)?,
+                    ))
+                },
+            )
+            .optional();
+
+        let Ok(Some((enabled, secret, backup_codes_json, enabled_at, last_verified))) = row else {
+            return None;
+        };
+
+        let backup_codes = backup_codes_json
+            .as_deref()
+            .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+            .unwrap_or_default();
+
+        let totp_config = secret.map(|secret| TotpConfig {
+            secret,
+            digits: 6,
+            step: 30,
+            algorithm: "SHA256".to_string(),
+        });
+
+        Some(User2FA {
+            username: username.to_string(),
+            enabled,
+            totp_config,
+            backup_codes,
+            enabled_at,
+            last_verified,
+        })
+    }
+
+    /// Upserts a [`User2FA`] record using SQLite's `ON CONFLICT … DO UPDATE`
+    /// semantics so the same call can both insert new records and update
+    /// existing ones without callers needing to distinguish the two cases.
+    fn upsert_user_2fa(&self, user: &User2FA) {
+        let Some(conn) = self.open_conn() else {
+            return;
+        };
+
+        let secret = user.totp_config.as_ref().map(|cfg| cfg.secret.clone());
+        let backup_codes_json =
+            serde_json::to_string(&user.backup_codes).unwrap_or_else(|_| "[]".to_string());
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO user_2fa(username, enabled, secret, backup_codes, enabled_at, last_verified)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(username) DO UPDATE SET
+                 enabled       = excluded.enabled,
+                 secret        = excluded.secret,
+                 backup_codes  = excluded.backup_codes,
+                 enabled_at    = excluded.enabled_at,
+                 last_verified = excluded.last_verified",
+            params![
+                user.username,
+                user.enabled,
+                secret,
+                backup_codes_json,
+                user.enabled_at,
+                user.last_verified,
+            ],
+        ) {
+            warn!("2fa upsert failed for user {}: {}", user.username, e);
+        }
+    }
 }
 
+// ---------------------------------------------------------------------------
+// Channel — in-memory broadcast + history ring buffer
+// ---------------------------------------------------------------------------
+
+/// A named chat channel consisting of a bounded in-memory history ring buffer
+/// and a [tokio broadcast] channel for real-time fan-out to all subscribers.
+///
+/// `Channel` is cheap to clone; all clones share the same `Arc`-wrapped
+/// history and the same `broadcast::Sender` handle. New subscribers obtain a
+/// fresh `Receiver` via `tx.subscribe()`.
 #[derive(Clone)]
 struct Channel {
+    /// In-memory ring buffer of the last [`HISTORY_CAP`] messages.
+    /// Wrapped in `Arc<RwLock<…>>` so multiple tasks can read concurrently
+    /// while writes are exclusive.
     history: Arc<RwLock<VecDeque<Value>>>,
+
+    /// Broadcast sender. The channel capacity (256) is deliberately larger
+    /// than [`HISTORY_CAP`] to absorb short bursts without dropping frames.
     tx: broadcast::Sender<String>,
 }
 
 impl Channel {
+    /// Creates a new, empty channel with a 256-message broadcast buffer.
     fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
@@ -261,6 +618,9 @@ impl Channel {
             tx,
         }
     }
+
+    /// Appends `entry` to the in-memory history, evicting the oldest entry if
+    /// the ring buffer is at capacity.
     async fn push(&self, entry: Value) {
         let mut h = self.history.write().await;
         if h.len() >= HISTORY_CAP {
@@ -268,25 +628,70 @@ impl Channel {
         }
         h.push_back(entry);
     }
+
+    /// Returns a snapshot of the current history as a `Vec`, oldest first.
     async fn hist(&self) -> Vec<Value> {
         self.history.read().await.iter().cloned().collect()
     }
 }
 
+// ---------------------------------------------------------------------------
+// State — shared, thread-safe server state
+// ---------------------------------------------------------------------------
+
+/// Central server state shared by all connection handler tasks via `Arc`.
+///
+/// Every field uses a lock-free concurrent map ([`DashMap`]) or atomic
+/// primitive so that individual operations (insert, remove, lookup) do not
+/// require global locking. Per-channel operations that require exclusive
+/// history access use `tokio::sync::RwLock` scoped to the specific channel.
 struct State {
+    /// Named public channels, keyed by sanitised channel name.
+    /// DM channels live here too under the `__dm__<username>` naming
+    /// convention; they are filtered out when listing channels to clients.
     channels: DashMap<String, Channel>,
+
+    /// Per-room voice broadcast senders, keyed by room name.
     voice: DashMap<String, broadcast::Sender<String>>,
+
+    /// Current status value for each online user
+    /// (e.g. `{"text":"Online","emoji":"🟢"}`).
+    /// Presence in this map is the authoritative signal that a user is online.
     user_statuses: DashMap<String, Value>,
+
+    /// Public key (base64) for each online user, used by clients to encrypt
+    /// DM payloads without a separate key-exchange round-trip.
     user_pubkeys: DashMap<String, String>,
+
+    /// Per-user ring buffer of recently seen nonce values.
+    /// Bounded to [`NONCE_CACHE_CAP`] entries; the oldest entry is evicted
+    /// once the cap is reached. See [`validate_and_register_nonce`].
     recent_nonces: DashMap<String, VecDeque<String>>,
+
+    /// Metadata for in-progress file transfers, keyed by `file_id`.
+    /// Used by receivers to look up transfer details before accepting chunks.
     file_transfers: DashMap<String, Value>,
+
+    /// Number of WebSocket connections currently open. Managed via
+    /// [`ConnectionGuard`] RAII to guarantee accurate accounting even on
+    /// panics.
     active_connections: AtomicUsize,
+
+    /// Notified whenever `active_connections` reaches zero, allowing the
+    /// graceful-shutdown loop to wake immediately rather than polling.
     drained_notify: Notify,
+
+    /// SQLite-backed event persistence and 2-FA storage.
     store: EventStore,
+
+    /// Whether structured logging is active. Checked before every `info!` /
+    /// `warn!` call to avoid the overhead of the logging facade when it is
+    /// off.
     log_enabled: bool,
 }
 
 impl State {
+    /// Creates the initial server state, pre-populating the `"general"` channel.
     fn new(log_enabled: bool, db_path: String) -> Arc<Self> {
         let s = Arc::new(Self {
             channels: DashMap::new(),
@@ -300,10 +705,13 @@ impl State {
             store: EventStore::new(db_path),
             log_enabled,
         });
+        // `"general"` is guaranteed to exist so that new connections always
+        // have a channel to subscribe to before any `"join"` event is sent.
         s.channels.insert("general".into(), Channel::new());
         s
     }
 
+    /// Returns the [`Channel`] for `name`, creating it lazily on first access.
     fn chan(&self, name: &str) -> Channel {
         self.channels
             .entry(name.into())
@@ -311,6 +719,10 @@ impl State {
             .clone()
     }
 
+    /// Returns the voice broadcast sender for `room`, creating it lazily on
+    /// first access. The `_` receiver returned by `broadcast::channel` is
+    /// immediately dropped — active subscribers obtain their own receivers
+    /// via `vtx.subscribe()` when they call `"vjoin"`.
     fn voice_tx(&self, room: &str) -> broadcast::Sender<String> {
         self.voice
             .entry(room.into())
@@ -321,12 +733,13 @@ impl State {
             .clone()
     }
 
-    /// Get the count of online users
+    /// Returns the number of currently online users (users with an active
+    /// WebSocket connection that has completed auth).
     fn online_count(&self) -> usize {
         self.user_statuses.len()
     }
 
-    /// Get all channels as JSON array (excluding DM channels)
+    /// Serialises the list of public (non-DM) channel names as a JSON array.
     fn channels_json(&self) -> Value {
         Value::Array(
             self.channels
@@ -337,7 +750,11 @@ impl State {
         )
     }
 
-    /// Get online users and their public keys as JSON array.
+    /// Serialises the list of online users with their public keys as a JSON
+    /// array of `{"u": "...", "pk": "..."}` objects.
+    ///
+    /// This is included in the `"ok"` auth response so clients can populate
+    /// their local key stores without making a separate `"users"` request.
     fn users_with_keys_json(&self) -> Value {
         Value::Array(
             self.user_pubkeys
@@ -351,6 +768,9 @@ impl State {
         self.active_connections.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Decrements the connection counter. If the counter reaches zero, notifies
+    /// the [`drained_notify`](Self::drained_notify) condition variable so the
+    /// graceful-shutdown loop can wake immediately.
     fn connection_closed(&self) {
         let prev = self.active_connections.fetch_sub(1, Ordering::SeqCst);
         if prev <= 1 {
@@ -363,6 +783,13 @@ impl State {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RAII connection tracking guard
+// ---------------------------------------------------------------------------
+
+/// RAII guard that increments [`State::active_connections`] on construction
+/// and decrements it on drop, guaranteeing accurate accounting even when a
+/// connection handler panics or returns early.
 struct ConnectionGuard {
     state: Arc<State>,
 }
@@ -380,14 +807,40 @@ impl Drop for ConnectionGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+/// Clamps a raw `limit` parameter from a client request to `[1, max]`,
+/// substituting `default` when the field is absent.
+///
+/// This prevents clients from requesting zero or unreasonably large result
+/// sets while still allowing the server to apply sensible per-endpoint
+/// maximums without duplicating clamping logic in each handler.
 fn clamp_limit(raw: Option<u64>, default: usize, max: usize) -> usize {
     raw.map(|v| v as usize).unwrap_or(default).clamp(1, max)
 }
 
+/// Enqueues a JSON `payload` onto the per-connection outbound mpsc channel.
+///
+/// The error from `send` is intentionally ignored: if the receiver has been
+/// dropped (e.g. because the WebSocket sink task exited), the connection is
+/// already being torn down and there is nowhere meaningful to report the error.
 fn send_out_json(out_tx: &mpsc::UnboundedSender<String>, payload: Value) {
     let _ = out_tx.send(payload.to_string());
 }
 
+/// Spawns a background task that forwards messages from a broadcast `rx` to
+/// an mpsc `out_tx`, bridging the fan-out broadcast model to the single-writer
+/// sink task.
+///
+/// The task exits cleanly when:
+/// - `rx` reports `RecvError::Closed` (channel dropped).
+/// - `out_tx.send()` fails (the sink task has exited).
+///
+/// Lagged messages (`RecvError::Lagged`) are silently skipped — the client
+/// will see a gap in the message stream, which is preferable to crashing the
+/// connection.
 fn spawn_broadcast_forwarder(
     mut rx: broadcast::Receiver<String>,
     out_tx: mpsc::UnboundedSender<String>,
@@ -401,12 +854,57 @@ fn spawn_broadcast_forwarder(
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(_) => {}
+                Err(_) => {} // Lagged: skip and continue
             }
         }
     });
 }
 
+// ---------------------------------------------------------------------------
+// Event handler
+// ---------------------------------------------------------------------------
+
+/// Dispatches a single post-auth WebSocket event to the appropriate handler.
+///
+/// This function is the central routing switch for all client-initiated actions.
+/// It is called in the connection's main read loop after the frame has been
+/// size-checked and JSON-parsed.
+///
+/// # Replay protection
+///
+/// For event types listed in [`requires_fresh_protection`], this function
+/// first validates the timestamp skew and then registers the nonce (if present)
+/// before any business logic runs. A validation failure sends an `err` response
+/// and returns early, leaving the connection open for subsequent valid frames.
+///
+/// # Supported event types
+///
+/// | Type          | Description                                         |
+/// |---------------|-----------------------------------------------------|
+/// | `msg`         | Broadcast a channel message (ciphertext + plaintext index) |
+/// | `img`         | Broadcast a base64-encoded image to a channel       |
+/// | `dm`          | Send an encrypted direct message to a single user   |
+/// | `join`        | Subscribe to a channel and receive its history      |
+/// | `history`     | Fetch persisted history for a channel               |
+/// | `search`      | Full-text search over a channel's plaintext index   |
+/// | `rewind`      | Fetch events within a relative time window          |
+/// | `users`       | Get the current online user → public key directory  |
+/// | `info`        | Get server info (channels list, online count)       |
+/// | `vjoin`       | Join a voice room                                   |
+/// | `vleave`      | Leave the current voice room                        |
+/// | `vdata`       | Forward audio data to all members of a voice room   |
+/// | `ping`        | Heartbeat — server replies with `pong`              |
+/// | `edit`        | Edit a previously sent message (in-memory only)     |
+/// | `file_meta`   | Announce a file transfer to a channel               |
+/// | `file_chunk`  | Stream a chunk of a file transfer                   |
+/// | `status`      | Update the caller's presence status                 |
+/// | `reaction`    | Add an emoji reaction to a message                  |
+/// | `2fa_setup`   | Begin the TOTP enrollment flow                      |
+/// | `2fa_enable`  | Finalise TOTP enrollment with a verification code   |
+/// | `2fa_disable` | Disable 2-FA for the current user                   |
+/// | `2fa_verify`  | Verify a TOTP or backup code post-auth              |
+///
+/// Unknown event types are silently ignored.
 async fn handle_event(
     d: &Value,
     state: &Arc<State>,
@@ -429,6 +927,8 @@ async fn handle_event(
         }
     }
 
+    // --- Replay protection (timestamp skew + nonce dedup) ------------------
+    // Only applied to mutating events (see requires_fresh_protection).
     if requires_fresh_protection(t) {
         if let Err(e) = validate_timestamp_skew(d) {
             if state.log_enabled {
@@ -457,8 +957,13 @@ async fn handle_event(
             return;
         }
     }
+
+    // --- Event dispatch switch ---------------------------------------------
     match t {
         "msg" => {
+            // Broadcast an encrypted message to a channel.
+            // `"c"` is the ciphertext blob; `"p"` is optional plaintext for
+            // the search index only — it is never echoed back to clients.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let c = d["c"].as_str().unwrap_or("").to_string();
             let p = d["p"].as_str().unwrap_or("").to_string();
@@ -468,6 +973,7 @@ async fn handle_event(
             let entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
             let chan = state.chan(&ch);
             chan.push(entry.clone()).await;
+            // Fall back to ciphertext as the search index when no plaintext is provided.
             let searchable = if p.is_empty() { c.clone() } else { p };
             state
                 .store
@@ -475,6 +981,8 @@ async fn handle_event(
             let _ = chan.tx.send(entry.to_string());
         }
         "img" => {
+            // Broadcast a base64-encoded image. Not persisted to avoid bloating
+            // the event store with large binary payloads.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let a = d["a"].as_str().unwrap_or("").to_string();
             if a.is_empty() {
@@ -485,6 +993,9 @@ async fn handle_event(
             );
         }
         "dm" => {
+            // Send an encrypted direct message.
+            // The sender's public key is injected by the server so the
+            // recipient can verify / decrypt without a separate lookup.
             let target = d["to"].as_str().unwrap_or("").to_string();
             let c = d["c"].as_str().unwrap_or("").to_string();
             let ptxt = d["p"].as_str().unwrap_or("").to_string();
@@ -496,8 +1007,13 @@ async fn handle_event(
                 .get(username)
                 .map(|v| v.value().clone())
                 .unwrap_or_default();
-            let event = serde_json::json!({"t":"dm","from":username,"to":target,"c":c,"pk":sender_pk,"ts":now()});
+            let event = serde_json::json!({
+                "t":"dm","from":username,"to":target,
+                "c":c,"pk":sender_pk,"ts":now()
+            });
             let p = event.to_string();
+            // Persist to both the recipient's and the sender's DM channel so
+            // history is available from either party's perspective.
             state.store.persist(
                 "dm",
                 &format!("__dm__{}", target),
@@ -510,6 +1026,9 @@ async fn handle_event(
             let _ = state.chan(&format!("__dm__{}", username)).tx.send(p);
         }
         "join" => {
+            // Subscribe to a channel and immediately receive its history.
+            // SQLite history takes precedence over the in-memory ring buffer
+            // so newly booted servers serve correct history from persisted data.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let chan = state.chan(&ch);
             let mut hist = state.store.history(&ch, HISTORY_CAP);
@@ -521,18 +1040,20 @@ async fn handle_event(
                 out_tx,
                 serde_json::json!({"t":"joined","ch":ch,"hist":hist}),
             );
-            let join_msg = serde_json::json!({"t":"sys","m":format!("→ {} joined #{}", username, ch),"ts":now()});
+            let join_msg = serde_json::json!({
+                "t":"sys",
+                "m":format!("→ {} joined #{}", username, ch),
+                "ts":now()
+            });
             state.store.persist(
-                "sys",
-                &ch,
-                username,
-                None,
-                &join_msg,
+                "sys", &ch, username, None, &join_msg,
                 &format!("{} joined", username),
             );
             let _ = chan.tx.send(join_msg.to_string());
         }
         "history" => {
+            // Return persisted events for a channel, newest-first from SQLite,
+            // re-ordered to oldest-first by query_events before sending.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let limit = clamp_limit(
                 d.get("limit").and_then(|v| v.as_u64()),
@@ -546,6 +1067,8 @@ async fn handle_event(
             );
         }
         "search" => {
+            // Full-text search over the `search_text` index column.
+            // An empty query returns an empty result set rather than all events.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let q = d["q"].as_str().unwrap_or("").trim().to_string();
             let limit = clamp_limit(
@@ -564,6 +1087,9 @@ async fn handle_event(
             );
         }
         "rewind" => {
+            // Time-window query: return events from the last `seconds` seconds.
+            // The maximum window is capped at 31 days to prevent accidental
+            // full-history dumps from a misconfigured client.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let seconds = d
                 .get("seconds")
@@ -576,18 +1102,22 @@ async fn handle_event(
                 500,
             );
             let events = state.store.rewind(&ch, seconds, limit);
+            // Rewind reuses the `"history"` frame type so clients only need
+            // one parser for time-ranged and offset-based history.
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"history","ch":ch,"events":events,"ts":now()}),
             );
         }
         "users" => {
+            // Return the current user → public key directory.
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"users","users":state.users_with_keys_json()}),
             );
         }
         "info" => {
+            // Return server metadata: channel list and online user count.
             let chs: Vec<String> = state
                 .channels
                 .iter()
@@ -600,51 +1130,65 @@ async fn handle_event(
             );
         }
         "vjoin" => {
+            // Subscribe to a voice room's broadcast channel.
+            // A system message is posted to the room's text channel to
+            // notify other members.
             let room = safe_ch(d["r"].as_str().unwrap_or("general"));
             let vtx = state.voice_tx(&room);
             spawn_broadcast_forwarder(vtx.subscribe(), out_tx.clone());
             *voice_room = Some(room.clone());
-            let join_voice = serde_json::json!({"t":"sys","m":format!("🎙 {} joined voice #{}", username, room),"ts":now()});
+            let join_voice = serde_json::json!({
+                "t":"sys",
+                "m":format!("🎙 {} joined voice #{}", username, room),
+                "ts":now()
+            });
             state.store.persist(
-                "sys",
-                &room,
-                username,
-                None,
-                &join_voice,
+                "sys", &room, username, None, &join_voice,
                 &format!("{} voice joined", username),
             );
             let _ = state.chan(&room).tx.send(join_voice.to_string());
         }
         "vleave" => {
+            // Unsubscribe from the voice room (the broadcast receiver is
+            // dropped when the forwarder task exits) and notify other members.
             if let Some(ref room) = voice_room.take() {
-                let leave_voice = serde_json::json!({"t":"sys","m":format!("🎙 {} left voice #{}", username, room),"ts":now()});
+                let leave_voice = serde_json::json!({
+                    "t":"sys",
+                    "m":format!("🎙 {} left voice #{}", username, room),
+                    "ts":now()
+                });
                 state.store.persist(
-                    "sys",
-                    room,
-                    username,
-                    None,
-                    &leave_voice,
+                    "sys", room, username, None, &leave_voice,
                     &format!("{} voice left", username),
                 );
                 let _ = state.chan(room).tx.send(leave_voice.to_string());
             }
         }
         "vdata" => {
+            // Forward raw audio payload to all other voice-room members.
+            // The sender's username is injected so receivers know who is
+            // speaking without a separate signalling round-trip.
             let a = d["a"].as_str().unwrap_or("").to_string();
             if a.is_empty() {
                 return;
             }
             if let Some(ref room) = voice_room {
                 if let Some(vtx) = state.voice.get(room) {
-                    let _ = vtx
-                        .send(serde_json::json!({"t":"vdata","from":username,"a":a}).to_string());
+                    let _ = vtx.send(
+                        serde_json::json!({"t":"vdata","from":username,"a":a}).to_string(),
+                    );
                 }
             }
         }
         "ping" => {
+            // Heartbeat — keep-alive for clients behind proxies with idle
+            // connection timeouts.
             let _ = out_tx.send(r#"{"t":"pong"}"#.into());
         }
         "edit" => {
+            // In-memory edit of the most recent matching message.
+            // The edit is persisted for history but not applied retroactively
+            // to the SQLite event store — the original row is left intact.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let old_text = d["old_text"].as_str().unwrap_or("").to_string();
             let new_text = d["new_text"].as_str().unwrap_or("").to_string();
@@ -653,6 +1197,8 @@ async fn handle_event(
             }
             let chan = state.chan(&ch);
             let mut h = chan.history.write().await;
+            // Search in reverse to find the most-recent matching message from
+            // this user (avoids editing an older message by mistake).
             if let Some(pos) = h.iter().rposition(|m| {
                 m.get("t") == Some(&Value::from("msg"))
                     && m.get("u") == Some(&Value::from(username.to_string()))
@@ -662,12 +1208,8 @@ async fn handle_event(
                 h[pos]["ts"] = Value::from(now());
             }
             let edit_msg = serde_json::json!({
-                "t": "edit",
-                "ch": ch,
-                "u": username,
-                "old_text": old_text,
-                "new_text": new_text,
-                "ts": now()
+                "t":"edit","ch":ch,"u":username,
+                "old_text":old_text,"new_text":new_text,"ts":now()
             });
             state
                 .store
@@ -675,6 +1217,8 @@ async fn handle_event(
             let _ = chan.tx.send(edit_msg.to_string());
         }
         "file_meta" => {
+            // Announce a pending file transfer to the channel. The `file_id`
+            // acts as a correlation key for subsequent `file_chunk` frames.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
             let size = d["size"].as_u64().unwrap_or(0);
@@ -684,53 +1228,38 @@ async fn handle_event(
                 .to_string();
             state.file_transfers.insert(file_id.clone(), d.clone());
             let file_announce = serde_json::json!({
-                "t": "file_meta",
-                "from": username,
-                "filename": filename,
-                "size": size,
-                "file_id": file_id,
-                "ch": ch,
-                "ts": now()
+                "t":"file_meta","from":username,"filename":filename,
+                "size":size,"file_id":file_id,"ch":ch,"ts":now()
             });
             state.store.persist(
-                "file_meta",
-                &ch,
-                username,
-                None,
-                &file_announce,
-                file_announce
-                    .get("filename")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
+                "file_meta", &ch, username, None, &file_announce,
+                file_announce.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
             );
             let _ = state.chan(&ch).tx.send(file_announce.to_string());
         }
         "file_chunk" => {
+            // Relay a single chunk of a file transfer to the channel.
+            // Chunks are not persisted — they are ephemeral relay frames.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let file_id = d["file_id"].as_str().unwrap_or("").to_string();
             let chunk_data = d["data"].as_str().unwrap_or("").to_string();
             let index = d["index"].as_u64().unwrap_or(0);
             let chunk_msg = serde_json::json!({
-                "t": "file_chunk",
-                "from": username,
-                "file_id": file_id,
-                "data": chunk_data,
-                "index": index,
-                "ch": ch,
-                "ts": now()
+                "t":"file_chunk","from":username,"file_id":file_id,
+                "data":chunk_data,"index":index,"ch":ch,"ts":now()
             })
             .to_string();
             let _ = state.chan(&ch).tx.send(chunk_msg);
         }
         "status" => {
+            // Broadcast a presence update to all channels so every connected
+            // client can update its member list without polling.
             if let Some(status_val) = d.get("status") {
                 state
                     .user_statuses
                     .insert(username.to_string(), status_val.clone());
                 let status_update = serde_json::json!({
-                    "t": "status_update",
-                    "user": username,
-                    "status": status_val
+                    "t":"status_update","user":username,"status":status_val
                 })
                 .to_string();
                 for chan_entry in state.channels.iter() {
@@ -739,27 +1268,135 @@ async fn handle_event(
             }
         }
         "reaction" => {
+            // Broadcast an emoji reaction to a specific message in a channel.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let emoji = d["emoji"].as_str().unwrap_or("👍").to_string();
             let msg_id = d["msg_id"].as_str().unwrap_or("unknown").to_string();
             let reaction_msg = serde_json::json!({
-                "t": "reaction",
-                "user": username,
-                "emoji": emoji,
-                "msg_id": msg_id,
-                "ch": ch,
-                "ts": now()
+                "t":"reaction","user":username,"emoji":emoji,
+                "msg_id":msg_id,"ch":ch,"ts":now()
             });
             state
                 .store
                 .persist("reaction", &ch, username, None, &reaction_msg, &emoji);
             let _ = state.chan(&ch).tx.send(reaction_msg.to_string());
         }
-        _ => {}
+        "2fa_setup" => {
+            // Begin the TOTP enrollment flow: generate a fresh secret and
+            // return a QR-code URL that the user can scan with an authenticator
+            // app. The secret is NOT persisted here — it is only saved when
+            // the user confirms enrollment via `2fa_enable`.
+            let secret = generate_secret();
+            let issuer = d["issuer"].as_str().unwrap_or("Chatify");
+            let qr_url = generate_qr_url(username, issuer, &secret);
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t":"2fa_setup","secret":secret,"qr_url":qr_url,
+                    "issuer":issuer,"user":username,"ts":now()
+                }),
+            );
+        }
+        "2fa_enable" => {
+            // Finalise TOTP enrollment. The client must supply the secret from
+            // the previous `2fa_setup` step and a live TOTP code to prove the
+            // authenticator app is correctly configured before the secret is
+            // persisted.
+            let secret = d["secret"].as_str().unwrap_or("").to_string();
+            let code = d["code"].as_str().unwrap_or("").to_string();
+            if secret.is_empty() || code.is_empty() {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"2fa_enable requires secret and code"}),
+                );
+                return;
+            }
+
+            let mut user_2fa = User2FA::new(username.to_string());
+            user_2fa.enable(secret);
+            if !user_2fa.verify_totp(&code) {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"invalid 2FA code"}),
+                );
+                return;
+            }
+
+            state.store.upsert_user_2fa(&user_2fa);
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t":"2fa_enabled","enabled":true,
+                    "backup_codes":user_2fa.backup_codes,"ts":now()
+                }),
+            );
+        }
+        "2fa_disable" => {
+            // Disable 2-FA for the current user. The record is updated
+            // (not deleted) so audit history is preserved.
+            let mut user_2fa = state
+                .store
+                .load_user_2fa(username)
+                .unwrap_or_else(|| User2FA::new(username.to_string()));
+            user_2fa.disable();
+            state.store.upsert_user_2fa(&user_2fa);
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"2fa_disabled","enabled":false,"ts":now()}),
+            );
+        }
+        "2fa_verify" => {
+            // Post-auth TOTP verification (used for privileged operations that
+            // require step-up authentication). Accepts either a live TOTP code
+            // or a backup code; backup codes are single-use.
+            let code = d["code"].as_str().unwrap_or("").to_string();
+            if code.is_empty() {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"2fa_verify requires code"}),
+                );
+                return;
+            }
+
+            let mut user_2fa = match state.store.load_user_2fa(username) {
+                Some(v) if v.enabled => v,
+                _ => {
+                    send_out_json(
+                        out_tx,
+                        serde_json::json!({"t":"err","m":"2FA is not enabled"}),
+                    );
+                    return;
+                }
+            };
+
+            let ok = verify_user_2fa_code(&mut user_2fa, &code);
+            if ok {
+                state.store.upsert_user_2fa(&user_2fa);
+            }
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"2fa_verify","ok":ok,"ts":now()}),
+            );
+        }
+        _ => {
+            // Unknown event type — silently ignore. This is intentional:
+            // newer clients may send events that older servers do not
+            // understand, and a hard error would break forward compatibility.
+        }
     }
 }
 
-/// Get current Unix timestamp as f64
+// ---------------------------------------------------------------------------
+// Small utility functions
+// ---------------------------------------------------------------------------
+
+/// Returns the current Unix timestamp as a floating-point number of seconds.
+///
+/// `f64` provides sub-millisecond precision and is the format used for all
+/// `ts` fields in the protocol. Timestamps are used for clock-skew validation
+/// and event ordering; they are not used for security-critical comparisons
+/// where integer arithmetic would be safer.
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -767,13 +1404,28 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
-/// Hash a password using SHA256
+/// Hashes `pw` with SHA-256 and returns the lowercase hex digest.
+///
+/// Currently unused at the server level (the server accepts any non-empty
+/// password hash value and relies on clients to hash before sending), but
+/// retained for future server-side verification.
 #[allow(dead_code)]
 fn hash_pw(pw: &str) -> String {
     hex::encode(Sha256::digest(pw.as_bytes()))
 }
 
-/// Sanitize a channel name: lowercase, remove special chars, limit to 32 chars
+/// Normalises a raw channel name to a safe, consistent format.
+///
+/// Rules applied in order:
+/// 1. Lowercase the input.
+/// 2. Strip a leading `#` (clients may include it as a UI convention).
+/// 3. Keep only ASCII alphanumeric characters, `-`, and `_`.
+/// 4. Truncate to 32 characters.
+/// 5. Fall back to `"general"` if the result is empty.
+///
+/// This is applied to every client-supplied channel or room name before it
+/// is used as a `DashMap` key or SQLite parameter, preventing channel-name
+/// injection and collisions between logically identical names.
 fn safe_ch(raw: &str) -> String {
     let s: String = raw
         .to_lowercase()
@@ -789,19 +1441,28 @@ fn safe_ch(raw: &str) -> String {
     }
 }
 
-/// Create a system message JSON string
+/// Constructs a serialised system message JSON string with the current
+/// timestamp.
 fn sys(text: &str) -> String {
     serde_json::json!({"t":"sys","m":text,"ts":now()}).to_string()
 }
 
-/// Log a message with timestamp if logging is enabled
+/// Logs `msg` via `log::info!` if `state.log_enabled` is set.
+///
+/// The guard check avoids the overhead of the logging facade (format string
+/// allocation, level filter) when the server is run without `--log`.
 fn log(state: &State, msg: &str) {
     if state.log_enabled {
         info!("{}", msg);
     }
 }
 
-/// Send a system message to all channels
+/// Sends a system message to every public channel's broadcast sender.
+///
+/// Used for server-wide announcements (joins, leaves, shutdown notice).
+/// DM channels are included in the broadcast because the channel map contains
+/// them alongside public channels; this is harmless since DM channels
+/// typically have at most two subscribers.
 async fn broadcast_system_msg(state: &Arc<State>, msg: &str) {
     let sys_msg = sys(msg);
     for e in state.channels.iter() {
@@ -809,7 +1470,10 @@ async fn broadcast_system_msg(state: &Arc<State>, msg: &str) {
     }
 }
 
-/// Create JSON response for successful connection
+/// Constructs the serialised `"ok"` auth response payload.
+///
+/// Inline construction here (rather than in the caller) keeps all protocol
+/// field names in one place, making it easier to evolve the auth contract.
 fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>) -> String {
     serde_json::json!({
         "t": "ok",
@@ -825,6 +1489,16 @@ fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>) -> S
     .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `name` is a valid username.
+///
+/// Valid usernames are non-empty, at most [`MAX_USERNAME_LEN`] characters,
+/// and consist entirely of ASCII alphanumeric characters, `-`, or `_`.
+/// Whitespace, punctuation, and Unicode are rejected to keep usernames safe
+/// for use as map keys, log fields, and SQL parameters.
 fn is_valid_username(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_USERNAME_LEN {
         return false;
@@ -833,6 +1507,11 @@ fn is_valid_username(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Returns `true` if `pk` is a base64-encoded 32-byte public key.
+///
+/// The length check on the raw string (≤ [`MAX_PUBLIC_KEY_FIELD_LEN`])
+/// prevents base64 decoding arbitrarily large inputs. After decoding, the
+/// decoded length must be exactly 32 bytes to match the Ed25519 key size.
 fn is_valid_pubkey_b64(pk: &str) -> bool {
     if pk.is_empty() || pk.len() > MAX_PUBLIC_KEY_FIELD_LEN {
         return false;
@@ -843,6 +1522,17 @@ fn is_valid_pubkey_b64(pk: &str) -> bool {
     }
 }
 
+/// Parses and validates an auth frame, returning a typed [`AuthInfo`] on
+/// success or a [`ChatifyError`] on the first validation failure.
+///
+/// Validation is applied in field order so that error messages are
+/// deterministic and easy to assert in tests:
+///
+/// 1. Frame must be a JSON object with `"t": "auth"`.
+/// 2. `"u"` must pass [`is_valid_username`].
+/// 3. `"pw"` must be non-empty and ≤ [`MAX_PASSWORD_FIELD_LEN`].
+/// 4. `"pk"` must pass [`is_valid_pubkey_b64`].
+/// 5. `"otp"` (optional) must be ≤ [`MAX_NONCE_LEN`] characters if present.
 fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
     if !d.is_object() {
         return Err(ChatifyError::Validation("invalid auth frame".to_string()));
@@ -886,13 +1576,91 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
         .cloned()
         .unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
 
+    let otp_code = d
+        .get("otp")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    if let Some(code) = otp_code.as_deref() {
+        if code.len() > MAX_NONCE_LEN {
+            return Err(ChatifyError::Validation("invalid otp code".to_string()));
+        }
+    }
+
     Ok(AuthInfo {
         username,
         status,
         pubkey,
+        otp_code,
     })
 }
 
+// ---------------------------------------------------------------------------
+// 2-FA helpers
+// ---------------------------------------------------------------------------
+
+/// Verifies a TOTP or backup code for `user_2fa`, mutating state on success.
+///
+/// The verification order is:
+/// 1. TOTP code (live window) — if valid, updates `last_verified`.
+/// 2. Backup code — if valid, the code is consumed (removed from the list) by
+///    `verify_backup_code`. This enforces single-use semantics at the model
+///    layer before the caller persists the updated record.
+fn verify_user_2fa_code(user_2fa: &mut User2FA, code: &str) -> bool {
+    if user_2fa.verify_totp(code) {
+        user_2fa.last_verified = Some(now());
+        true
+    } else {
+        user_2fa.verify_backup_code(code)
+    }
+}
+
+/// Enforces 2-FA requirements during the authentication handshake.
+///
+/// - If no `user_2fa` record exists for `username`, 2-FA is not configured
+///   and authentication proceeds unconditionally.
+/// - If a record exists but `enabled` is `false`, 2-FA is configured but
+///   disabled; authentication proceeds unconditionally.
+/// - If 2-FA is enabled and `otp_code` is `None`, returns
+///   `Err("2FA code required")` so the client knows to prompt for a code.
+/// - If 2-FA is enabled and the code fails verification, returns
+///   `Err("invalid 2FA code")`.
+/// - On success, persists the updated `user_2fa` record (updated
+///   `last_verified` or consumed backup code).
+fn enforce_2fa_on_auth(
+    state: &Arc<State>,
+    username: &str,
+    otp_code: Option<&str>,
+) -> ChatifyResult<()> {
+    let Some(mut user_2fa) = state.store.load_user_2fa(username) else {
+        return Ok(());
+    };
+
+    if !user_2fa.enabled {
+        return Ok(());
+    }
+
+    let code = otp_code.ok_or_else(|| ChatifyError::Message("2FA code required".to_string()))?;
+    if !verify_user_2fa_code(&mut user_2fa, code) {
+        return Err(ChatifyError::Message("invalid 2FA code".to_string()));
+    }
+
+    state.store.upsert_user_2fa(&user_2fa);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Replay-protection helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `event_type` requires timestamp-skew validation and
+/// nonce-based replay protection.
+///
+/// Only mutating events that change server state or carry sensitive content
+/// are protected. Read-only queries (`"history"`, `"search"`, `"users"`,
+/// `"info"`, `"ping"`) and control events (`"join"`, `"vjoin"`) are excluded
+/// because replaying them is either idempotent or harmless.
 fn requires_fresh_protection(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -908,10 +1676,18 @@ fn requires_fresh_protection(event_type: &str) -> bool {
     )
 }
 
+/// Validates that the client-supplied `"ts"` field is within
+/// ±[`MAX_CLOCK_SKEW_SECS`] of the server's wall clock.
+///
+/// Nonce-based replay protection is only enforced when the client includes a
+/// `"n"` field. Frames without `"n"` are accepted unconditionally for
+/// backward compatibility with older clients that do not implement nonces.
+///
+/// A timestamp of `0` or below, or a non-finite value, is unconditionally
+/// rejected to guard against clients that send uninitialised fields.
 fn validate_timestamp_skew(d: &Value) -> ChatifyResult<()> {
     if d.get("n").and_then(|v| v.as_str()).is_none() {
-        // Backward-compatible: only enforce timestamp freshness when nonce-based replay
-        // protection is used by the client.
+        // No nonce present — backward-compatible path: skip skew check.
         return Ok(());
     }
 
@@ -935,9 +1711,26 @@ fn validate_timestamp_skew(d: &Value) -> ChatifyResult<()> {
     Ok(())
 }
 
+/// Checks that the `"n"` nonce field has not been seen before, then records it.
+///
+/// # Nonce format
+///
+/// Nonces must be non-empty lowercase hexadecimal strings of at most
+/// [`MAX_NONCE_LEN`] characters. This restriction:
+/// - Prevents injection via non-hex characters in storage paths or logs.
+/// - Bounds the per-entry size in the nonce cache.
+///
+/// # Cache eviction
+///
+/// Each user's nonce deque is capped at [`NONCE_CACHE_CAP`] entries. When the
+/// cap is reached the oldest entry is evicted. Nonces older than
+/// [`MAX_CLOCK_SKEW_SECS`] would be rejected by the timestamp check before
+/// reaching nonce validation, so eviction does not open a replay window within
+/// the skew window as long as `NONCE_CACHE_CAP` is large enough to hold all
+/// nonces that could arrive within that window.
 fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> ChatifyResult<()> {
     let Some(nonce) = d.get("n").and_then(|v| v.as_str()) else {
-        // Backward-compatible: accept events without nonce.
+        // No nonce present — backward-compatible path.
         return Ok(());
     };
 
@@ -962,18 +1755,45 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Chat
     Ok(())
 }
 
-/// Main client connection handler
+// ---------------------------------------------------------------------------
+// Connection handler
+// ---------------------------------------------------------------------------
+
+/// Handles a single client WebSocket connection from TCP accept to disconnect.
+///
+/// # Lifecycle
+///
+/// ```text
+/// accept_async → read auth frame → validate auth → enforce 2FA
+///     → register user → send "ok" → spawn sink writer task
+///     → main recv loop ( handle_event )
+///     → deregister user → broadcast leave
+/// ```
+///
+/// A [`ConnectionGuard`] is created immediately after accept and dropped at
+/// the end of the function, ensuring `active_connections` is always accurate.
+///
+/// # Concurrency model
+///
+/// The WebSocket stream is read sequentially in this task. Outbound messages
+/// from broadcast channels and other connection tasks are queued via an
+/// `mpsc::unbounded_channel` and drained by a dedicated sink-writer task.
+/// This decouples the read path from the write path, preventing a slow write
+/// from blocking event processing.
 async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
+    // ConnectionGuard increments active_connections and decrements it on drop,
+    // even if we return early.
     let _conn_guard = ConnectionGuard::new(state.clone());
 
-    // Accept WebSocket connection
+    // Upgrade the raw TCP stream to a WebSocket connection.
     let ws = match accept_async(stream).await {
         Ok(w) => w,
         Err(_) => return,
     };
     let (mut sink, mut stream) = ws.split();
 
-    // Read initial authentication message
+    // ---- Phase 1: read and validate the auth frame --------------------------
+
     let raw = match stream.next().await {
         Some(Ok(Message::Text(r))) => r,
         Some(Ok(_)) => {
@@ -986,6 +1806,8 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         }
         _ => return,
     };
+
+    // Reject oversized auth frames before JSON parsing.
     if raw.len() > MAX_AUTH_BYTES {
         let _ = sink
             .send(Message::Text(
@@ -994,6 +1816,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             .await;
         return;
     }
+
     let d: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
@@ -1018,13 +1841,24 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         }
     };
 
-    let username = auth.username;
+    let AuthInfo { username, status, pubkey, otp_code } = auth;
 
-    // Track user status
-    state.user_statuses.insert(username.clone(), auth.status);
-    state.user_pubkeys.insert(username.clone(), auth.pubkey);
+    if let Err(err) = enforce_2fa_on_auth(&state, &username, otp_code.as_deref()) {
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({"t":"err","m":err.to_string()}).to_string(),
+            ))
+            .await;
+        return;
+    }
 
-    // Get general channel and send welcome response
+    // ---- Phase 2: register user and send welcome response -------------------
+
+    state.user_statuses.insert(username.clone(), status);
+    state.user_pubkeys.insert(username.clone(), pubkey);
+
+    // Subscribe to "general" before sending "ok" to avoid missing messages
+    // that arrive between the response send and the subscription.
     let general = state.chan("general");
     let gen_rx = general.tx.subscribe();
     let mut hist = state.store.history("general", HISTORY_CAP);
@@ -1037,17 +1871,19 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         return;
     }
 
-    // Announce user join
     broadcast_system_msg(&state, &format!("→ {} joined", username)).await;
     log(&state, &format!("+ {}", username));
 
-    // Create channel for sending messages to client
+    // ---- Phase 3: set up bidirectional message routing ----------------------
+
+    // mpsc channel: all tasks that want to send to this client queue here.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // Spawn task to forward general channel messages to output channel
+    // Forward "general" broadcast to the outbound queue.
     spawn_broadcast_forwarder(gen_rx, out_tx.clone());
 
-    // Spawn task to send queued messages to WebSocket
+    // Sink writer task: drains out_rx and writes to the WebSocket sink.
+    // Runs until out_rx is closed (out_tx is dropped at function exit).
     tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
             if sink.send(Message::Text(m)).await.is_err() {
@@ -1056,9 +1892,11 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         }
     });
 
+    // ---- Phase 4: main event loop -------------------------------------------
+
+    // Tracks the current voice room so vleave / vdata know which room to act on.
     let mut voice_room: Option<String> = None;
 
-    // Main message handling loop
     loop {
         let msg = match stream.next().await {
             Some(Ok(msg)) => msg,
@@ -1066,15 +1904,16 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 log(&state, &format!("ws recv error for {}: {}", username, e));
                 break;
             }
-            None => break,
+            None => break, // Client closed the connection cleanly.
         };
+
         let raw = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
-            _ => continue,
+            _ => continue, // Binary / ping / pong frames are ignored.
         };
 
-        // Validate message size
+        // Payload size gate (post-auth; auth size is gated earlier).
         if raw.len() > MAX_BYTES {
             send_out_json(
                 &out_tx,
@@ -1083,7 +1922,6 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             continue;
         }
 
-        // Parse message
         let d: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(_) => {
@@ -1094,6 +1932,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 continue;
             }
         };
+
         if !d.is_object() {
             send_out_json(
                 &out_tx,
@@ -1105,15 +1944,30 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         handle_event(&d, &state, &username, &out_tx, &mut voice_room).await;
     }
 
-    // User disconnected - cleanup
+    // ---- Phase 5: cleanup ---------------------------------------------------
+    // Remove user presence so they no longer appear in the user directory.
     state.user_statuses.remove(&username);
     state.user_pubkeys.remove(&username);
+    // Clear the nonce cache to free memory; replays from this session are
+    // no longer possible once the connection is closed.
     state.recent_nonces.remove(&username);
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     log(&state, &format!("- {}", username));
+    // _conn_guard drops here, decrementing active_connections.
 }
 
-/// Main entry point
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Server entry point.
+///
+/// 1. Parses CLI args and initialises optional logging.
+/// 2. Binds the TCP listener.
+/// 3. Initialises shared [`State`] (which runs SQLite migrations).
+/// 4. Accepts connections in a `tokio::select!` loop until Ctrl+C.
+/// 5. Broadcasts a shutdown notice and waits up to 10 s for connections to
+///    drain before returning.
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
@@ -1126,7 +1980,6 @@ async fn main() -> ChatifyResult<()> {
     }
 
     let listener = TcpListener::bind(&addr).await?;
-
     let state = State::new(args.log, args.db.clone());
 
     println!(" Chatify running on ws://{}", addr);
@@ -1137,6 +1990,7 @@ async fn main() -> ChatifyResult<()> {
         info!("server started addr=ws://{} db={}", addr, args.db);
     }
 
+    // Accept loop: runs until Ctrl+C is received.
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -1159,7 +2013,9 @@ async fn main() -> ChatifyResult<()> {
         }
     }
 
-    // Wait for active connections to drain with a bounded timeout.
+    // Graceful drain: wait up to 10 s for all handlers to finish.
+    // The `drained_notify` Notify wakes us immediately if connections drain
+    // before the 250 ms poll interval fires.
     let drain_timeout = Duration::from_secs(10);
     let start = std::time::Instant::now();
     loop {
@@ -1168,15 +2024,9 @@ async fn main() -> ChatifyResult<()> {
             break;
         }
         if start.elapsed() >= drain_timeout {
-            println!(
-                "Shutdown timeout reached with {} active connection(s)",
-                active
-            );
+            println!("Shutdown timeout reached with {} active connection(s)", active);
             if state.log_enabled {
-                warn!(
-                    "shutdown timeout reached with {} active connection(s)",
-                    active
-                );
+                warn!("shutdown timeout reached with {} active connection(s)", active);
             }
             break;
         }
@@ -1194,15 +2044,26 @@ async fn main() -> ChatifyResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Verifies that [`validate_auth_payload`] returns a `ChatifyError::Validation`
+    /// variant (not `Message`) for an invalid username, allowing callers to
+    /// distinguish validation errors from protocol errors.
+    ///
+    /// The specific error message `"invalid username"` is part of the public
+    /// error contract and must not change without updating client-side error
+    /// handling.
     #[test]
     fn auth_payload_rejects_invalid_username_with_typed_error() {
         let payload = serde_json::json!({
             "t": "auth",
-            "u": "bad user",
+            "u": "bad user",  // space is not allowed
             "pw": "abc123",
             "pk": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
         });
@@ -1217,6 +2078,13 @@ mod tests {
         }
     }
 
+    /// Verifies that [`ConnectionGuard`] correctly increments and decrements
+    /// [`State::active_connections`].
+    ///
+    /// Two guards are created concurrently to confirm the counter reaches 2,
+    /// then both are dropped. The test polls until the counter returns to 0
+    /// with a 1-second timeout to account for any scheduling delay between
+    /// the drop and the atomic write.
     #[tokio::test]
     async fn connection_counter_tracks_open_and_close() {
         let state = State::new(false, ":memory:".to_string());

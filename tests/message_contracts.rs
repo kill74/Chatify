@@ -1,23 +1,78 @@
+//! # `clicord-server` Integration Test Suite
+//!
+//! End-to-end contract tests for the `clicord-server` WebSocket binary.
+//!
+//! ## Architecture
+//!
+//! Each test:
+//!   1. Binds an ephemeral OS port via [`allocate_port`].
+//!   2. Spawns the compiled server binary as a child process pointing at a
+//!      temporary SQLite database.
+//!   3. Exercises the public WebSocket protocol through [`connect_and_auth`] /
+//!      [`recv_by_type`] helpers.
+//!   4. Drops [`TestServer`], which kills the child process and deletes the
+//!      database file, leaving no test artefacts on disk.
+//!
+//! ## Running
+//!
+//! ```bash
+//! cargo test --test integration
+//! ```
+//!
+//! The binary path is resolved at compile time via the `CARGO_BIN_EXE_clicord-server`
+//! env var injected by Cargo, so no manual `PATH` setup is needed.
+//!
+//! ## Coverage Areas
+//!
+//! | Area             | Tests                                                   |
+//! |------------------|---------------------------------------------------------|
+//! | Auth contract    | Field validation, key format, oversized frames, JSON    |
+//! | 2-FA             | Missing code, backup-code happy path, code consumption  |
+//! | Protocol safety  | Timestamp skew, nonce replay, payload size, fuzz corpus |
+//! | Schema migration | v0→v2 upgrade, future-version no-downgrade              |
+//! | Feature contracts| Messages, history, search, rewind, voice (vdata)        |
+
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use clicord_server::crypto::{new_keypair, pub_b64};
 
+// ---------------------------------------------------------------------------
+// Test infrastructure
+// ---------------------------------------------------------------------------
+
+/// A running server process paired with its database and WebSocket URL.
+///
+/// Implements [`Drop`] to guarantee cleanup of both the child process and the
+/// temporary database file regardless of whether the test panics.
 struct TestServer {
+    /// The spawned server process. Prefixed with `_` so Rust keeps it alive
+    /// for the full lifetime of [`TestServer`] without an "unused" warning.
     _child: Child,
+
+    /// `ws://127.0.0.1:<port>` – the root WebSocket endpoint.
     url: String,
+
+    /// Absolute path to the SQLite file used by this server instance.
+    /// Stored here so tests can inspect database state after server operations
+    /// and so [`Drop`] can delete the file after the test.
     db_path: PathBuf,
 }
 
 impl Drop for TestServer {
+    /// Kills the server process and removes the temporary database.
+    ///
+    /// Errors from `kill`, `wait`, and `remove_file` are deliberately ignored:
+    /// the process may have already exited and the file may have already been
+    /// removed by the OS, both of which are acceptable in a test teardown.
     fn drop(&mut self) {
         let _ = self._child.kill();
         let _ = self._child.wait();
@@ -25,13 +80,30 @@ impl Drop for TestServer {
     }
 }
 
+/// Convenience type alias for an authenticated, ready-to-use WebSocket stream.
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+// ---------------------------------------------------------------------------
+// Server / database helpers
+// ---------------------------------------------------------------------------
+
+/// Binds a TCP listener on `127.0.0.1:0` to let the OS assign a free port,
+/// then immediately drops the listener so the server can reuse that port.
+///
+/// **Note:** There is an inherent TOCTOU window between releasing the listener
+/// and the server binding. In practice this is negligible on loopback for
+/// integration tests, but it is worth being aware of in constrained CI
+/// environments where ports recycle quickly.
 fn allocate_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("read local addr").port()
 }
 
+/// Returns a unique temporary database path of the form
+/// `$TMPDIR/chatify-test-<port>-<nanoseconds>.db`.
+///
+/// The port and nanosecond timestamp together make collisions between
+/// concurrent test runs vanishingly unlikely.
 fn temp_db_path(port: u16) -> PathBuf {
     std::env::temp_dir().join(format!(
         "chatify-test-{}-{}.db",
@@ -43,12 +115,18 @@ fn temp_db_path(port: u16) -> PathBuf {
     ))
 }
 
+/// Pre-populates `schema_meta` with the given `version` string.
+///
+/// Used by migration tests to simulate a database that was created by an
+/// earlier (or future) version of the server. The `schema_meta` table is
+/// created if it does not already exist, so this helper is safe to call on a
+/// fresh, empty SQLite file.
 fn seed_schema_version(db_path: &PathBuf, version: &str) {
     let conn = Connection::open(db_path).expect("create sqlite db");
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS schema_meta (
-            key TEXT PRIMARY KEY,
+            key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
         INSERT INTO schema_meta(key, value)
@@ -64,6 +142,74 @@ fn seed_schema_version(db_path: &PathBuf, version: &str) {
     .expect("update schema version");
 }
 
+/// Seeds a user record in `user_2fa` with 2-FA **already enabled** and a set
+/// of hashed backup codes.
+///
+/// This simulates a production database state where a user has completed the
+/// 2-FA enrollment flow, allowing tests to exercise the authentication path
+/// without needing a real TOTP device.
+///
+/// # Parameters
+///
+/// * `db_path`      – Absolute path to the target SQLite file.
+/// * `username`     – The username to seed (must satisfy the server's username
+///                    validation rules).
+/// * `backup_codes` – Raw backup code strings. These are stored as a JSON
+///                    array; the server is expected to consume (delete) a code
+///                    upon successful use.
+fn seed_enabled_2fa_user(db_path: &PathBuf, username: &str, backup_codes: &[&str]) {
+    let conn = Connection::open(db_path).expect("create sqlite db for 2fa seed");
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO schema_meta(key, value)
+        VALUES('schema_version', '2')
+        ON CONFLICT(key) DO UPDATE SET value='2';
+
+        CREATE TABLE IF NOT EXISTS user_2fa (
+            username      TEXT PRIMARY KEY,
+            enabled       BOOLEAN NOT NULL DEFAULT FALSE,
+            secret        TEXT,
+            backup_codes  TEXT,
+            enabled_at    REAL,
+            last_verified REAL
+        );
+        ",
+    )
+    .expect("create schema and user_2fa tables for seed");
+
+    let backup_codes_json =
+        serde_json::to_string(&backup_codes).expect("serialize backup codes for seed");
+
+    conn.execute(
+        "INSERT INTO user_2fa(username, enabled, secret, backup_codes, enabled_at, last_verified)
+         VALUES(?1, TRUE, NULL, ?2, ?3, NULL)
+         ON CONFLICT(username) DO UPDATE SET
+             enabled       = TRUE,
+             secret        = NULL,
+             backup_codes  = excluded.backup_codes,
+             enabled_at    = excluded.enabled_at,
+             last_verified = NULL",
+        params![
+            username,
+            backup_codes_json,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+        ],
+    )
+    .expect("seed enabled 2fa user");
+}
+
+/// Reads `schema_meta.schema_version` directly from SQLite.
+///
+/// Used by migration tests to assert the final schema version without going
+/// through the server's own API, keeping migration assertions independent of
+/// any server-side serialization changes.
 fn read_schema_version(db_path: &PathBuf) -> String {
     let conn = Connection::open(db_path).expect("open sqlite db");
     conn.query_row(
@@ -74,25 +220,34 @@ fn read_schema_version(db_path: &PathBuf) -> String {
     .expect("schema_version row exists")
 }
 
+/// Spawns the server binary against `db_path` on a newly allocated port and
+/// polls the WebSocket endpoint until it is accepting connections (up to 5 s).
+///
+/// # Panics
+///
+/// Panics if the server does not become ready within the polling window, which
+/// prevents tests from hanging indefinitely in CI.
 async fn start_server_with_db(db_path: PathBuf) -> TestServer {
     let port = allocate_port();
     let url = format!("ws://127.0.0.1:{}", port);
+
+    // Cargo injects the compiled binary path as an env var so we don't need
+    // to hard-code build-directory paths or shell out to `cargo build`.
     let server_bin = std::env::var("CARGO_BIN_EXE_clicord-server")
         .expect("CARGO_BIN_EXE_clicord-server must be set by cargo test");
 
     let child = Command::new(server_bin)
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--db")
-        .arg(db_path.to_string_lossy().to_string())
+        .arg("--host").arg("127.0.0.1")
+        .arg("--port").arg(port.to_string())
+        .arg("--db").arg(db_path.to_string_lossy().to_string())
+        // Suppress server stdout/stderr to keep test output clean. To debug a
+        // flaky test, swap Stdio::null() for Stdio::inherit() temporarily.
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn server");
 
-    // Wait until the websocket endpoint is accepting connections.
+    // Poll with a 100 ms back-off; 50 attempts = 5 s total timeout.
     let mut ready = false;
     for _ in 0..50 {
         if let Ok((mut ws, _)) = connect_async(&url).await {
@@ -104,29 +259,65 @@ async fn start_server_with_db(db_path: PathBuf) -> TestServer {
     }
     assert!(ready, "server did not start in time at {}", url);
 
-    TestServer {
-        _child: child,
-        url,
-        db_path,
-    }
+    TestServer { _child: child, url, db_path }
 }
 
+/// Convenience wrapper around [`start_server_with_db`] that allocates a fresh
+/// temporary database automatically.
 async fn start_server() -> TestServer {
     let port = allocate_port();
     let db_path = temp_db_path(port);
     start_server_with_db(db_path).await
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket helpers
+// ---------------------------------------------------------------------------
+
+/// Opens a WebSocket connection and authenticates as `username` **without**
+/// a 2-FA code.
+///
+/// Asserts that the server responds with an `"ok"` frame containing the
+/// expected `"u"` field before returning the live socket.
 async fn connect_and_auth(url: &str, username: &str) -> Ws {
+    connect_and_auth_with_otp(url, username, None).await
+}
+
+/// Opens a WebSocket connection and authenticates as `username`, optionally
+/// supplying a TOTP or backup `otp` code.
+///
+/// # Protocol
+///
+/// ```json
+/// // Request
+/// { "t": "auth", "u": "<username>", "pw": "<hash>", "pk": "<base64>",
+///   "status": { "text": "Online", "emoji": "🟢" }, "otp": "<code>" }
+///
+/// // Expected response
+/// { "t": "ok", "u": "<username>", "channels": [...], "hist": [...],
+///   "users": [ { "u": "...", "pk": "..." }, ... ] }
+/// ```
+///
+/// A fresh ephemeral keypair is generated for every call so tests never share
+/// key material, mirroring real client behaviour.
+async fn connect_and_auth_with_otp(url: &str, username: &str, otp: Option<&str>) -> Ws {
     let (mut ws, _) = connect_async(url).await.expect("connect websocket");
 
-    let auth = json!({
-        "t": "auth",
-        "u": username,
-        "pw": "test-password-hash",
-        "pk": pub_b64(&new_keypair()),
-        "status": {"text":"Online","emoji":"🟢"}
-    });
+    let auth = match otp {
+        Some(code) => json!({
+            "t": "auth", "u": username,
+            "pw": "test-password-hash",
+            "pk": pub_b64(&new_keypair()),
+            "status": {"text":"Online","emoji":"🟢"},
+            "otp": code
+        }),
+        None => json!({
+            "t": "auth", "u": username,
+            "pw": "test-password-hash",
+            "pk": pub_b64(&new_keypair()),
+            "status": {"text":"Online","emoji":"🟢"}
+        }),
+    };
 
     ws.send(Message::Text(auth.to_string()))
         .await
@@ -137,6 +328,19 @@ async fn connect_and_auth(url: &str, username: &str) -> Ws {
     ws
 }
 
+/// Drains incoming WebSocket frames until one whose `"t"` field matches
+/// `expected_type` is found, then returns the parsed [`Value`].
+///
+/// Non-matching frames (e.g. heartbeats, presence events) are silently
+/// discarded. Each frame has a 3-second read timeout; after 50 attempts the
+/// helper panics with a descriptive message to aid debugging.
+///
+/// # Panics
+///
+/// Panics if:
+/// - The WebSocket closes unexpectedly.
+/// - A receive I/O error occurs.
+/// - No matching frame is seen within 50 attempts.
 async fn recv_by_type(ws: &mut Ws, expected_type: &str) -> Value {
     for _ in 0..50 {
         let msg = timeout(Duration::from_secs(3), ws.next())
@@ -155,37 +359,142 @@ async fn recv_by_type(ws: &mut Ws, expected_type: &str) -> Value {
     panic!("did not receive message type '{}'", expected_type);
 }
 
+// ---------------------------------------------------------------------------
+// Auth contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that a user with 2-FA enabled **cannot** authenticate without
+/// supplying an OTP code.
+///
+/// # Expected behaviour
+///
+/// The server must respond with `{ "t": "err", "m": "2FA code required" }`
+/// rather than accepting the connection or returning a generic error, so the
+/// client can present the correct UI prompt.
+#[tokio::test]
+async fn auth_contract_rejects_when_2fa_enabled_without_code() {
+    let seed_port = allocate_port();
+    let db_path = temp_db_path(seed_port);
+    seed_enabled_2fa_user(&db_path, "alice", &["backup-aa11bb22"]);
+
+    let server = start_server_with_db(db_path).await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for 2fa missing code test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "alice",
+            "pw": "test-password-hash",
+            "pk": pub_b64(&new_keypair()),
+            "status": {"text":"Online","emoji":"🟢"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send auth without otp");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("2FA code required")
+    );
+}
+
+/// Verifies that a valid backup code is accepted **and then consumed** (i.e.
+/// single-use semantics), preventing the same code from being used twice.
+///
+/// # Test sequence
+///
+/// 1. Seed `alice` with one backup code.
+/// 2. Authenticate successfully using that code.
+/// 3. Reconnect and attempt to use the **same** code again.
+/// 4. Assert the second attempt is rejected with `"invalid 2FA code"`.
+///
+/// This enforces that the server deletes (or marks used) the backup code on
+/// first successful consumption rather than treating it as a persistent secret.
+#[tokio::test]
+async fn auth_contract_accepts_backup_code_and_consumes_it() {
+    let seed_port = allocate_port();
+    let db_path = temp_db_path(seed_port);
+    let backup_code = "feedface1234abcd";
+    seed_enabled_2fa_user(&db_path, "alice", &[backup_code]);
+
+    let server = start_server_with_db(db_path).await;
+
+    // First use of the backup code — must succeed.
+    let mut ws = connect_and_auth_with_otp(&server.url, "alice", Some(backup_code)).await;
+    ws.close(None)
+        .await
+        .expect("close first authenticated socket");
+
+    // Second use of the same backup code — must be rejected.
+    let (mut ws2, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for consumed backup code test");
+    let auth = json!({
+        "t": "auth", "u": "alice",
+        "pw": "test-password-hash",
+        "pk": pub_b64(&new_keypair()),
+        "status": {"text":"Online","emoji":"🟢"},
+        "otp": backup_code
+    });
+    ws2.send(Message::Text(auth.to_string()))
+        .await
+        .expect("send auth with consumed backup code");
+
+    let err = recv_by_type(&mut ws2, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("invalid 2FA code")
+    );
+}
+
+/// Verifies the complete shape of the `"ok"` auth response payload.
+///
+/// The `"ok"` frame is the only frame clients **must** parse on startup, so
+/// its schema is treated as a hard API contract:
+///
+/// | Field      | Type           | Constraint          |
+/// |------------|----------------|---------------------|
+/// | `t`        | `"ok"`         | Literal             |
+/// | `u`        | string         | Matches sent username |
+/// | `channels` | array          | May be empty        |
+/// | `hist`     | array          | May be empty        |
+/// | `users`    | non-empty array| Each entry: `u`, `pk` |
+///
+/// Also verifies that the `"info"` command returns a frame with a numeric
+/// `"online"` field, ensuring basic post-auth RPC works.
 #[tokio::test]
 async fn auth_contract_returns_expected_fields() {
     let server = start_server().await;
     let mut ws = connect_and_auth(&server.url, "alice").await;
 
+    // Smoke-test that info RPC works after auth.
     ws.send(Message::Text(json!({"t":"info"}).to_string()))
         .await
         .expect("send info");
     let info = recv_by_type(&mut ws, "info").await;
     assert!(info.get("online").and_then(|v| v.as_u64()).is_some());
 
+    // Validate the full auth-ok contract on a second connection.
     let (mut ws2, _) = connect_async(&server.url)
         .await
         .expect("connect second websocket");
-    let auth = json!({
-        "t": "auth",
-        "u": "auth-contract-check",
-        "pw": "test",
-        "pk": pub_b64(&new_keypair()),
-        "status": {"text":"Online","emoji":"🟢"}
-    });
-    ws2.send(Message::Text(auth.to_string()))
-        .await
-        .expect("send second auth");
-    let ok = recv_by_type(&mut ws2, "ok").await;
+    ws2.send(Message::Text(
+        json!({
+            "t": "auth", "u": "auth-contract-check",
+            "pw": "test", "pk": pub_b64(&new_keypair()),
+            "status": {"text":"Online","emoji":"🟢"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send second auth");
 
+    let ok = recv_by_type(&mut ws2, "ok").await;
     assert_eq!(ok.get("t").and_then(|v| v.as_str()), Some("ok"));
-    assert_eq!(
-        ok.get("u").and_then(|v| v.as_str()),
-        Some("auth-contract-check")
-    );
+    assert_eq!(ok.get("u").and_then(|v| v.as_str()), Some("auth-contract-check"));
     assert!(ok.get("channels").and_then(|v| v.as_array()).is_some());
     assert!(ok.get("hist").and_then(|v| v.as_array()).is_some());
 
@@ -193,32 +502,33 @@ async fn auth_contract_returns_expected_fields() {
         .get("users")
         .and_then(|v| v.as_array())
         .expect("users must be an array");
-    assert!(
-        !users.is_empty(),
-        "users array should include at least self"
-    );
+    assert!(!users.is_empty(), "users array should include at least self");
     for user in users {
         assert!(user.get("u").and_then(|v| v.as_str()).is_some());
         assert!(user.get("pk").and_then(|v| v.as_str()).is_some());
     }
 }
 
+/// Verifies that usernames containing whitespace are rejected during auth.
+///
+/// Whitespace in usernames would allow homoglyph-style confusion attacks and
+/// complicate routing logic. The server must reject them with a human-readable
+/// validation error rather than silently sanitising or truncating.
 #[tokio::test]
 async fn auth_contract_rejects_invalid_username() {
     let server = start_server().await;
     let (mut ws, _) = connect_async(&server.url).await.expect("connect websocket");
 
-    let bad_auth = json!({
-        "t": "auth",
-        "u": "invalid user",
-        "pw": "test-password-hash",
-        "pk": pub_b64(&new_keypair()),
-        "status": {"text":"Online","emoji":"🟢"}
-    });
-
-    ws.send(Message::Text(bad_auth.to_string()))
-        .await
-        .expect("send invalid auth payload");
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "invalid user",
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+            "status": {"text":"Online","emoji":"🟢"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send invalid auth payload");
 
     let err = recv_by_type(&mut ws, "err").await;
     assert_eq!(
@@ -227,6 +537,239 @@ async fn auth_contract_rejects_invalid_username() {
     );
 }
 
+/// Verifies that the first frame sent by a client **must** be an auth frame.
+///
+/// Clients that attempt to send any other frame type (e.g. `"ping"`) before
+/// authenticating must receive a clear error. This prevents ambiguous server
+/// state and ensures unauthenticated sessions can never inject messages.
+#[tokio::test]
+async fn auth_contract_rejects_non_auth_first_frame() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for invalid auth test");
+
+    ws.send(Message::Text(
+        json!({"t": "ping", "u": "alice"}).to_string(),
+    ))
+    .await
+    .expect("send invalid first frame");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("first frame must be auth")
+    );
+}
+
+/// Verifies that a public key that is not valid base64 is rejected at auth time.
+///
+/// Accepting a malformed key would either panic during later crypto operations
+/// or silently store invalid state in the user table. Rejecting at the
+/// boundary is the correct defence-in-depth strategy.
+#[tokio::test]
+async fn auth_contract_rejects_invalid_public_key() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for invalid key test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "alice",
+            "pw": "test-password-hash", "pk": "not-base64",
+            "status": {"text":"Online","emoji":"🟢"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send invalid public key");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("invalid public key")
+    );
+}
+
+/// Verifies that auth frames exceeding 4 096 bytes are rejected immediately.
+///
+/// Without an early size gate the server would parse arbitrarily large JSON
+/// objects, opening a memory-exhaustion vector before any authentication has
+/// taken place. The limit of 4 096 bytes is generous enough for all legitimate
+/// auth payloads (username + password hash + base64 public key + status).
+#[tokio::test]
+async fn auth_contract_rejects_oversized_auth_frame() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for oversized auth frame test");
+
+    let oversized_payload = "x".repeat(4_097);
+    ws.send(Message::Text(oversized_payload))
+        .await
+        .expect("send oversized auth frame");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("auth frame too large")
+    );
+}
+
+/// Verifies that malformed (non-parseable) JSON in the auth frame is rejected.
+///
+/// A proper error response rather than a silent close ensures the client can
+/// surface a meaningful message to the user and log the failure correctly.
+#[tokio::test]
+async fn auth_contract_rejects_malformed_json() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for malformed auth json test");
+
+    ws.send(Message::Text("{bad-json".to_string()))
+        .await
+        .expect("send malformed auth json");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("invalid auth JSON")
+    );
+}
+
+/// Verifies that SQL-injection-style strings in the `"u"` field are rejected
+/// by the input validation layer — **before** they can reach any SQL statement.
+///
+/// This is a belt-and-suspenders test: parameterised queries should already
+/// prevent injection, but enforcing strict username formatting ensures the
+/// character set is well-controlled across all code paths (logging, routing,
+/// etc.).
+#[tokio::test]
+async fn auth_contract_rejects_sql_injection_like_username() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for sql-injection username test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "alice' OR '1'='1",
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+            "status": {"text":"Online","emoji":"🟢"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send sql-injection-like username payload");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("validation error: invalid username")
+    );
+}
+
+/// Verifies that OTP codes longer than 64 characters are rejected with a
+/// validation error rather than being evaluated against the backup-code list.
+///
+/// This prevents brute-force probing via artificially long strings that could
+/// trigger timing-unsafe string comparisons or exhaust memory in pathological
+/// implementations.
+#[tokio::test]
+async fn auth_contract_rejects_oversized_otp_input() {
+    let seed_port = allocate_port();
+    let db_path = temp_db_path(seed_port);
+    seed_enabled_2fa_user(&db_path, "alice", &["backup-aa11bb22"]);
+
+    let server = start_server_with_db(db_path).await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for oversized otp test");
+
+    let oversized_otp = "1".repeat(65); // one byte over the 64-char limit
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "alice",
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+            "status": {"text":"Online","emoji":"🟢"},
+            "otp": oversized_otp
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send oversized otp payload");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("validation error: invalid otp code")
+    );
+}
+
+/// Verifies that repeated wrong OTP attempts do not lock out a user who still
+/// has a valid backup code.
+///
+/// This test deliberately **does not** assert rate-limiting behaviour (that
+/// would be a separate security test). Its goal is to confirm that the auth
+/// state remains consistent after a sequence of failures — i.e. the valid
+/// backup code still works after all wrong attempts, and there is no
+/// accidental state corruption in the `user_2fa` row.
+#[tokio::test]
+async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
+    let seed_port = allocate_port();
+    let db_path = temp_db_path(seed_port);
+    let backup_code = "ab12cd34ef56ab78";
+    seed_enabled_2fa_user(&db_path, "alice", &[backup_code]);
+
+    let server = start_server_with_db(db_path).await;
+
+    // Submit several wrong codes; each must be rejected cleanly.
+    for wrong_otp in ["000000", "123456", "999999", "abcdef"] {
+        let (mut ws, _) = connect_async(&server.url)
+            .await
+            .expect("connect websocket for wrong otp attempt");
+
+        ws.send(Message::Text(
+            json!({
+                "t": "auth", "u": "alice",
+                "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+                "status": {"text":"Online","emoji":"🟢"},
+                "otp": wrong_otp
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send auth with wrong otp");
+
+        let err = recv_by_type(&mut ws, "err").await;
+        assert_eq!(
+            err.get("m").and_then(|v| v.as_str()),
+            Some("invalid 2FA code"),
+            "wrong otp attempt should be rejected: {}",
+            wrong_otp
+        );
+    }
+
+    // After all failures, the correct backup code must still be accepted.
+    let mut ws = connect_and_auth_with_otp(&server.url, "alice", Some(backup_code)).await;
+    ws.close(None)
+        .await
+        .expect("close successful backup-code auth socket");
+}
+
+// ---------------------------------------------------------------------------
+// User directory contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that the `"users"` RPC returns an array where every element has a
+/// non-empty `"u"` (username) and `"pk"` (public key) field.
+///
+/// The public key field is essential for end-to-end encrypted DMs: if a client
+/// cannot retrieve a recipient's key, it cannot encrypt a message to them.
+/// This test ensures the directory always provides key material alongside
+/// identity.
 #[tokio::test]
 async fn users_contract_returns_user_objects_with_public_keys() {
     let server = start_server().await;
@@ -247,12 +790,29 @@ async fn users_contract_returns_user_objects_with_public_keys() {
     assert!(users.len() >= 2, "expected at least alice and bob");
     for user in users {
         let name = user.get("u").and_then(|v| v.as_str()).unwrap_or_default();
-        let pk = user.get("pk").and_then(|v| v.as_str()).unwrap_or_default();
+        let pk   = user.get("pk").and_then(|v| v.as_str()).unwrap_or_default();
         assert!(!name.is_empty(), "username must be non-empty");
-        assert!(!pk.is_empty(), "public key must be non-empty");
+        assert!(!pk.is_empty(),   "public key must be non-empty");
     }
 }
 
+// ---------------------------------------------------------------------------
+// Messaging contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies the round-trip contract for a channel message.
+///
+/// After sending a `"msg"` frame the server must broadcast a `"msg"` frame
+/// back to the sender (and to all other channel members). The echoed frame
+/// must preserve:
+///
+/// * `"ch"` – the target channel name.
+/// * `"u"`  – the sending username (added by the server).
+/// * `"c"`  – the ciphertext blob (unchanged).
+///
+/// Because messages are end-to-end encrypted the server MUST NOT inspect or
+/// modify the `"c"` field; any corruption would silently break decryption on
+/// the receiving end.
 #[tokio::test]
 async fn msg_contract_roundtrips_channel_payload() {
     let server = start_server().await;
@@ -261,10 +821,8 @@ async fn msg_contract_roundtrips_channel_payload() {
     alice
         .send(Message::Text(
             json!({
-                "t": "msg",
-                "ch": "general",
-                "c": "ciphertext-blob",
-                "ts": 123
+                "t": "msg", "ch": "general",
+                "c": "ciphertext-blob", "ts": 123
             })
             .to_string(),
         ))
@@ -273,18 +831,32 @@ async fn msg_contract_roundtrips_channel_payload() {
 
     let msg = recv_by_type(&mut alice, "msg").await;
     assert_eq!(msg.get("ch").and_then(|v| v.as_str()), Some("general"));
-    assert_eq!(msg.get("u").and_then(|v| v.as_str()), Some("alice"));
-    assert_eq!(
-        msg.get("c").and_then(|v| v.as_str()),
-        Some("ciphertext-blob")
-    );
+    assert_eq!(msg.get("u").and_then(|v| v.as_str()),  Some("alice"));
+    assert_eq!(msg.get("c").and_then(|v| v.as_str()),  Some("ciphertext-blob"));
 }
 
+// ---------------------------------------------------------------------------
+// Voice contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that `"vdata"` frames sent by one room member are forwarded to
+/// all other members of the same voice room.
+///
+/// # Test sequence
+///
+/// 1. Alice and Bob both join `"room-a"` via `"vjoin"`.
+/// 2. Alice sends a `"vdata"` frame with a fake audio payload.
+/// 3. Bob must receive a `"vdata"` frame annotated with `"from": "alice"` and
+///    an unchanged `"a"` (audio data) field.
+///
+/// The 150 ms sleep after the `"vjoin"` frames gives the server time to
+/// register both members in the room before Alice sends audio, avoiding a
+/// race where Bob has not yet joined when the forward occurs.
 #[tokio::test]
 async fn voice_contract_forwards_vdata_between_room_members() {
     let server = start_server().await;
     let mut alice = connect_and_auth(&server.url, "alice").await;
-    let mut bob = connect_and_auth(&server.url, "bob").await;
+    let mut bob   = connect_and_auth(&server.url, "bob").await;
 
     alice
         .send(Message::Text(json!({"t":"vjoin","r":"room-a"}).to_string()))
@@ -294,6 +866,7 @@ async fn voice_contract_forwards_vdata_between_room_members() {
         .await
         .expect("bob joins voice room");
 
+    // Allow both join events to be processed server-side before sending audio.
     sleep(Duration::from_millis(150)).await;
 
     alice
@@ -311,6 +884,17 @@ async fn voice_contract_forwards_vdata_between_room_members() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// History & search contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that messages sent to a channel are durably persisted and
+/// returned by the `"history"` RPC.
+///
+/// Persistence is non-negotiable for a chat server: if a message is confirmed
+/// (i.e. echoed back to the sender) it must appear in subsequent history
+/// queries. This test uses a sentinel ciphertext (`"history-cipher"`) to
+/// uniquely identify the test message in the history response.
 #[tokio::test]
 async fn history_contract_returns_persisted_events() {
     let server = start_server().await;
@@ -319,8 +903,7 @@ async fn history_contract_returns_persisted_events() {
     alice
         .send(Message::Text(
             json!({
-                "t": "msg",
-                "ch": "general",
+                "t": "msg", "ch": "general",
                 "c": "history-cipher",
                 "p": "history plain text marker"
             })
@@ -329,16 +912,12 @@ async fn history_contract_returns_persisted_events() {
         .await
         .expect("send message for history");
 
+    // Wait for the echo to confirm the message was accepted and stored.
     let _ = recv_by_type(&mut alice, "msg").await;
 
     alice
         .send(Message::Text(
-            json!({
-                "t": "history",
-                "ch": "general",
-                "limit": 25
-            })
-            .to_string(),
+            json!({"t": "history", "ch": "general", "limit": 25}).to_string(),
         ))
         .await
         .expect("request history");
@@ -356,6 +935,16 @@ async fn history_contract_returns_persisted_events() {
     assert!(found, "expected persisted message in history response");
 }
 
+/// Verifies that the `"search"` RPC filters messages by a plaintext index
+/// field (`"p"`) and returns only matching events.
+///
+/// The `"p"` field carries un-encrypted, server-searchable text alongside the
+/// encrypted ciphertext. This allows keyword search without the server ever
+/// seeing the full decrypted content. The test asserts:
+///
+/// * The response echoes the original query in `"q"`.
+/// * At least one event in `"events"` matches both the sentinel ciphertext and
+///   the message type.
 #[tokio::test]
 async fn search_contract_filters_by_plaintext_index() {
     let server = start_server().await;
@@ -364,8 +953,7 @@ async fn search_contract_filters_by_plaintext_index() {
     alice
         .send(Message::Text(
             json!({
-                "t": "msg",
-                "ch": "general",
+                "t": "msg", "ch": "general",
                 "c": "search-cipher-hit",
                 "p": "deploy completed successfully"
             })
@@ -378,13 +966,7 @@ async fn search_contract_filters_by_plaintext_index() {
 
     alice
         .send(Message::Text(
-            json!({
-                "t": "search",
-                "ch": "general",
-                "q": "deploy",
-                "limit": 25
-            })
-            .to_string(),
+            json!({"t": "search", "ch": "general", "q": "deploy", "limit": 25}).to_string(),
         ))
         .await
         .expect("request search");
@@ -402,6 +984,14 @@ async fn search_contract_filters_by_plaintext_index() {
     assert!(found, "expected matching message in search response");
 }
 
+/// Verifies that the `"rewind"` RPC returns messages sent within the requested
+/// time window.
+///
+/// `"rewind"` is a time-bounded history query (e.g. "show me the last 5
+/// minutes"). Unlike `"history"` which is offset-based, `"rewind"` uses a
+/// `"seconds"` look-back window. The response type is `"history"` (reusing the
+/// same frame shape). This test confirms a message sent moments ago appears in
+/// a 300-second rewind.
 #[tokio::test]
 async fn rewind_contract_returns_recent_events() {
     let server = start_server().await;
@@ -410,8 +1000,7 @@ async fn rewind_contract_returns_recent_events() {
     alice
         .send(Message::Text(
             json!({
-                "t": "msg",
-                "ch": "general",
+                "t": "msg", "ch": "general",
                 "c": "rewind-cipher-hit",
                 "p": "rewind marker"
             })
@@ -424,13 +1013,7 @@ async fn rewind_contract_returns_recent_events() {
 
     alice
         .send(Message::Text(
-            json!({
-                "t": "rewind",
-                "ch": "general",
-                "seconds": 300,
-                "limit": 25
-            })
-            .to_string(),
+            json!({"t": "rewind", "ch": "general", "seconds": 300, "limit": 25}).to_string(),
         ))
         .await
         .expect("request rewind");
@@ -447,18 +1030,36 @@ async fn rewind_contract_returns_recent_events() {
     assert!(found, "expected recent message in rewind response");
 }
 
+// ---------------------------------------------------------------------------
+// Schema migration contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that a fresh server initialises `schema_meta` to version `"2"`.
+///
+/// This is the baseline migration contract: any server started against an
+/// empty or newly created database must create and stamp the expected schema
+/// version before serving traffic.
 #[tokio::test]
 async fn schema_meta_contains_current_version() {
     let server = start_server().await;
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-
-    assert_eq!(version, "1");
+    assert_eq!(version, "2");
 }
 
+/// Verifies that a server migrates a `v0` database to schema `v2` on startup.
+///
+/// Migration correctness is verified by:
+///
+/// 1. Confirming `schema_meta.schema_version` is updated to `"2"`.
+/// 2. Confirming the `events` table exists (created by `v1` migration).
+/// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
+///
+/// All assertions are made directly against SQLite rather than through the
+/// server API to keep migration tests independent of server protocol changes.
 #[tokio::test]
-async fn schema_migrates_from_version_zero_to_one() {
+async fn schema_migrates_from_version_zero_to_two() {
     let seed_port = allocate_port();
     let db_path = temp_db_path(seed_port);
     seed_schema_version(&db_path, "0");
@@ -467,11 +1068,7 @@ async fn schema_migrates_from_version_zero_to_one() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let conn = Connection::open(&db_path).expect("open migrated db");
-    let version: String = read_schema_version(&db_path);
-    assert_eq!(
-        version, "1",
-        "expected migration to set schema version to 1"
-    );
+    assert_eq!(read_schema_version(&db_path), "2", "expected migration to set schema version to 2");
 
     let events_exists: i64 = conn
         .query_row(
@@ -480,14 +1077,28 @@ async fn schema_migrates_from_version_zero_to_one() {
             |row| row.get(0),
         )
         .expect("query sqlite_master");
-    assert_eq!(
-        events_exists, 1,
-        "events table should exist after migration"
-    );
+    assert_eq!(events_exists, 1, "events table should exist after migration");
+
+    let user_2fa_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_2fa'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for user_2fa");
+    assert_eq!(user_2fa_exists, 1, "user_2fa table should exist after migration");
 
     drop(server);
 }
 
+/// Verifies that a server does **not** downgrade a database with a schema
+/// version higher than its own current version.
+///
+/// This handles the "rollback" deployment scenario: if `v999` of the server
+/// writes new tables and a `v998` server is deployed, the older server must
+/// leave the schema version intact and continue serving traffic against the
+/// newer schema rather than silently rolling back migrations. Downgrading
+/// could destroy data written by the newer server.
 #[tokio::test]
 async fn schema_newer_version_is_not_downgraded_and_server_auth_still_works() {
     let seed_port = allocate_port();
@@ -497,6 +1108,7 @@ async fn schema_newer_version_is_not_downgraded_and_server_auth_still_works() {
     let server = start_server_with_db(db_path.clone()).await;
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
+    // Server must remain fully functional, not crash or refuse connections.
     alice
         .send(Message::Text(json!({"t":"info"}).to_string()))
         .await
@@ -508,65 +1120,22 @@ async fn schema_newer_version_is_not_downgraded_and_server_auth_still_works() {
     );
 
     let version = read_schema_version(&db_path);
-    assert_eq!(
-        version, "999",
-        "server must not silently downgrade newer schema versions"
-    );
+    assert_eq!(version, "999", "server must not silently downgrade newer schema versions");
 
     drop(server);
 }
 
-#[tokio::test]
-async fn auth_contract_rejects_non_auth_first_frame() {
-    let server = start_server().await;
-    let (mut ws, _) = connect_async(&server.url)
-        .await
-        .expect("connect websocket for invalid auth test");
+// ---------------------------------------------------------------------------
+// Protocol safety contract tests
+// ---------------------------------------------------------------------------
 
-    ws.send(Message::Text(
-        json!({
-            "t": "ping",
-            "u": "alice"
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send invalid first frame");
-
-    let err = recv_by_type(&mut ws, "err").await;
-    assert_eq!(
-        err.get("m").and_then(|v| v.as_str()),
-        Some("first frame must be auth")
-    );
-}
-
-#[tokio::test]
-async fn auth_contract_rejects_invalid_public_key() {
-    let server = start_server().await;
-    let (mut ws, _) = connect_async(&server.url)
-        .await
-        .expect("connect websocket for invalid key test");
-
-    ws.send(Message::Text(
-        json!({
-            "t": "auth",
-            "u": "alice",
-            "pw": "test-password-hash",
-            "pk": "not-base64",
-            "status": {"text":"Online","emoji":"🟢"}
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send invalid public key");
-
-    let err = recv_by_type(&mut ws, "err").await;
-    assert_eq!(
-        err.get("m").and_then(|v| v.as_str()),
-        Some("invalid public key")
-    );
-}
-
+/// Verifies that messages with a timestamp outside the allowed clock-skew
+/// window are rejected.
+///
+/// Accepting arbitrarily old timestamps would allow replay attacks where an
+/// attacker captures a legitimate frame and resubmits it later. The server
+/// must enforce a tight clock-skew window (typically ±30–60 s) and reject
+/// anything outside it with a descriptive error.
 #[tokio::test]
 async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
     let server = start_server().await;
@@ -575,10 +1144,8 @@ async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
     alice
         .send(Message::Text(
             json!({
-                "t": "msg",
-                "ch": "general",
-                "c": "stale-cipher",
-                "ts": 1,
+                "t": "msg", "ch": "general",
+                "c": "stale-cipher", "ts": 1,
                 "n": "11111111111111111111111111111111"
             })
             .to_string(),
@@ -595,6 +1162,13 @@ async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
     );
 }
 
+/// Verifies that a nonce used in a successfully accepted message cannot be
+/// reused in a subsequent message.
+///
+/// Nonces are the primary anti-replay mechanism. Once a `(user, nonce)` pair
+/// has been accepted, any future message with the same nonce must be rejected
+/// regardless of whether the timestamp is fresh. This prevents an adversary
+/// who can observe or intercept traffic from resubmitting captured frames.
 #[tokio::test]
 async fn protocol_contract_rejects_replayed_nonce() {
     let server = start_server().await;
@@ -605,19 +1179,19 @@ async fn protocol_contract_rejects_replayed_nonce() {
         .as_secs_f64();
 
     let payload = json!({
-        "t": "msg",
-        "ch": "general",
-        "c": "replay-cipher",
-        "ts": now,
+        "t": "msg", "ch": "general",
+        "c": "replay-cipher", "ts": now,
         "n": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     });
 
+    // First send — must succeed.
     alice
         .send(Message::Text(payload.to_string()))
         .await
         .expect("send first message with nonce");
     let _ = recv_by_type(&mut alice, "msg").await;
 
+    // Identical replay — must be rejected.
     alice
         .send(Message::Text(payload.to_string()))
         .await
@@ -629,4 +1203,161 @@ async fn protocol_contract_rejects_replayed_nonce() {
         "expected replay nonce rejection, got: {}",
         msg
     );
+}
+
+/// Verifies that nonces must be lowercase hexadecimal strings.
+///
+/// Restricting the nonce character set to `[0-9a-f]` prevents injection of
+/// special characters into nonce-storage paths (e.g. Redis keys, log lines)
+/// and ensures a stable, well-defined encoding. Any nonce that contains
+/// non-hex characters (such as `@`) must be rejected before storage.
+#[tokio::test]
+async fn protocol_contract_rejects_invalid_nonce_format() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg", "ch": "general",
+                "c": "nonce-format-attack", "ts": now,
+                "n": "NOT_HEX_@@@"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send invalid nonce format payload");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("invalid nonce format"),
+        "expected invalid nonce format rejection, got: {}",
+        msg
+    );
+}
+
+/// Verifies that runtime (post-auth) payloads exceeding 16 000 bytes are
+/// rejected.
+///
+/// This cap prevents a single authenticated client from monopolising server
+/// memory or saturating network bandwidth with a single oversized frame.
+/// Legitimate chat payloads (even with large encrypted blobs) should comfortably
+/// fit within this limit.
+#[tokio::test]
+async fn protocol_contract_rejects_oversized_runtime_payload() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    let oversized_payload = "x".repeat(16_001);
+    alice
+        .send(Message::Text(oversized_payload))
+        .await
+        .expect("send oversized runtime payload");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("payload exceeds max size")
+    );
+}
+
+/// Fuzz-style test verifying that malformed and non-object JSON frames are
+/// always rejected with consistent, specific error messages.
+///
+/// Two classes of bad input are exercised:
+///
+/// 1. **Malformed JSON** (`{`, unterminated strings, bare strings, null
+///    bytes): must return `"invalid JSON payload"`.
+/// 2. **Valid JSON that is not an object** (arrays, `null`, numbers, strings):
+///    must return `"payload must be a JSON object"`.
+///
+/// The distinction matters for client-side error handling: a malformed frame
+/// indicates a serialisation bug, while a non-object frame indicates a
+/// protocol violation that could be caught at development time.
+#[tokio::test]
+async fn protocol_contract_fuzz_corpus_rejects_malformed_and_non_object_frames() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    let malformed_frames = vec!["{", "{\"t\":\"msg\"", "not-json", "\\u0000"];
+    for frame in malformed_frames {
+        alice
+            .send(Message::Text(frame.to_string()))
+            .await
+            .expect("send malformed fuzz frame");
+        let err = recv_by_type(&mut alice, "err").await;
+        assert_eq!(
+            err.get("m").and_then(|v| v.as_str()),
+            Some("invalid JSON payload"),
+            "expected invalid JSON payload for frame: {:?}",
+            frame
+        );
+    }
+
+    let non_object_frames = vec!["[]", "null", "123", "\"string\""];
+    for frame in non_object_frames {
+        alice
+            .send(Message::Text(frame.to_string()))
+            .await
+            .expect("send non-object fuzz frame");
+        let err = recv_by_type(&mut alice, "err").await;
+        assert_eq!(
+            err.get("m").and_then(|v| v.as_str()),
+            Some("payload must be a JSON object"),
+            "expected object-shape rejection for frame: {:?}",
+            frame
+        );
+    }
+}
+
+/// Stress-tests the nonce-replay defence by flooding the server with 20
+/// replays of the same nonce in rapid succession.
+///
+/// All 20 replays must be individually rejected with `"replayed nonce"`. This
+/// confirms that the nonce store does not have race conditions under load and
+/// that the server remains responsive (no panics, no silent drops) throughout
+/// the flood. A chat server that degrades under replay floods could be used
+/// as a denial-of-service vector against legitimate users sharing the same
+/// server process.
+#[tokio::test]
+async fn protocol_contract_rejects_replay_nonce_flood() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let payload = json!({
+        "t": "msg", "ch": "general",
+        "c": "nonce-flood-cipher", "ts": now,
+        "n": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    });
+
+    // First send must succeed.
+    alice
+        .send(Message::Text(payload.to_string()))
+        .await
+        .expect("send first message for nonce flood test");
+    let _ = recv_by_type(&mut alice, "msg").await;
+
+    // All subsequent replays must be consistently rejected.
+    for _ in 0..20 {
+        alice
+            .send(Message::Text(payload.to_string()))
+            .await
+            .expect("send replayed nonce in flood attempt");
+        let err = recv_by_type(&mut alice, "err").await;
+        let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("replayed nonce"),
+            "expected replay nonce rejection during flood, got: {}",
+            msg
+        );
+    }
 }
