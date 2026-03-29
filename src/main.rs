@@ -81,7 +81,7 @@ use clicord_server::error::{ChatifyError, ChatifyResult};
 use clicord_server::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
 use std::pin::Pin;
@@ -90,7 +90,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async,
+    accept_hdr_async,
+    tungstenite::{
+        handshake::server::{Callback, Request, Response},
+        http,
+        Message,
+    },
+};
 
 // ---------------------------------------------------------------------------
 // CLI configuration
@@ -166,6 +174,16 @@ const MAX_BYTES: usize = 16_000;
 /// Tighter than [`MAX_BYTES`] because the auth payload is parsed before the
 /// client is known/trusted, making it a potential amplification target.
 const MAX_AUTH_BYTES: usize = 4_096;
+
+/// Maximum HTTP header size during WebSocket handshake (CVE-2023-43668 mitigation).
+/// Limits the total size of HTTP headers during the WebSocket upgrade handshake
+/// to prevent denial-of-service attacks via excessive header length.
+/// Tungstenite 0.21.0+ includes this fix, but we enforce it explicitly.
+const MAX_HANDSHAKE_HEADER_SIZE: usize = 8192;
+
+/// Maximum number of HTTP headers during WebSocket handshake.
+/// Limits the number of individual headers to prevent resource exhaustion.
+const MAX_HANDSHAKE_HEADERS: usize = 64;
 
 /// SQLite schema version this binary was built against.
 /// The migration path in [`EventStore::migrate`] upgrades from any lower
@@ -2181,6 +2199,67 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Chat
 }
 
 // ---------------------------------------------------------------------------
+// Handshake validation (CVE-2023-43668 mitigation)
+// ---------------------------------------------------------------------------
+
+/// Callback for validating WebSocket handshake HTTP headers.
+///
+/// This callback is invoked during the WebSocket upgrade handshake to validate
+/// HTTP headers before the connection is established. It mitigates CVE-2023-43668
+/// by enforcing limits on header size and count, preventing denial-of-service
+/// attacks via excessive HTTP headers.
+///
+/// # Security considerations
+///
+/// - Rejects requests with headers exceeding `MAX_HANDSHAKE_HEADER_SIZE` bytes
+/// - Rejects requests with more than `MAX_HANDSHAKE_HEADERS` headers
+/// - Logs suspicious activity for monitoring
+struct HandshakeValidator;
+
+impl Callback for HandshakeValidator {
+    fn on_request(
+        self,
+        req: &Request,
+        response: Response,
+    ) -> Result<Response, http::Response<Option<String>>> {
+        // Calculate total header size
+        let mut total_header_size = req.uri().to_string().len();
+        let header_count = req.headers().len();
+
+        for (name, value) in req.headers().iter() {
+            total_header_size += name.as_str().len();
+            total_header_size += value.len();
+        }
+
+        // Validate header count
+        if header_count > MAX_HANDSHAKE_HEADERS {
+            warn!(
+                "Handshake rejected: too many headers ({} > {})",
+                header_count, MAX_HANDSHAKE_HEADERS
+            );
+            return Err(http::Response::builder()
+                .status(431)
+                .body(Some("Too Many Headers".to_string()))
+                .unwrap());
+        }
+
+        // Validate total header size
+        if total_header_size > MAX_HANDSHAKE_HEADER_SIZE {
+            warn!(
+                "Handshake rejected: headers too large ({} > {} bytes)",
+                total_header_size, MAX_HANDSHAKE_HEADER_SIZE
+            );
+            return Err(http::Response::builder()
+                .status(431)
+                .body(Some("Request Header Fields Too Large".to_string()))
+                .unwrap());
+        }
+
+        Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
 
@@ -2239,9 +2318,15 @@ where
     let _conn_guard = ConnectionGuard::new(state.clone(), addr);
 
     // Upgrade the raw TCP stream to a WebSocket connection.
-    let ws = match accept_async(stream).await {
+    // Use accept_hdr_async with custom callback to validate headers (CVE-2023-43668 mitigation).
+    let ws = match accept_hdr_async(stream, HandshakeValidator).await {
         Ok(w) => w,
-        Err(_) => return,
+        Err(e) => {
+            if state.log_enabled {
+                debug!("WebSocket handshake failed from {}: {}", addr, e);
+            }
+            return;
+        }
     };
     let (mut sink, mut stream) = ws.split();
 

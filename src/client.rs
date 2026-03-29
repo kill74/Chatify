@@ -1056,29 +1056,31 @@ async fn main() -> ChatifyResult<()> {
     };
 
     {
-        let auth = match parse_auth_payload(&resp, &username) {
-            Ok(v) => v,
-            Err(err) => {
-                error!("{}", err);
-                return Ok(());
-            }
-        };
-        // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
+    let auth = match parse_auth_payload(&resp, &username) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("{}", err);
+            return Ok(());
+        }
+    };
+    // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
 
-        // Spawn task to forward mpsc messages to WebSocket
-        tokio::spawn(async move {
-            let mut msg_rx = msg_rx;
-            while let Some(msg) = msg_rx.recv().await {
-                let _ = ws_tx.send(Message::Text(msg)).await;
-            }
-        });
+    // Spawn task to forward mpsc messages to WebSocket
+    tokio::spawn(async move {
+        let mut msg_rx = msg_rx;
+        while let Some(msg) = msg_rx.recv().await {
+            let _ = ws_tx.send(Message::Text(msg)).await;
+        }
+    });
 
-        // We'll store the state in an Arc for sharing between tasks
-        let state = Arc::new(tokio::sync::Mutex::new(ClientState {
-            ws_tx: msg_tx.clone(), // Use mpsc sender instead of WebSocket
-            me: auth.me.clone(),
-            pw: password,
+    // We'll store the state in an Arc for sharing between tasks
+    // Store the client-side hash (not the raw password) for key derivation
+    // The hash was already computed before password zeroization
+    let state = Arc::new(tokio::sync::Mutex::new(ClientState {
+        ws_tx: msg_tx.clone(), // Use mpsc sender instead of WebSocket
+        me: auth.me.clone(),
+        pw: pw_hash,
             ch: "general".to_string(),
             chs: HashMap::from([("general".to_string(), true)]),
             users: auth.users,

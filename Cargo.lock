@@ -438,11 +438,13 @@ dependencies = [
  "pbkdf2",
  "rand",
  "ratatui",
+ "ring 0.17.14",
  "rodio",
  "rpassword",
  "rusqlite",
  "rustls 0.22.4",
  "rustls-pemfile 2.2.0",
+ "rustls-webpki 0.103.10",
  "serde",
  "serde_json",
  "serenity",
@@ -2431,6 +2433,17 @@ name = "rustls-webpki"
 version = "0.102.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+dependencies = [
+ "ring 0.17.14",
+ "rustls-pki-types",
+ "untrusted 0.9.0",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "ring 0.17.14",
  "rustls-pki-types",

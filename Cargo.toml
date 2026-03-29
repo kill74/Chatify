@@ -56,6 +56,8 @@ rustls-pemfile = "2"
 tokio-rustls = "0.25"
 subtle = "2.6"
 zeroize = { version = "1.7", features = ["derive"] }
+ring = "0.17"
+rustls-webpki = "0.103"
 
 [profile.release]
 opt-level = 3
