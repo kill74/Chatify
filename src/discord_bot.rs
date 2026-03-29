@@ -18,7 +18,7 @@
 //! - `CHATIFY_LOG`: Set to "1" to enable logging
 
 use clicord_server::crypto::dh_key;
-use clicord_server::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash};
+use clicord_server::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash_client};
 
 use std::collections::HashMap;
 use std::env;
@@ -272,10 +272,7 @@ impl BotState {
             .users
             .get(username)
             .ok_or_else(|| format!("User '{}' not found", username))?;
-        let key = dh_key(&self.priv_key, pk.value().as_str());
-        if key.len() != 32 {
-            return Err(format!("Invalid derived key for '{}'", username));
-        }
+        let key = dh_key(&self.priv_key, pk.value().as_str())?;
         self.dm_keys.insert(username.to_string(), key.clone());
         Ok(key)
     }
@@ -324,10 +321,10 @@ impl EventHandler for DiscordHandler {
             (channel, key, ws_tx, src_tag)
         };
 
-        let encrypted = enc_bytes(&key, formatted_msg.as_bytes());
-        if encrypted.is_empty() {
-            return;
-        }
+        let encrypted = match enc_bytes(&key, formatted_msg.as_bytes()) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
         let encoded = general_purpose::STANDARD.encode(&encrypted);
         let chatify_msg = serde_json::json!({
             "t": "msg",
@@ -484,8 +481,8 @@ async fn run_chatify_session(
         let auth_msg = serde_json::json!({
             "t": "auth",
             "u": bot_state.username,
-            "pw": pw_hash(&bot_state.password),
-            "pk": pub_b64(&bot_state.priv_key),
+            "pw": pw_hash_client(&bot_state.password),
+            "pk": pub_b64(&bot_state.priv_key).expect("generated keypair must produce valid public key"),
             "status": {"text": "Online", "emoji": "🟢"}
         });
         send_ws_json(&bridge_tx, auth_msg);

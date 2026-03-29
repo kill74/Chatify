@@ -307,14 +307,14 @@ async fn connect_and_auth_with_otp(url: &str, username: &str, otp: Option<&str>)
         Some(code) => json!({
             "t": "auth", "u": username,
             "pw": "test-password-hash",
-            "pk": pub_b64(&new_keypair()),
+            "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"🟢"},
             "otp": code
         }),
         None => json!({
             "t": "auth", "u": username,
             "pw": "test-password-hash",
-            "pk": pub_b64(&new_keypair()),
+            "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"🟢"}
         }),
     };
@@ -386,7 +386,7 @@ async fn auth_contract_rejects_when_2fa_enabled_without_code() {
         json!({
             "t": "auth", "u": "alice",
             "pw": "test-password-hash",
-            "pk": pub_b64(&new_keypair()),
+            "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"🟢"}
         })
         .to_string(),
@@ -435,7 +435,7 @@ async fn auth_contract_accepts_backup_code_and_consumes_it() {
     let auth = json!({
         "t": "auth", "u": "alice",
         "pw": "test-password-hash",
-        "pk": pub_b64(&new_keypair()),
+        "pk": pub_b64(&new_keypair()).unwrap(),
         "status": {"text":"Online","emoji":"🟢"},
         "otp": backup_code
     });
@@ -484,7 +484,7 @@ async fn auth_contract_returns_expected_fields() {
     ws2.send(Message::Text(
         json!({
             "t": "auth", "u": "auth-contract-check",
-            "pw": "test", "pk": pub_b64(&new_keypair()),
+            "pw": "test", "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"🟢"}
         })
         .to_string(),
@@ -522,7 +522,7 @@ async fn auth_contract_rejects_invalid_username() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "invalid user",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"🟢"}
         })
         .to_string(),
@@ -656,7 +656,7 @@ async fn auth_contract_rejects_sql_injection_like_username() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice' OR '1'='1",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"🟢"}
         })
         .to_string(),
@@ -692,7 +692,7 @@ async fn auth_contract_rejects_oversized_otp_input() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"🟢"},
             "otp": oversized_otp
         })
@@ -734,7 +734,7 @@ async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
         ws.send(Message::Text(
             json!({
                 "t": "auth", "u": "alice",
-                "pw": "test-password-hash", "pk": pub_b64(&new_keypair()),
+                "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
                 "status": {"text":"Online","emoji":"🟢"},
                 "otp": wrong_otp
             })
@@ -1045,21 +1045,22 @@ async fn schema_meta_contains_current_version() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-    assert_eq!(version, "2");
+    assert_eq!(version, "3");
 }
 
-/// Verifies that a server migrates a `v0` database to schema `v2` on startup.
+/// Verifies that a server migrates a `v0` database to schema `v3` on startup.
 ///
 /// Migration correctness is verified by:
 ///
-/// 1. Confirming `schema_meta.schema_version` is updated to `"2"`.
+/// 1. Confirming `schema_meta.schema_version` is updated to `"3"`.
 /// 2. Confirming the `events` table exists (created by `v1` migration).
 /// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
+/// 4. Confirming the `user_credentials` table exists (created by `v3` migration).
 ///
 /// All assertions are made directly against SQLite rather than through the
 /// server API to keep migration tests independent of server protocol changes.
 #[tokio::test]
-async fn schema_migrates_from_version_zero_to_two() {
+async fn schema_migrates_from_version_zero_to_current() {
     let seed_port = allocate_port();
     let db_path = temp_db_path(seed_port);
     seed_schema_version(&db_path, "0");
@@ -1068,7 +1069,7 @@ async fn schema_migrates_from_version_zero_to_two() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let conn = Connection::open(&db_path).expect("open migrated db");
-    assert_eq!(read_schema_version(&db_path), "2", "expected migration to set schema version to 2");
+    assert_eq!(read_schema_version(&db_path), "3", "expected migration to set schema version to 3");
 
     let events_exists: i64 = conn
         .query_row(
@@ -1087,6 +1088,15 @@ async fn schema_migrates_from_version_zero_to_two() {
         )
         .expect("query sqlite_master for user_2fa");
     assert_eq!(user_2fa_exists, 1, "user_2fa table should exist after migration");
+
+    let user_credentials_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_credentials'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for user_credentials");
+    assert_eq!(user_credentials_exists, 1, "user_credentials table should exist after migration");
 
     drop(server);
 }

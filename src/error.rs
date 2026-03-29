@@ -1,4 +1,8 @@
 //! Shared error types used across Chatify binaries.
+//!
+//! Error variants are deliberately granular so that callers (and clients
+//! receiving `err` frames) can distinguish between validation failures,
+//! authentication errors, and operational failures without parsing messages.
 
 use std::error::Error;
 use std::fmt;
@@ -13,7 +17,19 @@ pub enum ChatifyError {
     Json(Box<serde_json::Error>),
     Crypto(String),
     Validation(String),
+    /// Authentication failure (wrong credentials, missing 2FA, etc.).
+    /// Kept separate from [`Validation`] so clients can distinguish
+    /// "the request is malformed" from "the credentials are wrong".
+    Auth(String),
+    /// Rate-limit or connection-limit rejection.
+    /// Carries an optional retry-after hint in seconds.
+    RateLimit {
+        msg: String,
+        retry_after_secs: Option<u64>,
+    },
     Audio(String),
+    /// Database / persistence errors.
+    Database(String),
     Message(String),
 }
 
@@ -25,7 +41,15 @@ impl fmt::Display for ChatifyError {
             ChatifyError::Json(err) => write!(f, "json error: {}", err),
             ChatifyError::Crypto(msg) => write!(f, "crypto error: {}", msg),
             ChatifyError::Validation(msg) => write!(f, "validation error: {}", msg),
+            ChatifyError::Auth(msg) => write!(f, "auth error: {}", msg),
+            ChatifyError::RateLimit {
+                msg,
+                retry_after_secs: _,
+            } => {
+                write!(f, "rate limit: {}", msg)
+            }
             ChatifyError::Audio(msg) => write!(f, "audio error: {}", msg),
+            ChatifyError::Database(msg) => write!(f, "database error: {}", msg),
             ChatifyError::Message(msg) => write!(f, "{}", msg),
         }
     }
@@ -48,5 +72,11 @@ impl From<tokio_tungstenite::tungstenite::Error> for ChatifyError {
 impl From<serde_json::Error> for ChatifyError {
     fn from(value: serde_json::Error) -> Self {
         ChatifyError::Json(Box::new(value))
+    }
+}
+
+impl From<rusqlite::Error> for ChatifyError {
+    fn from(value: rusqlite::Error) -> Self {
+        ChatifyError::Database(format!("{}", value))
     }
 }

@@ -4,7 +4,7 @@
 //! file transfers, message editing, reactions, and user status tracking.
 
 use clicord_server::crypto::{
-    channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash,
+    channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash_client,
 };
 use clicord_server::error::{ChatifyError, ChatifyResult};
 use std::collections::{HashMap, VecDeque};
@@ -192,13 +192,8 @@ impl ClientState {
                 .users
                 .get(name)
                 .ok_or_else(|| ChatifyError::Validation(format!("user '{}' not found", name)))?;
-            let key = dh_key(&self.priv_key, pk);
-            if key.len() != 32 {
-                return Err(ChatifyError::Crypto(format!(
-                    "invalid public key for user '{}'",
-                    name
-                )));
-            }
+            let key = dh_key(&self.priv_key, pk)
+                .map_err(|e| ChatifyError::Crypto(format!("invalid public key for user '{}': {}", name, e)))?;
             self.dm_keys.insert(name.to_string(), key.clone());
             Ok(key)
         } else {
@@ -1012,7 +1007,8 @@ async fn main() -> ChatifyResult<()> {
 
     let password = rpassword::prompt_password("password: ")?;
     let client_priv_key = new_keypair();
-    let client_pub_key = pub_b64(&client_priv_key);
+    let client_pub_key = pub_b64(&client_priv_key)
+        .expect("generated keypair must produce valid public key");
 
     // Set up logging
     if log_enabled {
@@ -1030,7 +1026,7 @@ async fn main() -> ChatifyResult<()> {
     let auth_msg = serde_json::json!({
         "t": "auth",
         "u": username,
-        "pw": pw_hash(&password),
+        "pw": pw_hash_client(&password),
         "pk": client_pub_key,
         "status": {"text": "Online", "emoji": "🟢"}
     });
@@ -1176,7 +1172,13 @@ async fn main() -> ChatifyResult<()> {
                             }
                             {
                                 let encrypted = match state.dmkey(target) {
-                                    Ok(key) => enc_bytes(&key, msg.as_bytes()),
+                                    Ok(key) => match enc_bytes(&key, msg.as_bytes()) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            state.log("WARN", &format!("encryption failed: {}", e));
+                                            continue;
+                                        }
+                                    },
                                     Err(e) => {
                                         state.log("WARN", &format!("DM failed: {}", e));
                                         continue;
@@ -1194,7 +1196,13 @@ async fn main() -> ChatifyResult<()> {
                             if !action.is_empty() {
                                 let ch = state.ch.clone();
                                 let msg = format!("* {} {}", state.me, action);
-                                let encrypted = enc_bytes(&state.ckey(&ch), msg.as_bytes());
+                                let encrypted = match enc_bytes(&state.ckey(&ch), msg.as_bytes()) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        state.log("WARN", &format!("encryption failed: {}", e));
+                                        continue;
+                                    }
+                                };
                                 let encoded = general_purpose::STANDARD.encode(&encrypted);
                                 enqueue_timed(
                                     &state.ws_tx,
@@ -1322,7 +1330,13 @@ async fn main() -> ChatifyResult<()> {
                         (state.ch.clone(), state.pw.clone())
                     };
                     let key = channel_key(&pw, &channel);
-                    let encrypted = enc_bytes(&key, line.as_bytes());
+                    let encrypted = match enc_bytes(&key, line.as_bytes()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            state_clone2.lock().await.log("WARN", &format!("encryption failed: {}", e));
+                            continue;
+                        }
+                    };
                     let encoded = general_purpose::STANDARD.encode(&encrypted);
                     let state = state_clone2.lock().await;
                     enqueue_timed(

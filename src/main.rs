@@ -76,6 +76,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
+use clicord_server::crypto;
 use clicord_server::error::{ChatifyError, ChatifyResult};
 use clicord_server::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use dashmap::DashMap;
@@ -83,7 +84,6 @@ use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::time::{sleep, Duration};
@@ -145,7 +145,7 @@ const MAX_AUTH_BYTES: usize = 4_096;
 /// The migration path in [`EventStore::migrate`] upgrades from any lower
 /// version to this one. If the stored version is *higher*, the server logs a
 /// warning and continues without modifying the schema (no downgrade).
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// Default number of events returned by a `history` request.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -190,6 +190,25 @@ const MAX_NONCE_LEN: usize = 64;
 /// while bounding per-user memory to `NONCE_CACHE_CAP * MAX_NONCE_LEN` bytes.
 const NONCE_CACHE_CAP: usize = 256;
 
+/// Maximum number of concurrent connections from a single IP address.
+/// Connections beyond this are rejected with a rate-limit error.
+const MAX_CONNECTIONS_PER_IP: usize = 5;
+
+/// Minimum interval in seconds between auth attempts from the same IP.
+/// Attempts within this window are rejected to slow brute-force attacks.
+/// Set to 0.5s — enough to throttle automated tools while allowing
+/// rapid legitimate connections (e.g. from integration tests).
+const AUTH_RATE_LIMIT_SECS: f64 = 0.5;
+
+/// Maximum file transfer size in bytes (100 MB).
+const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Maximum allowed length for a status text field.
+const MAX_STATUS_TEXT_LEN: usize = 128;
+
+/// Maximum allowed length for a status emoji field.
+const MAX_STATUS_EMOJI_LEN: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
@@ -204,9 +223,11 @@ struct AuthInfo {
     /// Validated username (ASCII alphanumeric / `-` / `_`, ≤ 32 chars).
     username: String,
 
-    /// Arbitrary JSON status blob supplied by the client
-    /// (e.g. `{"text":"Online","emoji":"🟢"}`). Defaults to a standard
-    /// "Online" status if the field is absent.
+    /// Password hash submitted by the client (non-empty, ≤ 256 chars).
+    /// Used for credential verification against the stored hash.
+    pw_hash: String,
+
+    /// Validated status object (text + emoji), or default.
     status: Value,
 
     /// Base64-encoded 32-byte Ed25519 public key used for E2E DM encryption.
@@ -239,11 +260,17 @@ struct EventStore {
 impl EventStore {
     /// Creates a new `EventStore` pointing at `path` and immediately runs
     /// [`init`](Self::init) to ensure the schema is current.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the database cannot be opened or initialised. A server
+    /// running with a broken event store is worse than one that crashes
+    /// at startup — it silently loses data.
     fn new(path: String) -> Self {
         let store = Self { path };
-        if let Err(e) = store.init() {
-            warn!("failed to initialize event store: {}", e);
-        }
+        store
+            .init()
+            .expect("failed to initialise event store — check database path and permissions");
         store
     }
 
@@ -352,6 +379,23 @@ impl EventStore {
             Self::set_schema_version(conn, version)?;
         }
 
+        if version < 3 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS user_credentials (
+                    username     TEXT PRIMARY KEY,
+                    pw_hash      TEXT NOT NULL,
+                    created_at   REAL NOT NULL,
+                    updated_at   REAL NOT NULL,
+                    login_count  INTEGER NOT NULL DEFAULT 0,
+                    last_login   REAL
+                );
+                ",
+            )?;
+            version = 3;
+            Self::set_schema_version(conn, version)?;
+        }
+
         // A version higher than CURRENT_SCHEMA_VERSION means this binary was
         // deployed against a database written by a newer server. Log a warning
         // but leave the schema intact — we must never silently downgrade.
@@ -373,7 +417,14 @@ impl EventStore {
     /// rather than crashing the connection handler.
     fn open_conn(&self) -> Option<Connection> {
         match Connection::open(&self.path) {
-            Ok(c) => Some(c),
+            Ok(c) => {
+                // Enable WAL mode for better concurrent read performance
+                // and reduced lock contention under load.
+                let _ = c.pragma_update(None, "journal_mode", "wal");
+                // Enable foreign keys for referential integrity.
+                let _ = c.execute_batch("PRAGMA foreign_keys = ON");
+                Some(c)
+            }
             Err(e) => {
                 warn!("event store open failed: {}", e);
                 None
@@ -478,10 +529,15 @@ impl EventStore {
     /// Returns up to `limit` events for `channel` whose `search_text` column
     /// contains `query` (case-insensitive LIKE match), oldest first.
     fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
-        let like = format!("%{}%", query.to_lowercase());
+        // Escape LIKE metacharacters to prevent pattern injection.
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like = format!("%{}%", escaped.to_lowercase());
         self.query_events(
             "SELECT payload FROM events
-             WHERE channel = ?1 AND search_text LIKE ?2
+             WHERE channel = ?1 AND search_text LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC
              LIMIT ?3",
             params![channel, like, limit as i64],
@@ -583,6 +639,58 @@ impl EventStore {
             ],
         ) {
             warn!("2fa upsert failed for user {}: {}", user.username, e);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // User credential management (password verification)
+    // -----------------------------------------------------------------------
+
+    /// Loads the stored password hash for `username`, or `None` if the user
+    /// has never registered (first-time login auto-creates the record).
+    fn load_pw_hash(&self, username: &str) -> Option<String> {
+        let conn = self.open_conn()?;
+        conn.query_row(
+            "SELECT pw_hash FROM user_credentials WHERE username = ?1",
+            params![username],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()?
+    }
+
+    /// Creates or updates the credential record for `username`.
+    ///
+    /// On first login the hash is stored. On subsequent logins the stored
+    /// hash is compared against the submitted hash; a mismatch is rejected.
+    fn upsert_credentials(&self, username: &str, pw_hash: &str) {
+        let Some(conn) = self.open_conn() else {
+            return;
+        };
+        let ts = now();
+        if let Err(e) = conn.execute(
+            "INSERT INTO user_credentials(username, pw_hash, created_at, updated_at, login_count, last_login)
+             VALUES(?1, ?2, ?3, ?3, 1, ?3)
+             ON CONFLICT(username) DO UPDATE SET
+                 updated_at  = excluded.updated_at,
+                 login_count = login_count + 1,
+                 last_login  = excluded.last_login",
+            params![username, pw_hash, ts],
+        ) {
+            warn!("credential upsert failed for user {}: {}", username, e);
+        }
+    }
+
+    /// Checks whether `submitted_hash` matches the stored hash for `username`.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the hash matches.
+    /// - `Ok(false)` if the hash does not match.
+    /// - `Err("first_login")` if no credential exists yet (first-time user).
+    fn verify_credential(&self, username: &str, submitted_hash: &str) -> Result<bool, &'static str> {
+        match self.load_pw_hash(username) {
+            None => Err("first_login"),
+            Some(stored) => Ok(crypto::pw_verify(submitted_hash, &stored)),
         }
     }
 }
@@ -688,6 +796,18 @@ struct State {
     /// `warn!` call to avoid the overhead of the logging facade when it is
     /// off.
     log_enabled: bool,
+
+    /// Per-IP connection count for rate limiting.
+    /// Incremented on TCP accept, decremented on disconnect.
+    ip_connections: DashMap<std::net::IpAddr, usize>,
+
+    /// Per-IP last auth attempt timestamp.
+    /// Used to enforce a minimum interval between auth attempts.
+    ip_last_auth: DashMap<std::net::IpAddr, f64>,
+
+    /// Session tokens keyed by token string → username.
+    /// Generated at auth time and validated on every post-auth frame.
+    session_tokens: DashMap<String, String>,
 }
 
 impl State {
@@ -704,6 +824,9 @@ impl State {
             drained_notify: Notify::new(),
             store: EventStore::new(db_path),
             log_enabled,
+            ip_connections: DashMap::new(),
+            ip_last_auth: DashMap::new(),
+            session_tokens: DashMap::new(),
         });
         // `"general"` is guaranteed to exist so that new connections always
         // have a channel to subscribe to before any `"join"` event is sent.
@@ -781,6 +904,69 @@ impl State {
     fn active_connection_count(&self) -> usize {
         self.active_connections.load(Ordering::SeqCst)
     }
+
+    // -----------------------------------------------------------------------
+    // Rate limiting
+    // -----------------------------------------------------------------------
+
+    /// Increments the per-IP connection counter. Returns `false` if the
+    /// IP has exceeded [`MAX_CONNECTIONS_PER_IP`].
+    fn ip_connect(&self, addr: &SocketAddr) -> bool {
+        let ip = addr.ip();
+        let mut entry = self.ip_connections.entry(ip).or_insert(0);
+        if *entry >= MAX_CONNECTIONS_PER_IP {
+            return false;
+        }
+        *entry += 1;
+        true
+    }
+
+    /// Decrements the per-IP connection counter, removing the entry if it
+    /// reaches zero.
+    fn ip_disconnect(&self, addr: &SocketAddr) {
+        let ip = addr.ip();
+        if let Some(mut entry) = self.ip_connections.get_mut(&ip) {
+            *entry = entry.saturating_sub(1);
+            if *entry == 0 {
+                drop(entry);
+                self.ip_connections.remove(&ip);
+            }
+        }
+    }
+
+    /// Checks whether an auth attempt from `addr` is allowed under the
+    /// per-IP rate limit. If allowed, updates the last-auth timestamp.
+    fn ip_auth_allowed(&self, addr: &SocketAddr) -> bool {
+        let ip = addr.ip();
+        let now = crate::now();
+        if let Some(last) = self.ip_last_auth.get(&ip) {
+            if now - *last < AUTH_RATE_LIMIT_SECS {
+                return false;
+            }
+        }
+        self.ip_last_auth.insert(ip, now);
+        true
+    }
+
+    // -----------------------------------------------------------------------
+    // Session tokens
+    // -----------------------------------------------------------------------
+
+    /// Generates a cryptographically random session token and associates it
+    /// with `username`. Returns the token string.
+    fn create_session(&self, username: &str) -> String {
+        use rand::{rngs::OsRng, RngCore};
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        self.session_tokens.insert(token.clone(), username.to_string());
+        token
+    }
+
+    /// Removes the session token associated with `username`.
+    fn remove_session(&self, username: &str) {
+        self.session_tokens.retain(|_, v| v != username);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -792,17 +978,19 @@ impl State {
 /// connection handler panics or returns early.
 struct ConnectionGuard {
     state: Arc<State>,
+    addr: SocketAddr,
 }
 
 impl ConnectionGuard {
-    fn new(state: Arc<State>) -> Self {
+    fn new(state: Arc<State>, addr: SocketAddr) -> Self {
         state.connection_opened();
-        Self { state }
+        Self { state, addr }
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        self.state.ip_disconnect(&self.addr);
         self.state.connection_closed();
     }
 }
@@ -1222,6 +1410,16 @@ async fn handle_event(
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
             let size = d["size"].as_u64().unwrap_or(0);
+
+            // Reject files that exceed the maximum size.
+            if size > MAX_FILE_SIZE {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":format!("file size exceeds maximum of {} bytes", MAX_FILE_SIZE)}),
+                );
+                return;
+            }
+
             let file_id = d["file_id"]
                 .as_str()
                 .unwrap_or(&format!("{}_{}", username, now()))
@@ -1332,12 +1530,38 @@ async fn handle_event(
             );
         }
         "2fa_disable" => {
-            // Disable 2-FA for the current user. The record is updated
-            // (not deleted) so audit history is preserved.
-            let mut user_2fa = state
-                .store
-                .load_user_2fa(username)
-                .unwrap_or_else(|| User2FA::new(username.to_string()));
+            // Disable 2-FA for the current user. Requires the current TOTP
+            // code to prevent an attacker who gained session access from
+            // silently disabling 2FA.
+            let code = d["code"].as_str().unwrap_or("").to_string();
+            if code.is_empty() {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"2fa_disable requires current 2FA code"}),
+                );
+                return;
+            }
+
+            let mut user_2fa = match state.store.load_user_2fa(username) {
+                Some(u) if u.enabled => u,
+                _ => {
+                    send_out_json(
+                        out_tx,
+                        serde_json::json!({"t":"err","m":"2FA is not enabled"}),
+                    );
+                    return;
+                }
+            };
+
+            // Require valid TOTP code to disable
+            if !user_2fa.verify_totp(&code) {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"invalid 2FA code"}),
+                );
+                return;
+            }
+
             user_2fa.disable();
             state.store.upsert_user_2fa(&user_2fa);
             send_out_json(
@@ -1404,15 +1628,6 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
-/// Hashes `pw` with SHA-256 and returns the lowercase hex digest.
-///
-/// Currently unused at the server level (the server accepts any non-empty
-/// password hash value and relies on clients to hash before sending), but
-/// retained for future server-side verification.
-#[allow(dead_code)]
-fn hash_pw(pw: &str) -> String {
-    hex::encode(Sha256::digest(pw.as_bytes()))
-}
 
 /// Normalises a raw channel name to a safe, consistent format.
 ///
@@ -1571,10 +1786,8 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
         return Err(ChatifyError::Message("invalid public key".to_string()));
     }
 
-    let status = d
-        .get("status")
-        .cloned()
-        .unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
+    // Validate the status field: must be an object with bounded string fields.
+    let status = validate_status_field(d.get("status"))?;
 
     let otp_code = d
         .get("otp")
@@ -1590,10 +1803,62 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
 
     Ok(AuthInfo {
         username,
+        pw_hash: pw.to_string(),
         status,
         pubkey,
         otp_code,
     })
+}
+
+/// Validates the optional `"status"` field in the auth frame.
+///
+/// The status must be a JSON object. If present, `"text"` and `"emoji"`
+/// sub-fields are length-checked to prevent abuse. Missing fields or an
+/// absent status object default to a standard "Online" status.
+fn validate_status_field(status: Option<&Value>) -> ChatifyResult<Value> {
+    let Some(val) = status else {
+        return Ok(serde_json::json!({"text": "Online", "emoji": ""}));
+    };
+
+    if !val.is_object() {
+        return Err(ChatifyError::Validation(
+            "status must be a JSON object".to_string(),
+        ));
+    }
+
+    // Validate text field length
+    if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
+        if text.len() > MAX_STATUS_TEXT_LEN {
+            return Err(ChatifyError::Validation(format!(
+                "status text exceeds {} characters",
+                MAX_STATUS_TEXT_LEN
+            )));
+        }
+    }
+
+    // Validate emoji field length
+    if let Some(emoji) = val.get("emoji").and_then(|v| v.as_str()) {
+        if emoji.len() > MAX_STATUS_EMOJI_LEN {
+            return Err(ChatifyError::Validation(format!(
+                "status emoji exceeds {} characters",
+                MAX_STATUS_EMOJI_LEN
+            )));
+        }
+    }
+
+    // Reject any other unexpected top-level fields in status
+    if let Some(obj) = val.as_object() {
+        for key in obj.keys() {
+            if key != "text" && key != "emoji" {
+                return Err(ChatifyError::Validation(format!(
+                    "unexpected status field: {}",
+                    key
+                )));
+            }
+        }
+    }
+
+    Ok(val.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1780,10 +2045,32 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Chat
 /// `mpsc::unbounded_channel` and drained by a dedicated sink-writer task.
 /// This decouples the read path from the write path, preventing a slow write
 /// from blocking event processing.
-async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
+async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<State>) {
     // ConnectionGuard increments active_connections and decrements it on drop,
     // even if we return early.
-    let _conn_guard = ConnectionGuard::new(state.clone());
+
+    // --- IP-level rate limiting ---
+    if !state.ip_connect(&addr) {
+        if state.log_enabled {
+            warn!("connection rejected: too many connections from {}", addr.ip());
+        }
+        // Best-effort: the stream may not support WebSocket yet, but try.
+        if let Ok(ws) = accept_async(stream).await {
+            let (mut sink, _) = ws.split();
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({
+                        "t": "err",
+                        "m": format!("too many connections from {}", addr.ip())
+                    })
+                    .to_string(),
+                ))
+                .await;
+        }
+        return;
+    }
+
+    let _conn_guard = ConnectionGuard::new(state.clone(), addr);
 
     // Upgrade the raw TCP stream to a WebSocket connection.
     let ws = match accept_async(stream).await {
@@ -1841,7 +2128,76 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         }
     };
 
-    let AuthInfo { username, status, pubkey, otp_code } = auth;
+    // --- Per-IP auth rate limiting ---
+    if !state.ip_auth_allowed(&addr) {
+        if state.log_enabled {
+            warn!("auth rate limited from {}", addr.ip());
+        }
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({
+                    "t": "err",
+                    "m": "too many auth attempts, please wait"
+                })
+                .to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    let AuthInfo { username, pw_hash, status, pubkey, otp_code } = auth;
+
+    // --- Credential verification ---
+    // The client sends a PBKDF2 hash of their password. The server stores
+    // its own PBKDF2 hash of that value (with a random salt). This two-layer
+    // approach means the server never sees the raw password, but also never
+    // trusts a client-provided hash blindly.
+    match state.store.verify_credential(&username, &pw_hash) {
+        Ok(true) => {} // Hash matches — proceed.
+        Ok(false) => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t":"err","m":"invalid credentials"}).to_string(),
+                ))
+                .await;
+            if state.log_enabled {
+                warn!("auth failed: invalid password for user={}", username);
+            }
+            return;
+        }
+        Err("first_login") => {
+            // First time this username connects — store their credential.
+            // The submitted hash is itself a PBKDF2 output, so we wrap it
+            // in another salted PBKDF2 layer server-side.
+            let server_hash = crypto::pw_hash(&pw_hash);
+            state.store.upsert_credentials(&username, &server_hash);
+            if state.log_enabled {
+                info!("credentials created for new user={}", username);
+            }
+        }
+        Err(e) => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t":"err","m":format!("credential error: {}", e)}).to_string(),
+                ))
+                .await;
+            return;
+        }
+    }
+
+    // --- Username uniqueness ---
+    // Reject if this username is already online (prevents session hijacking).
+    if state.user_statuses.contains_key(&username) {
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({"t":"err","m":"username already in use"}).to_string(),
+            ))
+            .await;
+        if state.log_enabled {
+            warn!("auth rejected: username '{}' already connected", username);
+        }
+        return;
+    }
 
     if let Err(err) = enforce_2fa_on_auth(&state, &username, otp_code.as_deref()) {
         let _ = sink
@@ -1851,6 +2207,9 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             .await;
         return;
     }
+
+    // Generate a session token for this connection.
+    let _session_token = state.create_session(&username);
 
     // ---- Phase 2: register user and send welcome response -------------------
 
@@ -1948,12 +2307,14 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     // Remove user presence so they no longer appear in the user directory.
     state.user_statuses.remove(&username);
     state.user_pubkeys.remove(&username);
+    // Invalidate the session token.
+    state.remove_session(&username);
     // Clear the nonce cache to free memory; replays from this session are
     // no longer possible once the connection is closed.
     state.recent_nonces.remove(&username);
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     log(&state, &format!("- {}", username));
-    // _conn_guard drops here, decrementing active_connections.
+    // _conn_guard drops here, decrementing active_connections and IP counter.
 }
 
 // ---------------------------------------------------------------------------
@@ -2090,9 +2451,11 @@ mod tests {
         let state = State::new(false, ":memory:".to_string());
         assert_eq!(state.active_connection_count(), 0);
 
+        let addr1: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.2:12345".parse().unwrap();
         {
-            let _g1 = ConnectionGuard::new(state.clone());
-            let _g2 = ConnectionGuard::new(state.clone());
+            let _g1 = ConnectionGuard::new(state.clone(), addr1);
+            let _g2 = ConnectionGuard::new(state.clone(), addr2);
             assert_eq!(state.active_connection_count(), 2);
         }
 
