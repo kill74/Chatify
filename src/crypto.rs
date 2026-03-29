@@ -11,14 +11,13 @@ use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
+/// Maximum allowed plaintext length for encryption (10 MB).
+const MAX_PLAINTEXT_LEN: usize = 10 * 1024 * 1024;
 
-fn cipher_from_key(key: &[u8]) -> Option<ChaCha20Poly1305> {
-    use generic_array::GenericArray;
-    let key_arr: [u8; 32] = key.try_into().ok()?;
-    let key_ga = GenericArray::from(key_arr);
-    Some(ChaCha20Poly1305::new(&key_ga))
-}
+/// Maximum allowed ciphertext length for decryption (10 MB + overhead).
+const MAX_CIPHERTEXT_LEN: usize = 10 * 1024 * 1024 + 28; // 28 bytes overhead for nonce + tag
 
 /// Derive a channel-specific encryption key using PBKDF2.
 ///
@@ -31,7 +30,7 @@ pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
         120_000,
         &mut key,
     )
-    .expect("PBKDF2 output size must be valid");
+    .expect("PBKDF2 with 32-byte output should always succeed");
     key.to_vec()
 }
 
@@ -40,13 +39,25 @@ pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
 /// Returns an error string on any failure (bad key length, invalid base64,
 /// or decode failure) instead of returning an empty vector.
 pub fn dh_key(priv_key: &[u8], pubkey_b64: &str) -> Result<Vec<u8>, String> {
+    if priv_key.len() != 32 {
+        return Err("private key must be exactly 32 bytes".to_string());
+    }
+
     let priv_arr: [u8; 32] = priv_key
         .try_into()
         .map_err(|_| "private key must be exactly 32 bytes".to_string())?;
 
+    if pubkey_b64.is_empty() || pubkey_b64.len() > 256 {
+        return Err("invalid public key length".to_string());
+    }
+
     let peer_pub_raw = general_purpose::STANDARD
         .decode(pubkey_b64)
         .map_err(|e| format!("invalid base64 public key: {}", e))?;
+
+    if peer_pub_raw.len() != 32 {
+        return Err("decoded public key must be exactly 32 bytes".to_string());
+    }
 
     let peer_pub_arr: [u8; 32] = peer_pub_raw
         .as_slice()
@@ -69,13 +80,33 @@ pub fn dh_key(priv_key: &[u8], pubkey_b64: &str) -> Result<Vec<u8>, String> {
 /// The nonce (12 bytes) is prepended to the ciphertext.
 /// Returns `Err` on encryption failure — callers must propagate this.
 pub fn enc_bytes(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    // Validate inputs
+    if key.len() != 32 {
+        return Err("encryption key must be exactly 32 bytes".to_string());
+    }
+    if plaintext.is_empty() {
+        return Err("plaintext cannot be empty".to_string());
+    }
+    if plaintext.len() > MAX_PLAINTEXT_LEN {
+        return Err(format!(
+            "plaintext exceeds maximum size of {} bytes",
+            MAX_PLAINTEXT_LEN
+        ));
+    }
+
     use chacha20poly1305::Nonce;
     let nonce_bytes = chacha20_nonce();
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher = cipher_from_key(key).ok_or_else(|| "key must be 32 bytes".to_string())?;
+
+    let key_arr: [u8; 32] = key
+        .try_into()
+        .map_err(|_| "key must be 32 bytes".to_string())?;
+    let cipher = ChaCha20Poly1305::new(&key_arr.into());
+
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
         .map_err(|e| format!("encryption failure: {}", e))?;
+
     let mut combined = nonce_bytes.to_vec();
     combined.extend_from_slice(&ciphertext);
     Ok(combined)
@@ -83,13 +114,29 @@ pub fn enc_bytes(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decrypt data using ChaCha20Poly1305.
 pub fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::Nonce;
+    // Validate inputs
+    if key.len() != 32 {
+        return Err("decryption key must be exactly 32 bytes".to_string());
+    }
     if ciphertext.len() < 12 {
         return Err("ciphertext too short".to_string());
     }
+    if ciphertext.len() > MAX_CIPHERTEXT_LEN {
+        return Err(format!(
+            "ciphertext exceeds maximum size of {} bytes",
+            MAX_CIPHERTEXT_LEN
+        ));
+    }
+
+    use chacha20poly1305::Nonce;
     let (nonce_bytes, ciphertext_data) = ciphertext.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    let cipher = cipher_from_key(key).ok_or_else(|| "key must be 32 bytes".to_string())?;
+
+    let key_arr: [u8; 32] = key
+        .try_into()
+        .map_err(|_| "key must be 32 bytes".to_string())?;
+    let cipher = ChaCha20Poly1305::new(&key_arr.into());
+
     cipher
         .decrypt(nonce, ciphertext_data)
         .map_err(|e| format!("decryption failure: {}", e))
@@ -115,7 +162,14 @@ pub fn cha_cha20_nonce() -> [u8; 12] {
 /// because the server-side hashing provides the real per-user protection.
 ///
 /// Returns a lowercase hex string.
-pub fn pw_hash_client(password: &str) -> String {
+pub fn pw_hash_client(password: &str) -> Result<String, String> {
+    if password.is_empty() {
+        return Err("password cannot be empty".to_string());
+    }
+    if password.len() > 1024 {
+        return Err("password exceeds maximum length".to_string());
+    }
+
     let mut hash = [0u8; 32];
     pbkdf2::<Hmac<Sha256>>(
         password.as_bytes(),
@@ -123,8 +177,8 @@ pub fn pw_hash_client(password: &str) -> String {
         120_000,
         &mut hash,
     )
-    .expect("PBKDF2 output size must be valid");
-    hex::encode(hash)
+    .expect("PBKDF2 with 32-byte output should always succeed");
+    Ok(hex::encode(hash))
 }
 
 /// Hash a password using PBKDF2 with SHA256 and a random per-user salt.
@@ -141,7 +195,7 @@ pub fn pw_hash(password: &str) -> String {
 pub fn pw_hash_with_salt(password: &str, salt: &[u8]) -> String {
     let mut hash = [0u8; 32];
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 120_000, &mut hash)
-        .expect("PBKDF2 output size must be valid");
+        .expect("PBKDF2 with 32-byte output should always succeed");
     format!("{}${}", hex::encode(salt), hex::encode(hash))
 }
 
@@ -166,11 +220,10 @@ pub fn pw_verify(password: &str, stored: &str) -> bool {
     if actual_hash_hex.len() != expected_hash_hex.len() {
         return false;
     }
-    let mut diff: u8 = 0;
-    for (a, b) in actual_hash_hex.bytes().zip(expected_hash_hex.bytes()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    actual_hash_hex
+        .as_bytes()
+        .ct_eq(expected_hash_hex.as_bytes())
+        .into()
 }
 
 /// Generate a new X25519 private key (32 bytes).
@@ -184,10 +237,86 @@ pub fn new_keypair() -> Vec<u8> {
 ///
 /// Returns an error string if the private key is not exactly 32 bytes.
 pub fn pub_b64(priv_key: &[u8]) -> Result<String, String> {
+    if priv_key.len() != 32 {
+        return Err("private key must be exactly 32 bytes".to_string());
+    }
     let priv_arr: [u8; 32] = priv_key
         .try_into()
         .map_err(|_| "private key must be exactly 32 bytes".to_string())?;
     let secret = StaticSecret::from(priv_arr);
     let public = PublicKey::from(&secret);
     Ok(general_purpose::STANDARD.encode(public.as_bytes()))
+}
+
+/// Constant-time comparison of two byte slices.
+///
+/// Returns `true` if the slices are equal, `false` otherwise.
+/// This function executes in constant time regardless of where the
+/// first difference occurs, preventing timing side-channel attacks.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
+}
+
+/// Securely compare two strings in constant time.
+///
+/// Returns `true` if the strings are equal, `false` otherwise.
+pub fn secure_string_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"hello", b"hell"));
+        assert!(!constant_time_eq(b"", b"hello"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_secure_string_eq() {
+        assert!(secure_string_eq("hello", "hello"));
+        assert!(!secure_string_eq("hello", "world"));
+        assert!(secure_string_eq("", ""));
+    }
+
+    #[test]
+    fn test_pw_hash_client_validation() {
+        assert!(pw_hash_client("").is_err());
+        assert!(pw_hash_client("valid_password").is_ok());
+    }
+
+    #[test]
+    fn test_enc_dec_roundtrip() {
+        let key = new_keypair();
+        let plaintext = b"test message";
+        let encrypted = enc_bytes(&key, plaintext).unwrap();
+        let decrypted = dec_bytes(&key, &encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_enc_rejects_empty_plaintext() {
+        let key = new_keypair();
+        assert!(enc_bytes(&key, b"").is_err());
+    }
+
+    #[test]
+    fn test_enc_rejects_invalid_key() {
+        assert!(enc_bytes(&[0u8; 31], b"test").is_err());
+        assert!(enc_bytes(&[0u8; 33], b"test").is_err());
+    }
+
+    #[test]
+    fn test_dh_key_validation() {
+        let priv_key = new_keypair();
+        let pub_key = pub_b64(&priv_key).unwrap();
+        assert!(dh_key(&priv_key, &pub_key).is_ok());
+        assert!(dh_key(&priv_key, "invalid-base64").is_err());
+        assert!(dh_key(&[0u8; 31], &pub_key).is_err());
+    }
 }

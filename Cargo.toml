@@ -54,6 +54,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 rustls = "0.22"
 rustls-pemfile = "2"
 tokio-rustls = "0.25"
+subtle = "2.6"
+zeroize = { version = "1.7", features = ["derive"] }
 
 [profile.release]
 opt-level = 3

@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 use base64::{self, engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -1006,7 +1007,7 @@ async fn main() -> ChatifyResult<()> {
 
     let username = read_username()?;
 
-    let password = rpassword::prompt_password("password: ")?;
+    let mut password = rpassword::prompt_password("password: ")?;
     let client_priv_key = new_keypair();
     let client_pub_key =
         pub_b64(&client_priv_key).expect("generated keypair must produce valid public key");
@@ -1023,11 +1024,22 @@ async fn main() -> ChatifyResult<()> {
     println!("Connected to server");
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
+    // Hash password and immediately zeroize the plaintext
+    let pw_hash = match pw_hash_client(&password) {
+        Ok(hash) => hash,
+        Err(e) => {
+            error!("Password hashing failed: {}", e);
+            password.zeroize();
+            return Ok(());
+        }
+    };
+    password.zeroize();
+
     // Authenticate
     let auth_msg = serde_json::json!({
         "t": "auth",
         "u": username,
-        "pw": pw_hash_client(&password),
+        "pw": pw_hash,
         "pk": client_pub_key,
         "status": {"text": "Online", "emoji": "🟢"}
     });

@@ -80,3 +80,21 @@ impl From<rusqlite::Error> for ChatifyError {
         ChatifyError::Database(format!("{}", value))
     }
 }
+
+impl From<base64::DecodeError> for ChatifyError {
+    fn from(value: base64::DecodeError) -> Self {
+        ChatifyError::Validation(format!("base64 decode error: {}", value))
+    }
+}
+
+impl From<hex::FromHexError> for ChatifyError {
+    fn from(value: hex::FromHexError) -> Self {
+        ChatifyError::Validation(format!("hex decode error: {}", value))
+    }
+}
+
+impl From<std::string::FromUtf8Error> for ChatifyError {
+    fn from(value: std::string::FromUtf8Error) -> Self {
+        ChatifyError::Validation(format!("UTF-8 decode error: {}", value))
+    }
+}

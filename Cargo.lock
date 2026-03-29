@@ -447,11 +447,13 @@ dependencies = [
  "serde_json",
  "serenity",
  "sha2",
+ "subtle",
  "tokio",
  "tokio-rustls 0.25.0",
  "tokio-tungstenite",
  "tungstenite 0.21.0",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

@@ -44,6 +44,7 @@ use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use clicord_server::crypto::{new_keypair, pub_b64};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
@@ -142,6 +143,14 @@ fn seed_schema_version(db_path: &PathBuf, version: &str) {
     .expect("update schema version");
 }
 
+/// Hash a backup code for secure storage (matching totp.rs implementation)
+fn hash_backup_code(code: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"chatify:backup:v1:");
+    hasher.update(code.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Seeds a user record in `user_2fa` with 2-FA **already enabled** and a set
 /// of hashed backup codes.
 ///
@@ -154,9 +163,8 @@ fn seed_schema_version(db_path: &PathBuf, version: &str) {
 /// * `db_path`      – Absolute path to the target SQLite file.
 /// * `username`     – The username to seed (must satisfy the server's username
 ///                    validation rules).
-/// * `backup_codes` – Raw backup code strings. These are stored as a JSON
-///                    array; the server is expected to consume (delete) a code
-///                    upon successful use.
+/// * `backup_codes` – Raw backup code strings. These are hashed before storage
+///                    to match the server's security model.
 fn seed_enabled_2fa_user(db_path: &PathBuf, username: &str, backup_codes: &[&str]) {
     let conn = Connection::open(db_path).expect("create sqlite db for 2fa seed");
     conn.execute_batch(
@@ -181,8 +189,13 @@ fn seed_enabled_2fa_user(db_path: &PathBuf, username: &str, backup_codes: &[&str
     )
     .expect("create schema and user_2fa tables for seed");
 
+    // Hash the backup codes before storing (matching totp.rs security model)
+    let hashed_codes: Vec<String> = backup_codes
+        .iter()
+        .map(|code| hash_backup_code(code))
+        .collect();
     let backup_codes_json =
-        serde_json::to_string(&backup_codes).expect("serialize backup codes for seed");
+        serde_json::to_string(&hashed_codes).expect("serialize backup codes for seed");
 
     conn.execute(
         "INSERT INTO user_2fa(username, enabled, secret, backup_codes, enabled_at, last_verified)
