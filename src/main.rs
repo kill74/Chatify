@@ -91,12 +91,10 @@ use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
-    accept_async,
-    accept_hdr_async,
+    accept_async, accept_hdr_async,
     tungstenite::{
         handshake::server::{Callback, Request, Response},
-        http,
-        Message,
+        http, Message,
     },
 };
 
