@@ -162,9 +162,9 @@ fn hash_backup_code(code: &str) -> String {
 ///
 /// * `db_path`      – Absolute path to the target SQLite file.
 /// * `username`     – The username to seed (must satisfy the server's username
-///                    validation rules).
+///   validation rules).
 /// * `backup_codes` – Raw backup code strings. These are hashed before storage
-///                    to match the server's security model.
+///   to match the server's security model.
 fn seed_enabled_2fa_user(db_path: &PathBuf, username: &str, backup_codes: &[&str]) {
     let conn = Connection::open(db_path).expect("create sqlite db for 2fa seed");
     conn.execute_batch(
