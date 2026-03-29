@@ -192,8 +192,9 @@ impl ClientState {
                 .users
                 .get(name)
                 .ok_or_else(|| ChatifyError::Validation(format!("user '{}' not found", name)))?;
-            let key = dh_key(&self.priv_key, pk)
-                .map_err(|e| ChatifyError::Crypto(format!("invalid public key for user '{}': {}", name, e)))?;
+            let key = dh_key(&self.priv_key, pk).map_err(|e| {
+                ChatifyError::Crypto(format!("invalid public key for user '{}': {}", name, e))
+            })?;
             self.dm_keys.insert(name.to_string(), key.clone());
             Ok(key)
         } else {
@@ -1007,8 +1008,8 @@ async fn main() -> ChatifyResult<()> {
 
     let password = rpassword::prompt_password("password: ")?;
     let client_priv_key = new_keypair();
-    let client_pub_key = pub_b64(&client_priv_key)
-        .expect("generated keypair must produce valid public key");
+    let client_pub_key =
+        pub_b64(&client_priv_key).expect("generated keypair must produce valid public key");
 
     // Set up logging
     if log_enabled {
@@ -1333,7 +1334,10 @@ async fn main() -> ChatifyResult<()> {
                     let encrypted = match enc_bytes(&key, line.as_bytes()) {
                         Ok(v) => v,
                         Err(e) => {
-                            state_clone2.lock().await.log("WARN", &format!("encryption failed: {}", e));
+                            state_clone2
+                                .lock()
+                                .await
+                                .log("WARN", &format!("encryption failed: {}", e));
                             continue;
                         }
                     };

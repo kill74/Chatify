@@ -237,9 +237,12 @@ async fn start_server_with_db(db_path: PathBuf) -> TestServer {
         .expect("CARGO_BIN_EXE_clicord-server must be set by cargo test");
 
     let child = Command::new(server_bin)
-        .arg("--host").arg("127.0.0.1")
-        .arg("--port").arg(port.to_string())
-        .arg("--db").arg(db_path.to_string_lossy().to_string())
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--db")
+        .arg(db_path.to_string_lossy().to_string())
         // Suppress server stdout/stderr to keep test output clean. To debug a
         // flaky test, swap Stdio::null() for Stdio::inherit() temporarily.
         .stdout(Stdio::null())
@@ -259,7 +262,11 @@ async fn start_server_with_db(db_path: PathBuf) -> TestServer {
     }
     assert!(ready, "server did not start in time at {}", url);
 
-    TestServer { _child: child, url, db_path }
+    TestServer {
+        _child: child,
+        url,
+        db_path,
+    }
 }
 
 /// Convenience wrapper around [`start_server_with_db`] that allocates a fresh
@@ -494,7 +501,10 @@ async fn auth_contract_returns_expected_fields() {
 
     let ok = recv_by_type(&mut ws2, "ok").await;
     assert_eq!(ok.get("t").and_then(|v| v.as_str()), Some("ok"));
-    assert_eq!(ok.get("u").and_then(|v| v.as_str()), Some("auth-contract-check"));
+    assert_eq!(
+        ok.get("u").and_then(|v| v.as_str()),
+        Some("auth-contract-check")
+    );
     assert!(ok.get("channels").and_then(|v| v.as_array()).is_some());
     assert!(ok.get("hist").and_then(|v| v.as_array()).is_some());
 
@@ -502,7 +512,10 @@ async fn auth_contract_returns_expected_fields() {
         .get("users")
         .and_then(|v| v.as_array())
         .expect("users must be an array");
-    assert!(!users.is_empty(), "users array should include at least self");
+    assert!(
+        !users.is_empty(),
+        "users array should include at least self"
+    );
     for user in users {
         assert!(user.get("u").and_then(|v| v.as_str()).is_some());
         assert!(user.get("pk").and_then(|v| v.as_str()).is_some());
@@ -790,9 +803,9 @@ async fn users_contract_returns_user_objects_with_public_keys() {
     assert!(users.len() >= 2, "expected at least alice and bob");
     for user in users {
         let name = user.get("u").and_then(|v| v.as_str()).unwrap_or_default();
-        let pk   = user.get("pk").and_then(|v| v.as_str()).unwrap_or_default();
+        let pk = user.get("pk").and_then(|v| v.as_str()).unwrap_or_default();
         assert!(!name.is_empty(), "username must be non-empty");
-        assert!(!pk.is_empty(),   "public key must be non-empty");
+        assert!(!pk.is_empty(), "public key must be non-empty");
     }
 }
 
@@ -831,8 +844,11 @@ async fn msg_contract_roundtrips_channel_payload() {
 
     let msg = recv_by_type(&mut alice, "msg").await;
     assert_eq!(msg.get("ch").and_then(|v| v.as_str()), Some("general"));
-    assert_eq!(msg.get("u").and_then(|v| v.as_str()),  Some("alice"));
-    assert_eq!(msg.get("c").and_then(|v| v.as_str()),  Some("ciphertext-blob"));
+    assert_eq!(msg.get("u").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(
+        msg.get("c").and_then(|v| v.as_str()),
+        Some("ciphertext-blob")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -856,7 +872,7 @@ async fn msg_contract_roundtrips_channel_payload() {
 async fn voice_contract_forwards_vdata_between_room_members() {
     let server = start_server().await;
     let mut alice = connect_and_auth(&server.url, "alice").await;
-    let mut bob   = connect_and_auth(&server.url, "bob").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
         .send(Message::Text(json!({"t":"vjoin","r":"room-a"}).to_string()))
@@ -1069,7 +1085,11 @@ async fn schema_migrates_from_version_zero_to_current() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let conn = Connection::open(&db_path).expect("open migrated db");
-    assert_eq!(read_schema_version(&db_path), "3", "expected migration to set schema version to 3");
+    assert_eq!(
+        read_schema_version(&db_path),
+        "3",
+        "expected migration to set schema version to 3"
+    );
 
     let events_exists: i64 = conn
         .query_row(
@@ -1078,7 +1098,10 @@ async fn schema_migrates_from_version_zero_to_current() {
             |row| row.get(0),
         )
         .expect("query sqlite_master");
-    assert_eq!(events_exists, 1, "events table should exist after migration");
+    assert_eq!(
+        events_exists, 1,
+        "events table should exist after migration"
+    );
 
     let user_2fa_exists: i64 = conn
         .query_row(
@@ -1087,7 +1110,10 @@ async fn schema_migrates_from_version_zero_to_current() {
             |row| row.get(0),
         )
         .expect("query sqlite_master for user_2fa");
-    assert_eq!(user_2fa_exists, 1, "user_2fa table should exist after migration");
+    assert_eq!(
+        user_2fa_exists, 1,
+        "user_2fa table should exist after migration"
+    );
 
     let user_credentials_exists: i64 = conn
         .query_row(
@@ -1096,7 +1122,10 @@ async fn schema_migrates_from_version_zero_to_current() {
             |row| row.get(0),
         )
         .expect("query sqlite_master for user_credentials");
-    assert_eq!(user_credentials_exists, 1, "user_credentials table should exist after migration");
+    assert_eq!(
+        user_credentials_exists, 1,
+        "user_credentials table should exist after migration"
+    );
 
     drop(server);
 }
@@ -1130,7 +1159,10 @@ async fn schema_newer_version_is_not_downgraded_and_server_auth_still_works() {
     );
 
     let version = read_schema_version(&db_path);
-    assert_eq!(version, "999", "server must not silently downgrade newer schema versions");
+    assert_eq!(
+        version, "999",
+        "server must not silently downgrade newer schema versions"
+    );
 
     drop(server);
 }

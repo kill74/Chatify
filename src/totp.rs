@@ -95,7 +95,8 @@ impl User2FA {
 
         if let Some(config) = &self.totp_config {
             let current_code = generate_totp_code(&config.secret, config.step);
-            let previous_code = generate_totp_code_at_time(&config.secret, config.step, now() - config.step as f64);
+            let previous_code =
+                generate_totp_code_at_time(&config.secret, config.step, now() - config.step as f64);
 
             code == current_code || code == previous_code
         } else {
@@ -145,8 +146,8 @@ fn generate_hotp_code(secret: &str, counter: u64) -> String {
     let counter_bytes = counter.to_be_bytes();
 
     use hmac::Mac;
-    let mut mac = Hmac::<Sha256>::new_from_slice(&decoded_secret)
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(&decoded_secret).expect("HMAC can take key of any size");
     mac.update(&counter_bytes);
     let result = mac.finalize();
     let digest = result.into_bytes();
@@ -166,7 +167,10 @@ fn generate_hotp_code(secret: &str, counter: u64) -> String {
 /// Generate a QR code URL for TOTP setup
 pub fn generate_qr_url(username: &str, issuer: &str, secret: &str) -> String {
     let label = format!("{}:{}", issuer, username);
-    let params = format!("secret={}&issuer={}&algorithm=SHA256&digits=6&period=30", secret, issuer);
+    let params = format!(
+        "secret={}&issuer={}&algorithm=SHA256&digits=6&period=30",
+        secret, issuer
+    );
     format!("otpauth://totp/{}?{}", label, params)
 }
 

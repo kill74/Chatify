@@ -18,7 +18,9 @@
 //! - `CHATIFY_LOG`: Set to "1" to enable logging
 
 use clicord_server::crypto::dh_key;
-use clicord_server::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash_client};
+use clicord_server::crypto::{
+    channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash_client,
+};
 
 use std::collections::HashMap;
 use std::env;

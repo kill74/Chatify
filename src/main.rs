@@ -687,7 +687,11 @@ impl EventStore {
     /// - `Ok(true)` if the hash matches.
     /// - `Ok(false)` if the hash does not match.
     /// - `Err("first_login")` if no credential exists yet (first-time user).
-    fn verify_credential(&self, username: &str, submitted_hash: &str) -> Result<bool, &'static str> {
+    fn verify_credential(
+        &self,
+        username: &str,
+        submitted_hash: &str,
+    ) -> Result<bool, &'static str> {
         match self.load_pw_hash(username) {
             None => Err("first_login"),
             Some(stored) => Ok(crypto::pw_verify(submitted_hash, &stored)),
@@ -959,7 +963,8 @@ impl State {
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
-        self.session_tokens.insert(token.clone(), username.to_string());
+        self.session_tokens
+            .insert(token.clone(), username.to_string());
         token
     }
 
@@ -1234,7 +1239,11 @@ async fn handle_event(
                 "ts":now()
             });
             state.store.persist(
-                "sys", &ch, username, None, &join_msg,
+                "sys",
+                &ch,
+                username,
+                None,
+                &join_msg,
                 &format!("{} joined", username),
             );
             let _ = chan.tx.send(join_msg.to_string());
@@ -1331,7 +1340,11 @@ async fn handle_event(
                 "ts":now()
             });
             state.store.persist(
-                "sys", &room, username, None, &join_voice,
+                "sys",
+                &room,
+                username,
+                None,
+                &join_voice,
                 &format!("{} voice joined", username),
             );
             let _ = state.chan(&room).tx.send(join_voice.to_string());
@@ -1346,7 +1359,11 @@ async fn handle_event(
                     "ts":now()
                 });
                 state.store.persist(
-                    "sys", room, username, None, &leave_voice,
+                    "sys",
+                    room,
+                    username,
+                    None,
+                    &leave_voice,
                     &format!("{} voice left", username),
                 );
                 let _ = state.chan(room).tx.send(leave_voice.to_string());
@@ -1362,9 +1379,8 @@ async fn handle_event(
             }
             if let Some(ref room) = voice_room {
                 if let Some(vtx) = state.voice.get(room) {
-                    let _ = vtx.send(
-                        serde_json::json!({"t":"vdata","from":username,"a":a}).to_string(),
-                    );
+                    let _ = vtx
+                        .send(serde_json::json!({"t":"vdata","from":username,"a":a}).to_string());
                 }
             }
         }
@@ -1430,8 +1446,15 @@ async fn handle_event(
                 "size":size,"file_id":file_id,"ch":ch,"ts":now()
             });
             state.store.persist(
-                "file_meta", &ch, username, None, &file_announce,
-                file_announce.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
+                "file_meta",
+                &ch,
+                username,
+                None,
+                &file_announce,
+                file_announce
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
             );
             let _ = state.chan(&ch).tx.send(file_announce.to_string());
         }
@@ -1627,7 +1650,6 @@ fn now() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
 }
-
 
 /// Normalises a raw channel name to a safe, consistent format.
 ///
@@ -2052,7 +2074,10 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<State>) {
     // --- IP-level rate limiting ---
     if !state.ip_connect(&addr) {
         if state.log_enabled {
-            warn!("connection rejected: too many connections from {}", addr.ip());
+            warn!(
+                "connection rejected: too many connections from {}",
+                addr.ip()
+            );
         }
         // Best-effort: the stream may not support WebSocket yet, but try.
         if let Ok(ws) = accept_async(stream).await {
@@ -2145,7 +2170,13 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<State>) {
         return;
     }
 
-    let AuthInfo { username, pw_hash, status, pubkey, otp_code } = auth;
+    let AuthInfo {
+        username,
+        pw_hash,
+        status,
+        pubkey,
+        otp_code,
+    } = auth;
 
     // --- Credential verification ---
     // The client sends a PBKDF2 hash of their password. The server stores
@@ -2178,7 +2209,8 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<State>) {
         Err(e) => {
             let _ = sink
                 .send(Message::Text(
-                    serde_json::json!({"t":"err","m":format!("credential error: {}", e)}).to_string(),
+                    serde_json::json!({"t":"err","m":format!("credential error: {}", e)})
+                        .to_string(),
                 ))
                 .await;
             return;
@@ -2385,9 +2417,15 @@ async fn main() -> ChatifyResult<()> {
             break;
         }
         if start.elapsed() >= drain_timeout {
-            println!("Shutdown timeout reached with {} active connection(s)", active);
+            println!(
+                "Shutdown timeout reached with {} active connection(s)",
+                active
+            );
             if state.log_enabled {
-                warn!("shutdown timeout reached with {} active connection(s)", active);
+                warn!(
+                    "shutdown timeout reached with {} active connection(s)",
+                    active
+                );
             }
             break;
         }
