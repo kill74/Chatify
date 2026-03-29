@@ -577,7 +577,7 @@ impl EventStore {
     /// * `target`      — Recipient username, used only for DMs.
     /// * `payload`     — The full JSON event value to store and replay.
     /// * `search_text` — Plaintext index field (stored lowercased for
-    ///                   case-insensitive LIKE queries).
+    ///   case-insensitive LIKE queries).
     fn persist(
         &self,
         event_type: &str,
@@ -2533,7 +2533,7 @@ impl Unpin for ChatifyTlsStream {}
 /// Holds either a plain TCP stream or a TLS-wrapped stream.
 enum StreamType {
     Plain(TcpStream),
-    Tls(ChatifyTlsStream),
+    Tls(Box<ChatifyTlsStream>),
 }
 
 impl tokio::io::AsyncRead for StreamType {
@@ -2601,7 +2601,7 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> ChatifyResult<TlsAcceptor
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key.into())
+        .with_single_cert(certs, key)
         .map_err(|e| ChatifyError::Validation(format!("TLS config error: {}", e)))?;
 
     Ok(TlsAcceptor::from(Arc::new(config)))
@@ -2738,7 +2738,7 @@ async fn main() -> ChatifyResult<()> {
                                 match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
                                         handle(
-                                            StreamType::Tls(ChatifyTlsStream { inner: tls_stream }),
+                                            StreamType::Tls(Box::new(ChatifyTlsStream { inner: tls_stream })),
                                             addr,
                                             s,
                                         )

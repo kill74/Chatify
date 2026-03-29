@@ -82,7 +82,7 @@ impl User2FA {
             .map(|_| {
                 let mut bytes = [0u8; 8];
                 rng.fill_bytes(&mut bytes);
-                hex::encode(&bytes)
+                hex::encode(bytes)
             })
             .collect();
     }
@@ -122,7 +122,7 @@ pub fn generate_secret() -> String {
     let mut rng = rand::thread_rng();
     let mut bytes = [0u8; 20];
     rng.fill_bytes(&mut bytes);
-    general_purpose::STANDARD.encode(&bytes)
+    general_purpose::STANDARD.encode(bytes)
 }
 
 /// Generate a TOTP code based on the current time
