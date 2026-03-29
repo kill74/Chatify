@@ -181,12 +181,18 @@ Release automation:
 
 ### Server (`clicord-server`)
 
-| Flag     | Default      | Description          |
-| -------- | ------------ | -------------------- |
-| `--host` | `0.0.0.0`    | Bind address         |
-| `--port` | `8765`       | Bind port            |
-| `--db`   | `chatify.db` | SQLite database path |
-| `--log`  | `false`      | Enable logging       |
+| Flag       | Default      | Description                                           |
+| ---------- | ------------ | ----------------------------------------------------- |
+| `--host`   | `0.0.0.0`    | Bind address                                          |
+| `--port`   | `8765`       | Bind port                                             |
+| `--db`     | `chatify.db` | SQLite database path                                  |
+| `--db-key` | (auto)       | Hex-encoded 32-byte encryption key (64 hex chars)     |
+| `--log`    | `false`      | Enable logging                                        |
+
+Encryption key resolution order:
+1. `--db-key` flag (hex string)
+2. `<db>.key` file (auto-generated on first run)
+3. No encryption for `:memory:` databases
 
 ### Client (`clicord-client`)
 
@@ -368,14 +374,15 @@ Chatify includes encryption helpers, protocol checks, and authentication hardeni
 - **Input validation** — username format, channel name sanitization, status field schema, file size caps (100MB), LIKE wildcard escaping.
 - **Crypto** — ChaCha20-Poly1305 AEAD for message encryption, X25519 Diffie-Hellman for DM key exchange, domain-separated hashing.
 - **Database** — WAL mode for concurrency, parameterized queries (no SQL injection), schema versioning with no-downgrade policy.
+- **Database encryption at rest** — ChaCha20-Poly1305 encryption of `payload` and `search_text` columns. Key auto-generated in `<db>.key` on first run; pass `--db-key` for custom keys.
 - **Error propagation** — all crypto operations return `Result` types; no silent failures.
 
 ### Known limitations
 
 - No TLS support on the server (use a reverse proxy for production).
-- No database encryption at rest.
 - No certificate pinning on the client.
 - No persistent session tokens across server restarts.
+- Encrypted search is linear scan (acceptable for typical chat volumes).
 
 Use in development, learning, or controlled environments unless you complete independent threat modeling and hardening.
 
@@ -411,7 +418,6 @@ Near-term priorities:
 
 - Complete `/edit` end-to-end behavior
 - TLS support on the server
-- Database encryption at rest
 - Expand integration and contract-level test coverage
 - Improve bridge operational readiness and observability
 

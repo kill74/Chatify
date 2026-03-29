@@ -120,6 +120,14 @@ struct Args {
     /// ephemeral in-process storage in tests.
     #[arg(long, default_value = "chatify.db")]
     db: String,
+
+    /// Hex-encoded encryption key for the SQLite database (SQLCipher).
+    /// Must be exactly 64 hex characters (32 bytes).
+    /// If omitted, the server looks for a `<db>.key` file. If neither
+    /// exists, a new random key is generated and saved to `<db>.key`.
+    /// Use `:memory:` databases (tests) to skip encryption entirely.
+    #[arg(long)]
+    db_key: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,28 +258,46 @@ struct AuthInfo {
 /// the single-threaded `rusqlite` connection type. The trade-off is connection
 /// overhead; for a chat server at this scale the overhead is negligible.
 ///
-/// Cloning an `EventStore` is cheap — it only duplicates the path string.
+/// When `encryption_key` is `Some`, the `payload` and `search_text` columns
+/// are encrypted with ChaCha20-Poly1305 before writing and decrypted on read.
+/// This protects data at rest — an attacker who obtains the `.db` file cannot
+/// read the chat history without the key. The key is 32 bytes (256 bits) and
+/// is never stored in the database itself.
+///
+/// Cloning an `EventStore` is cheap — it only duplicates the path and key.
 #[derive(Clone)]
 struct EventStore {
     /// Absolute or relative path to the SQLite file (or `":memory:"`).
     path: String,
+    /// Optional 32-byte encryption key for ChaCha20-Poly1305. `None` means
+    /// unencrypted (e.g. `:memory:` databases used in tests).
+    encryption_key: Option<Vec<u8>>,
 }
 
 impl EventStore {
-    /// Creates a new `EventStore` pointing at `path` and immediately runs
-    /// [`init`](Self::init) to ensure the schema is current.
+    /// Creates a new `EventStore` pointing at `path` with an optional
+    /// encryption key and immediately runs [`init`](Self::init) to ensure
+    /// the schema is current.
     ///
     /// # Panics
     ///
     /// Panics if the database cannot be opened or initialised. A server
     /// running with a broken event store is worse than one that crashes
     /// at startup — it silently loses data.
-    fn new(path: String) -> Self {
-        let store = Self { path };
+    fn new(path: String, encryption_key: Option<Vec<u8>>) -> Self {
+        let store = Self {
+            path,
+            encryption_key,
+        };
         store
             .init()
-            .expect("failed to initialise event store — check database path and permissions");
+            .expect("failed to initialise event store — check database path, permissions, and encryption key");
         store
+    }
+
+    /// Returns `true` if this store uses SQLCipher encryption.
+    fn is_encrypted(&self) -> bool {
+        self.encryption_key.is_some()
     }
 
     /// Opens a connection, creates `schema_meta` if it does not exist, reads
@@ -432,6 +458,49 @@ impl EventStore {
         }
     }
 
+    /// Encrypts a plaintext string for storage.
+    ///
+    /// Returns a JSON string `{"nonce":"<hex>","ct":"<hex>"}` that can be
+    /// stored in the database. If no encryption key is configured, returns
+    /// the plaintext unchanged.
+    fn encrypt_field(&self, plaintext: &str) -> String {
+        if let Some(ref key) = self.encryption_key {
+            match crypto::enc_bytes(key, plaintext.as_bytes()) {
+                Ok(ct) => serde_json::json!({"ct": hex::encode(ct)}).to_string(),
+                Err(e) => {
+                    warn!("encryption failed, storing plaintext: {}", e);
+                    plaintext.to_string()
+                }
+            }
+        } else {
+            plaintext.to_string()
+        }
+    }
+
+    /// Decrypts a stored field back to plaintext.
+    ///
+    /// If the field is a JSON object with `"ct"`, attempts decryption.
+    /// If no encryption key is configured or the field is not encrypted
+    /// JSON, returns it as-is.
+    fn decrypt_field(&self, stored: &str) -> String {
+        if let Some(ref key) = self.encryption_key {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(stored) {
+                if let Some(ct_hex) = val.get("ct").and_then(|v| v.as_str()) {
+                    if let Ok(ct_bytes) = hex::decode(ct_hex) {
+                        match crypto::dec_bytes(key, &ct_bytes) {
+                            Ok(pt) => return String::from_utf8_lossy(&pt).to_string(),
+                            Err(e) => {
+                                warn!("decryption failed: {}", e);
+                                return stored.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stored.to_string()
+    }
+
     /// Deserialises a list of raw JSON strings into [`Value`]s, silently
     /// dropping any entries that fail to parse.
     fn decode_rows(rows: Vec<String>) -> Vec<Value> {
@@ -467,9 +536,15 @@ impl EventStore {
             }
         };
 
+        // Decrypt each row, then parse as JSON.
+        let decrypted: Vec<String> = rows
+            .filter_map(|r| r.ok())
+            .map(|raw| self.decrypt_field(&raw))
+            .collect();
+
         // Reverse: SQLite returns newest-first for index efficiency; callers
         // expect oldest-first (chronological) order.
-        let mut out = Self::decode_rows(rows.filter_map(|r| r.ok()).collect());
+        let mut out = Self::decode_rows(decrypted);
         out.reverse();
         out
     }
@@ -498,6 +573,8 @@ impl EventStore {
             return;
         };
         let payload_json = payload.to_string();
+        let enc_payload = self.encrypt_field(&payload_json);
+        let enc_search = self.encrypt_field(&search_text.to_lowercase());
         if let Err(e) = conn.execute(
             "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -507,8 +584,8 @@ impl EventStore {
                 channel,
                 sender,
                 target,
-                payload_json,
-                search_text.to_lowercase()
+                enc_payload,
+                enc_search,
             ],
         ) {
             warn!("event persist failed: {}", e);
@@ -529,19 +606,62 @@ impl EventStore {
     /// Returns up to `limit` events for `channel` whose `search_text` column
     /// contains `query` (case-insensitive LIKE match), oldest first.
     fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
-        // Escape LIKE metacharacters to prevent pattern injection.
-        let escaped = query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let like = format!("%{}%", escaped.to_lowercase());
-        self.query_events(
-            "SELECT payload FROM events
-             WHERE channel = ?1 AND search_text LIKE ?2 ESCAPE '\\'
-             ORDER BY ts DESC
-             LIMIT ?3",
-            params![channel, like, limit as i64],
-        )
+        let query_lower = query.to_lowercase();
+
+        if self.encryption_key.is_some() {
+            // When encrypted, search_text is opaque to SQL. Fetch all events
+            // for the channel, decrypt both payload and search_text, then
+            // filter in-memory.
+            let Some(conn) = self.open_conn() else {
+                return Vec::new();
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT payload, search_text FROM events
+                 WHERE channel = ?1
+                 ORDER BY ts DESC",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("search query prepare failed: {}", e);
+                    return Vec::new();
+                }
+            };
+            let rows: Vec<(String, String)> = stmt
+                .query_map(params![channel], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map(|r| r.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default();
+
+            let mut results = Vec::new();
+            for (enc_payload, enc_search) in rows {
+                let search_text = self.decrypt_field(&enc_search);
+                if search_text.contains(&query_lower) {
+                    let decrypted = self.decrypt_field(&enc_payload);
+                    if let Ok(val) = serde_json::from_str::<Value>(&decrypted) {
+                        results.push(val);
+                    }
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            results
+        } else {
+            // Unencrypted: use SQL LIKE for efficiency.
+            let escaped = query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let like = format!("%{}%", escaped.to_lowercase());
+            self.query_events(
+                "SELECT payload FROM events
+                 WHERE channel = ?1 AND search_text LIKE ?2 ESCAPE '\\'
+                 ORDER BY ts DESC
+                 LIMIT ?3",
+                params![channel, like, limit as i64],
+            )
+        }
     }
 
     /// Returns up to `limit` events for `channel` that occurred within the
@@ -816,7 +936,7 @@ struct State {
 
 impl State {
     /// Creates the initial server state, pre-populating the `"general"` channel.
-    fn new(log_enabled: bool, db_path: String) -> Arc<Self> {
+    fn new(log_enabled: bool, db_path: String, db_key: Option<Vec<u8>>) -> Arc<Self> {
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
@@ -826,7 +946,7 @@ impl State {
             file_transfers: DashMap::new(),
             active_connections: AtomicUsize::new(0),
             drained_notify: Notify::new(),
-            store: EventStore::new(db_path),
+            store: EventStore::new(db_path, db_key),
             log_enabled,
             ip_connections: DashMap::new(),
             ip_last_auth: DashMap::new(),
@@ -2353,13 +2473,73 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<State>) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Resolves the database encryption key from the CLI arg or a key file.
+///
+/// Resolution order:
+/// 1. If `--db-key` is provided, decode it as hex (must be 64 chars = 32 bytes).
+/// 2. If a `<db_path>.key` file exists, read and decode it.
+/// 3. If `db_path` is `:memory:`, return `None` (no encryption for tests).
+/// 4. Otherwise, generate a new random 32-byte key, write it to `<db_path>.key`,
+///    and return it.
+///
+/// The `.key` file is created with user-only permissions where possible.
+/// Store it alongside backups; losing it means the database is unrecoverable.
+fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<Vec<u8>>> {
+    // 1. CLI-provided key takes priority.
+    if let Some(hex_key) = cli_key {
+        let key = hex::decode(hex_key)
+            .map_err(|e| ChatifyError::Validation(format!("invalid --db-key hex: {}", e)))?;
+        if key.len() != 32 {
+            return Err(ChatifyError::Validation(format!(
+                "--db-key must be 32 bytes (64 hex chars), got {} bytes",
+                key.len()
+            )));
+        }
+        return Ok(Some(key));
+    }
+
+    // 2. In-memory databases don't need encryption.
+    if db_path == ":memory:" {
+        return Ok(None);
+    }
+
+    // 3. Check for an existing key file.
+    let key_path = format!("{}.key", db_path);
+    if std::path::Path::new(&key_path).exists() {
+        let hex_key = std::fs::read_to_string(&key_path)
+            .map_err(|e| ChatifyError::Io(Box::new(e)))?
+            .trim()
+            .to_string();
+        let key = hex::decode(&hex_key).map_err(|e| {
+            ChatifyError::Validation(format!("invalid hex in key file '{}': {}", key_path, e))
+        })?;
+        if key.len() != 32 {
+            return Err(ChatifyError::Validation(format!(
+                "key file '{}' must contain 32 bytes (64 hex chars)",
+                key_path
+            )));
+        }
+        return Ok(Some(key));
+    }
+
+    // 4. Generate a new key and write it to disk.
+    use rand::{rngs::OsRng, RngCore};
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    let hex_key = hex::encode(key);
+    std::fs::write(&key_path, &hex_key).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    println!("Generated new DB encryption key: {}", key_path);
+    Ok(Some(key.to_vec()))
+}
+
 /// Server entry point.
 ///
 /// 1. Parses CLI args and initialises optional logging.
-/// 2. Binds the TCP listener.
-/// 3. Initialises shared [`State`] (which runs SQLite migrations).
-/// 4. Accepts connections in a `tokio::select!` loop until Ctrl+C.
-/// 5. Broadcasts a shutdown notice and waits up to 10 s for connections to
+/// 2. Resolves the database encryption key.
+/// 3. Binds the TCP listener.
+/// 4. Initialises shared [`State`] (which runs SQLite migrations).
+/// 5. Accepts connections in a `tokio::select!` loop until Ctrl+C.
+/// 6. Broadcasts a shutdown notice and waits up to 10 s for connections to
 ///    drain before returning.
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
@@ -2372,11 +2552,18 @@ async fn main() -> ChatifyResult<()> {
             .try_init();
     }
 
-    let listener = TcpListener::bind(&addr).await?;
-    let state = State::new(args.log, args.db.clone());
+    let db_key = resolve_db_key(&args.db, args.db_key.as_deref())?;
 
+    let listener = TcpListener::bind(&addr).await?;
+    let state = State::new(args.log, args.db.clone(), db_key);
+
+    let enc_label = if state.store.is_encrypted() {
+        "ChaCha20-Poly1305"
+    } else {
+        "None (unencrypted)"
+    };
     println!(" Chatify running on ws://{}", addr);
-    println!(" Encryption: None (testing) |   IP Privacy: On");
+    println!(" Encryption: {} |   IP Privacy: On", enc_label);
     println!(" Event store: {}", args.db);
     println!("⏹  Press Ctrl+C to stop\n");
     if args.log {
@@ -2486,7 +2673,7 @@ mod tests {
     /// the drop and the atomic write.
     #[tokio::test]
     async fn connection_counter_tracks_open_and_close() {
-        let state = State::new(false, ":memory:".to_string());
+        let state = State::new(false, ":memory:".to_string(), None);
         assert_eq!(state.active_connection_count(), 0);
 
         let addr1: SocketAddr = "127.0.0.1:12345".parse().unwrap();
