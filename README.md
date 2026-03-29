@@ -181,13 +181,16 @@ Release automation:
 
 ### Server (`clicord-server`)
 
-| Flag       | Default      | Description                                           |
-| ---------- | ------------ | ----------------------------------------------------- |
-| `--host`   | `0.0.0.0`    | Bind address                                          |
-| `--port`   | `8765`       | Bind port                                             |
-| `--db`     | `chatify.db` | SQLite database path                                  |
-| `--db-key` | (auto)       | Hex-encoded 32-byte encryption key (64 hex chars)     |
-| `--log`    | `false`      | Enable logging                                        |
+| Flag         | Default      | Description                                           |
+| ------------ | ------------ | ----------------------------------------------------- |
+| `--host`     | `0.0.0.0`    | Bind address                                          |
+| `--port`     | `8765`       | Bind port                                             |
+| `--db`       | `chatify.db` | SQLite database path                                  |
+| `--db-key`   | (auto)       | Hex-encoded 32-byte encryption key (64 hex chars)     |
+| `--tls`      | `false`      | Enable TLS (wss://)                                   |
+| `--tls-cert` | `cert.pem`   | Path to TLS certificate (PEM)                         |
+| `--tls-key`  | `key.pem`    | Path to TLS private key (PEM)                         |
+| `--log`      | `false`      | Enable logging                                        |
 
 Encryption key resolution order:
 1. `--db-key` flag (hex string)
@@ -365,6 +368,8 @@ Chatify includes encryption helpers, protocol checks, and authentication hardeni
 
 ### What's in place
 
+- **TLS support** — server accepts `wss://` connections with `--tls`, `--tls-cert`, `--tls-key`. Uses rustls (TLS 1.2/1.3).
+
 - **Credential storage** — per-user salted PBKDF2 hashing (120k iterations, SHA-256). Passwords are hashed client-side, then re-hashed server-side with a unique random salt.
 - **Rate limiting** — per-IP connection caps (max 5 concurrent) and auth attempt throttling (0.5s minimum interval).
 - **Username uniqueness** — duplicate usernames are rejected to prevent session hijacking.
@@ -379,7 +384,6 @@ Chatify includes encryption helpers, protocol checks, and authentication hardeni
 
 ### Known limitations
 
-- No TLS support on the server (use a reverse proxy for production).
 - No certificate pinning on the client.
 - No persistent session tokens across server restarts.
 - Encrypted search is linear scan (acceptable for typical chat volumes).
@@ -417,7 +421,6 @@ This list is intentionally concrete so reviewers can verify engineering maturity
 Near-term priorities:
 
 - Complete `/edit` end-to-end behavior
-- TLS support on the server
 - Expand integration and contract-level test coverage
 - Improve bridge operational readiness and observability
 

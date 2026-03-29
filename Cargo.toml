@@ -51,6 +51,9 @@ serenity = { version = "0.11", features = ["client", "gateway", "standard_framew
 base64 = "0.21"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+rustls = "0.22"
+rustls-pemfile = "2"
+tokio-rustls = "0.25"
 
 [profile.release]
 opt-level = 3

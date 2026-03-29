@@ -84,9 +84,12 @@ use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::time::{sleep, Duration};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 // ---------------------------------------------------------------------------
@@ -128,6 +131,21 @@ struct Args {
     /// Use `:memory:` databases (tests) to skip encryption entirely.
     #[arg(long)]
     db_key: Option<String>,
+
+    /// Enable TLS for WebSocket connections (wss://).
+    /// Requires `--tls-cert` and `--tls-key`.
+    #[arg(long)]
+    tls: bool,
+
+    /// Path to the TLS certificate file (PEM format).
+    /// Used when `--tls` is enabled.
+    #[arg(long, default_value = "cert.pem")]
+    tls_cert: String,
+
+    /// Path to the TLS private key file (PEM format).
+    /// Used when `--tls` is enabled.
+    #[arg(long, default_value = "key.pem")]
+    tls_key: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2187,7 +2205,10 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Chat
 /// `mpsc::unbounded_channel` and drained by a dedicated sink-writer task.
 /// This decouples the read path from the write path, preventing a slow write
 /// from blocking event processing.
-async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<State>) {
+async fn handle<S>(stream: S, addr: SocketAddr, state: Arc<State>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // ConnectionGuard increments active_connections and decrements it on drop,
     // even if we return early.
 
@@ -2470,6 +2491,123 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<State>) {
 }
 
 // ---------------------------------------------------------------------------
+// TLS support
+// ---------------------------------------------------------------------------
+
+/// Wraps a TLS stream, forwarding [`AsyncRead`] and [`AsyncWrite`] to the
+/// inner `TlsStream<TcpStream>`. Needed because the two concrete stream types
+/// (plain `TcpStream` and `TlsStream<TcpStream>`) are different types, and
+/// [`accept_async`] needs a single type parameter.
+struct ChatifyTlsStream {
+    inner: tokio_rustls::server::TlsStream<TcpStream>,
+}
+
+impl tokio::io::AsyncRead for ChatifyTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ChatifyTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Unpin for ChatifyTlsStream {}
+
+/// Holds either a plain TCP stream or a TLS-wrapped stream.
+enum StreamType {
+    Plain(TcpStream),
+    Tls(ChatifyTlsStream),
+}
+
+impl tokio::io::AsyncRead for StreamType {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamType::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            StreamType::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for StreamType {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            StreamType::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            StreamType::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamType::Plain(s) => Pin::new(s).poll_flush(cx),
+            StreamType::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamType::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            StreamType::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Loads a PEM certificate chain and private key, returning a [`TlsAcceptor`].
+fn load_tls_config(cert_path: &str, key_path: &str) -> ChatifyResult<TlsAcceptor> {
+    // Load certificate chain
+    let cert_file = std::fs::File::open(cert_path).map_err(|e| {
+        ChatifyError::Validation(format!("cannot open TLS cert '{}': {}", cert_path, e))
+    })?;
+    let mut cert_reader = std::io::BufReader::new(cert_file);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ChatifyError::Validation(format!("failed to parse TLS cert: {}", e)))?;
+    if certs.is_empty() {
+        return Err(ChatifyError::Validation(
+            "TLS cert file is empty".to_string(),
+        ));
+    }
+
+    // Load private key
+    let key_file = std::fs::File::open(key_path).map_err(|e| {
+        ChatifyError::Validation(format!("cannot open TLS key '{}': {}", key_path, e))
+    })?;
+    let mut key_reader = std::io::BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| ChatifyError::Validation(format!("failed to parse TLS key: {}", e)))?
+        .ok_or_else(|| ChatifyError::Validation("TLS key file is empty".to_string()))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key.into())
+        .map_err(|e| ChatifyError::Validation(format!("TLS config error: {}", e)))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -2554,6 +2692,14 @@ async fn main() -> ChatifyResult<()> {
 
     let db_key = resolve_db_key(&args.db, args.db_key.as_deref())?;
 
+    // Set up TLS if enabled.
+    let tls_acceptor = if args.tls {
+        let acceptor = load_tls_config(&args.tls_cert, &args.tls_key)?;
+        Some(acceptor)
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(&addr).await?;
     let state = State::new(args.log, args.db.clone(), db_key);
 
@@ -2562,12 +2708,13 @@ async fn main() -> ChatifyResult<()> {
     } else {
         "None (unencrypted)"
     };
-    println!(" Chatify running on ws://{}", addr);
+    let proto = if tls_acceptor.is_some() { "wss" } else { "ws" };
+    println!(" Chatify running on {}://{}", proto, addr);
     println!(" Encryption: {} |   IP Privacy: On", enc_label);
     println!(" Event store: {}", args.db);
     println!("⏹  Press Ctrl+C to stop\n");
     if args.log {
-        info!("server started addr=ws://{} db={}", addr, args.db);
+        info!("server started addr={}://{} db={}", proto, addr, args.db);
     }
 
     // Accept loop: runs until Ctrl+C is received.
@@ -2585,7 +2732,28 @@ async fn main() -> ChatifyResult<()> {
                 match accept_result {
                     Ok((stream, addr)) => {
                         let s = state.clone();
-                        tokio::spawn(handle(stream, addr, s));
+                        if let Some(ref acceptor) = tls_acceptor {
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        handle(
+                                            StreamType::Tls(ChatifyTlsStream { inner: tls_stream }),
+                                            addr,
+                                            s,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        if s.log_enabled {
+                                            warn!("TLS handshake failed from {}: {}", addr, e);
+                                        }
+                                    }
+                                }
+                            });
+                        } else {
+                            tokio::spawn(handle(StreamType::Plain(stream), addr, s));
+                        }
                     }
                     Err(_) => continue,
                 }
