@@ -25,6 +25,7 @@ Chatify ships three binaries:
 - Explicit peer trust workflow (`/fingerprint`, `/trust`) with key-change detection
 - Credential hardening (PBKDF2), rate limiting, 2FA (TOTP + backup codes)
 - Replay protection (nonce + timestamp validation)
+- Automatic nonce cache eviction (periodic cleanup for ghost connections)
 - Optional Discord bridge with mapped bidirectional relay, loop prevention, and health telemetry
 - Windows release artifacts with SHA256 checksums (ZIP + installer)
 - Structured security test report attached per release tag (`.json` + `.md`)
@@ -173,6 +174,7 @@ Secret hygiene:
 | `/rewind <time> [n]`          | Replay events from a time window (example: `15m`, `2h`) |
 | `/fingerprint [user]`         | Show trust state and key fingerprint(s)                 |
 | `/trust <user> <fingerprint>` | Mark a peer key fingerprint as trusted                  |
+| `/edit [#N] <new text>`       | Edit your last (or Nth most recent) message             |
 | `/clear`                      | Clear terminal output                                   |
 | `/help`                       | Alias for `/help [command]`                             |
 | `/quit`, `/exit`, `/q`        | Disconnect and exit                                     |
@@ -227,7 +229,8 @@ Example dashboard layout:
 
 Notes:
 
-- `/edit` is currently a placeholder command.
+- Edited messages show an `(edited)` suffix in the feed.
+- Both incoming and outgoing edits update the message in-place.
 
 ## Identity and Trust UX
 
@@ -239,7 +242,14 @@ Notes:
 
 ## Discord Bridge (Optional)
 
-Bridge builds are pinned for stability (`serenity = =0.11.7`) and remain optional behind the `discord-bridge` feature flag.
+Bridge builds are pinned for stability (`serenity = =0.11.7`) and remain optional behind the `discord-bridge` feature flag. The client `/bridge status` command requires the `bridge-client` feature flag.
+
+Build with bridge support:
+
+```bash
+cargo build --release --features discord-bridge
+cargo build --release --features bridge-client
+```
 
 Run bridge binary:
 
@@ -298,9 +308,12 @@ Route file example (`bridge-channel-map.json`):
 
 The repository includes a safe template at [bridge-channel-map.json](bridge-channel-map.json) with empty routes; fill it with your real Discord channel IDs before enabling bidirectional relay.
 
-Bridge health command:
+Bridge health commands:
 
-- Send `/bridge status` in Discord and the bot replies with current bridge health counters.
+- In Discord: send `/bridge status` and the bot replies with current bridge health counters.
+- In the Rust client (with `bridge-client` feature): run `/bridge status` to see all connected bridge instances, their type, uptime, and route count.
+
+The bridge bot identifies itself to the server during authentication, enabling the server to track connected bridge instances and report their status to clients.
 
 Loop prevention:
 
@@ -353,7 +366,7 @@ cargo test --locked --test message_contracts protocol_contract_advertises_backwa
 cargo test --locked --test message_contracts file_contract_relays_media_metadata_and_chunks
 cargo test --workspace --all-targets --locked
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo test --features discord-bridge --bin discord_bot
+cargo check --features bridge-client --bin clicord-client --locked
 ```
 
 ## Project Docs
