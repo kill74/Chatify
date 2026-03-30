@@ -257,6 +257,11 @@ Attachments and replies:
 - Discord -> Chatify relay preserves attachment URL/metadata and basic reply context.
 - Chatify -> Discord relay consumes preserved metadata and emits attachment/reply context in bridged messages.
 
+Bridge hardening:
+
+- Channel relay keys now follow the same derivation contract as the Rust client (avoids decrypt mismatch between client and bridge).
+- Discord outbound relay disables parsed mentions (`@everyone`, `@here`, role/user pings) to avoid cross-platform mention amplification.
+
 ## Security Posture
 
 Implemented:

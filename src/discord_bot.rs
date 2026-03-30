@@ -533,14 +533,13 @@ fn format_discord_relay_text(
         body_lines.push("[empty message]".to_string());
     }
 
-    let mut out = format!("{}: {}", sender, body_lines.join("\n"));
-    if out.len() <= MAX_DISCORD_RELAY_OUT_LEN {
+    let out = format!("{}: {}", sender, body_lines.join("\n"));
+    if out.chars().count() <= MAX_DISCORD_RELAY_OUT_LEN {
         return out;
     }
 
-    out.truncate(MAX_DISCORD_RELAY_OUT_LEN.saturating_sub(3));
-    out.push_str("...");
-    out
+    let clipped = truncate_chars(&out, MAX_DISCORD_RELAY_OUT_LEN.saturating_sub(3));
+    format!("{}...", clipped)
 }
 
 async fn send_to_discord_channel(
@@ -574,7 +573,13 @@ async fn send_to_discord_channel(
         return Ok(());
     }
 
-    channel_id.say(http.as_ref(), content).await?;
+    channel_id
+        .send_message(http.as_ref(), |message| {
+            message
+                .content(content)
+                .allowed_mentions(|mentions| mentions.empty_parse())
+        })
+        .await?;
     Ok(())
 }
 
@@ -959,8 +964,10 @@ struct BotState {
     discord_http: Option<Arc<Http>>,
     /// Bot's username on Chatify
     username: String,
-    /// Password for Chatify authentication
-    password: String,
+    /// Raw password for Chatify authentication hashing.
+    auth_password: String,
+    /// Pre-hashed secret used for channel key derivation (matches client contract).
+    channel_secret: String,
     /// Current Chatify channel
     channel: String,
     /// Optional map from Discord channel id -> Chatify channel name.
@@ -984,7 +991,8 @@ impl BotState {
             ws_tx: None,
             discord_http: None,
             username: String::new(),
-            password: String::new(),
+            auth_password: String::new(),
+            channel_secret: String::new(),
             channel: "general".to_string(),
             channel_map: HashMap::new(),
             bridge_src_tag: "discord-bridge".to_string(),
@@ -1000,7 +1008,7 @@ impl BotState {
         if let Some(key) = self.chan_keys.get(ch) {
             key.clone()
         } else {
-            let key = channel_key(&self.password, ch);
+            let key = channel_key(&self.channel_secret, ch);
             self.chan_keys.insert(ch.to_string(), key.clone());
             key
         }
@@ -1455,7 +1463,7 @@ async fn run_chatify_session(
     // Authenticate with Chatify.
     {
         let bot_state = state.lock().await;
-        let pw_hash = pw_hash_client(&bot_state.password).map_err(|e| {
+        let pw_hash = pw_hash_client(&bot_state.auth_password).map_err(|e| {
             metrics.inc_auth_failures();
             format!("Failed to hash bridge password for auth: {}", e)
         })?;
@@ -1657,9 +1665,22 @@ async fn main() {
 
     // Initialize bot state.
     let state = Arc::new(Mutex::new(BotState::new()));
+
+    let channel_secret = match pw_hash_client(&cfg.chatify_password) {
+        Ok(secret) => secret,
+        Err(err) => {
+            error!(
+                "event=bridge_start_failed reason=invalid_chatify_password error={}",
+                err
+            );
+            return;
+        }
+    };
+
     {
         let mut bot_state = state.lock().await;
-        bot_state.password = cfg.chatify_password.clone();
+        bot_state.auth_password = cfg.chatify_password.clone();
+        bot_state.channel_secret = channel_secret;
         bot_state.channel = cfg.chatify_channel.clone();
         bot_state.username = cfg.chatify_bot_username.clone();
         bot_state.channel_map = cfg.channel_map.clone();
@@ -1782,7 +1803,9 @@ mod tests {
         let state = Arc::new(Mutex::new(BotState::new()));
         {
             let mut bot_state = state.lock().await;
-            bot_state.password = "test-password".to_string();
+            bot_state.auth_password = "test-password".to_string();
+            bot_state.channel_secret =
+                pw_hash_client("test-password").expect("hash test bridge password");
             bot_state.channel = "general".to_string();
             bot_state.username = "DiscordBot".to_string();
         }
@@ -2034,6 +2057,29 @@ mod tests {
         assert!(text.contains("alice:"));
         assert!(text.contains("[reply to dave"));
         assert!(text.contains("[attachment] file.txt"));
+    }
+
+    #[test]
+    fn bridge_channel_key_matches_client_derivation_contract() {
+        let mut state = BotState::new();
+        state.auth_password = "test-password".to_string();
+        state.channel_secret =
+            pw_hash_client(&state.auth_password).expect("hash password for channel secret");
+
+        let bridge_key = state.get_channel_key("general");
+        let client_hash = pw_hash_client("test-password").expect("hash for client contract");
+        let client_key = channel_key(&client_hash, "general");
+
+        assert_eq!(bridge_key, client_key);
+    }
+
+    #[test]
+    fn discord_relay_text_truncates_unicode_safely() {
+        let long = "😀".repeat(MAX_DISCORD_RELAY_OUT_LEN + 32);
+        let rendered = format_discord_relay_text("alice", &long, &[], None);
+
+        assert!(rendered.ends_with("..."));
+        assert!(rendered.chars().count() <= MAX_DISCORD_RELAY_OUT_LEN);
     }
 
     #[test]
