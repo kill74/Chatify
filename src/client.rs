@@ -2268,56 +2268,6 @@ fn handle_slash_command(
     CommandFlow::Continue
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_fingerprint_accepts_hex_and_colon_formats() {
-        let raw = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
-        let normalized = normalize_fingerprint_input(raw).expect("normalized fingerprint");
-        assert_eq!(normalized.len(), 64);
-        assert!(normalized.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn trust_store_transitions_unknown_trusted_changed() {
-        let mut store = TrustStore {
-            path: PathBuf::from("trust-store-test.json"),
-            peers: HashMap::new(),
-        };
-        let fp1 = canonical_fingerprint_from_hex(&"11".repeat(32));
-        let fp2 = canonical_fingerprint_from_hex(&"22".repeat(32));
-
-        let first = store.observe("alice", &fp1, "test", 100);
-        assert!(first.persist_required);
-        assert_eq!(store.state_for("alice"), TrustState::Unknown);
-
-        store
-            .trust_current_fingerprint("alice", &fp1, 110)
-            .expect("trust initial key");
-        assert_eq!(store.state_for("alice"), TrustState::Trusted);
-
-        let changed = store.observe("alice", &fp2, "test", 120);
-        assert!(changed.changed);
-        assert_eq!(store.state_for("alice"), TrustState::Changed);
-
-        store
-            .trust_current_fingerprint("alice", &fp2, 130)
-            .expect("trust rotated key");
-        assert_eq!(store.state_for("alice"), TrustState::Trusted);
-    }
-
-    #[test]
-    fn fingerprint_is_deterministic_for_same_public_key() {
-        let keypair = new_keypair();
-        let pk = pub_b64(&keypair).expect("public key base64");
-        let fp1 = fingerprint_from_pubkey(&pk).expect("first fingerprint");
-        let fp2 = fingerprint_from_pubkey(&pk).expect("second fingerprint");
-        assert_eq!(fp1, fp2);
-    }
-}
-
 /// Main entry point for the WebSocket client
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
@@ -2623,4 +2573,54 @@ async fn main() -> ChatifyResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_fingerprint_accepts_hex_and_colon_formats() {
+        let raw = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        let normalized = normalize_fingerprint_input(raw).expect("normalized fingerprint");
+        assert_eq!(normalized.len(), 64);
+        assert!(normalized.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn trust_store_transitions_unknown_trusted_changed() {
+        let mut store = TrustStore {
+            path: PathBuf::from("trust-store-test.json"),
+            peers: HashMap::new(),
+        };
+        let fp1 = canonical_fingerprint_from_hex(&"11".repeat(32));
+        let fp2 = canonical_fingerprint_from_hex(&"22".repeat(32));
+
+        let first = store.observe("alice", &fp1, "test", 100);
+        assert!(first.persist_required);
+        assert_eq!(store.state_for("alice"), TrustState::Unknown);
+
+        store
+            .trust_current_fingerprint("alice", &fp1, 110)
+            .expect("trust initial key");
+        assert_eq!(store.state_for("alice"), TrustState::Trusted);
+
+        let changed = store.observe("alice", &fp2, "test", 120);
+        assert!(changed.changed);
+        assert_eq!(store.state_for("alice"), TrustState::Changed);
+
+        store
+            .trust_current_fingerprint("alice", &fp2, 130)
+            .expect("trust rotated key");
+        assert_eq!(store.state_for("alice"), TrustState::Trusted);
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_for_same_public_key() {
+        let keypair = new_keypair();
+        let pk = pub_b64(&keypair).expect("public key base64");
+        let fp1 = fingerprint_from_pubkey(&pk).expect("first fingerprint");
+        let fp2 = fingerprint_from_pubkey(&pk).expect("second fingerprint");
+        assert_eq!(fp1, fp2);
+    }
 }
