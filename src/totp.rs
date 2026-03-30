@@ -3,13 +3,13 @@
 //! Provides TOTP-based two-factor authentication with QR code generation,
 //! backup codes, and recovery mechanisms.
 
+use crate::crypto::secure_string_eq;
 use base64::{engine::general_purpose, Engine as _};
 use hmac::Hmac;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq;
 
 /// TOTP configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,11 +232,6 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
-}
-
-/// Constant-time string comparison
-fn secure_string_eq(a: &str, b: &str) -> bool {
-    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 #[cfg(test)]

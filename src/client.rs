@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 use zeroize::Zeroize;
 
 use base64::{self, engine::general_purpose, Engine as _};
@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
-const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /image <path>, /video <path>, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /quit";
+const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /image <path>, /video <path>, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit [#N] <new text>, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
 const DASHBOARD_HEADER_ROWS: usize = 2;
@@ -153,6 +153,12 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         example: "/channels",
     },
     CommandSpec {
+        name: "/bridge",
+        usage: "/bridge [status]",
+        summary: "Show connected bridge instances (requires bridge-client feature).",
+        example: "/bridge status",
+    },
+    CommandSpec {
         name: "/voice",
         usage: "/voice [room]",
         summary: "Toggle voice session in a room.",
@@ -202,9 +208,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/edit",
-        usage: "/edit ...",
-        summary: "Placeholder for edit workflow in Rust client.",
-        example: "/edit",
+        usage: "/edit [#N] <new text>",
+        summary: "Edit your last (or Nth most recent) message.",
+        example: "/edit fixed the typo",
     },
     CommandSpec {
         name: "/quit",
@@ -728,6 +734,33 @@ struct DisplayedMessage {
     user: Option<String>,
     /// Channel name (if applicable)
     channel: Option<String>,
+    /// If true, the message was edited after initial send
+    #[allow(dead_code)]
+    edited: bool,
+}
+
+impl Default for DisplayedMessage {
+    fn default() -> Self {
+        Self {
+            time: String::new(),
+            text: String::new(),
+            msg_type: MessageType::Sys,
+            user: None,
+            channel: None,
+            edited: false,
+        }
+    }
+}
+
+/// Record of a message the client sent, kept so `/edit` can reference it.
+#[derive(Debug, Clone)]
+struct SentMessage {
+    /// The channel the message was sent to.
+    channel: String,
+    /// Plaintext content as typed by the user.
+    plaintext: String,
+    /// Unix timestamp (seconds) when the message was sent.
+    timestamp: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -878,6 +911,9 @@ struct ClientState {
     activity_hint: Option<(String, u64)>,
     /// Active typing indicators for peers
     typing_presence: HashMap<String, TypingPresence>,
+    /// Recent sent messages, most recent last. Used by `/edit` to reference
+    /// the user's own messages by index.
+    recent_sents: VecDeque<SentMessage>,
     /// Enable debug logging
     log_enabled: bool,
 }
@@ -1058,6 +1094,7 @@ impl ClientState {
                 msg_type: MessageType::UnreadMarker,
                 user: None,
                 channel: unread_separator_channel(scope),
+            edited: false,
             });
         }
     }
@@ -1172,6 +1209,7 @@ impl ClientState {
             msg_type: MessageType::Sys,
             user: None,
             channel: None,
+        edited: false,
         });
     }
 
@@ -1186,9 +1224,66 @@ impl ClientState {
                 msg_type: MessageType::Sys,
                 user: None,
                 channel: None,
+            edited: false,
             });
         }
         self.refresh_dashboard();
+    }
+
+    /// Records a sent message so `/edit` can reference it later.
+    fn record_sent(&mut self, channel: &str, plaintext: &str) {
+        const MAX_SENT_HISTORY: usize = 50;
+        self.recent_sents.push_back(SentMessage {
+            channel: channel.to_string(),
+            plaintext: plaintext.to_string(),
+            timestamp: now_secs(),
+        });
+        while self.recent_sents.len() > MAX_SENT_HISTORY {
+            self.recent_sents.pop_front();
+        }
+    }
+
+    /// Returns the Nth most recent sent message (1-indexed, 1 = most recent)
+    /// filtered to the given channel. Returns `None` if the index is out of
+    /// range or the channel doesn't match.
+    fn find_recent_sent(&self, channel: &str, index: usize) -> Option<&SentMessage> {
+        if index == 0 {
+            return None;
+        }
+        self.recent_sents
+            .iter()
+            .rev()
+            .filter(|m| m.channel == channel)
+            .nth(index - 1)
+    }
+
+    /// Finds a message in the display feed by user, channel, and content,
+    /// then updates it in-place and marks it as edited.
+    fn update_message_in_feed(
+        &mut self,
+        user: &str,
+        channel: &str,
+        old_text: &str,
+        new_text: &str,
+    ) -> bool {
+        // Search in reverse to match the most recent occurrence.
+        for msg in self.message_history.iter_mut().rev() {
+            let channel_match = msg
+                .channel
+                .as_deref()
+                .map(|c| c == channel)
+                .unwrap_or(false);
+            if msg.user.as_deref() == Some(user)
+                && channel_match
+                && (msg.msg_type == MessageType::Msg || msg.msg_type == MessageType::Dm)
+                && msg.text == old_text
+            {
+                msg.text = new_text.to_string();
+                msg.edited = true;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1203,6 +1298,20 @@ fn format_time(ts: u64) -> String {
 fn format_time_full(ts: u64) -> String {
     let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(Utc::now);
     datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+/// Formats a duration in seconds as a compact human-readable string
+/// (e.g. "2d 3h", "45m", "30s").
+fn format_duration(secs: u64) -> String {
+    if secs >= 86400 {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 /// Render an image as compact ASCII for terminal preview.
@@ -1473,18 +1582,7 @@ fn queue_media_upload(
 
 /// Normalize channel name to match server rules.
 fn normalize_channel(raw: &str) -> Option<String> {
-    let s: String = raw
-        .to_lowercase()
-        .trim_start_matches('#')
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(32)
-        .collect();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    clicord_server::normalize_channel(raw)
 }
 
 fn is_valid_username_token(name: &str) -> bool {
@@ -1708,10 +1806,7 @@ fn ts_value(v: &serde_json::Value) -> u64 {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    clicord_server::now_secs()
 }
 
 fn truncate_with_ellipsis(input: &str, width: usize) -> String {
@@ -1831,11 +1926,13 @@ fn format_feed_entry(msg: &DisplayedMessage) -> String {
     match msg.msg_type {
         MessageType::Msg => {
             let user = msg.user.as_deref().unwrap_or("?");
-            format!("{} {}: {}", stamp, user, msg.text)
+            let suffix = if msg.edited { " (edited)" } else { "" };
+            format!("{} {}: {}{}", stamp, user, msg.text, suffix)
         }
         MessageType::Dm => {
             let user = msg.user.as_deref().unwrap_or("?");
-            format!("{} DM {} {}", stamp, user, msg.text)
+            let suffix = if msg.edited { " (edited)" } else { "" };
+            format!("{} DM {} {}{}", stamp, user, msg.text, suffix)
         }
         MessageType::Edit => format!("{} edit {}", stamp, msg.text),
         MessageType::UnreadMarker => msg.text.clone(),
@@ -1921,7 +2018,9 @@ where
                 }
 
                 let prefix = if group_started { "  > " } else { "    " };
-                lines.extend(prefixed_wrapped_lines(prefix, &msg.text, width, max_lines));
+                let suffix = if msg.edited { " (edited)" } else { "" };
+                let display_text = format!("{}{}", msg.text, suffix);
+                lines.extend(prefixed_wrapped_lines(prefix, &display_text, width, max_lines));
                 current_group = Some(key);
             }
             MessageType::Img => {
@@ -2248,9 +2347,7 @@ fn dashboard_header_lines(state: &ClientState) -> (String, String) {
 }
 
 fn fresh_nonce_hex() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    clicord_server::fresh_nonce_hex()
 }
 
 fn generate_guest_username() -> String {
@@ -2416,6 +2513,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Msg,
                 user: Some(u.to_string()),
                 channel: Some(ch.to_string()),
+            edited: false,
             });
             true
         }
@@ -2427,6 +2525,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Sys,
                 user: None,
                 channel: None,
+            edited: false,
             });
             true
         }
@@ -2434,16 +2533,25 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
             let user = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
             let old_text = event.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
             let new_text = event.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
-            state.add_message(DisplayedMessage {
-                time: format_time(ts),
-                text: format!("{} edited: '{}' -> '{}'", user, old_text, new_text),
-                msg_type: MessageType::Edit,
-                user: Some(user.to_string()),
-                channel: event
-                    .get("ch")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-            });
+            let ch = event
+                .get("ch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // Try to update the original message in-place.
+            if !state.update_message_in_feed(user, ch, old_text, new_text) {
+                // Original not found (scrollback limit or different client) —
+                // show an edit notice instead.
+                state.add_message(DisplayedMessage {
+                    time: format_time(ts),
+                    text: format!("{} edited a message: '{}'", user, new_text),
+                    msg_type: MessageType::Edit,
+                    user: Some(user.to_string()),
+                    channel: Some(ch.to_string()),
+                    edited: false,
+                });
+            }
+            state.refresh_dashboard();
             true
         }
         "dm" => {
@@ -2488,6 +2596,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Dm,
                 user: Some(from.to_string()),
                 channel: None,
+            edited: false,
             });
             true
         }
@@ -2503,6 +2612,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Sys,
                 user: Some(user.to_string()),
                 channel: Some(ch.to_string()),
+            edited: false,
             });
             true
         }
@@ -2541,6 +2651,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::FileMeta,
                 user: Some(from.to_string()),
                 channel: Some(ch.to_string()),
+            edited: false,
             });
             true
         }
@@ -2576,6 +2687,7 @@ async fn handle_msg_event(state: &SharedState, data: &JsonMap, ts: u64) {
             msg_type: MessageType::Msg,
             user: Some(u.to_string()),
             channel: Some(ch.to_string()),
+        edited: false,
         });
     }
 }
@@ -2603,6 +2715,7 @@ async fn handle_img_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Img,
         user: Some(u.to_string()),
         channel: Some(ch.to_string()),
+    edited: false,
     });
 }
 
@@ -2700,6 +2813,7 @@ async fn handle_file_meta_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::FileMeta,
         user: Some(from),
         channel: Some(channel),
+    edited: false,
     });
 }
 
@@ -2835,6 +2949,7 @@ async fn handle_file_chunk_event(state: &SharedState, data: &JsonMap, ts: u64) {
             msg_type,
             user: Some(transfer.from),
             channel: Some(transfer.channel),
+        edited: false,
         });
     }
 }
@@ -2852,6 +2967,7 @@ async fn handle_err_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Err,
         user: None,
         channel: None,
+    edited: false,
     });
 }
 
@@ -2864,6 +2980,7 @@ async fn handle_sys_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
+    edited: false,
     });
 }
 
@@ -2907,6 +3024,7 @@ async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
             msg_type: MessageType::Dm,
             user: Some(frm.to_string()),
             channel: None,
+        edited: false,
         });
     }
 }
@@ -2931,6 +3049,7 @@ async fn handle_users_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
+    edited: false,
     });
 }
 
@@ -2949,6 +3068,7 @@ async fn handle_joined_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
+    edited: false,
     });
     for event in hist {
         let _ = append_event_to_history(&mut state_lock, &event);
@@ -2987,7 +3107,80 @@ async fn handle_history_or_search_event(state: &SharedState, data: &JsonMap, t: 
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
+    edited: false,
     });
+}
+
+async fn handle_bridge_status_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let bridges = data.get("bridges").and_then(|v| v.as_array());
+    let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let mut state_lock = state.lock().await;
+
+    if count == 0 {
+        state_lock.add_message(DisplayedMessage {
+            time: format_time(ts),
+            text: "No bridge instances connected.".to_string(),
+            msg_type: MessageType::Sys,
+            user: None,
+            channel: None,
+        edited: false,
+        });
+        return;
+    }
+
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("Bridge status: {} instance(s) connected", count),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+    edited: false,
+    });
+
+    if let Some(bridge_list) = bridges {
+        for bridge in bridge_list {
+            let username = bridge
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let bridge_type = bridge
+                .get("bridge_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let instance_id = bridge
+                .get("instance_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let uptime = bridge
+                .get("uptime_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let routes = bridge
+                .get("route_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let uptime_fmt = format_duration(uptime);
+            let id_label = if instance_id.is_empty() {
+                String::new()
+            } else {
+                format!(" id={}", instance_id)
+            };
+
+            state_lock.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: format!(
+                    "  • {} ({}){} — routes={} uptime={}",
+                    username, bridge_type, id_label, routes, uptime_fmt
+                ),
+                msg_type: MessageType::Sys,
+                user: None,
+                channel: None,
+            edited: false,
+            });
+        }
+    }
 }
 
 async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
@@ -3003,6 +3196,7 @@ async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
+    edited: false,
     });
 }
 
@@ -3063,6 +3257,7 @@ async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
         "joined" => handle_joined_event(state, data, ts).await,
         "history" | "search" | "replay" => handle_history_or_search_event(state, data, t, ts).await,
         "info" => handle_info_event(state, data, ts).await,
+        "bridge_status" => handle_bridge_status_event(state, data, ts).await,
         "typing" => handle_typing_event(state, data).await,
         "vdata" => handle_vdata_event(state, data).await,
         _ => {}
@@ -3387,6 +3582,7 @@ fn queue_channel_message(state: &mut ClientState, channel: &str, plaintext: &str
         }
     };
     let encoded = general_purpose::STANDARD.encode(&encrypted);
+    state.record_sent(channel, plaintext);
     enqueue_timed(
         &state.ws_tx,
         serde_json::json!({"t": "msg", "ch": channel, "c": encoded, "p": plaintext}),
@@ -3463,6 +3659,7 @@ fn handle_slash_command(
                 }
             };
             let encoded = general_purpose::STANDARD.encode(&encrypted);
+            state.record_sent(&format!("dm:{}", target), msg);
             enqueue_timed(
                 &state.ws_tx,
                 serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
@@ -3601,6 +3798,23 @@ fn handle_slash_command(
         "/channels" => {
             enqueue_timed(&state.ws_tx, serde_json::json!({"t": "info"}));
         }
+        #[cfg(feature = "bridge-client")]
+        "/bridge" => {
+            let sub = args.trim().to_lowercase();
+            match sub.as_str() {
+                "status" | "" => {
+                    enqueue_timed(
+                        &state.ws_tx,
+                        serde_json::json!({"t": "bridge_status"}),
+                    );
+                    state
+                        .add_notice("Requesting bridge status from server...");
+                }
+                _ => {
+                    state.add_notice("Usage: /bridge [status]");
+                }
+            }
+        }
         "/voice" => {
             if state.voice_session.is_some() {
                 stop_voice_session(state, SessionStopFeedback::Notify);
@@ -3647,7 +3861,73 @@ fn handle_slash_command(
             }
         }
         "/edit" => {
-            state.add_notice("Edit command not yet implemented in Rust client");
+            let trimmed = args.trim();
+            if trimmed.is_empty() {
+                state.add_notice("Usage: /edit <new text>  — edit your last message");
+                state.add_notice("       /edit #N <new text> — edit your Nth most recent message");
+                return CommandFlow::Continue;
+            }
+
+            let ch = state.ch.clone();
+
+            // Parse optional index prefix: "#3 new text"
+            let (index, new_text) = if let Some(rest) = trimmed.strip_prefix('#') {
+                let mut parts = rest.splitn(2, ' ');
+                let num_str = parts.next().unwrap_or("");
+                let text = parts.next().unwrap_or("").trim();
+                match num_str.parse::<usize>() {
+                    Ok(n) if n >= 1 => (n, text),
+                    _ => {
+                        state.add_notice("Invalid index. Use /edit #N <text> where N >= 1.");
+                        return CommandFlow::Continue;
+                    }
+                }
+            } else {
+                (1, trimmed)
+            };
+
+            if new_text.is_empty() {
+                state.add_notice("New text cannot be empty.");
+                return CommandFlow::Continue;
+            }
+
+            let old_text = match state.find_recent_sent(&ch, index) {
+                Some(sent) => sent.plaintext.clone(),
+                None => {
+                    if index == 1 {
+                        state.add_notice("No recent messages to edit in this channel.");
+                    } else {
+                        state.add_notice(format!(
+                            "No message #{} found in this channel (have {} recent).",
+                            index,
+                            state
+                                .recent_sents
+                                .iter()
+                                .filter(|m| m.channel == ch)
+                                .count()
+                        ));
+                    }
+                    return CommandFlow::Continue;
+                }
+            };
+
+            // Send edit to server.
+            enqueue_timed(
+                &state.ws_tx,
+                serde_json::json!({
+                    "t": "edit",
+                    "ch": ch,
+                    "old_text": old_text,
+                    "new_text": new_text
+                }),
+            );
+
+            // Update local feed optimistically.
+            let me = state.me.clone();
+            if state.update_message_in_feed(&me, &ch, &old_text, new_text) {
+                state.add_notice(format!("Edited message #{}.", index));
+            }
+            state.refresh_dashboard();
         }
         "/history" => {
             let (scope, window_secs) = match parse_history_args(args, &state.ch) {
@@ -3893,6 +4173,7 @@ async fn main() -> ChatifyResult<()> {
             unread_separator_scopes: HashSet::new(),
             activity_hint: None,
             typing_presence: HashMap::new(),
+            recent_sents: VecDeque::new(),
             log_enabled,
         }));
         {
@@ -4064,6 +4345,46 @@ async fn main() -> ChatifyResult<()> {
 mod tests {
     use super::*;
 
+    /// Returns a `ClientState` with sensible defaults for unit tests.
+    /// The returned sender can be used to read outbound messages if needed.
+    fn test_client_state() -> (mpsc::UnboundedSender<String>, ClientState) {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let state = ClientState {
+            ws_tx: tx.clone(),
+            me: "alice".to_string(),
+            client_id: "CID-ABCD-1234-EF90".to_string(),
+            pw: "hash".to_string(),
+            ch: "general".to_string(),
+            chs: HashMap::from([("general".to_string(), true)]),
+            users: HashMap::new(),
+            trust_store: TrustStore {
+                path: PathBuf::from("test-trust.json"),
+                peers: HashMap::new(),
+            },
+            chan_keys: HashMap::new(),
+            dm_keys: HashMap::new(),
+            priv_key: vec![],
+            running: true,
+            voice_active: false,
+            voice_session: None,
+            theme: "retro-grid".to_string(),
+            file_transfers: HashMap::new(),
+            message_history: VecDeque::new(),
+            status: Status {
+                text: "Online".to_string(),
+                emoji: '🟢',
+            },
+            reactions: HashMap::new(),
+            unread_counts: HashMap::new(),
+            unread_separator_scopes: HashSet::new(),
+            activity_hint: None,
+            typing_presence: HashMap::new(),
+            recent_sents: VecDeque::new(),
+            log_enabled: false,
+        };
+        (tx, state)
+    }
+
     #[test]
     fn normalize_fingerprint_accepts_hex_and_colon_formats() {
         let raw = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
@@ -4158,6 +4479,7 @@ mod tests {
                 msg_type: MessageType::Msg,
                 user: Some("alice".to_string()),
                 channel: Some("general".to_string()),
+            edited: false,
             },
             DisplayedMessage {
                 time: "10:01".to_string(),
@@ -4165,6 +4487,7 @@ mod tests {
                 msg_type: MessageType::Msg,
                 user: Some("alice".to_string()),
                 channel: Some("general".to_string()),
+            edited: false,
             },
             DisplayedMessage {
                 time: "10:02".to_string(),
@@ -4172,6 +4495,7 @@ mod tests {
                 msg_type: MessageType::Sys,
                 user: None,
                 channel: None,
+            edited: false,
             },
         ];
 
@@ -4191,39 +4515,9 @@ mod tests {
 
     #[test]
     fn dashboard_header_lines_include_key_chips() {
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
-        let state = ClientState {
-            ws_tx: tx,
-            me: "alice".to_string(),
-            client_id: "CID-ABCD-1234-EF90".to_string(),
-            pw: "hash".to_string(),
-            ch: "general".to_string(),
-            chs: HashMap::from([("general".to_string(), true)]),
-            users: HashMap::from([("alice".to_string(), "pk".to_string())]),
-            trust_store: TrustStore {
-                path: PathBuf::from("test-trust.json"),
-                peers: HashMap::new(),
-            },
-            chan_keys: HashMap::new(),
-            dm_keys: HashMap::new(),
-            priv_key: vec![],
-            running: true,
-            voice_active: false,
-            voice_session: None,
-            theme: "retro-grid".to_string(),
-            file_transfers: HashMap::new(),
-            message_history: VecDeque::new(),
-            status: Status {
-                text: "Online".to_string(),
-                emoji: '🟢',
-            },
-            reactions: HashMap::new(),
-            unread_counts: HashMap::new(),
-            unread_separator_scopes: HashSet::new(),
-            activity_hint: None,
-            typing_presence: HashMap::new(),
-            log_enabled: false,
-        };
+        let (_tx, state) = test_client_state();
+        let mut state = state;
+        state.users.insert("alice".to_string(), "pk".to_string());
 
         let (header, subtitle) = dashboard_header_lines(&state);
         assert!(header.contains("[ONLINE:1]"));
@@ -4237,39 +4531,7 @@ mod tests {
 
     #[test]
     fn unread_tracking_counts_and_clears_scopes() {
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
-        let mut state = ClientState {
-            ws_tx: tx,
-            me: "alice".to_string(),
-            client_id: "CID-ABCD-1234-EF90".to_string(),
-            pw: "hash".to_string(),
-            ch: "general".to_string(),
-            chs: HashMap::from([("general".to_string(), true)]),
-            users: HashMap::new(),
-            trust_store: TrustStore {
-                path: PathBuf::from("test-trust.json"),
-                peers: HashMap::new(),
-            },
-            chan_keys: HashMap::new(),
-            dm_keys: HashMap::new(),
-            priv_key: vec![],
-            running: true,
-            voice_active: false,
-            voice_session: None,
-            theme: "retro-grid".to_string(),
-            file_transfers: HashMap::new(),
-            message_history: VecDeque::new(),
-            status: Status {
-                text: "Online".to_string(),
-                emoji: '🟢',
-            },
-            reactions: HashMap::new(),
-            unread_counts: HashMap::new(),
-            unread_separator_scopes: HashSet::new(),
-            activity_hint: None,
-            typing_presence: HashMap::new(),
-            log_enabled: false,
-        };
+        let (_tx, mut state) = test_client_state();
 
         state.note_unread_scope("ops");
         state.note_unread_scope("ops");
@@ -4343,39 +4605,7 @@ mod tests {
 
     #[test]
     fn typing_presence_summary_tracks_active_entries() {
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
-        let mut state = ClientState {
-            ws_tx: tx,
-            me: "alice".to_string(),
-            client_id: "CID-ABCD-1234-EF90".to_string(),
-            pw: "hash".to_string(),
-            ch: "general".to_string(),
-            chs: HashMap::from([("general".to_string(), true)]),
-            users: HashMap::new(),
-            trust_store: TrustStore {
-                path: PathBuf::from("test-trust.json"),
-                peers: HashMap::new(),
-            },
-            chan_keys: HashMap::new(),
-            dm_keys: HashMap::new(),
-            priv_key: vec![],
-            running: true,
-            voice_active: false,
-            voice_session: None,
-            theme: "retro-grid".to_string(),
-            file_transfers: HashMap::new(),
-            message_history: VecDeque::new(),
-            status: Status {
-                text: "Online".to_string(),
-                emoji: '🟢',
-            },
-            reactions: HashMap::new(),
-            unread_counts: HashMap::new(),
-            unread_separator_scopes: HashSet::new(),
-            activity_hint: None,
-            typing_presence: HashMap::new(),
-            log_enabled: false,
-        };
+        let (_tx, mut state) = test_client_state();
 
         state.set_typing_presence("bob", "#ops", true);
         assert_eq!(state.typing_count(), 1);

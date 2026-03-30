@@ -149,11 +149,6 @@ pub fn chacha20_nonce() -> [u8; 12] {
     nonce
 }
 
-/// Backward-compatible alias for previous nonce helper name.
-pub fn cha_cha20_nonce() -> [u8; 12] {
-    chacha20_nonce()
-}
-
 /// Hash a password using PBKDF2 with SHA256 and a static salt.
 ///
 /// This is used CLIENT-SIDE to produce a deterministic credential that

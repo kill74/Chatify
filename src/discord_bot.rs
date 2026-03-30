@@ -35,7 +35,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use base64::{engine::general_purpose, Engine as _};
 use dashmap::DashMap;
@@ -74,18 +74,7 @@ const RELAY_ORIGIN_DISCORD: &str = "discord";
 const RELAY_MARKER_PREFIX_DISCORD: &str = "discord:";
 
 fn normalize_chatify_channel(raw: &str) -> Option<String> {
-    let ch: String = raw
-        .to_lowercase()
-        .trim_start_matches('#')
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(32)
-        .collect();
-    if ch.is_empty() {
-        None
-    } else {
-        Some(ch)
-    }
+    clicord_server::normalize_channel(raw)
 }
 
 fn parse_channel_map(raw: &str) -> HashMap<String, String> {
@@ -758,17 +747,9 @@ impl BridgeMetrics {
             .dropped_messages
             .saturating_sub(prev.dropped_messages);
         let d_reconnects = current.reconnects.saturating_sub(prev.reconnects);
-        let d_attempts = current
-            .connect_attempts
-            .saturating_sub(prev.connect_attempts);
-        let d_auth_failures = current.auth_failures.saturating_sub(prev.auth_failures);
-        let d_ws_read = current.ws_read_errors.saturating_sub(prev.ws_read_errors);
-        let d_ws_write = current.ws_write_errors.saturating_sub(prev.ws_write_errors);
-        let d_pings = current.pings_sent.saturating_sub(prev.pings_sent);
-        let d_pongs = current.pongs_received.saturating_sub(prev.pongs_received);
 
         info!(
-            "event=bridge_health interval_s={} discord_in_total={} chatify_in_total={} discord_out_total={} chatify_out_total={} dropped_total={} reconnects_total={} connect_attempts_total={} auth_failures_total={} ws_read_errors_total={} ws_write_errors_total={} pings_total={} pongs_total={} discord_in_delta={} chatify_in_delta={} discord_out_delta={} chatify_out_delta={} dropped_delta={} reconnects_delta={} attempts_delta={} auth_failures_delta={} ws_read_delta={} ws_write_delta={} pings_delta={} pongs_delta={}",
+            "event=bridge_health interval_s={} discord_in_total={} chatify_in_total={} discord_out_total={} chatify_out_total={} dropped_total={} reconnects_total={} auth_failures_total={} ws_errors_total={} discord_in_delta={} chatify_in_delta={} discord_out_delta={} chatify_out_delta={} dropped_delta={} reconnects_delta={}",
             interval_secs,
             current.discord_ingress,
             current.chatify_ingress,
@@ -776,24 +757,14 @@ impl BridgeMetrics {
             current.chatify_forwarded,
             current.dropped_messages,
             current.reconnects,
-            current.connect_attempts,
             current.auth_failures,
-            current.ws_read_errors,
-            current.ws_write_errors,
-            current.pings_sent,
-            current.pongs_received,
+            current.ws_read_errors + current.ws_write_errors,
             d_discord_in,
             d_chatify_in,
             d_discord_out,
             d_chatify_out,
             d_drop,
-            d_reconnects,
-            d_attempts,
-            d_auth_failures,
-            d_ws_read,
-            d_ws_write,
-            d_pings,
-            d_pongs,
+            d_reconnects
         );
     }
 }
@@ -928,10 +899,7 @@ fn jittered_backoff_secs(base_secs: u64, jitter_pct: u64) -> u64 {
 
 /// Get current Unix timestamp
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    clicord_server::now_secs()
 }
 
 fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
@@ -939,9 +907,7 @@ fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
 }
 
 fn fresh_nonce_hex() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    clicord_server::fresh_nonce_hex()
 }
 
 fn load_users(users_value: &serde_json::Value, users_map: &DashMap<String, String>) {
@@ -1276,12 +1242,8 @@ async fn handle_chatify_msg(
         for discord_channel_id in discord_targets {
             if should_skip_chatify_to_discord(data, &own_source, &discord_channel_id) {
                 debug!(
-                    "event=chatify_loop_prevented chatify_channel={} discord_channel_id={} source_id={} relay_source={} relay_markers={}",
-                    ch,
-                    discord_channel_id,
-                    own_source,
-                    relay_source_id(data).unwrap_or(""),
-                    relay_markers(data).join("|")
+                    "event=chatify_loop_prevented chatify_channel={} discord_channel_id={} source_id={}",
+                    ch, discord_channel_id, own_source
                 );
                 continue;
             }
@@ -1307,26 +1269,17 @@ async fn handle_chatify_msg(
             {
                 Ok(_) => {
                     metrics.inc_chatify_forwarded();
-                    info!(
-                        "event=chatify_relayed_to_discord chatify_channel={} discord_channel_id={} sender={} relay_source={} relay_markers={} attachments_count={} reply_present={}",
-                        ch,
-                        discord_channel_id,
-                        u,
-                        relay_source_id(data).unwrap_or(""),
-                        relay_markers(data).join("|"),
-                        relay_attachments.len(),
-                        relay_reply.is_some()
+                    debug!(
+                        "event=chatify_relayed chatify_channel={} discord_channel_id={} sender={} attachments={} reply={}",
+                        ch, discord_channel_id, u, relay_attachments.len(), relay_reply.is_some()
                     );
                 }
                 Err(err) => {
-                    warn!(
-                        "event=chatify_drop reason=discord_send_failed channel={} discord_channel_id={} sender={} error={}",
-                        ch,
-                        discord_channel_id,
-                        u,
-                        err
-                    );
                     metrics.inc_dropped();
+                    warn!(
+                        "event=chatify_relay_failed chatify_channel={} discord_channel_id={} sender={} error={}",
+                        ch, discord_channel_id, u, err
+                    );
                 }
             }
         }
@@ -1438,14 +1391,11 @@ async fn run_chatify_session(
 ) -> Result<(), String> {
     let uri = cfg.uri();
     metrics.inc_connect_attempts();
-    info!(
-        "event=chatify_connect_attempt uri={} auth_timeout_s={}",
-        uri, cfg.auth_timeout_secs
-    );
+    info!("event=bridge_connect_attempt uri={} auth_timeout_s={}", uri, cfg.auth_timeout_secs);
     let (ws_stream, _) = connect_async(&uri)
         .await
         .map_err(|e| format!("Failed to connect to Chatify: {e}"))?;
-    info!("event=chatify_connected uri={}", uri);
+    info!("event=bridge_connected uri={}", uri);
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel::<WsMessage>();
@@ -1476,9 +1426,17 @@ async fn run_chatify_session(
             "u": bot_state.username,
             "pw": pw_hash,
             "pk": pk,
-            "status": {"text": "Online", "emoji": "🟢"}
+            "status": {"text": "Online", "emoji": "🟢"},
+            "bridge": true,
+            "bridge_type": "discord",
+            "bridge_instance_id": bot_state.bridge_src_tag,
+            "bridge_routes": bot_state.channel_map.len(),
         });
         send_ws_json(&bridge_tx, auth_msg);
+        info!(
+            "event=bridge_auth_sent username={} instance_id={} routes={}",
+            bot_state.username, bot_state.bridge_src_tag, bot_state.channel_map.len()
+        );
     }
 
     // Wait for auth response with timeout.
@@ -1526,18 +1484,22 @@ async fn run_chatify_session(
         return Err("Malformed auth users payload".to_string());
     }
 
+    let auth_username;
+    let bridge_instance_id;
     {
         let mut bot_state = state.lock().await;
-        bot_state.username = resp_val["u"]
+        auth_username = resp_val["u"]
             .as_str()
             .unwrap_or(&bot_state.username)
             .to_string();
+        bot_state.username = auth_username.clone();
         load_users(&resp_val["users"], &bot_state.users);
         bot_state.ws_tx = Some(bridge_tx.clone());
+        bridge_instance_id = bot_state.bridge_src_tag.clone();
     }
     info!(
-        "event=chatify_authenticated username={}",
-        resp_val["u"].as_str().unwrap_or("unknown")
+        "event=bridge_authenticated username={} instance_id={}",
+        auth_username, bridge_instance_id
     );
 
     let mut ping_interval = if cfg.ping_secs > 0 {
@@ -1616,18 +1578,12 @@ async fn bridge_supervisor(
                 if consecutive_failures >= cfg.reconnect_warn_threshold {
                     warn!(
                         "event=bridge_reconnect_slow consecutive_failures={} reason={} backoff_base_s={} backoff_sleep_s={}",
-                        consecutive_failures,
-                        err,
-                        backoff,
-                        sleep_secs
+                        consecutive_failures, err, backoff, sleep_secs
                     );
                 } else {
                     info!(
                         "event=bridge_reconnect reason={} consecutive_failures={} backoff_base_s={} backoff_sleep_s={}",
-                        err,
-                        consecutive_failures,
-                        backoff,
-                        sleep_secs
+                        err, consecutive_failures, backoff, sleep_secs
                     );
                 }
                 sleep(Duration::from_secs(sleep_secs)).await;
@@ -1650,17 +1606,8 @@ async fn main() {
     }
 
     info!(
-        "event=bridge_start host={} port={} channel={} ws_scheme={} reconnect_base_s={} reconnect_max_s={} reconnect_jitter_pct={} ping_s={} health_s={} channel_map_entries={}",
-        cfg.chatify_host,
-        cfg.chatify_port,
-        cfg.chatify_channel,
-        cfg.chatify_ws_scheme,
-        cfg.reconnect_base_secs,
-        cfg.reconnect_max_secs,
-        cfg.reconnect_jitter_pct,
-        cfg.ping_secs,
-        cfg.health_log_secs,
-        cfg.channel_map.len()
+        "event=bridge_start host={} port={} channel={} ws_scheme={} routes={}",
+        cfg.chatify_host, cfg.chatify_port, cfg.chatify_channel, cfg.chatify_ws_scheme, cfg.channel_map.len()
     );
 
     // Initialize bot state.
@@ -1669,10 +1616,7 @@ async fn main() {
     let channel_secret = match pw_hash_client(&cfg.chatify_password) {
         Ok(secret) => secret,
         Err(err) => {
-            error!(
-                "event=bridge_start_failed reason=invalid_chatify_password error={}",
-                err
-            );
+            error!("event=bridge_start_failed reason=invalid_chatify_password error={}", err);
             return;
         }
     };

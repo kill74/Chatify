@@ -72,7 +72,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
@@ -232,6 +232,18 @@ const MAX_NONCE_LEN: usize = 64;
 /// while bounding per-user memory to `NONCE_CACHE_CAP * MAX_NONCE_LEN` bytes.
 const NONCE_CACHE_CAP: usize = 256;
 
+/// How often the nonce cleanup task runs (seconds).
+/// The sweep is cheap — it only iterates `nonce_last_seen`, which has at most
+/// one entry per connected user.
+const NONCE_CLEANUP_INTERVAL_SECS: u64 = 60;
+
+/// Age threshold for nonce eviction (seconds).
+/// Users whose nonce cache has not been updated within this window are removed.
+/// Set to 2× the clock-skew window: any frame older than `MAX_CLOCK_SKEW_SECS`
+/// is already rejected by `validate_timestamp_skew`, so the extra margin is
+/// pure safety against clock jitter.
+const NONCE_MAX_AGE_SECS: f64 = MAX_CLOCK_SKEW_SECS * 2.0;
+
 /// Maximum number of concurrent connections from a single IP address.
 /// Connections beyond this are rejected with a rate-limit error.
 const MAX_CONNECTIONS_PER_IP: usize = 5;
@@ -287,6 +299,20 @@ struct AuthInfo {
     /// Optional TOTP or backup code. Present only when the client suspects
     /// or knows that 2-FA is enabled for this account.
     otp_code: Option<String>,
+
+    /// If true, the connecting client identifies as a bridge (e.g. Discord bot).
+    is_bridge: bool,
+
+    /// Bridge type identifier (e.g. "discord"). Only meaningful when
+    /// `is_bridge` is true.
+    bridge_type: String,
+
+    /// Instance ID for loop prevention. Only meaningful when `is_bridge` is
+    /// true.
+    bridge_instance_id: String,
+
+    /// Number of bridge routes. Only meaningful when `is_bridge` is true.
+    bridge_routes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,13 +354,8 @@ impl EventStore {
     /// running with a broken event store is worse than one that crashes
     /// at startup — it silently loses data.
     fn new(path: String, encryption_key: Option<Vec<u8>>) -> Self {
-        let store = Self {
-            path,
-            encryption_key,
-        };
-        store
-            .init()
-            .expect("failed to initialise event store — check database path, permissions, and encryption key");
+        let store = Self { path, encryption_key };
+        store.init().expect("failed to initialise event store — check database path, permissions, and encryption key");
         store
     }
 
@@ -348,6 +369,14 @@ impl EventStore {
     /// [`CURRENT_SCHEMA_VERSION`].
     fn init(&self) -> rusqlite::Result<()> {
         let conn = Connection::open(&self.path)?;
+
+        // Set PRAGMAs once here. For file-based databases these persist in the
+        // file and need not be repeated on every subsequent connection.
+        if self.path != ":memory:" {
+            let _ = conn.pragma_update(None, "journal_mode", "wal");
+            let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        }
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS schema_meta (
@@ -528,11 +557,13 @@ impl EventStore {
     fn open_conn(&self) -> Option<Connection> {
         match Connection::open(&self.path) {
             Ok(c) => {
-                // Enable WAL mode for better concurrent read performance
-                // and reduced lock contention under load.
-                let _ = c.pragma_update(None, "journal_mode", "wal");
-                // Enable foreign keys for referential integrity.
-                let _ = c.execute_batch("PRAGMA foreign_keys = ON");
+                // For in-memory databases each connection is independent, so
+                // PRAGMAs must be re-applied. For file-based databases they
+                // were already set once in `init()` and persist in the file.
+                if self.path == ":memory:" {
+                    let _ = c.pragma_update(None, "journal_mode", "wal");
+                    let _ = c.execute_batch("PRAGMA foreign_keys = ON");
+                }
                 Some(c)
             }
             Err(e) => {
@@ -757,57 +788,79 @@ impl EventStore {
         )
     }
 
+    /// Executes an encrypted-mode search: fetches rows matching `sql`/`params`,
+    /// decrypts each row's `search_text`, filters by `query_lower`, and returns
+    /// up to `limit` decrypted JSON values.
+    fn search_encrypted<P>(
+        &self,
+        sql: &str,
+        params: P,
+        query_lower: &str,
+        limit: usize,
+        label: &str,
+    ) -> Vec<Value>
+    where
+        P: rusqlite::Params,
+    {
+        let Some(conn) = self.open_conn() else {
+            return Vec::new();
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("{} search query prepare failed: {}", label, e);
+                return Vec::new();
+            }
+        };
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params, |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map(|r| r.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        let mut results = Vec::new();
+        for (enc_payload, enc_search) in rows {
+            let search_text = self.decrypt_field(&enc_search);
+            if search_text.contains(query_lower) {
+                let decrypted = self.decrypt_field(&enc_payload);
+                if let Ok(val) = serde_json::from_str::<Value>(&decrypted) {
+                    results.push(val);
+                }
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+        results
+    }
+
+    /// Escapes a query string for SQL LIKE and wraps it in `%...%`.
+    fn like_pattern(query: &str) -> String {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{}%", escaped.to_lowercase())
+    }
+
     /// Returns up to `limit` events for `channel` whose `search_text` column
     /// contains `query` (case-insensitive LIKE match), oldest first.
     fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
         let query_lower = query.to_lowercase();
 
         if self.encryption_key.is_some() {
-            // When encrypted, search_text is opaque to SQL. Fetch all events
-            // for the channel, decrypt both payload and search_text, then
-            // filter in-memory.
-            let Some(conn) = self.open_conn() else {
-                return Vec::new();
-            };
-            let mut stmt = match conn.prepare(
+            self.search_encrypted(
                 "SELECT payload, search_text FROM events
                  WHERE channel = ?1
                  ORDER BY ts DESC",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("search query prepare failed: {}", e);
-                    return Vec::new();
-                }
-            };
-            let rows: Vec<(String, String)> = stmt
-                .query_map(params![channel], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map(|r| r.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-
-            let mut results = Vec::new();
-            for (enc_payload, enc_search) in rows {
-                let search_text = self.decrypt_field(&enc_search);
-                if search_text.contains(&query_lower) {
-                    let decrypted = self.decrypt_field(&enc_payload);
-                    if let Ok(val) = serde_json::from_str::<Value>(&decrypted) {
-                        results.push(val);
-                    }
-                    if results.len() >= limit {
-                        break;
-                    }
-                }
-            }
-            results
+                params![channel],
+                &query_lower,
+                limit,
+                "channel",
+            )
         } else {
-            // Unencrypted: use SQL LIKE for efficiency.
-            let escaped = query
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            let like = format!("%{}%", escaped.to_lowercase());
+            let like = Self::like_pattern(query);
             self.query_events(
                 "SELECT payload FROM events
                  WHERE channel = ?1 AND search_text LIKE ?2 ESCAPE '\\'
@@ -824,11 +877,7 @@ impl EventStore {
         let query_lower = query.to_lowercase();
 
         if self.encryption_key.is_some() {
-            // Encrypted mode: filter after decrypting search_text.
-            let Some(conn) = self.open_conn() else {
-                return Vec::new();
-            };
-            let mut stmt = match conn.prepare(
+            self.search_encrypted(
                 "SELECT payload, search_text FROM (
                      SELECT ts, payload, search_text FROM events
                      WHERE event_type = 'dm' AND sender = ?1 AND target = ?2
@@ -837,56 +886,27 @@ impl EventStore {
                      WHERE event_type = 'dm' AND sender = ?2 AND target = ?1
                  )
                  ORDER BY ts DESC",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("dm search query prepare failed: {}", e);
-                    return Vec::new();
-                }
-            };
-
-            let rows: Vec<(String, String)> = stmt
-                .query_map(params![username, peer], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map(|r| r.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-
-            let mut results = Vec::new();
-            for (enc_payload, enc_search) in rows {
-                let search_text = self.decrypt_field(&enc_search);
-                if search_text.contains(&query_lower) {
-                    let decrypted = self.decrypt_field(&enc_payload);
-                    if let Ok(val) = serde_json::from_str::<Value>(&decrypted) {
-                        results.push(val);
-                    }
-                    if results.len() >= limit {
-                        break;
-                    }
-                }
-            }
-            results
+                params![username, peer],
+                &query_lower,
+                limit,
+                "dm",
+            )
         } else {
-            // Unencrypted mode: use SQL LIKE.
-            let escaped = query
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            let like = format!("%{}%", escaped.to_lowercase());
+            let like = Self::like_pattern(query);
             self.query_events(
                 "SELECT payload FROM (
-                                         SELECT ts, payload FROM events
-                                         WHERE event_type = 'dm'
-                                             AND sender = ?1 AND target = ?2
-                                             AND search_text LIKE ?3 ESCAPE '\\'
-                                         UNION ALL
-                                         SELECT ts, payload FROM events
-                                         WHERE event_type = 'dm'
-                                             AND sender = ?2 AND target = ?1
-                                             AND search_text LIKE ?3 ESCAPE '\\'
-                                 )
-                                 ORDER BY ts DESC
-                                 LIMIT ?4",
+                     SELECT ts, payload FROM events
+                     WHERE event_type = 'dm'
+                         AND sender = ?1 AND target = ?2
+                         AND search_text LIKE ?3 ESCAPE '\\'
+                     UNION ALL
+                     SELECT ts, payload FROM events
+                     WHERE event_type = 'dm'
+                         AND sender = ?2 AND target = ?1
+                         AND search_text LIKE ?3 ESCAPE '\\'
+                 )
+                 ORDER BY ts DESC
+                 LIMIT ?4",
                 params![username, peer, like, limit as i64],
             )
         }
@@ -1117,6 +1137,26 @@ impl Channel {
 }
 
 // ---------------------------------------------------------------------------
+// Bridge tracking
+// ---------------------------------------------------------------------------
+
+/// Metadata for a connected bridge (e.g. Discord ↔ Chatify).
+/// Stored in `State::bridges` for the lifetime of the connection.
+#[derive(Clone)]
+struct BridgeInfo {
+    /// The bridge's username on this server.
+    username: String,
+    /// Bridge type identifier (e.g. "discord").
+    bridge_type: String,
+    /// Instance ID for loop prevention (e.g. "discord-bridge:prod-1").
+    instance_id: String,
+    /// Unix timestamp (seconds) when the bridge connected.
+    connected_at: f64,
+    /// Number of routes configured on the bridge side.
+    route_count: usize,
+}
+
+// ---------------------------------------------------------------------------
 // State — shared, thread-safe server state
 // ---------------------------------------------------------------------------
 
@@ -1149,6 +1189,12 @@ struct State {
     /// once the cap is reached. See [`validate_and_register_nonce`].
     recent_nonces: DashMap<String, VecDeque<String>>,
 
+    /// Last-seen timestamp for each user's nonce cache entry.
+    /// Updated on every nonce validation. Used by the periodic cleanup
+    /// task to evict stale entries from `recent_nonces` when a user's
+    /// connection drops without proper cleanup (crash, network partition).
+    nonce_last_seen: DashMap<String, f64>,
+
     /// Number of WebSocket connections currently open. Managed via
     /// [`ConnectionGuard`] RAII to guarantee accurate accounting even on
     /// panics.
@@ -1161,11 +1207,6 @@ struct State {
     /// SQLite-backed event persistence and 2-FA storage.
     store: EventStore,
 
-    /// Whether structured logging is active. Checked before every `info!` /
-    /// `warn!` call to avoid the overhead of the logging facade when it is
-    /// off.
-    log_enabled: bool,
-
     /// Per-IP connection count for rate limiting.
     /// Incremented on TCP accept, decremented on disconnect.
     ip_connections: DashMap<std::net::IpAddr, usize>,
@@ -1177,29 +1218,64 @@ struct State {
     /// Session tokens keyed by token string → username.
     /// Generated at auth time and validated on every post-auth frame.
     session_tokens: DashMap<String, String>,
+
+    /// Connected bridge instances, keyed by username.
+    /// Populated during auth when the client sends `"bridge": true`.
+    bridges: DashMap<String, BridgeInfo>,
 }
 
 impl State {
     /// Creates the initial server state, pre-populating the `"general"` channel.
-    fn new(log_enabled: bool, db_path: String, db_key: Option<Vec<u8>>) -> Arc<Self> {
+    fn new(db_path: String, db_key: Option<Vec<u8>>) -> Arc<Self> {
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
             recent_nonces: DashMap::new(),
+            nonce_last_seen: DashMap::new(),
             active_connections: AtomicUsize::new(0),
             drained_notify: Notify::new(),
             store: EventStore::new(db_path, db_key),
-            log_enabled,
             ip_connections: DashMap::new(),
             ip_last_auth: DashMap::new(),
             session_tokens: DashMap::new(),
+            bridges: DashMap::new(),
         });
         // `"general"` is guaranteed to exist so that new connections always
         // have a channel to subscribe to before any `"join"` event is sent.
         s.channels.insert("general".into(), Channel::new());
         s
+    }
+
+    /// Removes stale nonce cache entries for users whose last activity is
+    /// older than `max_age_secs`.
+    ///
+    /// This is the safety net for connections that drop without proper cleanup
+    /// (crash, kernel panic, network partition). The timestamp check in
+    /// `validate_timestamp_skew` already rejects frames older than
+    /// `MAX_CLOCK_SKEW_SECS`, so entries beyond that window are unreachable
+    /// and safe to evict.
+    fn evict_stale_nonce_entries(&self, max_age_secs: f64) -> usize {
+        let cutoff = clicord_server::now() - max_age_secs;
+        let stale_keys: Vec<String> = self
+            .nonce_last_seen
+            .iter()
+            .filter_map(|entry| {
+                if *entry.value() < cutoff {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            self.nonce_last_seen.remove(key);
+            self.recent_nonces.remove(key);
+        }
+        count
     }
 
     /// Returns the [`Channel`] for `name`, creating it lazily on first access.
@@ -1387,6 +1463,12 @@ fn send_out_json(out_tx: &mpsc::UnboundedSender<String>, payload: Value) {
     let _ = out_tx.send(payload.to_string());
 }
 
+/// Sends an error message to the outbound queue.
+/// Shorthand for `send_out_json` with the `{"t":"err","m":...}` envelope.
+fn send_err(out_tx: &mpsc::UnboundedSender<String>, msg: impl std::fmt::Display) {
+    send_out_json(out_tx, serde_json::json!({"t":"err","m":msg.to_string()}));
+}
+
 /// Spawns a background task that forwards messages from a broadcast `rx` to
 /// an mpsc `out_tx`, bridging the fan-out broadcast model to the single-writer
 /// sink task.
@@ -1478,41 +1560,29 @@ async fn handle_event(
         .and_then(|v| v.as_str())
         .map(safe_ch);
 
-    if state.log_enabled {
-        if let Some(ch) = event_channel.as_deref() {
+    if let Some(ch) = event_channel.as_deref() {
             info!("event user={} type={} channel={}", username, t, ch);
         } else {
             info!("event user={} type={}", username, t);
         }
-    }
 
     // --- Replay protection (timestamp skew + nonce dedup) ------------------
     // Only applied to mutating events (see requires_fresh_protection).
     if requires_fresh_protection(t) {
         if let Err(e) = validate_timestamp_skew(d) {
-            if state.log_enabled {
-                warn!(
-                    "protocol validation failed user={} type={} reason={}",
-                    username, t, e
-                );
-            }
-            send_out_json(
-                out_tx,
-                serde_json::json!({"t":"err","m":format!("protocol validation failed: {}", e)}),
+            warn!(
+                "protocol validation failed user={} type={} reason={}",
+                username, t, e
             );
+            send_err(out_tx, format!("protocol validation failed: {}", e));
             return;
         }
         if let Err(e) = validate_and_register_nonce(state, username, d) {
-            if state.log_enabled {
-                warn!(
-                    "protocol validation failed user={} type={} reason={}",
-                    username, t, e
-                );
-            }
-            send_out_json(
-                out_tx,
-                serde_json::json!({"t":"err","m":format!("protocol validation failed: {}", e)}),
+            warn!(
+                "protocol validation failed user={} type={} reason={}",
+                username, t, e
             );
+            send_err(out_tx, format!("protocol validation failed: {}", e));
             return;
         }
     }
@@ -1639,7 +1709,7 @@ async fn handle_event(
             let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
                 Ok(v) => v,
                 Err(e) => {
-                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    send_err(out_tx, e.to_string());
                     return;
                 }
             };
@@ -1680,7 +1750,7 @@ async fn handle_event(
             let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
                 Ok(v) => v,
                 Err(e) => {
-                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    send_err(out_tx, e.to_string());
                     return;
                 }
             };
@@ -1713,7 +1783,7 @@ async fn handle_event(
             let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
                 Ok(v) => v,
                 Err(e) => {
-                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    send_err(out_tx, e.to_string());
                     return;
                 }
             };
@@ -1746,7 +1816,7 @@ async fn handle_event(
             let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
                 Ok(v) => v,
                 Err(e) => {
-                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    send_err(out_tx, e.to_string());
                     return;
                 }
             };
@@ -1755,18 +1825,12 @@ async fn handle_event(
                 .get("from_ts")
                 .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
             else {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"replay requires from_ts"}),
-                );
+                send_err(out_tx, "replay requires from_ts");
                 return;
             };
 
             if !from_ts.is_finite() || from_ts < 0.0 {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"replay requires valid from_ts"}),
-                );
+                send_err(out_tx, "replay requires valid from_ts");
                 return;
             }
 
@@ -1808,6 +1872,38 @@ async fn handle_event(
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"info","chs":chs,"online":state.online_count()}),
+            );
+        }
+        "bridge_status" => {
+            // Return status of all connected bridge instances.
+            let bridges: Vec<Value> = state
+                .bridges
+                .iter()
+                .map(|entry| {
+                    let info = entry.value();
+                    serde_json::json!({
+                        "username": info.username,
+                        "bridge_type": info.bridge_type,
+                        "instance_id": info.instance_id,
+                        "connected_at": info.connected_at,
+                        "route_count": info.route_count,
+                        "uptime_secs": (clicord_server::now() - info.connected_at) as u64,
+                    })
+                })
+                .collect();
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t": "bridge_status",
+                    "bridges": bridges,
+                    "count": bridges.len(),
+                    "ts": clicord_server::now(),
+                }),
+            );
+            info!(
+                "event=bridge_status_requested user={} bridge_count={}",
+                username,
+                bridges.len()
             );
         }
         "vjoin" => {
@@ -1916,20 +2012,14 @@ async fn handle_event(
                 .take(MAX_FILE_NAME_LEN)
                 .collect::<String>();
             if filename.is_empty() {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"filename is required"}),
-                );
+                send_err(out_tx, "filename is required");
                 return;
             }
             let size = d["size"].as_u64().unwrap_or(0);
 
             // Reject files that exceed the maximum size.
             if size > MAX_FILE_SIZE {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":format!("file size exceeds maximum of {} bytes", MAX_FILE_SIZE)}),
-                );
+                send_err(out_tx, format!("file size exceeds maximum of {} bytes", MAX_FILE_SIZE));
                 return;
             }
 
@@ -2010,10 +2100,7 @@ async fn handle_event(
             if let Some(target) = d.get("to").and_then(|v| v.as_str()) {
                 let target = target.trim().to_lowercase();
                 if target.is_empty() || !is_valid_username(&target) {
-                    send_out_json(
-                        out_tx,
-                        serde_json::json!({"t":"err","m":"typing to requires valid username"}),
-                    );
+                    send_err(out_tx, "typing to requires valid username");
                     return;
                 }
 
@@ -2103,20 +2190,14 @@ async fn handle_event(
             let secret = d["secret"].as_str().unwrap_or("").to_string();
             let code = d["code"].as_str().unwrap_or("").to_string();
             if secret.is_empty() || code.is_empty() {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"2fa_enable requires secret and code"}),
-                );
+                send_err(out_tx, "2fa_enable requires secret and code");
                 return;
             }
 
             let mut user_2fa = User2FA::new(username.to_string());
             user_2fa.enable(secret);
             if !user_2fa.verify_totp(&code) {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"invalid 2FA code"}),
-                );
+                send_err(out_tx, "invalid 2FA code");
                 return;
             }
 
@@ -2135,30 +2216,21 @@ async fn handle_event(
             // silently disabling 2FA.
             let code = d["code"].as_str().unwrap_or("").to_string();
             if code.is_empty() {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"2fa_disable requires current 2FA code"}),
-                );
+                send_err(out_tx, "2fa_disable requires current 2FA code");
                 return;
             }
 
             let mut user_2fa = match state.store.load_user_2fa(username) {
                 Some(u) if u.enabled => u,
                 _ => {
-                    send_out_json(
-                        out_tx,
-                        serde_json::json!({"t":"err","m":"2FA is not enabled"}),
-                    );
+                    send_err(out_tx, "2FA is not enabled");
                     return;
                 }
             };
 
             // Require valid TOTP code to disable
             if !user_2fa.verify_totp(&code) {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"invalid 2FA code"}),
-                );
+                send_err(out_tx, "invalid 2FA code");
                 return;
             }
 
@@ -2175,20 +2247,14 @@ async fn handle_event(
             // or a backup code; backup codes are single-use.
             let code = d["code"].as_str().unwrap_or("").to_string();
             if code.is_empty() {
-                send_out_json(
-                    out_tx,
-                    serde_json::json!({"t":"err","m":"2fa_verify requires code"}),
-                );
+                send_err(out_tx, "2fa_verify requires code");
                 return;
             }
 
             let mut user_2fa = match state.store.load_user_2fa(username) {
                 Some(v) if v.enabled => v,
                 _ => {
-                    send_out_json(
-                        out_tx,
-                        serde_json::json!({"t":"err","m":"2FA is not enabled"}),
-                    );
+                    send_err(out_tx, "2FA is not enabled");
                     return;
                 }
             };
@@ -2216,16 +2282,8 @@ async fn handle_event(
 // ---------------------------------------------------------------------------
 
 /// Returns the current Unix timestamp as a floating-point number of seconds.
-///
-/// `f64` provides sub-millisecond precision and is the format used for all
-/// `ts` fields in the protocol. Timestamps are used for clock-skew validation
-/// and event ordering; they are not used for security-critical comparisons
-/// where integer arithmetic would be safer.
 fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    clicord_server::now()
 }
 
 /// Normalises a raw channel name to a safe, consistent format.
@@ -2241,18 +2299,7 @@ fn now() -> f64 {
 /// is used as a `DashMap` key or SQLite parameter, preventing channel-name
 /// injection and collisions between logically identical names.
 fn safe_ch(raw: &str) -> String {
-    let s: String = raw
-        .to_lowercase()
-        .trim_start_matches('#')
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(32)
-        .collect();
-    if s.is_empty() {
-        "general".into()
-    } else {
-        s
-    }
+    clicord_server::normalize_channel(raw).unwrap_or_else(|| "general".into())
 }
 
 enum EventQueryScope {
@@ -2290,15 +2337,6 @@ fn sys(text: &str) -> String {
     serde_json::json!({"t":"sys","m":text,"ts":now()}).to_string()
 }
 
-/// Logs `msg` via `log::info!` if `state.log_enabled` is set.
-///
-/// The guard check avoids the overhead of the logging facade (format string
-/// allocation, level filter) when the server is run without `--log`.
-fn log(state: &State, msg: &str) {
-    if state.log_enabled {
-        info!("{}", msg);
-    }
-}
 
 /// Sends a system message to every public channel's broadcast sender.
 ///
@@ -2429,12 +2467,29 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
         }
     }
 
+    let is_bridge = d.get("bridge").and_then(|v| v.as_bool()).unwrap_or(false);
+    let bridge_type = d
+        .get("bridge_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let bridge_instance_id = d
+        .get("bridge_instance_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let bridge_routes = d.get("bridge_routes").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
     Ok(AuthInfo {
         username,
         pw_hash: pw.to_string(),
         status,
         pubkey,
         otp_code,
+        is_bridge,
+        bridge_type,
+        bridge_instance_id,
+        bridge_routes,
     })
 }
 
@@ -2644,6 +2699,12 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Chat
     if user_nonces.len() > NONCE_CACHE_CAP {
         let _ = user_nonces.pop_front();
     }
+    // Drop the mutable borrow before accessing nonce_last_seen.
+    drop(user_nonces);
+
+    state
+        .nonce_last_seen
+        .insert(username.to_string(), clicord_server::now());
 
     Ok(())
 }
@@ -2743,12 +2804,10 @@ where
 
     // --- IP-level rate limiting ---
     if !state.ip_connect(&addr) {
-        if state.log_enabled {
-            warn!(
-                "connection rejected: too many connections from {}",
-                addr.ip()
-            );
-        }
+        warn!(
+            "connection rejected: too many connections from {}",
+            addr.ip()
+        );
         // Best-effort: the stream may not support WebSocket yet, but try.
         if let Ok(ws) = accept_async(stream).await {
             let (mut sink, _) = ws.split();
@@ -2772,9 +2831,7 @@ where
     let ws = match accept_hdr_async(stream, HandshakeValidator).await {
         Ok(w) => w,
         Err(e) => {
-            if state.log_enabled {
-                debug!("WebSocket handshake failed from {}: {}", addr, e);
-            }
+            debug!("WebSocket handshake failed from {}: {}", addr, e);
             return;
         }
     };
@@ -2831,9 +2888,7 @@ where
 
     // --- Per-IP auth rate limiting ---
     if !state.ip_auth_allowed(&addr) {
-        if state.log_enabled {
-            warn!("auth rate limited from {}", addr.ip());
-        }
+        warn!("auth rate limited from {}", addr.ip());
         let _ = sink
             .send(Message::Text(
                 serde_json::json!({
@@ -2852,6 +2907,10 @@ where
         status,
         pubkey,
         otp_code,
+        is_bridge,
+        bridge_type,
+        bridge_instance_id,
+        bridge_routes,
     } = auth;
 
     // --- Credential verification ---
@@ -2867,9 +2926,7 @@ where
                     serde_json::json!({"t":"err","m":"invalid credentials"}).to_string(),
                 ))
                 .await;
-            if state.log_enabled {
-                warn!("auth failed: invalid password for user={}", username);
-            }
+            warn!("auth failed: invalid password for user={}", username);
             return;
         }
         Err("first_login") => {
@@ -2878,9 +2935,7 @@ where
             // in another salted PBKDF2 layer server-side.
             let server_hash = crypto::pw_hash(&pw_hash);
             state.store.upsert_credentials(&username, &server_hash);
-            if state.log_enabled {
-                info!("credentials created for new user={}", username);
-            }
+            info!("credentials created for new user={}", username);
         }
         Err(e) => {
             let _ = sink
@@ -2901,9 +2956,7 @@ where
                 serde_json::json!({"t":"err","m":"username already in use"}).to_string(),
             ))
             .await;
-        if state.log_enabled {
-            warn!("auth rejected: username '{}' already connected", username);
-        }
+        warn!("auth rejected: username '{}' already connected", username);
         return;
     }
 
@@ -2924,6 +2977,22 @@ where
     state.user_statuses.insert(username.clone(), status);
     state.user_pubkeys.insert(username.clone(), pubkey);
 
+    // Register bridge if the client identified as one.
+    if is_bridge {
+        let info = BridgeInfo {
+            username: username.clone(),
+            bridge_type: bridge_type.clone(),
+            instance_id: bridge_instance_id.clone(),
+            connected_at: clicord_server::now(),
+            route_count: bridge_routes,
+        };
+        state.bridges.insert(username.clone(), info);
+        info!(
+            "event=bridge_connected bridge_type={} instance_id={} user={} routes={}",
+            bridge_type, bridge_instance_id, username, bridge_routes
+        );
+    }
+
     // Subscribe to "general" before sending "ok" to avoid missing messages
     // that arrive between the response send and the subscription.
     let general = state.chan("general");
@@ -2939,7 +3008,7 @@ where
     }
 
     broadcast_system_msg(&state, &format!("→ {} joined", username)).await;
-    log(&state, &format!("+ {}", username));
+    info!("+ {}", username);
 
     // ---- Phase 3: set up bidirectional message routing ----------------------
 
@@ -2968,7 +3037,7 @@ where
         let msg = match stream.next().await {
             Some(Ok(msg)) => msg,
             Some(Err(e)) => {
-                log(&state, &format!("ws recv error for {}: {}", username, e));
+                info!("ws recv error for {}: {}", username, e);
                 break;
             }
             None => break, // Client closed the connection cleanly.
@@ -3020,8 +3089,15 @@ where
     // Clear the nonce cache to free memory; replays from this session are
     // no longer possible once the connection is closed.
     state.recent_nonces.remove(&username);
+    state.nonce_last_seen.remove(&username);
+    if state.bridges.remove(&username).is_some() {
+        info!(
+            "event=bridge_disconnected user={}",
+            username
+        );
+    }
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
-    log(&state, &format!("- {}", username));
+    info!("- {}", username);
     // _conn_guard drops here, decrementing active_connections and IP counter.
 }
 
@@ -3264,7 +3340,7 @@ async fn main() -> ChatifyResult<()> {
     };
 
     let listener = TcpListener::bind(&addr).await?;
-    let state = State::new(args.log, args.db.clone(), db_key);
+    let state = State::new(args.db.clone(), db_key);
 
     let enc_label = if state.store.is_encrypted() {
         "ChaCha20-Poly1305"
@@ -3280,15 +3356,29 @@ async fn main() -> ChatifyResult<()> {
         info!("server started addr={}://{} db={}", proto, addr, args.db);
     }
 
+    // Periodic nonce cache cleanup: evicts stale entries for users whose
+    // connection dropped without proper cleanup (crash, network partition).
+    {
+        let cleanup_state = state.clone();
+        let log_enabled = args.log;
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(NONCE_CLEANUP_INTERVAL_SECS)).await;
+                let evicted = cleanup_state.evict_stale_nonce_entries(NONCE_MAX_AGE_SECS);
+                if evicted > 0 && log_enabled {
+                    info!("nonce cache: evicted {} stale user entries", evicted);
+                }
+            }
+        });
+    }
+
     // Accept loop: runs until Ctrl+C is received.
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 broadcast_system_msg(&state, "Server is shutting down").await;
                 println!("\nShutdown signal received. Stopping server loop...");
-                if state.log_enabled {
-                    info!("shutdown signal received; stopping accept loop");
-                }
+                info!("shutdown signal received; stopping accept loop");
                 break;
             }
             accept_result = listener.accept() => {
@@ -3308,9 +3398,7 @@ async fn main() -> ChatifyResult<()> {
                                         .await;
                                     }
                                     Err(e) => {
-                                        if s.log_enabled {
-                                            warn!("TLS handshake failed from {}: {}", addr, e);
-                                        }
+                                        warn!("TLS handshake failed from {}: {}", addr, e);
                                     }
                                 }
                             });
@@ -3339,18 +3427,14 @@ async fn main() -> ChatifyResult<()> {
                 "Shutdown timeout reached with {} active connection(s)",
                 active
             );
-            if state.log_enabled {
-                warn!(
-                    "shutdown timeout reached with {} active connection(s)",
-                    active
-                );
-            }
+            warn!(
+                "shutdown timeout reached with {} active connection(s)",
+                active
+            );
             break;
         }
         println!("Waiting for {} active connection(s) to close...", active);
-        if state.log_enabled {
-            info!("waiting for active connections to drain count={}", active);
-        }
+        info!("waiting for active connections to drain count={}", active);
         tokio::select! {
             _ = state.drained_notify.notified() => {}
             _ = sleep(Duration::from_millis(250)) => {}
@@ -3404,7 +3488,7 @@ mod tests {
     /// the drop and the atomic write.
     #[tokio::test]
     async fn connection_counter_tracks_open_and_close() {
-        let state = State::new(false, ":memory:".to_string(), None);
+        let state = State::new(":memory:".to_string(), None);
         assert_eq!(state.active_connection_count(), 0);
 
         let addr1: SocketAddr = "127.0.0.1:12345".parse().unwrap();
