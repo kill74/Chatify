@@ -614,6 +614,7 @@ struct BridgeMetrics {
 }
 
 #[derive(Clone, Copy)]
+#[expect(dead_code)]
 struct BridgeMetricsSnapshot {
     discord_ingress: u64,
     chatify_ingress: u64,

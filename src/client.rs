@@ -754,6 +754,7 @@ impl Default for DisplayedMessage {
 
 /// Record of a message the client sent, kept so `/edit` can reference it.
 #[derive(Debug, Clone)]
+#[expect(dead_code)]
 struct SentMessage {
     /// The channel the message was sent to.
     channel: String,
