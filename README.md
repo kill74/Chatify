@@ -181,18 +181,19 @@ Release automation:
 
 ### Server (`clicord-server`)
 
-| Flag         | Default      | Description                                           |
-| ------------ | ------------ | ----------------------------------------------------- |
-| `--host`     | `0.0.0.0`    | Bind address                                          |
-| `--port`     | `8765`       | Bind port                                             |
-| `--db`       | `chatify.db` | SQLite database path                                  |
-| `--db-key`   | (auto)       | Hex-encoded 32-byte encryption key (64 hex chars)     |
-| `--tls`      | `false`      | Enable TLS (wss://)                                   |
-| `--tls-cert` | `cert.pem`   | Path to TLS certificate (PEM)                         |
-| `--tls-key`  | `key.pem`    | Path to TLS private key (PEM)                         |
-| `--log`      | `false`      | Enable logging                                        |
+| Flag         | Default      | Description                                       |
+| ------------ | ------------ | ------------------------------------------------- |
+| `--host`     | `0.0.0.0`    | Bind address                                      |
+| `--port`     | `8765`       | Bind port                                         |
+| `--db`       | `chatify.db` | SQLite database path                              |
+| `--db-key`   | (auto)       | Hex-encoded 32-byte encryption key (64 hex chars) |
+| `--tls`      | `false`      | Enable TLS (wss://)                               |
+| `--tls-cert` | `cert.pem`   | Path to TLS certificate (PEM)                     |
+| `--tls-key`  | `key.pem`    | Path to TLS private key (PEM)                     |
+| `--log`      | `false`      | Enable logging                                    |
 
 Encryption key resolution order:
+
 1. `--db-key` flag (hex string)
 2. `<db>.key` file (auto-generated on first run)
 3. No encryption for `:memory:` databases
@@ -237,12 +238,12 @@ Chatify persists events in SQLite using server flag `--db` (default: `chatify.db
 
 ### Database schema (v3)
 
-| Table              | Purpose                                          |
-| ------------------ | ------------------------------------------------ |
+| Table              | Purpose                                                       |
+| ------------------ | ------------------------------------------------------------- |
 | `events`           | Chat events with indexes on `(channel, ts)` and `search_text` |
-| `user_2fa`         | TOTP secrets, backup codes, verification state   |
-| `user_credentials` | Per-user salted password hashes, login counters   |
-| `schema_meta`      | Schema version tracking (no-downgrade policy)     |
+| `user_2fa`         | TOTP secrets, backup codes, verification state                |
+| `user_credentials` | Per-user salted password hashes, login counters               |
+| `schema_meta`      | Schema version tracking (no-downgrade policy)                 |
 
 WAL mode is enabled on every connection for concurrent read performance.
 
