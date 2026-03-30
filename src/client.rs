@@ -21,7 +21,7 @@ use rand::RngCore;
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
@@ -1103,8 +1103,12 @@ async fn main() -> ChatifyResult<()> {
         state.lock().await.me = auth.me;
 
         // Spawn tasks for reading from WebSocket and from stdin
+        // and coordinate shutdown so either side can terminate the other.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
         let state_clone = state.clone();
-        let rx_task = tokio::spawn(async move {
+        let shutdown_tx_rx = shutdown_tx.clone();
+        let mut rx_task = tokio::spawn(async move {
             loop {
                 let msg = match ws_rx.next().await {
                     Some(Ok(msg)) => msg,
@@ -1129,20 +1133,33 @@ async fn main() -> ChatifyResult<()> {
                     }
                 }
             }
+            let _ = shutdown_tx_rx.send(true);
         });
 
         let state_clone2 = state.clone();
-        let stdin_task = tokio::spawn(async move {
+        let shutdown_tx_stdin = shutdown_tx.clone();
+        let mut shutdown_rx_stdin = shutdown_rx.clone();
+        let mut stdin_task = tokio::spawn(async move {
             let stdin = BufReader::new(tokio::io::stdin());
             let mut lines = stdin.lines();
             loop {
-                let line = match lines.next_line().await {
-                    Ok(Some(line)) => line,
-                    Ok(None) => break,
-                    Err(e) => {
-                        let state = state_clone2.lock().await;
-                        state.log("WARN", &format!("stdin read error: {}", e));
-                        break;
+                let line = tokio::select! {
+                    changed = shutdown_rx_stdin.changed() => {
+                        if changed.is_ok() && *shutdown_rx_stdin.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    line_result = lines.next_line() => {
+                        match line_result {
+                            Ok(Some(line)) => line,
+                            Ok(None) => break,
+                            Err(e) => {
+                                let state = state_clone2.lock().await;
+                                state.log("WARN", &format!("stdin read error: {}", e));
+                                break;
+                            }
+                        }
                     }
                 };
                 let line = line.trim();
@@ -1332,6 +1349,7 @@ async fn main() -> ChatifyResult<()> {
                             }
                             state.voice_active = false;
                             state.running = false;
+                            let _ = shutdown_tx_stdin.send(true);
                             break;
                         }
                         _ => {
@@ -1365,13 +1383,43 @@ async fn main() -> ChatifyResult<()> {
             }
         });
 
-        // Wait for tasks to complete
+        tokio::select! {
+            _ = &mut rx_task => {
+                let _ = shutdown_tx.send(true);
+                stdin_task.abort();
+            }
+            _ = &mut stdin_task => {
+                let _ = shutdown_tx.send(true);
+                rx_task.abort();
+            }
+        }
+
         let _ = rx_task.await;
         let _ = stdin_task.await;
 
-        // Clean up
-        let mut state = state.lock().await;
-        state.running = false;
+        let (ws_tx_cleanup, voice_to_stop) = {
+            let mut state = state.lock().await;
+            state.running = false;
+            state.voice_active = false;
+            state.pw.zeroize();
+            state.priv_key.zeroize();
+            for key in state.chan_keys.values_mut() {
+                key.zeroize();
+            }
+            for key in state.dm_keys.values_mut() {
+                key.zeroize();
+            }
+            (state.ws_tx.clone(), state.voice_session.take())
+        };
+
+        if let Some(session) = voice_to_stop {
+            enqueue_timed(
+                &ws_tx_cleanup,
+                serde_json::json!({"t": "vleave", "r": session.room.clone()}),
+            );
+            let _ = session.event_tx.send(VoiceEvent::Stop);
+            let _ = session.task.join();
+        }
     }
 
     Ok(())

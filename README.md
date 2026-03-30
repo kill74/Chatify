@@ -197,6 +197,13 @@ Encryption key resolution order:
 2. `<db>.key` file (auto-generated on first run)
 3. No encryption for `:memory:` databases
 
+Local key hygiene:
+
+- Treat `<db>.key` as a production secret. Never commit it to source control.
+- On Unix platforms, auto-generated key files are created with owner-only permissions (`0600`).
+- Local runtime artifacts are ignored by default (`chatify.db`, `*.db.key`, `cert.pem`, `key.pem`).
+- If a key is exposed, rotate immediately by replacing the key and re-encrypting or recreating the database.
+
 ### Client (`clicord-client`)
 
 | Flag     | Default     | Description          |
@@ -379,7 +386,7 @@ Chatify includes encryption helpers, protocol checks, and authentication hardeni
 - **Input validation** — username format, channel name sanitization, status field schema, file size caps (100MB), LIKE wildcard escaping.
 - **Crypto** — ChaCha20-Poly1305 AEAD for message encryption, X25519 Diffie-Hellman for DM key exchange, domain-separated hashing.
 - **Database** — WAL mode for concurrency, parameterized queries (no SQL injection), schema versioning with no-downgrade policy.
-- **Database encryption at rest** — ChaCha20-Poly1305 encryption of `payload` and `search_text` columns. Key auto-generated in `<db>.key` on first run; pass `--db-key` for custom keys.
+- **Database encryption at rest** — ChaCha20-Poly1305 encryption of `payload` and `search_text` columns. Key auto-generated in `<db>.key` on first run (owner-only file mode on Unix); pass `--db-key` for custom keys.
 - **Error propagation** — all crypto operations return `Result` types; no silent failures.
 
 ### Known limitations

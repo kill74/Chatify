@@ -800,17 +800,35 @@ impl EventStore {
     // User credential management (password verification)
     // -----------------------------------------------------------------------
 
-    /// Loads the stored password hash for `username`, or `None` if the user
-    /// has never registered (first-time login auto-creates the record).
-    fn load_pw_hash(&self, username: &str) -> Option<String> {
-        let conn = self.open_conn()?;
+    /// Loads the stored password hash for `username`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(hash))` when a credential exists.
+    /// - `Ok(None)` when no credential exists yet.
+    /// - `Err(..)` when the storage layer is unavailable or query execution fails.
+    fn load_pw_hash(&self, username: &str) -> Result<Option<String>, &'static str> {
+        let Some(conn) = self.open_conn() else {
+            return Err("store_unavailable");
+        };
         conn.query_row(
             "SELECT pw_hash FROM user_credentials WHERE username = ?1",
             params![username],
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .ok()?
+        .map_err(|e| {
+            if let SqlError::SqliteFailure(_, Some(ref msg)) = e {
+                if msg.contains("no such table: user_credentials") {
+                    warn!(
+                        "credential table missing for user '{}'; allowing compatibility auth path",
+                        username
+                    );
+                    return "credentials_table_missing";
+                }
+            }
+            warn!("credential lookup failed for user '{}': {}", username, e);
+            "store_query_failed"
+        })
     }
 
     /// Creates or updates the credential record for `username`.
@@ -841,14 +859,17 @@ impl EventStore {
     /// - `Ok(true)` if the hash matches.
     /// - `Ok(false)` if the hash does not match.
     /// - `Err("first_login")` if no credential exists yet (first-time user).
+    /// - `Err("store_unavailable" | "store_query_failed")` on storage failures.
     fn verify_credential(
         &self,
         username: &str,
         submitted_hash: &str,
     ) -> Result<bool, &'static str> {
         match self.load_pw_hash(username) {
-            None => Err("first_login"),
-            Some(stored) => Ok(crypto::pw_verify(submitted_hash, &stored)),
+            Ok(None) => Err("first_login"),
+            Ok(Some(stored)) => Ok(crypto::pw_verify(submitted_hash, &stored)),
+            Err("credentials_table_missing") => Err("first_login"),
+            Err(e) => Err(e),
         }
     }
 }
@@ -934,10 +955,6 @@ struct State {
     /// once the cap is reached. See [`validate_and_register_nonce`].
     recent_nonces: DashMap<String, VecDeque<String>>,
 
-    /// Metadata for in-progress file transfers, keyed by `file_id`.
-    /// Used by receivers to look up transfer details before accepting chunks.
-    file_transfers: DashMap<String, Value>,
-
     /// Number of WebSocket connections currently open. Managed via
     /// [`ConnectionGuard`] RAII to guarantee accurate accounting even on
     /// panics.
@@ -977,7 +994,6 @@ impl State {
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
             recent_nonces: DashMap::new(),
-            file_transfers: DashMap::new(),
             active_connections: AtomicUsize::new(0),
             drained_notify: Notify::new(),
             store: EventStore::new(db_path, db_key),
@@ -1594,7 +1610,6 @@ async fn handle_event(
                 .as_str()
                 .unwrap_or(&format!("{}_{}", username, now()))
                 .to_string();
-            state.file_transfers.insert(file_id.clone(), d.clone());
             let file_announce = serde_json::json!({
                 "t":"file_meta","from":username,"filename":filename,
                 "size":size,"file_id":file_id,"ch":ch,"ts":now()
@@ -2705,6 +2720,34 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> ChatifyResult<TlsAcceptor
 ///
 /// The `.key` file is created with user-only permissions where possible.
 /// Store it alongside backups; losing it means the database is unrecoverable.
+fn write_db_key_file(key_path: &str, hex_key: &str) -> ChatifyResult<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut key_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(key_path)
+            .map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        key_file
+            .write_all(hex_key.as_bytes())
+            .map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        key_file
+            .write_all(b"\n")
+            .map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(key_path, hex_key).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    }
+
+    Ok(())
+}
+
 fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<Vec<u8>>> {
     // 1. CLI-provided key takes priority.
     if let Some(hex_key) = cli_key {
@@ -2748,7 +2791,7 @@ fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
     let hex_key = hex::encode(key);
-    std::fs::write(&key_path, &hex_key).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    write_db_key_file(&key_path, &hex_key)?;
     println!("Generated new DB encryption key: {}", key_path);
     Ok(Some(key.to_vec()))
 }

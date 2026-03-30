@@ -6,6 +6,10 @@ chatify.db
 chatify-*.db
 *.sqlite
 *.sqlite3
+*.db.key
+chatify.db.key
+cert.pem
+key.pem
 build.log
 
 # IDE and editor
