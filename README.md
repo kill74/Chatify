@@ -18,6 +18,7 @@ Chatify ships three binaries:
 
 - Multi-channel chat + direct messages
 - SQLite persistence (`history`, `search`, `rewind`)
+- Append-only event store with versioned schema migrations
 - Credential hardening (PBKDF2), rate limiting, 2FA (TOTP + backup codes)
 - Replay protection (nonce + timestamp validation)
 - Optional Discord bridge with reconnection, health logs, and ping/pong telemetry
@@ -101,6 +102,14 @@ Release pipeline:
 
 - [windows-release-package workflow](.github/workflows/windows-release-package.yml) publishes ZIP + installer + checksums on release.
 - [release-security-report workflow](.github/workflows/release-security-report.yml) publishes a structured security report per release tag.
+
+## Event Store Design
+
+- Write path is append-only: events are inserted, never updated/deleted.
+- SQLite schema is versioned (`schema_meta`) and upgraded sequentially on startup.
+- History lookups use channel + timestamp indexes (`channel`, `ts DESC`).
+- DM lookups use route-aware indexes (`event_type`, `sender`, `target`, `ts DESC`).
+- Contract tests verify history survives restart and that history/search remain responsive on a 100k local-event dataset.
 
 ## Configuration
 

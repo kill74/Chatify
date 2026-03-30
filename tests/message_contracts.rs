@@ -29,13 +29,13 @@
 //! | Auth contract    | Field validation, key format, oversized frames, JSON    |
 //! | 2-FA             | Missing code, backup-code happy path, code consumption  |
 //! | Protocol safety  | Timestamp skew, nonce replay, payload size, fuzz corpus |
-//! | Schema migration | v0→v2 upgrade, future-version no-downgrade              |
-//! | Feature contracts| Messages, history, search, rewind, voice (vdata)        |
+//! | Schema migration | v0→v4 upgrade, future-version no-downgrade              |
+//! | Feature contracts| Messages, history, search, replay, rewind, voice (vdata) |
 
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{params, Connection};
@@ -66,6 +66,9 @@ struct TestServer {
     /// Stored here so tests can inspect database state after server operations
     /// and so [`Drop`] can delete the file after the test.
     db_path: PathBuf,
+
+    /// When true, [`Drop`] removes `db_path` during teardown.
+    cleanup_db: bool,
 }
 
 impl Drop for TestServer {
@@ -77,7 +80,22 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self._child.kill();
         let _ = self._child.wait();
-        let _ = std::fs::remove_file(&self.db_path);
+        if self.cleanup_db {
+            let _ = std::fs::remove_file(&self.db_path);
+        }
+    }
+}
+
+impl TestServer {
+    /// Stops the running server process but preserves the backing SQLite file.
+    ///
+    /// Used by restart tests that need to re-launch the server against the
+    /// exact same database path.
+    fn stop_and_preserve_db(mut self) -> PathBuf {
+        self.cleanup_db = false;
+        let _ = self._child.kill();
+        let _ = self._child.wait();
+        self.db_path.clone()
     }
 }
 
@@ -279,6 +297,7 @@ async fn start_server_with_db(db_path: PathBuf) -> TestServer {
         _child: child,
         url,
         db_path,
+        cleanup_db: true,
     }
 }
 
@@ -1131,6 +1150,175 @@ async fn history_contract_returns_persisted_events() {
     assert!(found, "expected persisted message in history response");
 }
 
+/// Verifies that persisted history survives a full server restart cycle.
+///
+/// The test writes an event, terminates the process, starts a new server
+/// against the same DB file, and confirms history still includes the event.
+#[tokio::test]
+async fn history_contract_survives_server_restart() {
+    let seed_port = allocate_port();
+    let db_path = temp_db_path(seed_port);
+
+    let server_before = start_server_with_db(db_path.clone()).await;
+    let mut alice = connect_and_auth(&server_before.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg", "ch": "general",
+                "c": "restart-history-cipher",
+                "p": "restart history marker"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send message before restart");
+    let _ = recv_by_type(&mut alice, "msg").await;
+
+    let preserved_db = server_before.stop_and_preserve_db();
+
+    let server_after = start_server_with_db(preserved_db).await;
+    let mut bob = connect_and_auth(&server_after.url, "bob").await;
+    bob.send(Message::Text(
+        json!({"t": "history", "ch": "general", "limit": 50}).to_string(),
+    ))
+    .await
+    .expect("request history after restart");
+
+    let history = recv_by_type(&mut bob, "history").await;
+    let events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history events must be an array");
+    let found = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("msg")
+            && e.get("c").and_then(|v| v.as_str()) == Some("restart-history-cipher")
+    });
+    assert!(found, "expected persisted event after server restart");
+}
+
+/// Verifies that history and search remain responsive with a 100k-event local
+/// dataset.
+#[tokio::test]
+async fn history_and_search_latency_stays_low_with_100k_local_events() {
+    const EVENT_COUNT: usize = 100_000;
+    const HISTORY_LIMIT: i64 = 100;
+    const SEARCH_LIMIT: i64 = 100;
+    const HISTORY_MAX_MS: u128 = 600;
+    const SEARCH_MAX_MS: u128 = 2500;
+
+    let seed_port = allocate_port();
+    let db_path = temp_db_path(seed_port);
+
+    // Bootstrap schema, then stop server while preserving the DB file.
+    let bootstrap = start_server_with_db(db_path.clone()).await;
+    let preserved_db = bootstrap.stop_and_preserve_db();
+
+    let mut conn = Connection::open(&preserved_db).expect("open benchmark db");
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+        .expect("configure benchmark sqlite pragmas");
+
+    let tx = conn
+        .transaction()
+        .expect("begin benchmark insert transaction");
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .expect("prepare benchmark insert statement");
+
+        for i in 0..EVENT_COUNT {
+            let ts = 1_700_000_000.0 + (i as f64 * 0.001);
+            let payload = json!({
+                "t": "msg",
+                "ch": "benchroom",
+                "u": "seed",
+                "c": format!("bench-cipher-{}", i),
+                "ts": ts
+            })
+            .to_string();
+            let search_text = if i % 2_000 == 0 {
+                "needle-marker benchmark topic"
+            } else {
+                "noise marker"
+            };
+
+            stmt.execute(params![
+                ts,
+                "msg",
+                "benchroom",
+                "seed",
+                Option::<String>::None,
+                payload,
+                search_text,
+            ])
+            .expect("insert benchmark event");
+        }
+    }
+    tx.commit().expect("commit benchmark dataset");
+
+    let server = start_server_with_db(preserved_db).await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    let history_start = Instant::now();
+    alice
+        .send(Message::Text(
+            json!({"t": "history", "ch": "benchroom", "limit": HISTORY_LIMIT}).to_string(),
+        ))
+        .await
+        .expect("request benchmark history");
+    let history = recv_by_type(&mut alice, "history").await;
+    let history_latency_ms = history_start.elapsed().as_millis();
+    let history_events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("benchmark history events must be an array");
+    assert!(
+        !history_events.is_empty(),
+        "expected non-empty history response for benchmark dataset"
+    );
+    assert!(
+        history_latency_ms <= HISTORY_MAX_MS,
+        "history latency too high on {} events: {}ms (limit {}ms)",
+        EVENT_COUNT,
+        history_latency_ms,
+        HISTORY_MAX_MS
+    );
+
+    let search_start = Instant::now();
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "search",
+                "ch": "benchroom",
+                "q": "needle-marker",
+                "limit": SEARCH_LIMIT
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("request benchmark search");
+    let search = recv_by_type(&mut alice, "search").await;
+    let search_latency_ms = search_start.elapsed().as_millis();
+    let search_events = search
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("benchmark search events must be an array");
+    assert!(
+        !search_events.is_empty(),
+        "expected search hits in benchmark dataset"
+    );
+    assert!(
+        search_latency_ms <= SEARCH_MAX_MS,
+        "search latency too high on {} events: {}ms (limit {}ms)",
+        EVENT_COUNT,
+        search_latency_ms,
+        SEARCH_MAX_MS
+    );
+}
+
 /// Verifies that `"history"` supports a time window via the optional
 /// `"seconds"` field.
 ///
@@ -1506,7 +1694,8 @@ async fn replay_contract_returns_events_from_timestamp() {
 // Schema migration contract tests
 // ---------------------------------------------------------------------------
 
-/// Verifies that a fresh server initialises `schema_meta` to version `"2"`.
+/// Verifies that a fresh server initialises `schema_meta` to the latest
+/// version.
 ///
 /// This is the baseline migration contract: any server started against an
 /// empty or newly created database must create and stamp the expected schema
@@ -1517,17 +1706,18 @@ async fn schema_meta_contains_current_version() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-    assert_eq!(version, "3");
+    assert_eq!(version, "4");
 }
 
-/// Verifies that a server migrates a `v0` database to schema `v3` on startup.
+/// Verifies that a server migrates a `v0` database to schema `v4` on startup.
 ///
 /// Migration correctness is verified by:
 ///
-/// 1. Confirming `schema_meta.schema_version` is updated to `"3"`.
+/// 1. Confirming `schema_meta.schema_version` is updated to `"4"`.
 /// 2. Confirming the `events` table exists (created by `v1` migration).
 /// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
 /// 4. Confirming the `user_credentials` table exists (created by `v3` migration).
+/// 5. Confirming append-only and query indexes from `v4` exist.
 ///
 /// All assertions are made directly against SQLite rather than through the
 /// server API to keep migration tests independent of server protocol changes.
@@ -1543,8 +1733,8 @@ async fn schema_migrates_from_version_zero_to_current() {
     let conn = Connection::open(&db_path).expect("open migrated db");
     assert_eq!(
         read_schema_version(&db_path),
-        "3",
-        "expected migration to set schema version to 3"
+        "4",
+        "expected migration to set schema version to 4"
     );
 
     let events_exists: i64 = conn
@@ -1581,6 +1771,66 @@ async fn schema_migrates_from_version_zero_to_current() {
     assert_eq!(
         user_credentials_exists, 1,
         "user_credentials table should exist after migration"
+    );
+
+    let channel_ts_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_events_channel_ts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for idx_events_channel_ts");
+    assert_eq!(
+        channel_ts_index_exists, 1,
+        "idx_events_channel_ts should exist after migration"
+    );
+
+    let dm_route_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_events_dm_route_ts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for idx_events_dm_route_ts");
+    assert_eq!(
+        dm_route_index_exists, 1,
+        "idx_events_dm_route_ts should exist after migration"
+    );
+
+    let append_only_update_trigger_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='trg_events_append_only_update'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for append-only update trigger");
+    assert_eq!(
+        append_only_update_trigger_exists, 1,
+        "append-only update trigger should exist after migration"
+    );
+
+    conn.execute(
+        "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            1_700_000_000.0,
+            "msg",
+            "schema-room",
+            "alice",
+            Option::<String>::None,
+            "{\"t\":\"msg\",\"ch\":\"schema-room\",\"u\":\"alice\",\"c\":\"schema-test\",\"ts\":1700000000}",
+            "schema test"
+        ],
+    )
+    .expect("insert event for append-only trigger validation");
+
+    let update_result = conn.execute(
+        "UPDATE events SET payload = 'mutated' WHERE channel='schema-room'",
+        [],
+    );
+    assert!(
+        update_result.is_err(),
+        "events updates must be rejected by append-only trigger"
     );
 
     drop(server);

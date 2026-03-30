@@ -34,6 +34,14 @@ Track at least the following per test run:
 1. Inject latency and packet loss at OS/network layer.
 2. Validate latency tail behavior and reconnect stability.
 
+### Scenario D: Event-Store Query Latency (100k)
+
+1. Seed 100,000 local events in a single channel.
+2. Measure end-to-end RPC latency for:
+	- `history` with bounded limit.
+	- `search` with bounded limit and non-empty hit set.
+3. Run after a process restart to include cold-start and migration effects.
+
 ## Environment Recording
 
 For every benchmark report, record:
@@ -75,6 +83,7 @@ Treat these as release blockers:
 1. p95 latency regression greater than 20 percent without accepted trade-off.
 2. Throughput regression greater than 15 percent without accepted trade-off.
 3. Reconnect instability introduced in bridge regression paths.
+4. Event-store query latency regressions that break the 100k local dataset envelope.
 
 ## Next Step
 

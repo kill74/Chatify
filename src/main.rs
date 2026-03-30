@@ -187,7 +187,7 @@ const MAX_HANDSHAKE_HEADERS: usize = 64;
 /// The migration path in [`EventStore::migrate`] upgrades from any lower
 /// version to this one. If the stored version is *higher*, the server logs a
 /// warning and continues without modifying the schema (no downgrade).
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// Default number of events returned by a `history` request.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -392,10 +392,12 @@ impl EventStore {
     ///
     /// # Migration history
     ///
-    /// | Version | Tables / Indexes Added                              |
-    /// |---------|-----------------------------------------------------|
-    /// | 0 → 1   | `events`, `idx_events_channel_ts`, `idx_events_search` |
-    /// | 1 → 2   | `user_2fa`                                          |
+    /// | Version | Tables / Indexes Added                                    |
+    /// |---------|-----------------------------------------------------------|
+    /// | 0 → 1   | `events`, `idx_events_channel_ts`, `idx_events_search`   |
+    /// | 1 → 2   | `user_2fa`                                                |
+    /// | 2 → 3   | `user_credentials`                                        |
+    /// | 3 → 4   | append-only triggers + `idx_events_dm_route_ts`          |
     fn migrate(&self, conn: &Connection, from_version: i64) -> rusqlite::Result<()> {
         let mut version = from_version;
 
@@ -453,6 +455,45 @@ impl EventStore {
                 ",
             )?;
             version = 3;
+            Self::set_schema_version(conn, version)?;
+        }
+
+        if version < 4 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          REAL    NOT NULL,
+                    event_type  TEXT    NOT NULL,
+                    channel     TEXT    NOT NULL,
+                    sender      TEXT,
+                    target      TEXT,
+                    payload     TEXT    NOT NULL,
+                    search_text TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_channel_ts
+                    ON events(channel, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_search
+                    ON events(search_text);
+                CREATE INDEX IF NOT EXISTS idx_events_dm_route_ts
+                    ON events(event_type, sender, target, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_channel_search_ts
+                    ON events(channel, ts DESC, search_text);
+
+                CREATE TRIGGER IF NOT EXISTS trg_events_append_only_update
+                BEFORE UPDATE ON events
+                BEGIN
+                    SELECT RAISE(ABORT, 'events is append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_events_append_only_delete
+                BEFORE DELETE ON events
+                BEGIN
+                    SELECT RAISE(ABORT, 'events is append-only');
+                END;
+                ",
+            )?;
+            version = 4;
             Self::set_schema_version(conn, version)?;
         }
 
@@ -653,12 +694,15 @@ impl EventStore {
     /// `peer`, oldest first.
     fn dm_history(&self, username: &str, peer: &str, limit: usize) -> Vec<Value> {
         self.query_events(
-            "SELECT payload FROM events
-                         WHERE event_type = 'dm'
-                             AND ((sender = ?1 AND target = ?2)
-                                 OR (sender = ?2 AND target = ?1))
-                         ORDER BY ts DESC
-                         LIMIT ?3",
+            "SELECT payload FROM (
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2
+                 UNION ALL
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1
+             )
+             ORDER BY ts DESC
+             LIMIT ?3",
             params![username, peer, limit as i64],
         )
     }
@@ -668,13 +712,15 @@ impl EventStore {
     fn dm_rewind(&self, username: &str, peer: &str, seconds: u64, limit: usize) -> Vec<Value> {
         let cutoff = (now() - seconds as f64).max(0.0);
         self.query_events(
-            "SELECT payload FROM events
-                         WHERE event_type = 'dm'
-                             AND ((sender = ?1 AND target = ?2)
-                                 OR (sender = ?2 AND target = ?1))
-                             AND ts >= ?3
-                         ORDER BY ts DESC
-                         LIMIT ?4",
+            "SELECT payload FROM (
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2 AND ts >= ?3
+                 UNION ALL
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1 AND ts >= ?3
+             )
+             ORDER BY ts DESC
+             LIMIT ?4",
             params![username, peer, cutoff, limit as i64],
         )
     }
@@ -689,13 +735,15 @@ impl EventStore {
         limit: usize,
     ) -> Vec<Value> {
         self.query_events(
-            "SELECT payload FROM events
-                         WHERE event_type = 'dm'
-                             AND ((sender = ?1 AND target = ?2)
-                                 OR (sender = ?2 AND target = ?1))
-                             AND ts >= ?3
-                         ORDER BY ts DESC
-                         LIMIT ?4",
+            "SELECT payload FROM (
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2 AND ts >= ?3
+                 UNION ALL
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1 AND ts >= ?3
+             )
+             ORDER BY ts DESC
+             LIMIT ?4",
             params![username, peer, from_ts, limit as i64],
         )
     }
@@ -772,10 +820,13 @@ impl EventStore {
                 return Vec::new();
             };
             let mut stmt = match conn.prepare(
-                "SELECT payload, search_text FROM events
-                 WHERE event_type = 'dm'
-                   AND ((sender = ?1 AND target = ?2)
-                     OR (sender = ?2 AND target = ?1))
+                "SELECT payload, search_text FROM (
+                     SELECT ts, payload, search_text FROM events
+                     WHERE event_type = 'dm' AND sender = ?1 AND target = ?2
+                     UNION ALL
+                     SELECT ts, payload, search_text FROM events
+                     WHERE event_type = 'dm' AND sender = ?2 AND target = ?1
+                 )
                  ORDER BY ts DESC",
             ) {
                 Ok(s) => s,
@@ -814,13 +865,19 @@ impl EventStore {
                 .replace('_', "\\_");
             let like = format!("%{}%", escaped.to_lowercase());
             self.query_events(
-                "SELECT payload FROM events
-                 WHERE event_type = 'dm'
-                   AND ((sender = ?1 AND target = ?2)
-                     OR (sender = ?2 AND target = ?1))
-                   AND search_text LIKE ?3 ESCAPE '\\'
-                 ORDER BY ts DESC
-                 LIMIT ?4",
+                "SELECT payload FROM (
+                                         SELECT ts, payload FROM events
+                                         WHERE event_type = 'dm'
+                                             AND sender = ?1 AND target = ?2
+                                             AND search_text LIKE ?3 ESCAPE '\\'
+                                         UNION ALL
+                                         SELECT ts, payload FROM events
+                                         WHERE event_type = 'dm'
+                                             AND sender = ?2 AND target = ?1
+                                             AND search_text LIKE ?3 ESCAPE '\\'
+                                 )
+                                 ORDER BY ts DESC
+                                 LIMIT ?4",
                 params![username, peer, like, limit as i64],
             )
         }
