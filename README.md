@@ -2,12 +2,14 @@
 
 [![CI](https://github.com/kill74/Chatify/actions/workflows/ci.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/ci.yml)
 [![Windows Release Package](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml)
+[![Release Security Report](https://github.com/kill74/Chatify/actions/workflows/release-security-report.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/release-security-report.yml)
 [![Release](https://img.shields.io/github/v/release/kill74/Chatify)](https://github.com/kill74/Chatify/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Terminal-first, self-hosted chat built with Rust.
 
 Chatify ships three binaries:
+
 - `clicord-server`: WebSocket chat server with SQLite persistence.
 - `clicord-client`: terminal client for channels, DM, history, search, and rewind.
 - `discord_bot` (optional feature): Discord <-> Chatify bridge.
@@ -20,6 +22,7 @@ Chatify ships three binaries:
 - Replay protection (nonce + timestamp validation)
 - Optional Discord bridge with reconnection, health logs, and ping/pong telemetry
 - Windows release artifacts with SHA256 checksums (ZIP + installer)
+- Structured security test report attached per release tag (`.json` + `.md`)
 
 ## Quick Start
 
@@ -97,28 +100,31 @@ Generated artifacts:
 Release pipeline:
 
 - [windows-release-package workflow](.github/workflows/windows-release-package.yml) publishes ZIP + installer + checksums on release.
+- [release-security-report workflow](.github/workflows/release-security-report.yml) publishes a structured security report per release tag.
 
 ## Configuration
 
 ### Server (`clicord-server`)
 
-| Flag         | Default      | Description                                        |
-| ------------ | ------------ | -------------------------------------------------- |
-| `--host`     | `0.0.0.0`    | Bind address                                       |
-| `--port`     | `8765`       | Bind port                                          |
-| `--db`       | `chatify.db` | SQLite database path                               |
-| `--db-key`   | (auto)       | Hex-encoded 32-byte key (64 hex chars)             |
-| `--tls`      | `false`      | Enable TLS (`wss://`)                              |
-| `--tls-cert` | `cert.pem`   | TLS certificate path (PEM)                         |
-| `--tls-key`  | `key.pem`    | TLS private key path (PEM)                         |
-| `--log`      | `false`      | Enable logging                                     |
+| Flag         | Default      | Description                            |
+| ------------ | ------------ | -------------------------------------- |
+| `--host`     | `0.0.0.0`    | Bind address                           |
+| `--port`     | `8765`       | Bind port                              |
+| `--db`       | `chatify.db` | SQLite database path                   |
+| `--db-key`   | (auto)       | Hex-encoded 32-byte key (64 hex chars) |
+| `--tls`      | `false`      | Enable TLS (`wss://`)                  |
+| `--tls-cert` | `cert.pem`   | TLS certificate path (PEM)             |
+| `--tls-key`  | `key.pem`    | TLS private key path (PEM)             |
+| `--log`      | `false`      | Enable logging                         |
 
 DB key resolution order:
+
 1. `--db-key`
 2. `<db>.key` auto-generated on first run
 3. No encryption for `:memory:`
 
 Secret hygiene:
+
 - Never commit `<db>.key`.
 - Rotate keys immediately if exposed.
 - Keep runtime secrets out of VCS (`*.db.key`, `cert.pem`, `key.pem`).
@@ -134,22 +140,24 @@ Secret hygiene:
 
 ## Client Commands
 
-| Command                | Description                                             |
-| ---------------------- | ------------------------------------------------------- |
-| `/join <channel>`      | Join or create a channel                                |
-| `/dm <user> <message>` | Send direct message                                     |
-| `/me <action>`         | Send action-style message                               |
-| `/users`               | List online users                                       |
-| `/channels`            | List channels                                           |
-| `/voice [room]`        | Toggle voice in room                                    |
-| `/history [limit]`     | Load persisted channel history                          |
-| `/search <query>`      | Search persisted events in current channel              |
-| `/rewind <time> [n]`   | Replay events from a time window (example: `15m`, `2h`) |
-| `/clear`               | Clear terminal output                                   |
-| `/help`                | Show command help                                       |
-| `/quit`, `/exit`, `/q` | Disconnect and exit                                     |
+| Command                       | Description                                             |
+| ----------------------------- | ------------------------------------------------------- |
+| `/join <channel>`             | Join or create a channel                                |
+| `/dm <user> <message>`        | Send direct message                                     |
+| `/me <action>`                | Send action-style message                               |
+| `/users`                      | List online users                                       |
+| `/channels`                   | List channels                                           |
+| `/voice [room]`               | Toggle voice in room                                    |
+| `/history [channel] [window]` | Load persisted history for a channel or DM scope        |
+| `/search <query>`             | Search persisted events in current channel              |
+| `/replay <timestamp>`         | Reconstruct state from an absolute timestamp            |
+| `/rewind <time> [n]`          | Replay events from a time window (example: `15m`, `2h`) |
+| `/clear`                      | Clear terminal output                                   |
+| `/help`                       | Show command help                                       |
+| `/quit`, `/exit`, `/q`        | Disconnect and exit                                     |
 
 Notes:
+
 - `/edit` is currently a placeholder command.
 
 ## Discord Bridge (Optional)
@@ -161,10 +169,12 @@ cargo run --features discord-bridge --bin discord_bot
 ```
 
 Required environment variables:
+
 - `DISCORD_TOKEN`
 - `CHATIFY_PASSWORD`
 
 Common bridge settings:
+
 - `CHATIFY_HOST` (`127.0.0.1`)
 - `CHATIFY_PORT` (`8765`)
 - `CHATIFY_CHANNEL` (`general`)
@@ -190,6 +200,7 @@ CHATIFY_DISCORD_CHANNEL_MAP=123456789012345678:general,987654321098765432:ops
 ## Security Posture
 
 Implemented:
+
 - TLS support with rustls
 - Credential hashing (PBKDF2, salted, per-user)
 - Rate limiting (connections and auth attempts)
@@ -201,6 +212,7 @@ Implemented:
 - Encryption at rest for `payload` and `search_text`
 
 Known limitations:
+
 - No certificate pinning on client
 - Session tokens are not persisted across server restarts
 - Encrypted search uses linear scan

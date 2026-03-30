@@ -17,6 +17,7 @@ It is intentionally explicit to avoid overstating guarantees.
 2. Protocol-level validation paths in server and client message handling.
 3. CI checks that prevent unchecked changes from bypassing lint and tests.
 4. Optional bridge isolation through feature flags so default builds stay minimal.
+5. Structured security test report is generated per release tag and attached to release assets (`.json` + `.md`).
 
 ## Known Limits
 
@@ -44,7 +45,13 @@ It is intentionally explicit to avoid overstating guarantees.
 1. Add stronger identity trust workflow and explicit fingerprint verification UX.
 2. Add replay and tamper-resistance tests for sensitive message flows.
 3. Add adversarial integration tests for malformed and reordered payloads.
-4. Add structured security test report per release tag.
+
+## Release Security Report Artifact
+
+Each published release tag generates a machine-readable and human-readable security report:
+
+1. `chatify-security-report-<tag>.json` includes check metadata (tag, commit, timestamp, run URL), required/optional results, and dependency-audit metrics.
+2. `chatify-security-report-<tag>.md` includes an executive summary and per-check status table with log references.
 
 ## Release Gate Recommendations
 

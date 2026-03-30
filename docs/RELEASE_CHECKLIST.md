@@ -62,7 +62,11 @@ git push origin v0.1.0
 2. Use the CHANGELOG v0.1.0 section as release notes.
 3. Publish release.
 4. Verify windows-release-package workflow completes.
-5. Verify attached assets include ZIP and SHA256.
+5. Verify release-security-report workflow completes.
+6. Verify attached assets include Windows ZIP and SHA256.
+7. Verify attached assets include Windows installer and SHA256.
+8. Verify attached assets include `chatify-security-report-<tag>.json`.
+9. Verify attached assets include `chatify-security-report-<tag>.md`.
 
 ## 9. Post-Release Verification
 

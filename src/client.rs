@@ -35,7 +35,7 @@ use log::{debug, error, info, warn};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
-const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [limit], /search <query>, /rewind <Ns|Nm|Nh|Nd> [limit], /clear, /edit, /help, /quit";
+const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /clear, /edit, /help, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
 const DASHBOARD_HEADER_ROWS: usize = 2;
@@ -319,6 +319,94 @@ fn normalize_channel(raw: &str) -> Option<String> {
     }
 }
 
+fn is_valid_username_token(name: &str) -> bool {
+    if name.is_empty() || name.len() > 32 {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn normalize_event_scope(raw: &str, current_channel: &str) -> Option<String> {
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return Some(current_channel.to_string());
+    }
+
+    if let Some(peer_raw) = candidate.strip_prefix("dm:") {
+        let peer = peer_raw.trim().to_lowercase();
+        if is_valid_username_token(&peer) {
+            return Some(format!("dm:{}", peer));
+        }
+        return None;
+    }
+
+    normalize_channel(candidate)
+}
+
+fn parse_history_args(args: &str, current_channel: &str) -> Result<(String, Option<u64>), String> {
+    let mut parts = args.split_whitespace();
+    let first = parts.next();
+    let second = parts.next();
+    if parts.next().is_some() {
+        return Err("Usage: /history [#channel|dm:user] [window]".to_string());
+    }
+
+    match (first, second) {
+        (None, None) => Ok((current_channel.to_string(), None)),
+        (Some(one), None) => {
+            if let Some(window_secs) = parse_duration_secs(one) {
+                Ok((current_channel.to_string(), Some(window_secs)))
+            } else if let Some(scope) = normalize_event_scope(one, current_channel) {
+                Ok((scope, None))
+            } else {
+                Err("Usage: /history [#channel|dm:user] [window]".to_string())
+            }
+        }
+        (Some(scope_raw), Some(window_raw)) => {
+            let Some(scope) = normalize_event_scope(scope_raw, current_channel) else {
+                return Err("Usage: /history [#channel|dm:user] [window]".to_string());
+            };
+            let Some(window_secs) = parse_duration_secs(window_raw) else {
+                return Err("Invalid window. Use values like 90s, 15m, 24h, 7d.".to_string());
+            };
+            Ok((scope, Some(window_secs)))
+        }
+        _ => Err("Usage: /history [#channel|dm:user] [window]".to_string()),
+    }
+}
+
+fn parse_replay_timestamp(raw: &str) -> Option<f64> {
+    let ts = raw.trim();
+    if ts.is_empty() {
+        return None;
+    }
+
+    if let Ok(v) = ts.parse::<f64>() {
+        if v.is_finite() && v >= 0.0 {
+            return Some(v);
+        }
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.timestamp_millis() as f64 / 1000.0);
+    }
+
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.and_utc().timestamp_millis() as f64 / 1000.0);
+    }
+
+    None
+}
+
+fn format_scope_label(scope: &str) -> String {
+    if scope.starts_with("dm:") {
+        scope.to_string()
+    } else {
+        format!("#{}", scope)
+    }
+}
+
 fn parse_limit(input: &str, default: usize, max: usize) -> usize {
     input
         .trim()
@@ -538,7 +626,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
         "/join <channel>".to_string(),
         "/dm <user> <msg>".to_string(),
         "/users /channels".to_string(),
-        "/history /search".to_string(),
+        "/history /search /replay".to_string(),
     ];
     if let Some(last) = state.message_history.last() {
         command_lines.push(truncate_with_ellipsis(
@@ -911,6 +999,57 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
             });
             true
         }
+        "dm" => {
+            let from = event.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+            let to = event.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+            if let Some(pk) = event.get("pk").and_then(|v| v.as_str()) {
+                if !pk.is_empty() {
+                    state.users.insert(from.to_string(), pk.to_string());
+                }
+            }
+
+            let c = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
+            let encrypted = match general_purpose::STANDARD.decode(c) {
+                Ok(bytes) => bytes,
+                Err(_) => return false,
+            };
+
+            let peer = if from == state.me { to } else { from };
+            let dm_key = match state.dmkey(peer) {
+                Ok(key) => key,
+                Err(_) => return false,
+            };
+            let content = match dec_bytes(&dm_key, &encrypted) {
+                Ok(content) => String::from_utf8(content)
+                    .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string()),
+                Err(_) => return false,
+            };
+            let arrow = if from == state.me { "→" } else { "←" };
+
+            state.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: format!("{} {} {}", from, arrow, content),
+                msg_type: MessageType::Dm,
+                user: Some(from.to_string()),
+                channel: None,
+            });
+            true
+        }
+        "join" => {
+            let ch = event
+                .get("ch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let user = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+            state.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: format!("{} joined #{}", user, ch),
+                msg_type: MessageType::Sys,
+                user: Some(user.to_string()),
+                channel: Some(ch.to_string()),
+            });
+            true
+        }
         _ => false,
     }
 }
@@ -1066,11 +1205,19 @@ async fn handle_history_or_search_event(state: &SharedState, data: &JsonMap, t: 
             count += 1;
         }
     }
+    let scope = format_scope_label(ch);
     let summary = if t == "search" {
         let q = data.get("q").and_then(|v| v.as_str()).unwrap_or("");
-        format!("Search '{}' in #{}: {} event(s)", q, ch, count)
+        format!("Search '{}' in {}: {} event(s)", q, scope, count)
+    } else if t == "replay" {
+        let from_ts = data
+            .get("from_ts")
+            .and_then(|v| v.as_f64())
+            .map(|v| format!("{:.0}", v))
+            .unwrap_or_else(|| "?".to_string());
+        format!("Replay from {} in {}: {} event(s)", from_ts, scope, count)
     } else {
-        format!("History for #{}: {} event(s)", ch, count)
+        format!("History for {}: {} event(s)", scope, count)
     };
     state_lock.add_message(DisplayedMessage {
         time: format_time(ts),
@@ -1126,7 +1273,7 @@ async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
         "dm" => handle_dm_event(state, data, ts).await,
         "users" => handle_users_event(state, data, ts).await,
         "joined" => handle_joined_event(state, data, ts).await,
-        "history" | "search" => handle_history_or_search_event(state, data, t, ts).await,
+        "history" | "search" | "replay" => handle_history_or_search_event(state, data, t, ts).await,
         "info" => handle_info_event(state, data, ts).await,
         "vdata" => handle_vdata_event(state, data).await,
         _ => {}
@@ -1547,12 +1694,20 @@ fn handle_slash_command(
             state.add_notice("Edit command not yet implemented in Rust client");
         }
         "/history" => {
-            let limit = parse_limit(args, 50, 200);
-            let ch = state.ch.clone();
-            enqueue_timed(
-                &state.ws_tx,
-                serde_json::json!({"t": "history", "ch": ch, "limit": limit}),
-            );
+            let (scope, window_secs) = match parse_history_args(args, &state.ch) {
+                Ok(v) => v,
+                Err(msg) => {
+                    state.add_notice(msg);
+                    state.add_notice("Examples: /history #general 24h, /history dm:alice 7d");
+                    return CommandFlow::Continue;
+                }
+            };
+
+            let mut payload = serde_json::json!({"t": "history", "ch": scope, "limit": 500});
+            if let Some(seconds) = window_secs {
+                payload["seconds"] = serde_json::json!(seconds);
+            }
+            enqueue_timed(&state.ws_tx, payload);
         }
         "/search" => {
             let q = args.trim();
@@ -1564,6 +1719,29 @@ fn handle_slash_command(
             enqueue_timed(
                 &state.ws_tx,
                 serde_json::json!({"t": "search", "ch": ch, "q": q, "limit": 50}),
+            );
+        }
+        "/replay" => {
+            let spec = args.trim();
+            if spec.is_empty() {
+                state.add_notice("Usage: /replay <timestamp>");
+                state.add_notice(
+                    "Timestamp formats: unix seconds, RFC3339, or 'YYYY-MM-DD HH:MM:SS'",
+                );
+                return CommandFlow::Continue;
+            }
+
+            let Some(from_ts) = parse_replay_timestamp(spec) else {
+                state.add_notice(
+                    "Invalid timestamp. Use unix seconds, RFC3339, or 'YYYY-MM-DD HH:MM:SS'.",
+                );
+                return CommandFlow::Continue;
+            };
+
+            let ch = state.ch.clone();
+            enqueue_timed(
+                &state.ws_tx,
+                serde_json::json!({"t": "replay", "ch": ch, "from_ts": from_ts, "limit": 1000}),
             );
         }
         "/rewind" => {

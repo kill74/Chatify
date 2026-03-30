@@ -734,6 +734,65 @@ async fn auth_contract_rejects_oversized_otp_input() {
     );
 }
 
+/// Verifies that auth rejects a non-object `"status"` field.
+///
+/// The status contract requires a JSON object (with optional `text` and
+/// `emoji` keys). Accepting arbitrary scalar values would make presence
+/// rendering ambiguous across clients.
+#[tokio::test]
+async fn auth_contract_rejects_non_object_status_field() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for non-object status test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "alice",
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+            "status": "online"
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send auth payload with invalid status type");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("validation error: status must be a JSON object")
+    );
+}
+
+/// Verifies that auth rejects unknown fields in the `"status"` object.
+///
+/// Keeping this schema closed (only `text` and `emoji`) protects the protocol
+/// from undocumented client-side extensions leaking into the server contract.
+#[tokio::test]
+async fn auth_contract_rejects_unexpected_status_object_field() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for unexpected status field test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "alice",
+            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+            "status": {"text":"Online","emoji":"🟢","mood":"focused"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send auth payload with unexpected status field");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("validation error: unexpected status field: mood")
+    );
+}
+
 /// Verifies that repeated wrong OTP attempts do not lock out a user who still
 /// has a valid backup code.
 ///
@@ -823,6 +882,73 @@ async fn users_contract_returns_user_objects_with_public_keys() {
 }
 
 // ---------------------------------------------------------------------------
+// Channel & presence contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that channel names are normalised by the server on join.
+///
+/// This contract ensures that cosmetic client input differences (uppercase,
+/// punctuation, leading `#`) do not create duplicate channel identities.
+#[tokio::test]
+async fn join_contract_normalizes_channel_name() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"join","ch":"#Dev Ops!!!_X"}).to_string(),
+        ))
+        .await
+        .expect("send join with unnormalized channel name");
+
+    let joined = recv_by_type(&mut alice, "joined").await;
+    assert_eq!(joined.get("ch").and_then(|v| v.as_str()), Some("devops_x"));
+    assert!(
+        joined.get("hist").and_then(|v| v.as_array()).is_some(),
+        "joined payload should include history array"
+    );
+}
+
+/// Verifies that status updates are broadcast to other connected clients.
+///
+/// Presence changes are part of the public runtime contract, so updates must
+/// include both the source user and the exact status payload.
+#[tokio::test]
+async fn status_contract_broadcasts_status_update_to_other_clients() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"status",
+                "status": {"text":"In focus","emoji":"✅"}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send status update");
+
+    let update = recv_by_type(&mut bob, "status_update").await;
+    assert_eq!(update.get("user").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(
+        update
+            .get("status")
+            .and_then(|v| v.get("text"))
+            .and_then(|v| v.as_str()),
+        Some("In focus")
+    );
+    assert_eq!(
+        update
+            .get("status")
+            .and_then(|v| v.get("emoji"))
+            .and_then(|v| v.as_str()),
+        Some("✅")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Messaging contract tests
 // ---------------------------------------------------------------------------
 
@@ -861,6 +987,47 @@ async fn msg_contract_roundtrips_channel_payload() {
     assert_eq!(
         msg.get("c").and_then(|v| v.as_str()),
         Some("ciphertext-blob")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// File-transfer contract tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that oversized file metadata is rejected before announcement.
+///
+/// The max file-size guard is a protocol-level safety contract that prevents
+/// clients from advertising transfers that exceed server policy.
+#[tokio::test]
+async fn file_contract_rejects_oversized_file_metadata() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"file_meta",
+                "ch":"general",
+                "filename":"huge.bin",
+                "size": 104_857_601_u64,
+                "file_id":"oversize-1"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send oversized file metadata");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("file size exceeds maximum of"),
+        "expected file-size rejection message, got: {}",
+        msg
+    );
+    assert!(
+        msg.contains("104857600"),
+        "expected max-size value in message, got: {}",
+        msg
     );
 }
 
@@ -964,6 +1131,152 @@ async fn history_contract_returns_persisted_events() {
     assert!(found, "expected persisted message in history response");
 }
 
+/// Verifies that `"history"` supports a time window via the optional
+/// `"seconds"` field.
+///
+/// The server should only return events newer than `now() - seconds`.
+#[tokio::test]
+async fn history_contract_respects_seconds_window_filter() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg", "ch": "window-room",
+                "c": "history-window-old",
+                "p": "older marker"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send older message");
+
+    // Ensure the first message is outside a 1-second history window.
+    sleep(Duration::from_millis(1200)).await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg", "ch": "window-room",
+                "c": "history-window-new",
+                "p": "newer marker"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send newer message");
+
+    alice
+        .send(Message::Text(
+            json!({"t": "history", "ch": "window-room", "seconds": 1, "limit": 50}).to_string(),
+        ))
+        .await
+        .expect("request windowed history");
+
+    let history = recv_by_type(&mut alice, "history").await;
+    let events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history events must be an array");
+
+    let found_old = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("msg")
+            && e.get("c").and_then(|v| v.as_str()) == Some("history-window-old")
+    });
+    let found_new = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("msg")
+            && e.get("c").and_then(|v| v.as_str()) == Some("history-window-new")
+    });
+
+    assert!(found_new, "expected newer message in 1s history window");
+    assert!(
+        !found_old,
+        "did not expect older message in 1s history window"
+    );
+}
+
+/// Verifies that channel history can be queried for a DM conversation using
+/// the `"dm:<user>"` scope format.
+#[tokio::test]
+async fn history_contract_supports_dm_scope() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let _bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "dm", "to": "bob",
+                "c": "dm-history-cipher",
+                "p": "dm history marker"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send dm for history scope");
+
+    alice
+        .send(Message::Text(
+            json!({"t": "history", "ch": "dm:bob", "limit": 50}).to_string(),
+        ))
+        .await
+        .expect("request dm-scoped history");
+
+    let history = recv_by_type(&mut alice, "history").await;
+    assert_eq!(history.get("ch").and_then(|v| v.as_str()), Some("dm:bob"));
+    let events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history events must be an array");
+
+    let found = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("dm")
+            && e.get("c").and_then(|v| v.as_str()) == Some("dm-history-cipher")
+    });
+    assert!(found, "expected DM event in dm:bob history response");
+}
+
+/// Verifies that `"join"` events are persisted and visible via history.
+#[tokio::test]
+async fn history_contract_persists_join_events() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t": "join", "ch": "join-contract-room"}).to_string(),
+        ))
+        .await
+        .expect("join test channel");
+
+    let joined = recv_by_type(&mut alice, "joined").await;
+    assert_eq!(
+        joined.get("ch").and_then(|v| v.as_str()),
+        Some("join-contract-room")
+    );
+
+    alice
+        .send(Message::Text(
+            json!({"t": "history", "ch": "join-contract-room", "limit": 100}).to_string(),
+        ))
+        .await
+        .expect("request join channel history");
+
+    let history = recv_by_type(&mut alice, "history").await;
+    let events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history events must be an array");
+
+    let found_join = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("join")
+            && e.get("u").and_then(|v| v.as_str()) == Some("alice")
+            && e.get("ch").and_then(|v| v.as_str()) == Some("join-contract-room")
+    });
+    assert!(found_join, "expected persisted join event in history");
+}
+
 /// Verifies that the `"search"` RPC filters messages by a plaintext index
 /// field (`"p"`) and returns only matching events.
 ///
@@ -1013,6 +1326,47 @@ async fn search_contract_filters_by_plaintext_index() {
     assert!(found, "expected matching message in search response");
 }
 
+/// Verifies that `"search"` supports `"dm:<user>"` conversation scope.
+#[tokio::test]
+async fn search_contract_supports_dm_scope() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let _bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "dm", "to": "bob",
+                "c": "dm-search-cipher",
+                "p": "sprint planning review"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send dm for search scope");
+
+    alice
+        .send(Message::Text(
+            json!({"t": "search", "ch": "dm:bob", "q": "planning", "limit": 50}).to_string(),
+        ))
+        .await
+        .expect("request dm-scoped search");
+
+    let search = recv_by_type(&mut alice, "search").await;
+    assert_eq!(search.get("ch").and_then(|v| v.as_str()), Some("dm:bob"));
+    assert_eq!(search.get("q").and_then(|v| v.as_str()), Some("planning"));
+
+    let events = search
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("search events must be an array");
+    let found = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("dm")
+            && e.get("c").and_then(|v| v.as_str()) == Some("dm-search-cipher")
+    });
+    assert!(found, "expected DM event in dm:bob search response");
+}
+
 /// Verifies that the `"rewind"` RPC returns messages sent within the requested
 /// time window.
 ///
@@ -1057,6 +1411,95 @@ async fn rewind_contract_returns_recent_events() {
             && e.get("c").and_then(|v| v.as_str()) == Some("rewind-cipher-hit")
     });
     assert!(found, "expected recent message in rewind response");
+}
+
+/// Verifies that `"replay"` returns events from an absolute timestamp
+/// onward, excluding older events.
+#[tokio::test]
+async fn replay_contract_returns_events_from_timestamp() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg", "ch": "replay-room",
+                "c": "replay-old-cipher",
+                "p": "replay old marker"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send old replay message");
+
+    alice
+        .send(Message::Text(
+            json!({"t": "history", "ch": "replay-room", "limit": 50}).to_string(),
+        ))
+        .await
+        .expect("request history to capture first replay timestamp");
+
+    let first_history = recv_by_type(&mut alice, "history").await;
+    let first_events = first_history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history events must be an array");
+    let first_ts = first_events
+        .iter()
+        .find_map(|e| {
+            if e.get("t").and_then(|v| v.as_str()) == Some("msg")
+                && e.get("c").and_then(|v| v.as_str()) == Some("replay-old-cipher")
+            {
+                e.get("ts")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
+            } else {
+                None
+            }
+        })
+        .expect("first replay message should exist in history with ts");
+
+    sleep(Duration::from_millis(1200)).await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg", "ch": "replay-room",
+                "c": "replay-new-cipher",
+                "p": "replay new marker"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send new replay message");
+
+    alice
+        .send(Message::Text(
+            json!({"t": "replay", "ch": "replay-room", "from_ts": first_ts + 0.5, "limit": 100})
+                .to_string(),
+        ))
+        .await
+        .expect("request replay from timestamp");
+
+    let replay = recv_by_type(&mut alice, "replay").await;
+    let events = replay
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("replay events must be an array");
+
+    let found_old = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("msg")
+            && e.get("c").and_then(|v| v.as_str()) == Some("replay-old-cipher")
+    });
+    let found_new = events.iter().any(|e| {
+        e.get("t").and_then(|v| v.as_str()) == Some("msg")
+            && e.get("c").and_then(|v| v.as_str()) == Some("replay-new-cipher")
+    });
+
+    assert!(found_new, "expected new message in replay response");
+    assert!(
+        !found_old,
+        "did not expect old message in replay response from timestamp"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,6 +1656,35 @@ async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
     assert!(
         msg.contains("timestamp outside allowed clock skew"),
         "expected timestamp skew rejection, got: {}",
+        msg
+    );
+}
+
+/// Verifies that a nonce-protected event must include a valid `"ts"` field.
+///
+/// This is critical for replay protection: if a nonce is present but timestamp
+/// validation is skipped, stale frame replays become possible.
+#[tokio::test]
+async fn protocol_contract_rejects_missing_timestamp_when_nonce_present() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg", "ch": "general",
+                "c": "missing-ts", "n": "cccccccccccccccccccccccccccccccc"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send nonce-protected payload without timestamp");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("missing timestamp"),
+        "expected missing timestamp rejection, got: {}",
         msg
     );
 }

@@ -637,6 +637,69 @@ impl EventStore {
         )
     }
 
+    /// Returns up to `limit` events for `channel` from `from_ts` onward,
+    /// oldest first.
+    fn history_since(&self, channel: &str, from_ts: f64, limit: usize) -> Vec<Value> {
+        self.query_events(
+            "SELECT payload FROM events
+                         WHERE channel = ?1 AND ts >= ?2
+                         ORDER BY ts DESC
+                         LIMIT ?3",
+            params![channel, from_ts, limit as i64],
+        )
+    }
+
+    /// Returns up to `limit` DM events exchanged between `username` and
+    /// `peer`, oldest first.
+    fn dm_history(&self, username: &str, peer: &str, limit: usize) -> Vec<Value> {
+        self.query_events(
+            "SELECT payload FROM events
+                         WHERE event_type = 'dm'
+                             AND ((sender = ?1 AND target = ?2)
+                                 OR (sender = ?2 AND target = ?1))
+                         ORDER BY ts DESC
+                         LIMIT ?3",
+            params![username, peer, limit as i64],
+        )
+    }
+
+    /// Returns up to `limit` DM events exchanged between `username` and `peer`
+    /// within the last `seconds`, oldest first.
+    fn dm_rewind(&self, username: &str, peer: &str, seconds: u64, limit: usize) -> Vec<Value> {
+        let cutoff = (now() - seconds as f64).max(0.0);
+        self.query_events(
+            "SELECT payload FROM events
+                         WHERE event_type = 'dm'
+                             AND ((sender = ?1 AND target = ?2)
+                                 OR (sender = ?2 AND target = ?1))
+                             AND ts >= ?3
+                         ORDER BY ts DESC
+                         LIMIT ?4",
+            params![username, peer, cutoff, limit as i64],
+        )
+    }
+
+    /// Returns up to `limit` DM events exchanged between `username` and `peer`
+    /// from `from_ts` onward, oldest first.
+    fn dm_history_since(
+        &self,
+        username: &str,
+        peer: &str,
+        from_ts: f64,
+        limit: usize,
+    ) -> Vec<Value> {
+        self.query_events(
+            "SELECT payload FROM events
+                         WHERE event_type = 'dm'
+                             AND ((sender = ?1 AND target = ?2)
+                                 OR (sender = ?2 AND target = ?1))
+                             AND ts >= ?3
+                         ORDER BY ts DESC
+                         LIMIT ?4",
+            params![username, peer, from_ts, limit as i64],
+        )
+    }
+
     /// Returns up to `limit` events for `channel` whose `search_text` column
     /// contains `query` (case-insensitive LIKE match), oldest first.
     fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
@@ -694,6 +757,71 @@ impl EventStore {
                  ORDER BY ts DESC
                  LIMIT ?3",
                 params![channel, like, limit as i64],
+            )
+        }
+    }
+
+    /// Returns up to `limit` DM events between `username` and `peer` whose
+    /// searchable text contains `query`, oldest first.
+    fn dm_search(&self, username: &str, peer: &str, query: &str, limit: usize) -> Vec<Value> {
+        let query_lower = query.to_lowercase();
+
+        if self.encryption_key.is_some() {
+            // Encrypted mode: filter after decrypting search_text.
+            let Some(conn) = self.open_conn() else {
+                return Vec::new();
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT payload, search_text FROM events
+                 WHERE event_type = 'dm'
+                   AND ((sender = ?1 AND target = ?2)
+                     OR (sender = ?2 AND target = ?1))
+                 ORDER BY ts DESC",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("dm search query prepare failed: {}", e);
+                    return Vec::new();
+                }
+            };
+
+            let rows: Vec<(String, String)> = stmt
+                .query_map(params![username, peer], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map(|r| r.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default();
+
+            let mut results = Vec::new();
+            for (enc_payload, enc_search) in rows {
+                let search_text = self.decrypt_field(&enc_search);
+                if search_text.contains(&query_lower) {
+                    let decrypted = self.decrypt_field(&enc_payload);
+                    if let Ok(val) = serde_json::from_str::<Value>(&decrypted) {
+                        results.push(val);
+                    }
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            results
+        } else {
+            // Unencrypted mode: use SQL LIKE.
+            let escaped = query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let like = format!("%{}%", escaped.to_lowercase());
+            self.query_events(
+                "SELECT payload FROM events
+                 WHERE event_type = 'dm'
+                   AND ((sender = ?1 AND target = ?2)
+                     OR (sender = ?2 AND target = ?1))
+                   AND search_text LIKE ?3 ESCAPE '\\'
+                 ORDER BY ts DESC
+                 LIMIT ?4",
+                params![username, peer, like, limit as i64],
             )
         }
     }
@@ -1251,6 +1379,7 @@ fn spawn_broadcast_forwarder(
 /// | `history`     | Fetch persisted history for a channel               |
 /// | `search`      | Full-text search over a channel's plaintext index   |
 /// | `rewind`      | Fetch events within a relative time window          |
+/// | `replay`      | Fetch events from an absolute timestamp onward       |
 /// | `users`       | Get the current online user → public key directory  |
 /// | `info`        | Get server info (channels list, online count)       |
 /// | `vjoin`       | Join a voice room                                   |
@@ -1408,6 +1537,12 @@ async fn handle_event(
                 "m":format!("→ {} joined #{}", username, ch),
                 "ts":now()
             });
+            let join_event = serde_json::json!({
+                "t":"join",
+                "ch":ch,
+                "u":username,
+                "ts":now()
+            });
             state.store.persist(
                 "sys",
                 &ch,
@@ -1416,48 +1551,99 @@ async fn handle_event(
                 &join_msg,
                 &format!("{} joined", username),
             );
+            state.store.persist(
+                "join",
+                &ch,
+                username,
+                None,
+                &join_event,
+                &format!("{} joined", username),
+            );
             let _ = chan.tx.send(join_msg.to_string());
         }
         "history" => {
-            // Return persisted events for a channel, newest-first from SQLite,
-            // re-ordered to oldest-first by query_events before sending.
-            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            // Return persisted events for a channel or DM scope.
+            let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
+                Ok(v) => v,
+                Err(e) => {
+                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    return;
+                }
+            };
             let limit = clamp_limit(
                 d.get("limit").and_then(|v| v.as_u64()),
                 DEFAULT_HISTORY_LIMIT,
-                200,
+                500,
             );
-            let events = state.store.history(&ch, limit);
+            let seconds = d
+                .get("seconds")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.clamp(1, 31 * 24 * 3600));
+
+            let response_ch = scope.response_channel();
+            let events = match scope {
+                EventQueryScope::Channel(ch) => {
+                    if let Some(window_secs) = seconds {
+                        state.store.rewind(&ch, window_secs, limit)
+                    } else {
+                        state.store.history(&ch, limit)
+                    }
+                }
+                EventQueryScope::DmConversation(peer) => {
+                    if let Some(window_secs) = seconds {
+                        state.store.dm_rewind(username, &peer, window_secs, limit)
+                    } else {
+                        state.store.dm_history(username, &peer, limit)
+                    }
+                }
+            };
             send_out_json(
                 out_tx,
-                serde_json::json!({"t":"history","ch":ch,"events":events,"ts":now()}),
+                serde_json::json!({"t":"history","ch":response_ch,"events":events,"ts":now()}),
             );
         }
         "search" => {
-            // Full-text search over the `search_text` index column.
-            // An empty query returns an empty result set rather than all events.
-            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            // Full-text search over channel or DM conversation events.
+            let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
+                Ok(v) => v,
+                Err(e) => {
+                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    return;
+                }
+            };
             let q = d["q"].as_str().unwrap_or("").trim().to_string();
             let limit = clamp_limit(
                 d.get("limit").and_then(|v| v.as_u64()),
                 DEFAULT_SEARCH_LIMIT,
                 200,
             );
+            let response_ch = scope.response_channel();
             let events = if q.is_empty() {
                 Vec::new()
             } else {
-                state.store.search(&ch, &q, limit)
+                match scope {
+                    EventQueryScope::Channel(ch) => state.store.search(&ch, &q, limit),
+                    EventQueryScope::DmConversation(peer) => {
+                        state.store.dm_search(username, &peer, &q, limit)
+                    }
+                }
             };
             send_out_json(
                 out_tx,
-                serde_json::json!({"t":"search","ch":ch,"q":q,"events":events,"ts":now()}),
+                serde_json::json!({"t":"search","ch":response_ch,"q":q,"events":events,"ts":now()}),
             );
         }
         "rewind" => {
             // Time-window query: return events from the last `seconds` seconds.
             // The maximum window is capped at 31 days to prevent accidental
             // full-history dumps from a misconfigured client.
-            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
+                Ok(v) => v,
+                Err(e) => {
+                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    return;
+                }
+            };
             let seconds = d
                 .get("seconds")
                 .and_then(|v| v.as_u64())
@@ -1468,12 +1654,67 @@ async fn handle_event(
                 DEFAULT_REWIND_LIMIT,
                 500,
             );
-            let events = state.store.rewind(&ch, seconds, limit);
+            let response_ch = scope.response_channel();
+            let events = match scope {
+                EventQueryScope::Channel(ch) => state.store.rewind(&ch, seconds, limit),
+                EventQueryScope::DmConversation(peer) => {
+                    state.store.dm_rewind(username, &peer, seconds, limit)
+                }
+            };
             // Rewind reuses the `"history"` frame type so clients only need
             // one parser for time-ranged and offset-based history.
             send_out_json(
                 out_tx,
-                serde_json::json!({"t":"history","ch":ch,"events":events,"ts":now()}),
+                serde_json::json!({"t":"history","ch":response_ch,"events":events,"ts":now()}),
+            );
+        }
+        "replay" => {
+            // Absolute replay query: return events from a given timestamp.
+            let scope = match parse_event_query_scope(d.get("ch").and_then(|v| v.as_str())) {
+                Ok(v) => v,
+                Err(e) => {
+                    send_out_json(out_tx, serde_json::json!({"t":"err","m":e.to_string()}));
+                    return;
+                }
+            };
+
+            let Some(from_ts) = d
+                .get("from_ts")
+                .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
+            else {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"replay requires from_ts"}),
+                );
+                return;
+            };
+
+            if !from_ts.is_finite() || from_ts < 0.0 {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"replay requires valid from_ts"}),
+                );
+                return;
+            }
+
+            let limit = clamp_limit(d.get("limit").and_then(|v| v.as_u64()), 1000, 5000);
+            let response_ch = scope.response_channel();
+            let events = match scope {
+                EventQueryScope::Channel(ch) => state.store.history_since(&ch, from_ts, limit),
+                EventQueryScope::DmConversation(peer) => state
+                    .store
+                    .dm_history_since(username, &peer, from_ts, limit),
+            };
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t":"replay",
+                    "ch":response_ch,
+                    "from_ts":from_ts,
+                    "events":events,
+                    "ts":now()
+                }),
             );
         }
         "users" => {
@@ -1845,6 +2086,35 @@ fn safe_ch(raw: &str) -> String {
     } else {
         s
     }
+}
+
+enum EventQueryScope {
+    Channel(String),
+    DmConversation(String),
+}
+
+impl EventQueryScope {
+    fn response_channel(&self) -> String {
+        match self {
+            EventQueryScope::Channel(ch) => ch.clone(),
+            EventQueryScope::DmConversation(peer) => format!("dm:{}", peer),
+        }
+    }
+}
+
+fn parse_event_query_scope(raw: Option<&str>) -> ChatifyResult<EventQueryScope> {
+    let requested = raw.unwrap_or("general").trim();
+    if let Some(peer_raw) = requested.strip_prefix("dm:") {
+        let peer = peer_raw.trim().to_lowercase();
+        if !is_valid_username(&peer) {
+            return Err(ChatifyError::Validation(
+                "invalid dm conversation target".to_string(),
+            ));
+        }
+        return Ok(EventQueryScope::DmConversation(peer));
+    }
+
+    Ok(EventQueryScope::Channel(safe_ch(requested)))
 }
 
 /// Constructs a serialised system message JSON string with the current
