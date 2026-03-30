@@ -278,6 +278,9 @@ Bridge environment variables:
 - `CHATIFY_AUTH_TIMEOUT_SECS` (default: `15`)
 - `CHATIFY_RECONNECT_BASE_SECS` (default: `1`)
 - `CHATIFY_RECONNECT_MAX_SECS` (default: `30`)
+- `CHATIFY_RECONNECT_JITTER_PCT` (default: `20`, adds randomized reconnect jitter)
+- `CHATIFY_RECONNECT_WARN_THRESHOLD` (default: `5`, warn after N consecutive failures)
+- `CHATIFY_PING_SECS` (default: `20`, set `0` to disable keepalive pings)
 - `CHATIFY_HEALTH_LOG_SECS` (health log interval, default: `30`)
 - `CHATIFY_BRIDGE_INSTANCE_ID` (optional stable bridge source id)
 - `CHATIFY_DISCORD_CHANNEL_MAP` (optional map: `discordChannelId:chatifyChannel,...`)
@@ -288,6 +291,13 @@ Example channel map:
 ```text
 CHATIFY_DISCORD_CHANNEL_MAP=123456789012345678:general,987654321098765432:ops
 ```
+
+Operational readiness and observability:
+
+- Supervisor reconnection now uses exponential backoff with optional jitter (`CHATIFY_RECONNECT_JITTER_PCT`) to avoid synchronized reconnect storms.
+- The bridge emits periodic health snapshots with totals and per-interval deltas (ingress, forwarded, dropped, reconnects, auth failures, websocket read/write errors, ping/pong).
+- Keepalive ping/pong telemetry is enabled by default and can be tuned via `CHATIFY_PING_SECS`.
+- Structured logs include reconnect reason, backoff duration, and consecutive-failure thresholds for easier incident triage.
 
 ## Architecture
 
@@ -324,6 +334,8 @@ cargo test --features discord-bridge --bin discord_bot bridge_supervisor_reconne
 cargo test --features discord-bridge --bin discord_bot parse_channel_map_filters_and_normalizes_entries
 cargo test --features discord-bridge --bin discord_bot self_source_filter_matches_only_non_empty_identical_source
 cargo test --features discord-bridge --bin discord_bot self_source_filter_ignores_non_string_src_values
+cargo test --features discord-bridge --bin discord_bot jittered_backoff_without_jitter_is_stable
+cargo test --features discord-bridge --bin discord_bot jittered_backoff_with_jitter_stays_within_bounds
 ```
 
 Auto-format:

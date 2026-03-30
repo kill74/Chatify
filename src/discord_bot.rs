@@ -15,6 +15,12 @@
 //! - `CHATIFY_AUTH_TIMEOUT_SECS`: Auth response timeout in seconds (default: 15)
 //! - `CHATIFY_RECONNECT_BASE_SECS`: Reconnect base backoff in seconds (default: 1)
 //! - `CHATIFY_RECONNECT_MAX_SECS`: Reconnect max backoff in seconds (default: 30)
+//! - `CHATIFY_RECONNECT_JITTER_PCT`: Adds jitter to reconnect delay (default: 20)
+//! - `CHATIFY_RECONNECT_WARN_THRESHOLD`: Warn after N consecutive failures (default: 5)
+//! - `CHATIFY_PING_SECS`: Send keepalive ping every N seconds, 0 disables (default: 20)
+//! - `CHATIFY_HEALTH_LOG_SECS`: Periodic bridge health snapshot interval (default: 30)
+//! - `CHATIFY_BRIDGE_INSTANCE_ID`: Stable source marker for loop prevention and tracing
+//! - `CHATIFY_DISCORD_CHANNEL_MAP`: Optional map `discordChannelId:chatifyChannel,...`
 //! - `CHATIFY_LOG`: Set to "1" to enable logging
 
 use clicord_server::crypto::dh_key;
@@ -31,6 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose, Engine as _};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use log::{debug, error, info, warn};
 use rand::RngCore;
 use serenity::{
     async_trait,
@@ -44,6 +51,9 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 type WsSender = mpsc::UnboundedSender<WsMessage>;
 type PayloadMap = HashMap<String, serde_json::Value>;
 const MAX_DISCORD_CONTENT_LEN: usize = 4000;
+const DEFAULT_RECONNECT_JITTER_PCT: u64 = 20;
+const DEFAULT_RECONNECT_WARN_THRESHOLD: u64 = 5;
+const DEFAULT_PING_SECS: u64 = 20;
 
 fn normalize_chatify_channel(raw: &str) -> Option<String> {
     let ch: String = raw
@@ -83,8 +93,32 @@ fn is_self_sourced_event(data: &PayloadMap, own_source: &str) -> bool {
 struct BridgeMetrics {
     discord_ingress: AtomicU64,
     chatify_ingress: AtomicU64,
+    discord_forwarded: AtomicU64,
+    chatify_forwarded: AtomicU64,
     dropped_messages: AtomicU64,
     reconnects: AtomicU64,
+    connect_attempts: AtomicU64,
+    auth_failures: AtomicU64,
+    ws_read_errors: AtomicU64,
+    ws_write_errors: AtomicU64,
+    pings_sent: AtomicU64,
+    pongs_received: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct BridgeMetricsSnapshot {
+    discord_ingress: u64,
+    chatify_ingress: u64,
+    discord_forwarded: u64,
+    chatify_forwarded: u64,
+    dropped_messages: u64,
+    reconnects: u64,
+    connect_attempts: u64,
+    auth_failures: u64,
+    ws_read_errors: u64,
+    ws_write_errors: u64,
+    pings_sent: u64,
+    pongs_received: u64,
 }
 
 impl BridgeMetrics {
@@ -92,18 +126,154 @@ impl BridgeMetrics {
         Self {
             discord_ingress: AtomicU64::new(0),
             chatify_ingress: AtomicU64::new(0),
+            discord_forwarded: AtomicU64::new(0),
+            chatify_forwarded: AtomicU64::new(0),
             dropped_messages: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
+            connect_attempts: AtomicU64::new(0),
+            auth_failures: AtomicU64::new(0),
+            ws_read_errors: AtomicU64::new(0),
+            ws_write_errors: AtomicU64::new(0),
+            pings_sent: AtomicU64::new(0),
+            pongs_received: AtomicU64::new(0),
         }
     }
 
-    fn log_snapshot(&self) {
-        println!(
-            "[bridge health] discord_in={} chatify_in={} dropped={} reconnects={}",
-            self.discord_ingress.load(Ordering::Relaxed),
-            self.chatify_ingress.load(Ordering::Relaxed),
-            self.dropped_messages.load(Ordering::Relaxed),
-            self.reconnects.load(Ordering::Relaxed),
+    fn inc_discord_ingress(&self) {
+        self.discord_ingress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_chatify_ingress(&self) {
+        self.chatify_ingress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_discord_forwarded(&self) {
+        self.discord_forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_chatify_forwarded(&self) {
+        self.chatify_forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_dropped(&self) {
+        self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_reconnects(&self) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_connect_attempts(&self) {
+        self.connect_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_auth_failures(&self) {
+        self.auth_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_ws_read_errors(&self) {
+        self.ws_read_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_ws_write_errors(&self) {
+        self.ws_write_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_pings_sent(&self) {
+        self.pings_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_pongs_received(&self) {
+        self.pongs_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> BridgeMetricsSnapshot {
+        BridgeMetricsSnapshot {
+            discord_ingress: self.discord_ingress.load(Ordering::Relaxed),
+            chatify_ingress: self.chatify_ingress.load(Ordering::Relaxed),
+            discord_forwarded: self.discord_forwarded.load(Ordering::Relaxed),
+            chatify_forwarded: self.chatify_forwarded.load(Ordering::Relaxed),
+            dropped_messages: self.dropped_messages.load(Ordering::Relaxed),
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+            connect_attempts: self.connect_attempts.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            ws_read_errors: self.ws_read_errors.load(Ordering::Relaxed),
+            ws_write_errors: self.ws_write_errors.load(Ordering::Relaxed),
+            pings_sent: self.pings_sent.load(Ordering::Relaxed),
+            pongs_received: self.pongs_received.load(Ordering::Relaxed),
+        }
+    }
+
+    fn log_snapshot_delta(
+        &self,
+        current: BridgeMetricsSnapshot,
+        previous: Option<BridgeMetricsSnapshot>,
+        interval_secs: u64,
+    ) {
+        let zero = BridgeMetricsSnapshot {
+            discord_ingress: 0,
+            chatify_ingress: 0,
+            discord_forwarded: 0,
+            chatify_forwarded: 0,
+            dropped_messages: 0,
+            reconnects: 0,
+            connect_attempts: 0,
+            auth_failures: 0,
+            ws_read_errors: 0,
+            ws_write_errors: 0,
+            pings_sent: 0,
+            pongs_received: 0,
+        };
+        let prev = previous.unwrap_or(zero);
+
+        let d_discord_in = current.discord_ingress.saturating_sub(prev.discord_ingress);
+        let d_chatify_in = current.chatify_ingress.saturating_sub(prev.chatify_ingress);
+        let d_discord_out = current
+            .discord_forwarded
+            .saturating_sub(prev.discord_forwarded);
+        let d_chatify_out = current
+            .chatify_forwarded
+            .saturating_sub(prev.chatify_forwarded);
+        let d_drop = current
+            .dropped_messages
+            .saturating_sub(prev.dropped_messages);
+        let d_reconnects = current.reconnects.saturating_sub(prev.reconnects);
+        let d_attempts = current
+            .connect_attempts
+            .saturating_sub(prev.connect_attempts);
+        let d_auth_failures = current.auth_failures.saturating_sub(prev.auth_failures);
+        let d_ws_read = current.ws_read_errors.saturating_sub(prev.ws_read_errors);
+        let d_ws_write = current.ws_write_errors.saturating_sub(prev.ws_write_errors);
+        let d_pings = current.pings_sent.saturating_sub(prev.pings_sent);
+        let d_pongs = current.pongs_received.saturating_sub(prev.pongs_received);
+
+        info!(
+            "event=bridge_health interval_s={} discord_in_total={} chatify_in_total={} discord_out_total={} chatify_out_total={} dropped_total={} reconnects_total={} connect_attempts_total={} auth_failures_total={} ws_read_errors_total={} ws_write_errors_total={} pings_total={} pongs_total={} discord_in_delta={} chatify_in_delta={} discord_out_delta={} chatify_out_delta={} dropped_delta={} reconnects_delta={} attempts_delta={} auth_failures_delta={} ws_read_delta={} ws_write_delta={} pings_delta={} pongs_delta={}",
+            interval_secs,
+            current.discord_ingress,
+            current.chatify_ingress,
+            current.discord_forwarded,
+            current.chatify_forwarded,
+            current.dropped_messages,
+            current.reconnects,
+            current.connect_attempts,
+            current.auth_failures,
+            current.ws_read_errors,
+            current.ws_write_errors,
+            current.pings_sent,
+            current.pongs_received,
+            d_discord_in,
+            d_chatify_in,
+            d_discord_out,
+            d_chatify_out,
+            d_drop,
+            d_reconnects,
+            d_attempts,
+            d_auth_failures,
+            d_ws_read,
+            d_ws_write,
+            d_pings,
+            d_pongs,
         );
     }
 }
@@ -120,6 +290,9 @@ struct BridgeConfig {
     auth_timeout_secs: u64,
     reconnect_base_secs: u64,
     reconnect_max_secs: u64,
+    reconnect_jitter_pct: u64,
+    reconnect_warn_threshold: u64,
+    ping_secs: u64,
     health_log_secs: u64,
     instance_id: String,
     channel_map: HashMap<String, String>,
@@ -127,6 +300,17 @@ struct BridgeConfig {
 
 impl BridgeConfig {
     fn from_env() -> Self {
+        let ws_scheme_raw = env::var("CHATIFY_WS_SCHEME").unwrap_or_else(|_| "ws".to_string());
+        let chatify_ws_scheme = match ws_scheme_raw.to_ascii_lowercase().as_str() {
+            "ws" | "wss" => ws_scheme_raw.to_ascii_lowercase(),
+            invalid => {
+                eprintln!(
+                    "Invalid CHATIFY_WS_SCHEME='{}'. Falling back to 'ws'.",
+                    invalid
+                );
+                "ws".to_string()
+            }
+        };
         let auth_timeout_secs = env::var("CHATIFY_AUTH_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -141,6 +325,20 @@ impl BridgeConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30)
             .max(reconnect_base_secs);
+        let reconnect_jitter_pct = env::var("CHATIFY_RECONNECT_JITTER_PCT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_RECONNECT_JITTER_PCT)
+            .min(100);
+        let reconnect_warn_threshold = env::var("CHATIFY_RECONNECT_WARN_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_RECONNECT_WARN_THRESHOLD)
+            .max(1);
+        let ping_secs = env::var("CHATIFY_PING_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_PING_SECS);
         let health_log_secs = env::var("CHATIFY_HEALTH_LOG_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -155,6 +353,15 @@ impl BridgeConfig {
             .map(|s| parse_channel_map(&s))
             .unwrap_or_default();
 
+        let raw_channel = env::var("CHATIFY_CHANNEL").unwrap_or_else(|_| "general".to_string());
+        let chatify_channel = normalize_chatify_channel(&raw_channel).unwrap_or_else(|| {
+            eprintln!(
+                "Invalid CHATIFY_CHANNEL='{}'. Falling back to 'general'.",
+                raw_channel
+            );
+            "general".to_string()
+        });
+
         Self {
             discord_token: env::var("DISCORD_TOKEN")
                 .expect("Expected DISCORD_TOKEN in environment"),
@@ -162,13 +369,16 @@ impl BridgeConfig {
             chatify_port: env::var("CHATIFY_PORT").unwrap_or_else(|_| "8765".to_string()),
             chatify_password: env::var("CHATIFY_PASSWORD")
                 .expect("Expected CHATIFY_PASSWORD in environment"),
-            chatify_channel: env::var("CHATIFY_CHANNEL").unwrap_or_else(|_| "general".to_string()),
+            chatify_channel,
             chatify_bot_username: env::var("CHATIFY_BOT_USERNAME")
                 .unwrap_or_else(|_| "DiscordBot".to_string()),
-            chatify_ws_scheme: env::var("CHATIFY_WS_SCHEME").unwrap_or_else(|_| "ws".to_string()),
+            chatify_ws_scheme,
             auth_timeout_secs,
             reconnect_base_secs,
             reconnect_max_secs,
+            reconnect_jitter_pct,
+            reconnect_warn_threshold,
+            ping_secs,
             health_log_secs,
             instance_id,
             channel_map,
@@ -181,6 +391,22 @@ impl BridgeConfig {
             self.chatify_ws_scheme, self.chatify_host, self.chatify_port
         )
     }
+}
+
+fn jittered_backoff_secs(base_secs: u64, jitter_pct: u64) -> u64 {
+    if base_secs == 0 || jitter_pct == 0 {
+        return base_secs;
+    }
+
+    let max_extra = base_secs.saturating_mul(jitter_pct).saturating_div(100);
+    if max_extra == 0 {
+        return base_secs;
+    }
+
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let noise = u64::from_le_bytes(bytes) % (max_extra + 1);
+    base_secs.saturating_add(noise)
 }
 
 /// Get current Unix timestamp
@@ -298,12 +524,15 @@ impl EventHandler for DiscordHandler {
 
         let content = msg.content.trim().to_string();
         if content.is_empty() || content.len() > MAX_DISCORD_CONTENT_LEN {
-            self.metrics
-                .dropped_messages
-                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.inc_dropped();
+            debug!(
+                "event=discord_drop reason=empty_or_too_large content_len={} channel_id={}",
+                content.len(),
+                msg.channel_id
+            );
             return;
         }
-        self.metrics.discord_ingress.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inc_discord_ingress();
 
         let author = msg.author.name.clone();
         let formatted_msg = format!("{}: {}", author, content);
@@ -325,7 +554,14 @@ impl EventHandler for DiscordHandler {
 
         let encrypted = match enc_bytes(&key, formatted_msg.as_bytes()) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(e) => {
+                warn!(
+                    "event=discord_encrypt_failed channel={} author={} error={}",
+                    channel, author, e
+                );
+                self.metrics.inc_dropped();
+                return;
+            }
         };
         let encoded = general_purpose::STANDARD.encode(&encrypted);
         let chatify_msg = serde_json::json!({
@@ -338,17 +574,19 @@ impl EventHandler for DiscordHandler {
         });
         if let Some(tx) = ws_tx {
             send_ws_json(&tx, chatify_msg);
+            self.metrics.inc_discord_forwarded();
         } else {
-            eprintln!("Bridge not connected to Chatify; dropping Discord message");
-            self.metrics
-                .dropped_messages
-                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "event=discord_drop reason=chatify_disconnected channel_id={}",
+                discord_channel_id
+            );
+            self.metrics.inc_dropped();
         }
     }
 
     /// Called when the bot is ready
     async fn ready(&self, _ctx: Context, ready: Ready) {
-        println!("📡 Discord bot connected as: {}", ready.user.name);
+        info!("event=discord_ready bot_user={}", ready.user.name);
         let mut state = self.state.lock().await;
         state.username = ready.user.name.to_string();
     }
@@ -360,7 +598,7 @@ async fn handle_chatify_msg(
     state: &Arc<Mutex<BotState>>,
     metrics: &Arc<BridgeMetrics>,
 ) {
-    metrics.chatify_ingress.fetch_add(1, Ordering::Relaxed);
+    metrics.inc_chatify_ingress();
     let own_source = {
         let bot_state = state.lock().await;
         bot_state.bridge_src_tag.clone()
@@ -375,7 +613,11 @@ async fn handle_chatify_msg(
 
     let encrypted = match general_purpose::STANDARD.decode(c) {
         Ok(bytes) => bytes,
-        Err(_) => return,
+        Err(_) => {
+            metrics.inc_dropped();
+            debug!("event=chatify_drop reason=invalid_base64 type=msg");
+            return;
+        }
     };
 
     let key = {
@@ -386,14 +628,22 @@ async fn handle_chatify_msg(
     if let Ok(content) = dec_bytes(&key, &encrypted) {
         let content_str =
             String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
+        metrics.inc_chatify_forwarded();
         println!("[Chatify → Discord] {}: {}", u, content_str);
+    } else {
+        metrics.inc_dropped();
+        debug!(
+            "event=chatify_drop reason=decrypt_failed type=msg channel={}",
+            ch
+        );
     }
 }
 
 /// Handle Chatify system messages
 fn handle_system_msg(data: &PayloadMap, metrics: &Arc<BridgeMetrics>) {
-    metrics.chatify_ingress.fetch_add(1, Ordering::Relaxed);
+    metrics.inc_chatify_ingress();
     let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    metrics.inc_chatify_forwarded();
     println!("[Chatify → Discord] System: {}", m);
 }
 
@@ -403,14 +653,18 @@ async fn handle_dm_msg(
     state: &Arc<Mutex<BotState>>,
     metrics: &Arc<BridgeMetrics>,
 ) {
-    metrics.chatify_ingress.fetch_add(1, Ordering::Relaxed);
+    metrics.inc_chatify_ingress();
     let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
     let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
     let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
 
     let encrypted = match general_purpose::STANDARD.decode(c) {
         Ok(bytes) => bytes,
-        Err(_) => return,
+        Err(_) => {
+            metrics.inc_dropped();
+            debug!("event=chatify_drop reason=invalid_base64 type=dm");
+            return;
+        }
     };
 
     let dm_key = {
@@ -420,15 +674,27 @@ async fn handle_dm_msg(
     };
 
     let Ok(dm_key) = dm_key else {
+        metrics.inc_dropped();
+        debug!(
+            "event=chatify_drop reason=dm_key_unavailable from={} to={}",
+            frm, to
+        );
         return;
     };
 
     if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
         let content_str =
             String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
+        metrics.inc_chatify_forwarded();
         println!(
             "[Chatify → Discord] DM from {} to {}: {}",
             frm, to, content_str
+        );
+    } else {
+        metrics.inc_dropped();
+        debug!(
+            "event=chatify_drop reason=decrypt_failed type=dm from={} to={}",
+            frm, to
         );
     }
 }
@@ -437,6 +703,12 @@ async fn handle_users_update(data: &PayloadMap, state: &Arc<Mutex<BotState>>) {
     let users_value = data.get("users").cloned().unwrap_or(serde_json::json!([]));
     let bot_state = state.lock().await;
     load_users(&users_value, &bot_state.users);
+    debug!("event=chatify_users_update");
+}
+
+fn handle_pong(metrics: &Arc<BridgeMetrics>) {
+    metrics.inc_pongs_received();
+    debug!("event=chatify_pong");
 }
 
 async fn dispatch_chatify_event(
@@ -450,7 +722,10 @@ async fn dispatch_chatify_event(
         "sys" => handle_system_msg(data, metrics),
         "dm" => handle_dm_msg(data, state, metrics).await,
         "users" | "ok" => handle_users_update(data, state).await,
-        _ => {}
+        "pong" => handle_pong(metrics),
+        _ => {
+            debug!("event=chatify_unhandled_frame type={}", t);
+        }
     }
 }
 
@@ -460,18 +735,24 @@ async fn run_chatify_session(
     metrics: Arc<BridgeMetrics>,
 ) -> Result<(), String> {
     let uri = cfg.uri();
-    println!("Connecting to Chatify server at {}", uri);
+    metrics.inc_connect_attempts();
+    info!(
+        "event=chatify_connect_attempt uri={} auth_timeout_s={}",
+        uri, cfg.auth_timeout_secs
+    );
     let (ws_stream, _) = connect_async(&uri)
         .await
         .map_err(|e| format!("Failed to connect to Chatify: {e}"))?;
-    println!("Connected to Chatify server");
+    info!("event=chatify_connected uri={}", uri);
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let writer_metrics = metrics.clone();
     tokio::spawn(async move {
         while let Some(msg) = bridge_rx.recv().await {
             if let Err(err) = ws_write.send(msg).await {
-                eprintln!("Chatify writer task failed: {}", err);
+                writer_metrics.inc_ws_write_errors();
+                warn!("event=chatify_writer_error error={}", err);
                 break;
             }
         }
@@ -480,11 +761,19 @@ async fn run_chatify_session(
     // Authenticate with Chatify.
     {
         let bot_state = state.lock().await;
+        let pw_hash = pw_hash_client(&bot_state.password).map_err(|e| {
+            metrics.inc_auth_failures();
+            format!("Failed to hash bridge password for auth: {}", e)
+        })?;
+        let pk = pub_b64(&bot_state.priv_key).map_err(|e| {
+            metrics.inc_auth_failures();
+            format!("Failed to derive bridge public key: {}", e)
+        })?;
         let auth_msg = serde_json::json!({
             "t": "auth",
             "u": bot_state.username,
-            "pw": pw_hash_client(&bot_state.password),
-            "pk": pub_b64(&bot_state.priv_key).expect("generated keypair must produce valid public key"),
+            "pw": pw_hash,
+            "pk": pk,
             "status": {"text": "Online", "emoji": "🟢"}
         });
         send_ws_json(&bridge_tx, auth_msg);
@@ -493,30 +782,45 @@ async fn run_chatify_session(
     // Wait for auth response with timeout.
     let auth_reply = timeout(Duration::from_secs(cfg.auth_timeout_secs), ws_read.next())
         .await
-        .map_err(|_| "Auth response timeout from Chatify".to_string())?;
+        .map_err(|_| {
+            metrics.inc_auth_failures();
+            "Auth response timeout from Chatify".to_string()
+        })?;
 
     let auth_text = match auth_reply {
         Some(Ok(WsMessage::Text(resp))) => resp,
         Some(Ok(other)) => {
+            metrics.inc_auth_failures();
             return Err(format!("Unexpected auth frame from Chatify: {:?}", other));
         }
-        Some(Err(e)) => return Err(format!("WebSocket error during auth: {e}")),
-        None => return Err("Chatify closed connection before auth completed".to_string()),
+        Some(Err(e)) => {
+            metrics.inc_auth_failures();
+            return Err(format!("WebSocket error during auth: {e}"));
+        }
+        None => {
+            metrics.inc_auth_failures();
+            return Err("Chatify closed connection before auth completed".to_string());
+        }
     };
 
-    let resp_val: serde_json::Value =
-        serde_json::from_str(&auth_text).map_err(|e| format!("Invalid auth JSON: {e}"))?;
+    let resp_val: serde_json::Value = serde_json::from_str(&auth_text).map_err(|e| {
+        metrics.inc_auth_failures();
+        format!("Invalid auth JSON: {e}")
+    })?;
     let typ = resp_val.get("t").and_then(|v| v.as_str()).unwrap_or("");
     if typ == "err" {
+        metrics.inc_auth_failures();
         return Err(format!(
             "Authentication failed: {}",
             resp_val["m"].as_str().unwrap_or("unknown error")
         ));
     }
     if typ != "ok" {
+        metrics.inc_auth_failures();
         return Err(format!("Unexpected auth response type: {}", typ));
     }
     if !resp_val.get("users").map(|v| v.is_array()).unwrap_or(false) {
+        metrics.inc_auth_failures();
         return Err("Malformed auth users payload".to_string());
     }
 
@@ -529,29 +833,61 @@ async fn run_chatify_session(
         load_users(&resp_val["users"], &bot_state.users);
         bot_state.ws_tx = Some(bridge_tx.clone());
     }
-    println!("Chatify bridge authenticated as connected user");
+    info!(
+        "event=chatify_authenticated username={}",
+        resp_val["u"].as_str().unwrap_or("unknown")
+    );
 
-    while let Some(frame) = ws_read.next().await {
+    let mut ping_interval = if cfg.ping_secs > 0 {
+        let mut interval = tokio::time::interval(Duration::from_secs(cfg.ping_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(interval)
+    } else {
+        None
+    };
+
+    loop {
+        let frame = if let Some(interval) = ping_interval.as_mut() {
+            tokio::select! {
+                _ = interval.tick() => {
+                    send_ws_json(&bridge_tx, serde_json::json!({"t": "ping", "ts": now_secs()}));
+                    metrics.inc_pings_sent();
+                    debug!("event=chatify_ping");
+                    continue;
+                }
+                next = ws_read.next() => next,
+            }
+        } else {
+            ws_read.next().await
+        };
+
+        let Some(frame) = frame else {
+            return Err("Chatify websocket stream ended".to_string());
+        };
+
         match frame {
             Ok(WsMessage::Text(text)) => {
                 if let Ok(data) = serde_json::from_str::<PayloadMap>(&text) {
                     dispatch_chatify_event(&data, &state, &metrics).await;
                 } else {
-                    eprintln!("Received non-JSON Chatify event; ignoring");
-                    metrics.dropped_messages.fetch_add(1, Ordering::Relaxed);
+                    warn!("event=chatify_drop reason=non_json_payload");
+                    metrics.inc_dropped();
                 }
             }
-            Ok(WsMessage::Close(_)) => {
+            Ok(WsMessage::Close(close_frame)) => {
+                info!("event=chatify_closed frame={:?}", close_frame);
                 return Err("Chatify connection closed".to_string());
+            }
+            Ok(WsMessage::Ping(payload)) => {
+                let _ = bridge_tx.send(WsMessage::Pong(payload));
             }
             Ok(_) => {}
             Err(e) => {
+                metrics.inc_ws_read_errors();
                 return Err(format!("Chatify websocket read error: {e}"));
             }
         }
     }
-
-    Err("Chatify websocket stream ended".to_string())
 }
 
 async fn bridge_supervisor(
@@ -560,22 +896,39 @@ async fn bridge_supervisor(
     metrics: Arc<BridgeMetrics>,
 ) {
     let mut backoff = cfg.reconnect_base_secs;
+    let mut consecutive_failures = 0u64;
     loop {
         match run_chatify_session(state.clone(), &cfg, metrics.clone()).await {
             Ok(()) => {
                 backoff = cfg.reconnect_base_secs;
+                consecutive_failures = 0;
             }
             Err(err) => {
-                metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+                metrics.inc_reconnects();
+                consecutive_failures = consecutive_failures.saturating_add(1);
                 {
                     let mut bot_state = state.lock().await;
                     bot_state.ws_tx = None;
                 }
-                eprintln!(
-                    "Bridge session ended: {}. Reconnecting in {}s...",
-                    err, backoff
-                );
-                sleep(Duration::from_secs(backoff)).await;
+                let sleep_secs = jittered_backoff_secs(backoff, cfg.reconnect_jitter_pct);
+                if consecutive_failures >= cfg.reconnect_warn_threshold {
+                    warn!(
+                        "event=bridge_reconnect_slow consecutive_failures={} reason={} backoff_base_s={} backoff_sleep_s={}",
+                        consecutive_failures,
+                        err,
+                        backoff,
+                        sleep_secs
+                    );
+                } else {
+                    info!(
+                        "event=bridge_reconnect reason={} consecutive_failures={} backoff_base_s={} backoff_sleep_s={}",
+                        err,
+                        consecutive_failures,
+                        backoff,
+                        sleep_secs
+                    );
+                }
+                sleep(Duration::from_secs(sleep_secs)).await;
                 backoff = (backoff.saturating_mul(2)).min(cfg.reconnect_max_secs);
             }
         }
@@ -589,8 +942,24 @@ async fn main() {
 
     // Set up logging.
     if env::var("CHATIFY_LOG").unwrap_or_default() == "1" {
-        env_logger::init();
+        let _ = env_logger::Builder::from_default_env()
+            .format_timestamp_secs()
+            .try_init();
     }
+
+    info!(
+        "event=bridge_start host={} port={} channel={} ws_scheme={} reconnect_base_s={} reconnect_max_s={} reconnect_jitter_pct={} ping_s={} health_s={} channel_map_entries={}",
+        cfg.chatify_host,
+        cfg.chatify_port,
+        cfg.chatify_channel,
+        cfg.chatify_ws_scheme,
+        cfg.reconnect_base_secs,
+        cfg.reconnect_max_secs,
+        cfg.reconnect_jitter_pct,
+        cfg.ping_secs,
+        cfg.health_log_secs,
+        cfg.channel_map.len()
+    );
 
     // Initialize bot state.
     let state = Arc::new(Mutex::new(BotState::new()));
@@ -608,9 +977,12 @@ async fn main() {
         let metrics_clone = metrics.clone();
         let interval_secs = cfg.health_log_secs;
         tokio::spawn(async move {
+            let mut previous: Option<BridgeMetricsSnapshot> = None;
             loop {
                 sleep(Duration::from_secs(interval_secs)).await;
-                metrics_clone.log_snapshot();
+                let current = metrics_clone.snapshot();
+                metrics_clone.log_snapshot_delta(current, previous, interval_secs);
+                previous = Some(current);
             }
         });
     }
@@ -637,16 +1009,16 @@ async fn main() {
     // Start the Discord client.
     let discord_task = tokio::spawn(async move {
         if let Err(why) = client.start().await {
-            println!("Discord client error: {:?}", why);
+            error!("event=discord_client_error details={:?}", why);
         }
     });
 
     tokio::select! {
         _ = bridge_task => {
-            eprintln!("Bridge supervisor task ended unexpectedly");
+            error!("event=bridge_supervisor_ended_unexpectedly");
         }
         _ = discord_task => {
-            eprintln!("Discord task ended unexpectedly");
+            error!("event=discord_task_ended_unexpectedly");
         }
     }
 }
@@ -732,6 +1104,9 @@ mod tests {
             auth_timeout_secs: 2,
             reconnect_base_secs: 1,
             reconnect_max_secs: 1,
+            reconnect_jitter_pct: 0,
+            reconnect_warn_threshold: 3,
+            ping_secs: 0,
             health_log_secs: 30,
             instance_id: "test-instance".to_string(),
             channel_map: HashMap::new(),
@@ -812,5 +1187,27 @@ mod tests {
         let mut object_src = PayloadMap::new();
         object_src.insert("src".to_string(), serde_json::json!({"id": own}));
         assert!(!is_self_sourced_event(&object_src, own));
+    }
+
+    #[test]
+    fn jittered_backoff_without_jitter_is_stable() {
+        assert_eq!(jittered_backoff_secs(10, 0), 10);
+        assert_eq!(jittered_backoff_secs(0, 20), 0);
+    }
+
+    #[test]
+    fn jittered_backoff_with_jitter_stays_within_bounds() {
+        let base = 20;
+        let jitter_pct = 25;
+        let upper_bound = base + (base * jitter_pct / 100);
+
+        for _ in 0..128 {
+            let value = jittered_backoff_secs(base, jitter_pct);
+            assert!(value >= base, "backoff should never be less than base");
+            assert!(
+                value <= upper_bound,
+                "backoff should be bounded by jitter window"
+            );
+        }
     }
 }

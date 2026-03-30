@@ -17,6 +17,9 @@ use zeroize::Zeroize;
 use base64::{self, engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use crossterm::cursor::MoveTo;
+use crossterm::execute;
+use crossterm::terminal::{size as term_size, Clear, ClearType};
 use rand::RngCore;
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
@@ -33,8 +36,61 @@ use log::{debug, error, info, warn};
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
 const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [limit], /search <query>, /rewind <Ns|Nm|Nh|Nd> [limit], /clear, /edit, /help, /quit";
+const RETRO_MIN_WIDTH: usize = 72;
+const RETRO_MIN_HEIGHT: usize = 18;
+const DASHBOARD_HEADER_ROWS: usize = 2;
+const DASHBOARD_FOOTER_ROWS: usize = 1;
+const DASHBOARD_GUTTER_WIDTH: usize = 3;
+const SIDEBAR_RATIO_PERCENT: usize = 34;
+const SIDEBAR_MIN_WIDTH: usize = 28;
+const SIDEBAR_MAX_WIDTH: usize = 46;
+const MAIN_MIN_WIDTH: usize = 24;
+const FEED_LOOKBACK_MESSAGES: usize = 48;
+const PROFILE_PANEL_ROWS: usize = 6;
+const COMMANDS_PANEL_ROWS: usize = 6;
+const MIN_CHANNEL_PANEL_ROWS: usize = 3;
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_HEADER: &str = "\x1b[38;5;147m";
+const ANSI_LEFT: &str = "\x1b[38;5;117m";
+const ANSI_RIGHT: &str = "\x1b[38;5;120m";
+const ANSI_HINT: &str = "\x1b[38;5;220m";
+const ANSI_DIM: &str = "\x1b[38;5;245m";
 type SharedState = Arc<tokio::sync::Mutex<ClientState>>;
 type JsonMap = HashMap<String, serde_json::Value>;
+
+#[derive(Clone, Copy)]
+struct DashboardGeometry {
+    width: usize,
+    body_rows: usize,
+    left_w: usize,
+    right_w: usize,
+}
+
+impl DashboardGeometry {
+    fn from_terminal(width: usize, height: usize) -> Option<Self> {
+        if width < RETRO_MIN_WIDTH || height < RETRO_MIN_HEIGHT {
+            return None;
+        }
+
+        let body_rows = height.saturating_sub(DASHBOARD_HEADER_ROWS + DASHBOARD_FOOTER_ROWS);
+
+        let mut right_w = (width.saturating_mul(SIDEBAR_RATIO_PERCENT) / 100)
+            .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        if right_w + MAIN_MIN_WIDTH > width.saturating_sub(DASHBOARD_GUTTER_WIDTH) {
+            right_w = width
+                .saturating_sub(DASHBOARD_GUTTER_WIDTH)
+                .saturating_sub(MAIN_MIN_WIDTH);
+        }
+        let left_w = width.saturating_sub(right_w + DASHBOARD_GUTTER_WIDTH);
+
+        Some(Self {
+            width,
+            body_rows,
+            left_w,
+            right_w,
+        })
+    }
+}
 
 struct AuthContext {
     me: String,
@@ -120,6 +176,16 @@ enum VoiceEvent {
     Captured(VoiceFrame),
     Playback(VoiceFrame),
     Stop,
+}
+
+enum SessionStopFeedback {
+    Silent,
+    Notify,
+}
+
+enum CommandFlow {
+    Continue,
+    Exit,
 }
 
 /// Client connection state and data
@@ -210,6 +276,17 @@ impl ClientState {
         if self.message_history.len() > MAX_HISTORY {
             self.message_history.remove(0);
         }
+        let _ = render_terminal_dashboard(self);
+    }
+
+    fn add_notice(&mut self, text: impl Into<String>) {
+        self.add_message(DisplayedMessage {
+            time: format_time(now_secs()),
+            text: text.into(),
+            msg_type: MessageType::Sys,
+            user: None,
+            channel: None,
+        });
     }
 }
 
@@ -280,6 +357,390 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn truncate_with_ellipsis(input: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut chars = input.chars();
+    for _ in 0..width {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+
+    if chars.next().is_some() {
+        if width == 1 {
+            return ".".to_string();
+        }
+        out.pop();
+        out.push('…');
+    }
+
+    out
+}
+
+fn fit_to_width(input: &str, width: usize) -> String {
+    let clipped = truncate_with_ellipsis(input, width);
+    let clipped_len = clipped.chars().count();
+    if clipped_len >= width {
+        clipped
+    } else {
+        format!("{}{}", clipped, " ".repeat(width - clipped_len))
+    }
+}
+
+fn wrap_words(input: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in input.split_whitespace() {
+        let current_len = current.chars().count();
+        let word_len = word.chars().count();
+        let next_len = if current_len == 0 {
+            word_len
+        } else {
+            current_len + 1 + word_len
+        };
+
+        if next_len > width {
+            if !current.is_empty() {
+                lines.push(current);
+            }
+            current = truncate_with_ellipsis(word, width);
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    if lines.len() > max_lines {
+        lines.split_off(lines.len() - max_lines)
+    } else {
+        lines
+    }
+}
+
+fn build_panel(title: &str, lines: &[String], width: usize, height: usize) -> Vec<String> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    if width < 2 {
+        return vec![fit_to_width("", width); height];
+    }
+
+    let inner = width.saturating_sub(2);
+    let titled = truncate_with_ellipsis(&format!(" {} ", title), inner);
+    let titled_len = titled.chars().count();
+
+    let mut out = Vec::with_capacity(height);
+    out.push(format!(
+        "┌{}{}┐",
+        titled,
+        "─".repeat(inner.saturating_sub(titled_len))
+    ));
+
+    let body_rows = height.saturating_sub(2);
+    for idx in 0..body_rows {
+        let raw = lines.get(idx).cloned().unwrap_or_default();
+        out.push(format!("│{}│", fit_to_width(&raw, inner)));
+    }
+
+    if height > 1 {
+        out.push(format!("└{}┘", "─".repeat(inner)));
+    }
+
+    out
+}
+
+fn format_feed_entry(msg: &DisplayedMessage) -> String {
+    let stamp = format!("[{}]", msg.time);
+    match msg.msg_type {
+        MessageType::Msg => {
+            let user = msg.user.as_deref().unwrap_or("?");
+            format!("{} {}: {}", stamp, user, msg.text)
+        }
+        MessageType::Dm => {
+            let user = msg.user.as_deref().unwrap_or("?");
+            format!("{} DM {} {}", stamp, user, msg.text)
+        }
+        MessageType::Edit => format!("{} edit {}", stamp, msg.text),
+        MessageType::Sys => format!("{} • {}", stamp, msg.text),
+        _ => format!("{} {}", stamp, msg.text),
+    }
+}
+
+fn collect_recent_feed_lines(state: &ClientState, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let start = state
+        .message_history
+        .len()
+        .saturating_sub(FEED_LOOKBACK_MESSAGES);
+    for msg in &state.message_history[start..] {
+        let wrapped = wrap_words(&format_feed_entry(msg), width, max_lines);
+        for line in wrapped {
+            lines.push(line);
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("No messages yet. Join a channel and start chatting.".to_string());
+    }
+
+    if lines.len() > max_lines {
+        lines.split_off(lines.len() - max_lines)
+    } else {
+        lines
+    }
+}
+
+fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<String> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let profile_h = PROFILE_PANEL_ROWS;
+    let commands_h = COMMANDS_PANEL_ROWS;
+    let remaining = height.saturating_sub(profile_h + commands_h);
+    let online_h = remaining.saturating_mul(2) / 3;
+    let channels_h = remaining.saturating_sub(online_h);
+
+    let profile_lines = vec![
+        format!("{} {}", state.me, state.status.emoji),
+        format!("status: {}", state.status.text),
+        format!("channel: #{}", state.ch),
+        format!("voice: {}", if state.voice_active { "ON" } else { "OFF" }),
+    ];
+
+    let mut command_lines = vec![
+        "/join <channel>".to_string(),
+        "/dm <user> <msg>".to_string(),
+        "/users /channels".to_string(),
+        "/history /search".to_string(),
+    ];
+    if let Some(last) = state.message_history.last() {
+        command_lines.push(truncate_with_ellipsis(
+            &format!("last: {}", format_feed_entry(last)),
+            width.saturating_sub(2),
+        ));
+    }
+
+    let mut online_users: Vec<String> = state.users.keys().cloned().collect();
+    online_users.sort_unstable();
+    let online_lines = if online_users.is_empty() {
+        vec!["(waiting for users feed)".to_string()]
+    } else {
+        online_users
+            .into_iter()
+            .map(|u| format!("• {}", u))
+            .collect()
+    };
+
+    let mut channels: Vec<String> = state.chs.keys().cloned().collect();
+    channels.sort_unstable();
+    let channel_lines = if channels.is_empty() {
+        vec!["(none)".to_string()]
+    } else {
+        channels
+            .into_iter()
+            .map(|ch| {
+                if ch == state.ch {
+                    format!("* #{}", ch)
+                } else {
+                    format!("  #{}", ch)
+                }
+            })
+            .collect()
+    };
+
+    let mut out = Vec::new();
+    out.extend(build_panel(
+        "PROFILE",
+        &profile_lines,
+        width,
+        profile_h.min(height),
+    ));
+    if out.len() < height {
+        out.extend(build_panel(
+            "MESSAGES",
+            &command_lines,
+            width,
+            commands_h.min(height.saturating_sub(out.len())),
+        ));
+    }
+    if out.len() < height {
+        out.extend(build_panel(
+            "NOW ONLINE",
+            &online_lines,
+            width,
+            online_h.min(height.saturating_sub(out.len())),
+        ));
+    }
+    if out.len() < height {
+        out.extend(build_panel(
+            "YOUR CHANNELS",
+            &channel_lines,
+            width,
+            channels_h
+                .max(MIN_CHANNEL_PANEL_ROWS)
+                .min(height.saturating_sub(out.len())),
+        ));
+    }
+
+    if out.len() < height {
+        out.extend(std::iter::repeat_n(" ".repeat(width), height - out.len()));
+    }
+    out.truncate(height);
+    out
+}
+
+fn render_compact_dashboard(
+    out: &mut io::Stdout,
+    state: &ClientState,
+    width: usize,
+    height: usize,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "{}{}{}",
+        ANSI_HEADER,
+        fit_to_width("// CHATIFY //", width),
+        ANSI_RESET
+    )?;
+    writeln!(
+        out,
+        "{}{}{}",
+        ANSI_DIM,
+        fit_to_width(
+            "Terminal is small. Expand window for full dashboard mode.",
+            width
+        ),
+        ANSI_RESET
+    )?;
+
+    let max_feed_lines = height.saturating_sub(DASHBOARD_HEADER_ROWS + DASHBOARD_FOOTER_ROWS);
+    for msg in state
+        .message_history
+        .iter()
+        .rev()
+        .take(max_feed_lines)
+        .rev()
+    {
+        writeln!(out, "{}", fit_to_width(&format_feed_entry(msg), width))?;
+    }
+
+    writeln!(
+        out,
+        "{}{}{}",
+        ANSI_HINT,
+        fit_to_width("-> /help for commands", width),
+        ANSI_RESET
+    )
+}
+
+fn render_full_dashboard(
+    out: &mut io::Stdout,
+    state: &ClientState,
+    geom: DashboardGeometry,
+) -> io::Result<()> {
+    let header = format!(
+        "[ {} online ] [ {} channels ] [ {} events ]   // CHATIFY RETRO FEED //",
+        state.users.len(),
+        state.chs.len(),
+        state.message_history.len()
+    );
+    let subtitle = format!(
+        "#{}   mode:{}   voice:{}",
+        state.ch,
+        state.theme,
+        if state.voice_active { "on" } else { "off" }
+    );
+
+    writeln!(
+        out,
+        "{}{}{}",
+        ANSI_HEADER,
+        fit_to_width(&header, geom.width),
+        ANSI_RESET
+    )?;
+    writeln!(
+        out,
+        "{}{}{}",
+        ANSI_DIM,
+        fit_to_width(&subtitle, geom.width),
+        ANSI_RESET
+    )?;
+
+    let left_feed_lines =
+        collect_recent_feed_lines(state, geom.left_w.saturating_sub(2), geom.body_rows);
+    let left_panel = build_panel("GLOBAL_FEED", &left_feed_lines, geom.left_w, geom.body_rows);
+    let right_panel = build_right_column(state, geom.right_w, geom.body_rows);
+
+    for row in 0..geom.body_rows {
+        let left_line = left_panel
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| " ".repeat(geom.left_w));
+        let right_line = right_panel
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| " ".repeat(geom.right_w));
+        writeln!(
+            out,
+            "{}{}{}   {}{}{}",
+            ANSI_LEFT, left_line, ANSI_RESET, ANSI_RIGHT, right_line, ANSI_RESET
+        )?;
+    }
+
+    writeln!(
+        out,
+        "{}{}{}",
+        ANSI_HINT,
+        fit_to_width(
+            "-> Type + Enter | /join #channel | /dm user msg | /help | /quit",
+            geom.width
+        ),
+        ANSI_RESET
+    )
+}
+
+fn render_terminal_dashboard(state: &ClientState) -> io::Result<()> {
+    let (w, h) = term_size().unwrap_or((120, 36));
+    let width = usize::from(w);
+    let height = usize::from(h);
+
+    let mut out = io::stdout();
+    execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+
+    if let Some(geom) = DashboardGeometry::from_terminal(width, height) {
+        render_full_dashboard(&mut out, state, geom)?;
+    } else {
+        render_compact_dashboard(&mut out, state, width, height)?;
+    }
+
+    out.flush()
 }
 
 fn fresh_nonce_hex() -> String {
@@ -961,6 +1422,182 @@ fn start_voice_session(
     }
 }
 
+fn stop_voice_session(state: &mut ClientState, feedback: SessionStopFeedback) {
+    if let Some(session) = state.voice_session.take() {
+        let room = session.room.clone();
+        enqueue_timed(&state.ws_tx, serde_json::json!({"t": "vleave", "r": room}));
+        let _ = session.event_tx.send(VoiceEvent::Stop);
+        let _ = session.task.join();
+        state.voice_active = false;
+        if matches!(feedback, SessionStopFeedback::Notify) {
+            state.add_notice("Voice session stopped");
+        }
+    } else {
+        state.voice_active = false;
+    }
+}
+
+fn queue_channel_message(state: &mut ClientState, channel: &str, plaintext: &str) {
+    let encrypted = match enc_bytes(&state.ckey(channel), plaintext.as_bytes()) {
+        Ok(v) => v,
+        Err(e) => {
+            state.add_notice(format!("encryption failed: {}", e));
+            return;
+        }
+    };
+    let encoded = general_purpose::STANDARD.encode(&encrypted);
+    enqueue_timed(
+        &state.ws_tx,
+        serde_json::json!({"t": "msg", "ch": channel, "c": encoded, "p": plaintext}),
+    );
+}
+
+fn handle_slash_command(
+    state: &mut ClientState,
+    cmd: &str,
+    args: &str,
+    shutdown_tx: &watch::Sender<bool>,
+) -> CommandFlow {
+    match cmd {
+        "/join" => {
+            if let Some(ch) = normalize_channel(args.trim()) {
+                state.ch = ch.clone();
+                state.chs.insert(ch.clone(), true);
+                enqueue_timed(&state.ws_tx, serde_json::json!({"t": "join", "ch": ch}));
+            } else {
+                state.add_notice("Usage: /join <channel>. Allowed: letters, digits, -, _");
+            }
+        }
+        "/dm" => {
+            let mut parts = args.splitn(2, ' ');
+            let target = parts.next().unwrap_or("");
+            let msg = parts.next().unwrap_or("");
+            if target.is_empty() || msg.is_empty() {
+                state.add_notice("Usage: /dm <user> <message>");
+                return CommandFlow::Continue;
+            }
+            if target == state.me {
+                state.add_notice("Cannot DM yourself.");
+                return CommandFlow::Continue;
+            }
+
+            let encrypted = match state.dmkey(target) {
+                Ok(key) => match enc_bytes(&key, msg.as_bytes()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        state.add_notice(format!("encryption failed: {}", e));
+                        return CommandFlow::Continue;
+                    }
+                },
+                Err(e) => {
+                    state.add_notice(format!("DM failed: {}", e));
+                    return CommandFlow::Continue;
+                }
+            };
+            let encoded = general_purpose::STANDARD.encode(&encrypted);
+            enqueue_timed(
+                &state.ws_tx,
+                serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
+            );
+        }
+        "/me" => {
+            if !args.is_empty() {
+                let ch = state.ch.clone();
+                let msg = format!("* {} {}", state.me, args);
+                queue_channel_message(state, &ch, &msg);
+            }
+        }
+        "/users" => {
+            enqueue_timed(&state.ws_tx, serde_json::json!({"t": "users"}));
+        }
+        "/channels" => {
+            enqueue_timed(&state.ws_tx, serde_json::json!({"t": "info"}));
+        }
+        "/voice" => {
+            if state.voice_session.is_some() {
+                stop_voice_session(state, SessionStopFeedback::Notify);
+            } else {
+                let room = normalize_channel(args.trim()).unwrap_or_else(|| state.ch.clone());
+                let ws_tx = state.ws_tx.clone();
+                match start_voice_session(room.clone(), ws_tx.clone()) {
+                    Ok(session) => {
+                        state.voice_active = true;
+                        state.voice_session = Some(session);
+                        enqueue_timed(&ws_tx, serde_json::json!({"t": "vjoin", "r": room}));
+                        state.add_notice(format!("Voice started in #{}", room));
+                    }
+                    Err(e) => {
+                        error!("Voice start failed: {}", e);
+                        info!(
+                            "Check that your microphone/speakers are available and not in use by another app."
+                        );
+                        state.add_notice(format!("Voice start failed: {}", e));
+                    }
+                }
+            }
+        }
+        "/clear" => {
+            state.message_history.clear();
+            let _ = render_terminal_dashboard(state);
+        }
+        "/help" => {
+            state.add_notice(HELP_TEXT);
+        }
+        "/edit" => {
+            state.add_notice("Edit command not yet implemented in Rust client");
+        }
+        "/history" => {
+            let limit = parse_limit(args, 50, 200);
+            let ch = state.ch.clone();
+            enqueue_timed(
+                &state.ws_tx,
+                serde_json::json!({"t": "history", "ch": ch, "limit": limit}),
+            );
+        }
+        "/search" => {
+            let q = args.trim();
+            if q.is_empty() {
+                state.add_notice("Usage: /search <query>");
+                return CommandFlow::Continue;
+            }
+            let ch = state.ch.clone();
+            enqueue_timed(
+                &state.ws_tx,
+                serde_json::json!({"t": "search", "ch": ch, "q": q, "limit": 50}),
+            );
+        }
+        "/rewind" => {
+            let mut p = args.split_whitespace();
+            let window = p.next().unwrap_or("");
+            if window.is_empty() {
+                state.add_notice("Usage: /rewind <Ns|Nm|Nh|Nd> [limit]");
+                return CommandFlow::Continue;
+            }
+            let Some(seconds) = parse_duration_secs(window) else {
+                state.add_notice("Invalid duration. Use formats like 90s, 15m, 2h, 1d.");
+                return CommandFlow::Continue;
+            };
+            let limit = parse_limit(p.next().unwrap_or(""), 100, 500);
+            let ch = state.ch.clone();
+            enqueue_timed(
+                &state.ws_tx,
+                serde_json::json!({"t": "rewind", "ch": ch, "seconds": seconds, "limit": limit}),
+            );
+        }
+        "/quit" | "/exit" | "/q" => {
+            stop_voice_session(state, SessionStopFeedback::Silent);
+            state.running = false;
+            let _ = shutdown_tx.send(true);
+            return CommandFlow::Exit;
+        }
+        _ => {
+            state.add_notice(format!("Unknown command: {}", cmd));
+        }
+    }
+
+    CommandFlow::Continue
+}
+
 /// Main entry point for the WebSocket client
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
@@ -1021,7 +1658,6 @@ async fn main() -> ChatifyResult<()> {
 
     // Connect to WebSocket
     let (ws_stream, _) = connect_async(&uri).await?;
-    println!("Connected to server");
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
     // Hash password and immediately zeroize the plaintext
@@ -1090,7 +1726,7 @@ async fn main() -> ChatifyResult<()> {
             running: true,
             voice_active: false,
             voice_session: None,
-            theme: "default".to_string(),
+            theme: "retro-grid".to_string(),
             file_transfers: HashMap::new(),
             message_history: Vec::new(),
             status: Status {
@@ -1100,7 +1736,12 @@ async fn main() -> ChatifyResult<()> {
             reactions: HashMap::new(),
             log_enabled,
         }));
-        state.lock().await.me = auth.me;
+        {
+            let mut state_lock = state.lock().await;
+            state_lock.me = auth.me;
+            state_lock.add_notice(format!("Connected to {}", uri));
+            state_lock.add_notice("Use /help to list commands.");
+        }
 
         // Spawn tasks for reading from WebSocket and from stdin
         // and coordinate shutdown so either side can terminate the other.
@@ -1113,13 +1754,15 @@ async fn main() -> ChatifyResult<()> {
                 let msg = match ws_rx.next().await {
                     Some(Ok(msg)) => msg,
                     Some(Err(e)) => {
-                        let state = state_clone.lock().await;
+                        let mut state = state_clone.lock().await;
                         state.log("WARN", &format!("WebSocket receive error: {}", e));
+                        state.add_notice(format!("WebSocket receive error: {}", e));
                         break;
                     }
                     None => {
-                        let state = state_clone.lock().await;
+                        let mut state = state_clone.lock().await;
                         state.log("INFO", "Disconnected: server closed connection");
+                        state.add_notice("Disconnected: server closed connection");
                         break;
                     }
                 };
@@ -1128,8 +1771,9 @@ async fn main() -> ChatifyResult<()> {
                     if let Ok(data) = serde_json::from_str::<JsonMap>(&text) {
                         dispatch_incoming_event(&state_clone, &data).await;
                     } else {
-                        let state = state_clone.lock().await;
+                        let mut state = state_clone.lock().await;
                         state.log("WARN", "Dropped malformed JSON payload from server");
+                        state.add_notice("Dropped malformed JSON payload from server");
                     }
                 }
             }
@@ -1155,8 +1799,9 @@ async fn main() -> ChatifyResult<()> {
                             Ok(Some(line)) => line,
                             Ok(None) => break,
                             Err(e) => {
-                                let state = state_clone2.lock().await;
+                                let mut state = state_clone2.lock().await;
                                 state.log("WARN", &format!("stdin read error: {}", e));
+                                state.add_notice(format!("stdin read error: {}", e));
                                 break;
                             }
                         }
@@ -1173,212 +1818,17 @@ async fn main() -> ChatifyResult<()> {
                     let args = parts.next().unwrap_or("");
 
                     let mut state = state_clone2.lock().await;
-                    match cmd {
-                        "/join" => {
-                            if let Some(ch) = normalize_channel(args.trim()) {
-                                state.ch = ch.to_string();
-                                state.chs.insert(ch.to_string(), true);
-                                // Request history for the channel
-                                enqueue_timed(
-                                    &state.ws_tx,
-                                    serde_json::json!({"t": "join", "ch": ch}),
-                                );
-                            } else {
-                                state.log(
-                                    "INFO",
-                                    "Usage: /join <channel>. Allowed: letters, digits, -, _",
-                                );
-                            }
-                        }
-                        "/dm" => {
-                            let mut parts = args.splitn(2, ' ');
-                            let target = parts.next().unwrap_or("");
-                            let msg = parts.next().unwrap_or("");
-                            if target.is_empty() || msg.is_empty() {
-                                state.log("INFO", "Usage: /dm <user> <message>");
-                                continue;
-                            }
-                            if target == state.me {
-                                state.log("INFO", "Cannot DM yourself.");
-                                continue;
-                            }
-                            {
-                                let encrypted = match state.dmkey(target) {
-                                    Ok(key) => match enc_bytes(&key, msg.as_bytes()) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            state.log("WARN", &format!("encryption failed: {}", e));
-                                            continue;
-                                        }
-                                    },
-                                    Err(e) => {
-                                        state.log("WARN", &format!("DM failed: {}", e));
-                                        continue;
-                                    }
-                                };
-                                let encoded = general_purpose::STANDARD.encode(&encrypted);
-                                enqueue_timed(
-                                    &state.ws_tx,
-                                    serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
-                                );
-                            }
-                        }
-                        "/me" => {
-                            let action = args;
-                            if !action.is_empty() {
-                                let ch = state.ch.clone();
-                                let msg = format!("* {} {}", state.me, action);
-                                let encrypted = match enc_bytes(&state.ckey(&ch), msg.as_bytes()) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        state.log("WARN", &format!("encryption failed: {}", e));
-                                        continue;
-                                    }
-                                };
-                                let encoded = general_purpose::STANDARD.encode(&encrypted);
-                                enqueue_timed(
-                                    &state.ws_tx,
-                                    serde_json::json!({"t": "msg", "ch": ch, "c": encoded, "p": msg}),
-                                );
-                            }
-                        }
-                        "/users" => {
-                            enqueue_timed(&state.ws_tx, serde_json::json!({"t": "users"}));
-                        }
-                        "/channels" => {
-                            enqueue_timed(&state.ws_tx, serde_json::json!({"t": "info"}));
-                        }
-                        "/voice" => {
-                            if state.voice_session.is_some() {
-                                if let Some(session) = state.voice_session.take() {
-                                    state.voice_active = false;
-                                    enqueue_timed(
-                                        &state.ws_tx,
-                                        serde_json::json!({"t": "vleave", "r": session.room}),
-                                    );
-                                    let _ = session.event_tx.send(VoiceEvent::Stop);
-                                    let _ = session.task.join();
-                                    println!("Voice stopped");
-                                    state.log("INFO", "Voice session stopped");
-                                }
-                            } else {
-                                let room = normalize_channel(args.trim())
-                                    .unwrap_or_else(|| state.ch.clone());
-                                let ws_tx = state.ws_tx.clone();
-                                match start_voice_session(room.clone(), ws_tx.clone()) {
-                                    Ok(session) => {
-                                        state.voice_active = true;
-                                        state.voice_session = Some(session);
-                                        enqueue_timed(
-                                            &ws_tx,
-                                            serde_json::json!({"t": "vjoin", "r": room}),
-                                        );
-                                        println!("Voice started in #{}", room);
-                                        state.log("INFO", "Voice session started");
-                                    }
-                                    Err(e) => {
-                                        error!("Voice start failed: {}", e);
-                                        info!("Check that your microphone/speakers are available and not in use by another app.");
-                                        state.log("WARN", &format!("Voice start failed: {}", e));
-                                    }
-                                }
-                            }
-                        }
-                        "/clear" => {
-                            // Clear the terminal by printing many newlines
-                            for _ in 0..50 {
-                                println!();
-                            }
-                        }
-                        "/help" => {
-                            state.log("INFO", HELP_TEXT);
-                        }
-                        "/edit" => {
-                            // Placeholder for edit
-                            state.log("INFO", "Edit command not yet implemented in Rust client");
-                        }
-                        "/history" => {
-                            let limit = parse_limit(args, 50, 200);
-                            let ch = state.ch.clone();
-                            enqueue_timed(
-                                &state.ws_tx,
-                                serde_json::json!({"t": "history", "ch": ch, "limit": limit}),
-                            );
-                        }
-                        "/search" => {
-                            let q = args.trim();
-                            if q.is_empty() {
-                                state.log("INFO", "Usage: /search <query>");
-                                continue;
-                            }
-                            let ch = state.ch.clone();
-                            enqueue_timed(
-                                &state.ws_tx,
-                                serde_json::json!({"t": "search", "ch": ch, "q": q, "limit": 50}),
-                            );
-                        }
-                        "/rewind" => {
-                            let mut p = args.split_whitespace();
-                            let window = p.next().unwrap_or("");
-                            if window.is_empty() {
-                                state.log("INFO", "Usage: /rewind <Ns|Nm|Nh|Nd> [limit]");
-                                continue;
-                            }
-                            let Some(seconds) = parse_duration_secs(window) else {
-                                state.log(
-                                    "INFO",
-                                    "Invalid duration. Use formats like 90s, 15m, 2h, 1d.",
-                                );
-                                continue;
-                            };
-                            let limit = parse_limit(p.next().unwrap_or(""), 100, 500);
-                            let ch = state.ch.clone();
-                            enqueue_timed(
-                                &state.ws_tx,
-                                serde_json::json!({"t": "rewind", "ch": ch, "seconds": seconds, "limit": limit}),
-                            );
-                        }
-                        "/quit" | "/exit" | "/q" => {
-                            if let Some(session) = state.voice_session.take() {
-                                enqueue_timed(
-                                    &state.ws_tx,
-                                    serde_json::json!({"t": "vleave", "r": session.room}),
-                                );
-                                let _ = session.event_tx.send(VoiceEvent::Stop);
-                                let _ = session.task.join();
-                            }
-                            state.voice_active = false;
-                            state.running = false;
-                            let _ = shutdown_tx_stdin.send(true);
-                            break;
-                        }
-                        _ => {
-                            state.log("INFO", &format!("Unknown command: {}", cmd));
-                        }
+                    if matches!(
+                        handle_slash_command(&mut state, cmd, args, &shutdown_tx_stdin),
+                        CommandFlow::Exit
+                    ) {
+                        break;
                     }
                 } else {
                     // Send as a regular message
-                    let (channel, pw) = {
-                        let state = state_clone2.lock().await;
-                        (state.ch.clone(), state.pw.clone())
-                    };
-                    let key = channel_key(&pw, &channel);
-                    let encrypted = match enc_bytes(&key, line.as_bytes()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            state_clone2
-                                .lock()
-                                .await
-                                .log("WARN", &format!("encryption failed: {}", e));
-                            continue;
-                        }
-                    };
-                    let encoded = general_purpose::STANDARD.encode(&encrypted);
-                    let state = state_clone2.lock().await;
-                    enqueue_timed(
-                        &state.ws_tx,
-                        serde_json::json!({"t": "msg", "ch": channel, "c": encoded, "p": line}),
-                    );
+                    let mut state = state_clone2.lock().await;
+                    let channel = state.ch.clone();
+                    queue_channel_message(&mut state, &channel, line);
                 }
             }
         });
