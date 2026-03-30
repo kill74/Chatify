@@ -50,7 +50,7 @@ const SIDEBAR_MIN_WIDTH: usize = 28;
 const SIDEBAR_MAX_WIDTH: usize = 46;
 const MAIN_MIN_WIDTH: usize = 24;
 const FEED_LOOKBACK_MESSAGES: usize = 48;
-const PROFILE_PANEL_ROWS: usize = 6;
+const PROFILE_PANEL_ROWS: usize = 7;
 const COMMANDS_PANEL_ROWS: usize = 6;
 const MIN_CHANNEL_PANEL_ROWS: usize = 3;
 const ANSI_RESET: &str = "\x1b[0m";
@@ -68,6 +68,9 @@ const CLIENT_ID_GROUP_SIZE: usize = 4;
 const DEFAULT_GUEST_PREFIX: &str = "guest";
 const DEFAULT_GUEST_SUFFIX_BYTES: usize = 3;
 const COMPACT_MODE_HINT: &str = "compact mode: expand terminal for side panels";
+const UNREAD_SEPARATOR_TEXT: &str = "----- new activity -----";
+const DM_UNREAD_SCOPE_PREFIX: &str = "dm:";
+const ACTIVITY_PULSE_WINDOW_SECS: u64 = 12;
 
 #[derive(Clone, Copy)]
 struct CommandSpec {
@@ -794,6 +797,12 @@ struct ClientState {
     status: Status,
     /// Message reactions (msg_id -> emoji -> count)
     reactions: HashMap<String, HashMap<String, u32>>,
+    /// Unread counters keyed by scope (`channel` or `dm:<user>`)
+    unread_counts: HashMap<String, usize>,
+    /// Whether an unread separator has been injected in the feed
+    unread_separator_active: bool,
+    /// Recent live activity hint `(label, timestamp_secs)`
+    activity_hint: Option<(String, u64)>,
     /// Enable debug logging
     log_enabled: bool,
 }
@@ -933,6 +942,65 @@ impl ClientState {
         (unknown, trusted, changed)
     }
 
+    fn unread_total(&self) -> usize {
+        self.unread_counts.values().copied().sum()
+    }
+
+    fn unread_dm_total(&self) -> usize {
+        self.unread_counts
+            .iter()
+            .filter(|(scope, _)| scope.starts_with(DM_UNREAD_SCOPE_PREFIX))
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    fn unread_for_channel(&self, channel: &str) -> usize {
+        self.unread_counts.get(channel).copied().unwrap_or(0)
+    }
+
+    fn clear_unread_for_channel(&mut self, channel: &str) {
+        self.unread_counts.remove(channel);
+        if self.unread_total() == 0 {
+            self.unread_separator_active = false;
+        }
+    }
+
+    fn clear_unread_for_dm(&mut self, peer: &str) {
+        let scope = dm_unread_scope(peer);
+        self.unread_counts.remove(&scope);
+        if self.unread_total() == 0 {
+            self.unread_separator_active = false;
+        }
+    }
+
+    fn note_unread_scope(&mut self, scope: &str) {
+        *self.unread_counts.entry(scope.to_string()).or_insert(0) += 1;
+
+        if !self.unread_separator_active {
+            self.push_message(DisplayedMessage {
+                time: format_time(now_secs()),
+                text: UNREAD_SEPARATOR_TEXT.to_string(),
+                msg_type: MessageType::Sys,
+                user: None,
+                channel: None,
+            });
+            self.unread_separator_active = true;
+        }
+    }
+
+    fn note_live_activity(&mut self, actor: &str, scope: &str) {
+        self.activity_hint = Some((format!("{}@{}", actor, scope), now_secs()));
+    }
+
+    fn live_activity_label(&self) -> String {
+        if let Some((label, ts)) = self.activity_hint.as_ref() {
+            if now_secs().saturating_sub(*ts) <= ACTIVITY_PULSE_WINDOW_SECS {
+                return label.clone();
+            }
+        }
+        "idle".to_string()
+    }
+
     /// Add a message to the history, keeping only the last 100 messages
     #[allow(dead_code)]
     fn push_message(&mut self, msg: DisplayedMessage) {
@@ -1035,6 +1103,10 @@ fn normalize_event_scope(raw: &str, current_channel: &str) -> Option<String> {
     }
 
     normalize_channel(candidate)
+}
+
+fn dm_unread_scope(peer: &str) -> String {
+    format!("{}{}", DM_UNREAD_SCOPE_PREFIX, peer.trim().to_lowercase())
 }
 
 fn parse_history_args(args: &str, current_channel: &str) -> Result<(String, Option<u64>), String> {
@@ -1296,6 +1368,7 @@ fn format_feed_entry(msg: &DisplayedMessage) -> String {
             format!("{} DM {} {}", stamp, user, msg.text)
         }
         MessageType::Edit => format!("{} edit {}", stamp, msg.text),
+        MessageType::Sys if msg.text == UNREAD_SEPARATOR_TEXT => msg.text.clone(),
         MessageType::Sys => format!("{} • {}", stamp, msg.text),
         _ => format!("{} {}", stamp, msg.text),
     }
@@ -1400,13 +1473,18 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     let mut known_users: Vec<String> = state.users.keys().cloned().collect();
     known_users.sort_unstable();
     let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
+    let unread_total = state.unread_total();
+    let unread_dm = state.unread_dm_total();
 
     let profile_lines = vec![
         format!("{} {} [{}]", state.me, state.status.emoji, state.client_id),
         format!("status: {}", state.status.text),
         format!("channel: #{}", state.ch),
         format!("voice: {}", if state.voice_active { "ON" } else { "OFF" }),
-        format!("trust T:{} U:{} C:{}", trusted, unknown, changed),
+        format!(
+            "trust T:{} U:{} C:{} | unread:{} (dm:{})",
+            trusted, unknown, changed, unread_total, unread_dm
+        ),
     ];
 
     let mut command_lines = vec![
@@ -1450,10 +1528,16 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
         channels
             .into_iter()
             .map(|ch| {
-                if ch == state.ch {
-                    format!("* #{}", ch)
+                let unread = state.unread_for_channel(&ch);
+                let unread_badge = if unread > 0 {
+                    format!(" [{}]", unread)
                 } else {
-                    format!("  #{}", ch)
+                    String::new()
+                };
+                if ch == state.ch {
+                    format!("* #{}{}", ch, unread_badge)
+                } else {
+                    format!("  #{}{}", ch, unread_badge)
                 }
             })
             .collect()
@@ -1616,15 +1700,16 @@ fn dashboard_header_lines(state: &ClientState) -> (String, String) {
     let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
 
     let header = format!(
-        "// CHATIFY // {} {} {} {}",
+        "// CHATIFY // {} {} {} {} {}",
         status_chip("ONLINE", state.users.len()),
         status_chip("CHANNELS", state.chs.len()),
         status_chip("EVENTS", state.message_history.len()),
+        status_chip("UNREAD", state.unread_total()),
         status_chip("THEME", &state.theme),
     );
 
     let subtitle = format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
         status_chip("ROOM", format!("#{}", state.ch)),
         status_chip("VOICE", if state.voice_active { "ON" } else { "OFF" }),
         status_chip("TRUST", format!("T{}/U{}/C{}", trusted, unknown, changed)),
@@ -1632,6 +1717,7 @@ fn dashboard_header_lines(state: &ClientState) -> (String, String) {
             "STATUS",
             format!("{} {}", state.status.emoji, state.status.text)
         ),
+        status_chip("LIVE", state.live_activity_label()),
         status_chip("CLIENT", &state.client_id),
     );
 
@@ -1913,10 +1999,19 @@ async fn handle_msg_event(state: &SharedState, data: &JsonMap, ts: u64) {
     let mut state_lock = state.lock().await;
     let key = state_lock.ckey(ch);
     if let Ok(content) = dec_bytes(&key, &encrypted) {
+        let message =
+            String::from_utf8(content).unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string());
+        let is_self = u == state_lock.me.as_str();
+        if !is_self {
+            state_lock.note_live_activity(u, &format!("#{}", ch));
+            if ch != state_lock.ch {
+                state_lock.note_unread_scope(ch);
+            }
+        }
+
         state_lock.add_message(DisplayedMessage {
             time: format_time(ts),
-            text: String::from_utf8(content)
-                .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string()),
+            text: message,
             msg_type: MessageType::Msg,
             user: Some(u.to_string()),
             channel: Some(ch.to_string()),
@@ -1980,6 +2075,11 @@ async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
 
     if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
         let arrow = if frm == state_lock.me { "→" } else { "←" };
+        if frm != state_lock.me {
+            state_lock.note_live_activity(frm, &format!("dm:{}", frm));
+            let dm_scope = dm_unread_scope(frm);
+            state_lock.note_unread_scope(&dm_scope);
+        }
         state_lock.add_message(DisplayedMessage {
             time: format_time(ts),
             text: format!(
@@ -2026,6 +2126,7 @@ async fn handle_joined_event(state: &SharedState, data: &JsonMap, ts: u64) {
     let mut state_lock = state.lock().await;
     state_lock.ch = ch.to_string();
     state_lock.chs.insert(ch.to_string(), true);
+    state_lock.clear_unread_for_channel(ch);
     state_lock.add_message(DisplayedMessage {
         time: format_time(ts),
         text: format!("→ #{}", ch),
@@ -2464,6 +2565,7 @@ fn handle_slash_command(
             if let Some(ch) = normalize_channel(args.trim()) {
                 state.ch = ch.clone();
                 state.chs.insert(ch.clone(), true);
+                state.clear_unread_for_channel(&ch);
                 enqueue_timed(&state.ws_tx, serde_json::json!({"t": "join", "ch": ch}));
             } else {
                 state.add_notice(
@@ -2509,6 +2611,7 @@ fn handle_slash_command(
                 &state.ws_tx,
                 serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
             );
+            state.clear_unread_for_dm(target);
         }
         "/fingerprint" => {
             let target = args.trim();
@@ -2618,6 +2721,9 @@ fn handle_slash_command(
         }
         "/clear" => {
             state.message_history.clear();
+            state.unread_counts.clear();
+            state.unread_separator_active = false;
+            state.activity_hint = None;
             state.refresh_dashboard();
         }
         "/commands" => {
@@ -2876,6 +2982,9 @@ async fn main() -> ChatifyResult<()> {
                 emoji: '🟢',
             },
             reactions: HashMap::new(),
+            unread_counts: HashMap::new(),
+            unread_separator_active: false,
+            activity_hint: None,
             log_enabled,
         }));
         {
@@ -3201,13 +3310,69 @@ mod tests {
                 emoji: '🟢',
             },
             reactions: HashMap::new(),
+            unread_counts: HashMap::new(),
+            unread_separator_active: false,
+            activity_hint: None,
             log_enabled: false,
         };
 
         let (header, subtitle) = dashboard_header_lines(&state);
         assert!(header.contains("[ONLINE:1]"));
         assert!(header.contains("[CHANNELS:1]"));
+        assert!(header.contains("[UNREAD:0]"));
         assert!(subtitle.contains("[ROOM:#general]"));
+        assert!(subtitle.contains("[LIVE:idle]"));
         assert!(subtitle.contains("[CLIENT:CID-ABCD-1234-EF90]"));
+    }
+
+    #[test]
+    fn unread_tracking_counts_and_clears_scopes() {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let mut state = ClientState {
+            ws_tx: tx,
+            me: "alice".to_string(),
+            client_id: "CID-ABCD-1234-EF90".to_string(),
+            pw: "hash".to_string(),
+            ch: "general".to_string(),
+            chs: HashMap::from([("general".to_string(), true)]),
+            users: HashMap::new(),
+            trust_store: TrustStore {
+                path: PathBuf::from("test-trust.json"),
+                peers: HashMap::new(),
+            },
+            chan_keys: HashMap::new(),
+            dm_keys: HashMap::new(),
+            priv_key: vec![],
+            running: true,
+            voice_active: false,
+            voice_session: None,
+            theme: "retro-grid".to_string(),
+            file_transfers: HashMap::new(),
+            message_history: VecDeque::new(),
+            status: Status {
+                text: "Online".to_string(),
+                emoji: '🟢',
+            },
+            reactions: HashMap::new(),
+            unread_counts: HashMap::new(),
+            unread_separator_active: false,
+            activity_hint: None,
+            log_enabled: false,
+        };
+
+        state.note_unread_scope("ops");
+        state.note_unread_scope("ops");
+        state.note_unread_scope(&dm_unread_scope("bob"));
+
+        assert_eq!(state.unread_total(), 3);
+        assert_eq!(state.unread_for_channel("ops"), 2);
+        assert_eq!(state.unread_dm_total(), 1);
+        assert!(state.unread_separator_active);
+
+        state.clear_unread_for_channel("ops");
+        assert_eq!(state.unread_total(), 1);
+        state.clear_unread_for_dm("bob");
+        assert_eq!(state.unread_total(), 0);
+        assert!(!state.unread_separator_active);
     }
 }
