@@ -1009,6 +1009,86 @@ async fn msg_contract_roundtrips_channel_payload() {
     );
 }
 
+/// Verifies that optional bridge metadata (`src` and `relay`) survives
+/// server broadcast unchanged for channel messages, including attachment and
+/// reply metadata.
+///
+/// This is required for downstream bridge instances to make deterministic
+/// loop-prevention decisions based on source IDs and relay markers.
+#[tokio::test]
+async fn msg_contract_preserves_bridge_source_and_relay_markers() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t": "msg",
+                "ch": "general",
+                "c": "cipher-loop-marker",
+                "src": "discord-bridge:test-instance",
+                "relay": {
+                    "source_id": "discord-bridge:test-instance",
+                    "origin": "discord",
+                    "markers": ["discord:1234567890"],
+                    "attachments": [
+                        {
+                            "url": "https://cdn.example.com/file.png",
+                            "filename": "file.png",
+                            "size": 2048,
+                            "content_type": "image/png"
+                        }
+                    ],
+                    "reply": {
+                        "discord_message_id": "555",
+                        "discord_channel_id": "1234567890",
+                        "author": "bob",
+                        "excerpt": "previous message"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send channel message with bridge metadata");
+
+    let msg = recv_by_type(&mut alice, "msg").await;
+    assert_eq!(
+        msg.get("src").and_then(|v| v.as_str()),
+        Some("discord-bridge:test-instance")
+    );
+    assert_eq!(
+        msg.get("relay")
+            .and_then(|v| v.get("source_id"))
+            .and_then(|v| v.as_str()),
+        Some("discord-bridge:test-instance")
+    );
+    assert_eq!(
+        msg.get("relay")
+            .and_then(|v| v.get("markers"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str()),
+        Some("discord:1234567890")
+    );
+    assert_eq!(
+        msg.get("relay")
+            .and_then(|v| v.get("attachments"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|attachment| attachment.get("url"))
+            .and_then(|v| v.as_str()),
+        Some("https://cdn.example.com/file.png")
+    );
+    assert_eq!(
+        msg.get("relay")
+            .and_then(|v| v.get("reply"))
+            .and_then(|reply| reply.get("discord_message_id"))
+            .and_then(|v| v.as_str()),
+        Some("555")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // File-transfer contract tests
 // ---------------------------------------------------------------------------

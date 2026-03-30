@@ -2,7 +2,7 @@
 //!
 //! Bridges messages between Discord and a Chatify WebSocket server.
 //! Messages from Discord channels are encrypted and forwarded to Chatify,
-//! and messages from Chatify are displayed in the Discord console.
+//! and messages from Chatify are relayed back to mapped Discord channels.
 //!
 //! Environment variables required:
 //! - `DISCORD_TOKEN`: Discord bot authentication token
@@ -20,6 +20,7 @@
 //! - `CHATIFY_PING_SECS`: Send keepalive ping every N seconds, 0 disables (default: 20)
 //! - `CHATIFY_HEALTH_LOG_SECS`: Periodic bridge health snapshot interval (default: 30)
 //! - `CHATIFY_BRIDGE_INSTANCE_ID`: Stable source marker for loop prevention and tracing
+//! - `CHATIFY_DISCORD_CHANNEL_MAP_FILE`: Optional JSON file for bridge routes
 //! - `CHATIFY_DISCORD_CHANNEL_MAP`: Optional map `discordChannelId:chatifyChannel,...`
 //! - `CHATIFY_LOG`: Set to "1" to enable logging
 
@@ -30,6 +31,8 @@ use clicord_server::crypto::{
 
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,9 +42,16 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use rand::RngCore;
+use serde::Deserialize;
 use serenity::{
     async_trait,
-    model::{channel::Message, gateway::GatewayIntents, gateway::Ready},
+    http::Http,
+    model::{
+        channel::Message,
+        gateway::GatewayIntents,
+        gateway::Ready,
+        id::{ChannelId, MessageId},
+    },
     prelude::*,
 };
 use tokio::sync::{mpsc, Mutex};
@@ -51,9 +61,17 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 type WsSender = mpsc::UnboundedSender<WsMessage>;
 type PayloadMap = HashMap<String, serde_json::Value>;
 const MAX_DISCORD_CONTENT_LEN: usize = 4000;
+const MAX_DISCORD_RELAY_OUT_LEN: usize = 1900;
+const MAX_RELAY_ATTACHMENTS: usize = 6;
+const MAX_RELAY_ATTACHMENT_URL_LEN: usize = 512;
+const MAX_RELAY_ATTACHMENT_NAME_LEN: usize = 128;
+const MAX_RELAY_REPLY_EXCERPT_LEN: usize = 160;
 const DEFAULT_RECONNECT_JITTER_PCT: u64 = 20;
 const DEFAULT_RECONNECT_WARN_THRESHOLD: u64 = 5;
 const DEFAULT_PING_SECS: u64 = 20;
+const DEFAULT_CHANNEL_MAP_FILE: &str = "bridge-channel-map.json";
+const RELAY_ORIGIN_DISCORD: &str = "discord";
+const RELAY_MARKER_PREFIX_DISCORD: &str = "discord:";
 
 fn normalize_chatify_channel(raw: &str) -> Option<String> {
     let ch: String = raw
@@ -83,6 +101,503 @@ fn parse_channel_map(raw: &str) -> HashMap<String, String> {
             Some((discord_channel.to_string(), mapped))
         })
         .collect()
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RelayReplyMeta {
+    discord_message_id: Option<String>,
+    discord_channel_id: Option<String>,
+    author: Option<String>,
+    excerpt: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelayAttachmentMeta {
+    url: String,
+    filename: String,
+    size_bytes: u64,
+    content_type: Option<String>,
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    input.chars().take(max_chars).collect()
+}
+
+fn sanitize_single_line(input: &str, max_chars: usize) -> String {
+    let compact = input
+        .split_whitespace()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_chars(&compact, max_chars)
+}
+
+fn format_attachment_size(size_bytes: u64) -> String {
+    if size_bytes < 1024 {
+        return format!("{}B", size_bytes);
+    }
+    if size_bytes < 1024 * 1024 {
+        return format!("{:.1}KB", size_bytes as f64 / 1024.0);
+    }
+    format!("{:.1}MB", size_bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn extract_discord_attachments(msg: &Message) -> Vec<RelayAttachmentMeta> {
+    msg.attachments
+        .iter()
+        .take(MAX_RELAY_ATTACHMENTS)
+        .map(|attachment| RelayAttachmentMeta {
+            url: truncate_chars(&attachment.url, MAX_RELAY_ATTACHMENT_URL_LEN),
+            filename: sanitize_single_line(&attachment.filename, MAX_RELAY_ATTACHMENT_NAME_LEN),
+            size_bytes: attachment.size,
+            content_type: attachment
+                .content_type
+                .as_ref()
+                .map(|t| sanitize_single_line(t, 64)),
+        })
+        .filter(|attachment| !attachment.url.is_empty())
+        .collect()
+}
+
+fn extract_discord_reply(msg: &Message) -> Option<RelayReplyMeta> {
+    let mut reply = RelayReplyMeta::default();
+
+    if let Some(reference) = msg.message_reference.as_ref() {
+        reply.discord_message_id = reference.message_id.map(|id| id.to_string());
+        reply.discord_channel_id = Some(reference.channel_id.to_string());
+    }
+
+    if let Some(referenced) = msg.referenced_message.as_ref() {
+        reply.discord_message_id = Some(referenced.id.to_string());
+        reply.discord_channel_id = Some(referenced.channel_id.to_string());
+        reply.author = Some(sanitize_single_line(&referenced.author.name, 64));
+        let excerpt = sanitize_single_line(&referenced.content, MAX_RELAY_REPLY_EXCERPT_LEN);
+        if !excerpt.is_empty() {
+            reply.excerpt = Some(excerpt);
+        }
+    }
+
+    if reply.discord_message_id.is_none()
+        && reply.discord_channel_id.is_none()
+        && reply.author.is_none()
+        && reply.excerpt.is_none()
+    {
+        None
+    } else {
+        Some(reply)
+    }
+}
+
+fn attachment_to_json(attachment: &RelayAttachmentMeta) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "url".to_string(),
+        serde_json::Value::String(attachment.url.clone()),
+    );
+    out.insert(
+        "filename".to_string(),
+        serde_json::Value::String(attachment.filename.clone()),
+    );
+    out.insert(
+        "size".to_string(),
+        serde_json::Value::from(attachment.size_bytes),
+    );
+    if let Some(content_type) = attachment.content_type.as_ref() {
+        out.insert(
+            "content_type".to_string(),
+            serde_json::Value::String(content_type.clone()),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn reply_to_json(reply: &RelayReplyMeta) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(message_id) = reply.discord_message_id.as_ref() {
+        out.insert(
+            "discord_message_id".to_string(),
+            serde_json::Value::String(message_id.clone()),
+        );
+    }
+    if let Some(channel_id) = reply.discord_channel_id.as_ref() {
+        out.insert(
+            "discord_channel_id".to_string(),
+            serde_json::Value::String(channel_id.clone()),
+        );
+    }
+    if let Some(author) = reply.author.as_ref() {
+        out.insert(
+            "author".to_string(),
+            serde_json::Value::String(author.clone()),
+        );
+    }
+    if let Some(excerpt) = reply.excerpt.as_ref() {
+        out.insert(
+            "excerpt".to_string(),
+            serde_json::Value::String(excerpt.clone()),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn parse_attachment_from_json(raw: &serde_json::Value) -> Option<RelayAttachmentMeta> {
+    let url = raw
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|v| truncate_chars(v, MAX_RELAY_ATTACHMENT_URL_LEN))
+        .unwrap_or_default();
+    if url.is_empty() {
+        return None;
+    }
+
+    let filename = raw
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .map(|v| sanitize_single_line(v, MAX_RELAY_ATTACHMENT_NAME_LEN))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "attachment".to_string());
+
+    let size_bytes = raw.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let content_type = raw
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .map(|v| sanitize_single_line(v, 64))
+        .filter(|v| !v.is_empty());
+
+    Some(RelayAttachmentMeta {
+        url,
+        filename,
+        size_bytes,
+        content_type,
+    })
+}
+
+fn relay_attachments_from_payload(data: &PayloadMap) -> Vec<RelayAttachmentMeta> {
+    data.get("relay")
+        .and_then(|relay| relay.get("attachments"))
+        .and_then(|attachments| attachments.as_array())
+        .map(|attachments| {
+            attachments
+                .iter()
+                .filter_map(parse_attachment_from_json)
+                .take(MAX_RELAY_ATTACHMENTS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn relay_reply_from_payload(data: &PayloadMap) -> Option<RelayReplyMeta> {
+    let reply = data
+        .get("relay")
+        .and_then(|relay| relay.get("reply"))
+        .filter(|reply| reply.is_object())?;
+
+    let out = RelayReplyMeta {
+        discord_message_id: reply
+            .get("discord_message_id")
+            .and_then(|v| v.as_str())
+            .map(|v| sanitize_single_line(v, 64))
+            .filter(|v| !v.is_empty()),
+        discord_channel_id: reply
+            .get("discord_channel_id")
+            .and_then(|v| v.as_str())
+            .map(|v| sanitize_single_line(v, 64))
+            .filter(|v| !v.is_empty()),
+        author: reply
+            .get("author")
+            .and_then(|v| v.as_str())
+            .map(|v| sanitize_single_line(v, 64))
+            .filter(|v| !v.is_empty()),
+        excerpt: reply
+            .get("excerpt")
+            .and_then(|v| v.as_str())
+            .map(|v| sanitize_single_line(v, MAX_RELAY_REPLY_EXCERPT_LEN))
+            .filter(|v| !v.is_empty()),
+    };
+
+    if out.discord_message_id.is_none()
+        && out.discord_channel_id.is_none()
+        && out.author.is_none()
+        && out.excerpt.is_none()
+    {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn format_reply_context(reply: &RelayReplyMeta) -> Option<String> {
+    let target = reply
+        .author
+        .as_ref()
+        .map(|name| format!("to {}", name))
+        .unwrap_or_else(|| "to original message".to_string());
+
+    let id_hint = reply
+        .discord_message_id
+        .as_ref()
+        .map(|id| format!(" id={}", sanitize_single_line(id, 16)))
+        .unwrap_or_default();
+
+    let excerpt = reply
+        .excerpt
+        .as_ref()
+        .map(|excerpt| format!(": \"{}\"", sanitize_single_line(excerpt, 80)))
+        .unwrap_or_default();
+
+    let line = format!("[reply {}{}]{}", target, id_hint, excerpt);
+    if line.trim().is_empty() {
+        None
+    } else {
+        Some(line)
+    }
+}
+
+fn format_attachment_context(attachment: &RelayAttachmentMeta) -> String {
+    format!(
+        "[attachment] {} ({}) {}",
+        attachment.filename,
+        format_attachment_size(attachment.size_bytes),
+        attachment.url
+    )
+}
+
+fn build_chatify_bridge_body(
+    author: &str,
+    content: &str,
+    attachments: &[RelayAttachmentMeta],
+    reply: Option<&RelayReplyMeta>,
+) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(reply_line) = reply.and_then(format_reply_context) {
+        lines.push(reply_line);
+    }
+
+    let clean_content = content.trim();
+    if !clean_content.is_empty() {
+        lines.push(format!("{}: {}", author, clean_content));
+    } else if !attachments.is_empty() {
+        lines.push(format!(
+            "{} shared {} attachment(s)",
+            author,
+            attachments.len()
+        ));
+    }
+
+    for attachment in attachments {
+        lines.push(format_attachment_context(attachment));
+    }
+
+    lines.join("\n")
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgeRouteConfig {
+    routes: Vec<BridgeRoute>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgeRoute {
+    discord_channel_id: String,
+    chatify_channel: String,
+}
+
+fn parse_channel_map_file(raw: &str) -> Result<HashMap<String, String>, String> {
+    let parsed: BridgeRouteConfig = serde_json::from_str(raw)
+        .map_err(|e| format!("invalid JSON in channel map file: {}", e))?;
+    let mut map = HashMap::new();
+    for route in parsed.routes {
+        let discord_channel = route.discord_channel_id.trim();
+        let chatify_channel = route.chatify_channel.trim();
+        if discord_channel.is_empty() {
+            continue;
+        }
+        let Some(normalized_chatify) = normalize_chatify_channel(chatify_channel) else {
+            continue;
+        };
+        map.insert(discord_channel.to_string(), normalized_chatify);
+    }
+    Ok(map)
+}
+
+fn load_channel_map_file(path: &str) -> Result<HashMap<String, String>, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read channel map file '{}': {}", path, e))?;
+    parse_channel_map_file(&raw)
+}
+
+fn merged_channel_map_from_config() -> HashMap<String, String> {
+    let mut merged = HashMap::new();
+
+    let map_file = env::var("CHATIFY_DISCORD_CHANNEL_MAP_FILE")
+        .ok()
+        .or_else(|| {
+            if Path::new(DEFAULT_CHANNEL_MAP_FILE).exists() {
+                Some(DEFAULT_CHANNEL_MAP_FILE.to_string())
+            } else {
+                None
+            }
+        });
+
+    if let Some(path) = map_file {
+        match load_channel_map_file(&path) {
+            Ok(file_map) => {
+                merged.extend(file_map);
+            }
+            Err(err) => {
+                eprintln!(
+                    "Failed to load bridge route map from '{}': {}. Continuing without file routes.",
+                    path, err
+                );
+            }
+        }
+    }
+
+    if let Ok(raw_map) = env::var("CHATIFY_DISCORD_CHANNEL_MAP") {
+        // Environment routes override file routes for operational emergency fixes.
+        merged.extend(parse_channel_map(&raw_map));
+    }
+
+    merged
+}
+
+fn relay_marker_for_discord_channel(discord_channel_id: &str) -> String {
+    format!("{}{}", RELAY_MARKER_PREFIX_DISCORD, discord_channel_id)
+}
+
+fn relay_source_id(data: &PayloadMap) -> Option<&str> {
+    data.get("relay")
+        .and_then(|v| v.get("source_id"))
+        .and_then(|v| v.as_str())
+}
+
+fn relay_markers(data: &PayloadMap) -> Vec<String> {
+    data.get("relay")
+        .and_then(|v| v.get("markers"))
+        .and_then(|v| v.as_array())
+        .map(|markers| {
+            markers
+                .iter()
+                .filter_map(|m| m.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn should_skip_chatify_to_discord(
+    data: &PayloadMap,
+    own_source: &str,
+    discord_channel_id: &str,
+) -> bool {
+    if is_self_sourced_event(data, own_source) {
+        return true;
+    }
+
+    if relay_source_id(data).is_some_and(|src| src == own_source) {
+        return true;
+    }
+
+    let marker = relay_marker_for_discord_channel(discord_channel_id);
+    relay_markers(data)
+        .iter()
+        .any(|existing| existing == &marker)
+}
+
+fn format_discord_relay_text(
+    sender: &str,
+    content: &str,
+    attachments: &[RelayAttachmentMeta],
+    reply: Option<&RelayReplyMeta>,
+) -> String {
+    let mut body_lines = Vec::new();
+    let has_context_in_content = content.contains("[attachment]") || content.contains("[reply ");
+
+    if !has_context_in_content {
+        if let Some(reply_line) = reply.and_then(format_reply_context) {
+            body_lines.push(reply_line);
+        }
+    }
+
+    if !content.trim().is_empty() {
+        body_lines.push(content.trim().to_string());
+    }
+
+    if !has_context_in_content {
+        for attachment in attachments {
+            body_lines.push(format_attachment_context(attachment));
+        }
+    }
+
+    if body_lines.is_empty() {
+        body_lines.push("[empty message]".to_string());
+    }
+
+    let mut out = format!("{}: {}", sender, body_lines.join("\n"));
+    if out.len() <= MAX_DISCORD_RELAY_OUT_LEN {
+        return out;
+    }
+
+    out.truncate(MAX_DISCORD_RELAY_OUT_LEN.saturating_sub(3));
+    out.push_str("...");
+    out
+}
+
+async fn send_to_discord_channel(
+    http: &Arc<Http>,
+    channel_id_num: u64,
+    content: &str,
+    reply: Option<&RelayReplyMeta>,
+) -> Result<(), serenity::Error> {
+    let channel_id = ChannelId(channel_id_num);
+
+    let maybe_reply_message_id = reply
+        .and_then(|r| {
+            r.discord_channel_id
+                .as_ref()
+                .map(|channel_id_str| channel_id_str == &channel_id_num.to_string())
+                .unwrap_or(true)
+                .then_some(r.discord_message_id.as_deref())
+                .flatten()
+        })
+        .and_then(|id| id.parse::<u64>().ok());
+
+    if let Some(reply_message_id) = maybe_reply_message_id {
+        channel_id
+            .send_message(http.as_ref(), |message| {
+                message
+                    .content(content)
+                    .reference_message((channel_id, MessageId(reply_message_id)))
+                    .allowed_mentions(|mentions| mentions.empty_parse())
+            })
+            .await?;
+        return Ok(());
+    }
+
+    channel_id.say(http.as_ref(), content).await?;
+    Ok(())
+}
+
+fn format_bridge_status_line(
+    snapshot: BridgeMetricsSnapshot,
+    ws_connected: bool,
+    route_count: usize,
+    source_id: &str,
+) -> String {
+    format!(
+        "bridge status | ws_connected={} source_id={} routes={} discord_in={} chatify_in={} discord_out={} chatify_out={} dropped={} reconnects={} attempts={} auth_failures={}",
+        ws_connected,
+        source_id,
+        route_count,
+        snapshot.discord_ingress,
+        snapshot.chatify_ingress,
+        snapshot.discord_forwarded,
+        snapshot.chatify_forwarded,
+        snapshot.dropped_messages,
+        snapshot.reconnects,
+        snapshot.connect_attempts,
+        snapshot.auth_failures,
+    )
 }
 
 fn is_self_sourced_event(data: &PayloadMap, own_source: &str) -> bool {
@@ -348,10 +863,7 @@ impl BridgeConfig {
         rand::thread_rng().fill_bytes(&mut instance_id_bytes);
         let instance_id = env::var("CHATIFY_BRIDGE_INSTANCE_ID")
             .unwrap_or_else(|_| hex::encode(instance_id_bytes));
-        let channel_map = env::var("CHATIFY_DISCORD_CHANNEL_MAP")
-            .ok()
-            .map(|s| parse_channel_map(&s))
-            .unwrap_or_default();
+        let channel_map = merged_channel_map_from_config();
 
         let raw_channel = env::var("CHATIFY_CHANNEL").unwrap_or_else(|_| "general".to_string());
         let chatify_channel = normalize_chatify_channel(&raw_channel).unwrap_or_else(|| {
@@ -443,6 +955,8 @@ fn load_users(users_value: &serde_json::Value, users_map: &DashMap<String, Strin
 struct BotState {
     /// WebSocket sender for Chatify communication
     ws_tx: Option<WsSender>,
+    /// Discord HTTP client used for Chatify -> Discord relay.
+    discord_http: Option<Arc<Http>>,
     /// Bot's username on Chatify
     username: String,
     /// Password for Chatify authentication
@@ -468,6 +982,7 @@ impl BotState {
     fn new() -> Self {
         Self {
             ws_tx: None,
+            discord_http: None,
             username: String::new(),
             password: String::new(),
             channel: "general".to_string(),
@@ -504,6 +1019,20 @@ impl BotState {
         self.dm_keys.insert(username.to_string(), key.clone());
         Ok(key)
     }
+
+    /// Resolve Discord target channels for a Chatify channel.
+    fn discord_targets_for_chatify_channel(&self, ch: &str) -> Vec<String> {
+        self.channel_map
+            .iter()
+            .filter_map(|(discord_channel_id, chatify_channel)| {
+                if chatify_channel == ch {
+                    Some(discord_channel_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// Discord event handler for bridging messages
@@ -523,11 +1052,61 @@ impl EventHandler for DiscordHandler {
         }
 
         let content = msg.content.trim().to_string();
-        if content.is_empty() || content.len() > MAX_DISCORD_CONTENT_LEN {
+
+        if content.eq_ignore_ascii_case("/bridge status") {
+            let (ws_connected, route_count, source_id) = {
+                let state = self.state.lock().await;
+                (
+                    state.ws_tx.is_some(),
+                    state.channel_map.len(),
+                    state.bridge_src_tag.clone(),
+                )
+            };
+            let status = format_bridge_status_line(
+                self.metrics.snapshot(),
+                ws_connected,
+                route_count,
+                &source_id,
+            );
+
+            match msg.channel_id.say(&ctx.http, &status).await {
+                Ok(_) => {
+                    info!(
+                        "event=bridge_status_command requester={} channel_id={} ws_connected={} route_count={} source_id={}",
+                        msg.author.name,
+                        msg.channel_id,
+                        ws_connected,
+                        route_count,
+                        source_id
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "event=bridge_status_command_failed requester={} channel_id={} error={}",
+                        msg.author.name, msg.channel_id, err
+                    );
+                    self.metrics.inc_dropped();
+                }
+            }
+            return;
+        }
+
+        let attachments = extract_discord_attachments(&msg);
+        let reply_meta = extract_discord_reply(&msg);
+
+        if content.len() > MAX_DISCORD_CONTENT_LEN {
             self.metrics.inc_dropped();
             debug!(
-                "event=discord_drop reason=empty_or_too_large content_len={} channel_id={}",
+                "event=discord_drop reason=too_large content_len={} channel_id={}",
                 content.len(),
+                msg.channel_id
+            );
+            return;
+        }
+        if content.is_empty() && attachments.is_empty() {
+            self.metrics.inc_dropped();
+            debug!(
+                "event=discord_drop reason=empty_no_attachments channel_id={}",
                 msg.channel_id
             );
             return;
@@ -535,7 +1114,8 @@ impl EventHandler for DiscordHandler {
         self.metrics.inc_discord_ingress();
 
         let author = msg.author.name.clone();
-        let formatted_msg = format!("{}: {}", author, content);
+        let bridge_body =
+            build_chatify_bridge_body(&author, &content, &attachments, reply_meta.as_ref());
 
         // Encrypt and send to Chatify.
         let discord_channel_id = msg.channel_id.to_string();
@@ -552,7 +1132,7 @@ impl EventHandler for DiscordHandler {
             (channel, key, ws_tx, src_tag)
         };
 
-        let encrypted = match enc_bytes(&key, formatted_msg.as_bytes()) {
+        let encrypted = match enc_bytes(&key, bridge_body.as_bytes()) {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -564,17 +1144,54 @@ impl EventHandler for DiscordHandler {
             }
         };
         let encoded = general_purpose::STANDARD.encode(&encrypted);
+        let relay_marker = relay_marker_for_discord_channel(&discord_channel_id);
+        let mut relay = serde_json::Map::new();
+        relay.insert("source_id".to_string(), serde_json::json!(src_tag.clone()));
+        relay.insert(
+            "origin".to_string(),
+            serde_json::json!(RELAY_ORIGIN_DISCORD),
+        );
+        relay.insert(
+            "markers".to_string(),
+            serde_json::json!([relay_marker.clone()]),
+        );
+        if !attachments.is_empty() {
+            relay.insert(
+                "attachments".to_string(),
+                serde_json::Value::Array(
+                    attachments
+                        .iter()
+                        .map(attachment_to_json)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+        if let Some(reply) = reply_meta.as_ref() {
+            relay.insert("reply".to_string(), reply_to_json(reply));
+        }
+
         let chatify_msg = serde_json::json!({
             "t": "msg",
             "ch": channel,
             "c": encoded,
+            "p": bridge_body,
             "ts": now_secs(),
             "n": fresh_nonce_hex(),
-            "src": src_tag,
+            "src": src_tag.clone(),
+            "relay": serde_json::Value::Object(relay)
         });
         if let Some(tx) = ws_tx {
             send_ws_json(&tx, chatify_msg);
             self.metrics.inc_discord_forwarded();
+            info!(
+                "event=discord_relayed_to_chatify discord_channel_id={} chatify_channel={} author={} marker={} attachments_count={} reply_present={}",
+                discord_channel_id,
+                channel,
+                author,
+                relay_marker,
+                attachments.len(),
+                reply_meta.is_some()
+            );
         } else {
             warn!(
                 "event=discord_drop reason=chatify_disconnected channel_id={}",
@@ -585,10 +1202,11 @@ impl EventHandler for DiscordHandler {
     }
 
     /// Called when the bot is ready
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!("event=discord_ready bot_user={}", ready.user.name);
         let mut state = self.state.lock().await;
         state.username = ready.user.name.to_string();
+        state.discord_http = Some(ctx.http.clone());
     }
 }
 
@@ -599,17 +1217,19 @@ async fn handle_chatify_msg(
     metrics: &Arc<BridgeMetrics>,
 ) {
     metrics.inc_chatify_ingress();
-    let own_source = {
-        let bot_state = state.lock().await;
-        bot_state.bridge_src_tag.clone()
-    };
-    if is_self_sourced_event(data, &own_source) {
-        return;
-    }
-
     let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
     let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
     let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+
+    let (own_source, key, discord_targets, discord_http) = {
+        let bot_state = state.lock().await;
+        (
+            bot_state.bridge_src_tag.clone(),
+            bot_state.get_channel_key(ch),
+            bot_state.discord_targets_for_chatify_channel(ch),
+            bot_state.discord_http.clone(),
+        )
+    };
 
     let encrypted = match general_purpose::STANDARD.decode(c) {
         Ok(bytes) => bytes,
@@ -620,16 +1240,88 @@ async fn handle_chatify_msg(
         }
     };
 
-    let key = {
-        let bot_state = state.lock().await;
-        bot_state.get_channel_key(ch)
-    };
-
     if let Ok(content) = dec_bytes(&key, &encrypted) {
         let content_str =
             String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
-        metrics.inc_chatify_forwarded();
-        println!("[Chatify → Discord] {}: {}", u, content_str);
+        let relay_attachments = relay_attachments_from_payload(data);
+        let relay_reply = relay_reply_from_payload(data);
+
+        if discord_targets.is_empty() {
+            debug!(
+                "event=chatify_drop reason=no_discord_route channel={} sender={}",
+                ch, u
+            );
+            return;
+        }
+
+        let Some(discord_http) = discord_http else {
+            warn!(
+                "event=chatify_drop reason=discord_not_ready channel={} sender={}",
+                ch, u
+            );
+            metrics.inc_dropped();
+            return;
+        };
+
+        let relay_text =
+            format_discord_relay_text(u, &content_str, &relay_attachments, relay_reply.as_ref());
+        for discord_channel_id in discord_targets {
+            if should_skip_chatify_to_discord(data, &own_source, &discord_channel_id) {
+                debug!(
+                    "event=chatify_loop_prevented chatify_channel={} discord_channel_id={} source_id={} relay_source={} relay_markers={}",
+                    ch,
+                    discord_channel_id,
+                    own_source,
+                    relay_source_id(data).unwrap_or(""),
+                    relay_markers(data).join("|")
+                );
+                continue;
+            }
+
+            let Ok(channel_id_num) = discord_channel_id.parse::<u64>() else {
+                warn!(
+                    "event=chatify_drop reason=invalid_discord_channel_id channel={} discord_channel_id={} sender={}",
+                    ch,
+                    discord_channel_id,
+                    u
+                );
+                metrics.inc_dropped();
+                continue;
+            };
+
+            match send_to_discord_channel(
+                &discord_http,
+                channel_id_num,
+                &relay_text,
+                relay_reply.as_ref(),
+            )
+            .await
+            {
+                Ok(_) => {
+                    metrics.inc_chatify_forwarded();
+                    info!(
+                        "event=chatify_relayed_to_discord chatify_channel={} discord_channel_id={} sender={} relay_source={} relay_markers={} attachments_count={} reply_present={}",
+                        ch,
+                        discord_channel_id,
+                        u,
+                        relay_source_id(data).unwrap_or(""),
+                        relay_markers(data).join("|"),
+                        relay_attachments.len(),
+                        relay_reply.is_some()
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "event=chatify_drop reason=discord_send_failed channel={} discord_channel_id={} sender={} error={}",
+                        ch,
+                        discord_channel_id,
+                        u,
+                        err
+                    );
+                    metrics.inc_dropped();
+                }
+            }
+        }
     } else {
         metrics.inc_dropped();
         debug!(
@@ -644,7 +1336,7 @@ fn handle_system_msg(data: &PayloadMap, metrics: &Arc<BridgeMetrics>) {
     metrics.inc_chatify_ingress();
     let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
     metrics.inc_chatify_forwarded();
-    println!("[Chatify → Discord] System: {}", m);
+    info!("event=chatify_system message={}", m);
 }
 
 /// Handle Chatify direct messages between users
@@ -686,9 +1378,11 @@ async fn handle_dm_msg(
         let content_str =
             String::from_utf8(content).unwrap_or_else(|_| "[Invalid UTF-8]".to_string());
         metrics.inc_chatify_forwarded();
-        println!(
-            "[Chatify → Discord] DM from {} to {}: {}",
-            frm, to, content_str
+        info!(
+            "event=chatify_dm from={} to={} content_len={}",
+            frm,
+            to,
+            content_str.len()
         );
     } else {
         metrics.inc_dropped();
@@ -1154,6 +1848,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_channel_map_file_filters_and_normalizes_entries() {
+        let raw = r##"
+        {
+            "routes": [
+                {"discord_channel_id": "111", "chatify_channel": "General"},
+                {"discord_channel_id": "222", "chatify_channel": "#Ops"},
+                {"discord_channel_id": "", "chatify_channel": "ignore"},
+                {"discord_channel_id": "333", "chatify_channel": "***"}
+            ]
+        }
+        "##;
+
+        let parsed = parse_channel_map_file(raw).expect("parse route file");
+        assert_eq!(parsed.get("111"), Some(&"general".to_string()));
+        assert_eq!(parsed.get("222"), Some(&"ops".to_string()));
+        assert!(!parsed.contains_key("333"));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
     fn self_source_filter_matches_only_non_empty_identical_source() {
         let own = "discord-bridge:test-instance";
         let mut from_self = PayloadMap::new();
@@ -1187,6 +1901,139 @@ mod tests {
         let mut object_src = PayloadMap::new();
         object_src.insert("src".to_string(), serde_json::json!({"id": own}));
         assert!(!is_self_sourced_event(&object_src, own));
+    }
+
+    #[test]
+    fn loop_prevention_skips_when_discord_marker_is_present() {
+        let own = "discord-bridge:test-instance";
+        let mut payload = PayloadMap::new();
+        payload.insert("src".to_string(), serde_json::json!("discord-bridge:other"));
+        payload.insert(
+            "relay".to_string(),
+            serde_json::json!({
+                "source_id": "discord-bridge:other",
+                "origin": "discord",
+                "markers": ["discord:111", "chatify:general"]
+            }),
+        );
+
+        assert!(should_skip_chatify_to_discord(&payload, own, "111"));
+        assert!(!should_skip_chatify_to_discord(&payload, own, "222"));
+    }
+
+    #[test]
+    fn loop_prevention_skips_when_relay_source_matches_instance() {
+        let own = "discord-bridge:test-instance";
+        let mut payload = PayloadMap::new();
+        payload.insert(
+            "relay".to_string(),
+            serde_json::json!({
+                "source_id": own,
+                "origin": "discord",
+                "markers": ["discord:333"]
+            }),
+        );
+
+        assert!(should_skip_chatify_to_discord(&payload, own, "444"));
+    }
+
+    #[test]
+    fn bridge_status_line_contains_core_metrics() {
+        let snapshot = BridgeMetricsSnapshot {
+            discord_ingress: 1,
+            chatify_ingress: 2,
+            discord_forwarded: 3,
+            chatify_forwarded: 4,
+            dropped_messages: 5,
+            reconnects: 6,
+            connect_attempts: 7,
+            auth_failures: 8,
+            ws_read_errors: 9,
+            ws_write_errors: 10,
+            pings_sent: 11,
+            pongs_received: 12,
+        };
+
+        let line = format_bridge_status_line(snapshot, true, 2, "discord-bridge:test");
+        assert!(line.contains("ws_connected=true"));
+        assert!(line.contains("routes=2"));
+        assert!(line.contains("discord_in=1"));
+        assert!(line.contains("chatify_out=4"));
+    }
+
+    #[test]
+    fn build_chatify_bridge_body_includes_reply_and_attachments() {
+        let attachments = vec![RelayAttachmentMeta {
+            url: "https://cdn.example.com/a.png".to_string(),
+            filename: "a.png".to_string(),
+            size_bytes: 2048,
+            content_type: Some("image/png".to_string()),
+        }];
+        let reply = RelayReplyMeta {
+            discord_message_id: Some("9001".to_string()),
+            discord_channel_id: Some("123".to_string()),
+            author: Some("bob".to_string()),
+            excerpt: Some("earlier context".to_string()),
+        };
+
+        let body = build_chatify_bridge_body("alice", "new message", &attachments, Some(&reply));
+        assert!(body.contains("[reply to bob"));
+        assert!(body.contains("alice: new message"));
+        assert!(body.contains("[attachment] a.png"));
+    }
+
+    #[test]
+    fn relay_payload_extracts_attachment_and_reply_metadata() {
+        let mut payload = PayloadMap::new();
+        payload.insert(
+            "relay".to_string(),
+            serde_json::json!({
+                "attachments": [
+                    {
+                        "url": "https://cdn.example.com/doc.pdf",
+                        "filename": "doc.pdf",
+                        "size": 8192,
+                        "content_type": "application/pdf"
+                    }
+                ],
+                "reply": {
+                    "discord_message_id": "777",
+                    "discord_channel_id": "111",
+                    "author": "carol",
+                    "excerpt": "quoted"
+                }
+            }),
+        );
+
+        let attachments = relay_attachments_from_payload(&payload);
+        let reply = relay_reply_from_payload(&payload).expect("reply metadata");
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "doc.pdf");
+        assert_eq!(attachments[0].size_bytes, 8192);
+        assert_eq!(reply.discord_message_id.as_deref(), Some("777"));
+        assert_eq!(reply.author.as_deref(), Some("carol"));
+    }
+
+    #[test]
+    fn discord_relay_text_appends_context_when_not_in_body() {
+        let attachments = vec![RelayAttachmentMeta {
+            url: "https://cdn.example.com/file.txt".to_string(),
+            filename: "file.txt".to_string(),
+            size_bytes: 120,
+            content_type: Some("text/plain".to_string()),
+        }];
+        let reply = RelayReplyMeta {
+            discord_message_id: Some("42".to_string()),
+            discord_channel_id: Some("1".to_string()),
+            author: Some("dave".to_string()),
+            excerpt: Some("hello".to_string()),
+        };
+
+        let text = format_discord_relay_text("alice", "payload", &attachments, Some(&reply));
+        assert!(text.contains("alice:"));
+        assert!(text.contains("[reply to dave"));
+        assert!(text.contains("[attachment] file.txt"));
     }
 
     #[test]

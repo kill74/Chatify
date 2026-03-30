@@ -1519,7 +1519,13 @@ async fn handle_event(
             if c.is_empty() {
                 return;
             }
-            let entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
+            let mut entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
+            if let Some(src) = d.get("src").and_then(|v| v.as_str()) {
+                entry["src"] = Value::String(src.to_string());
+            }
+            if let Some(relay) = d.get("relay").filter(|v| v.is_object()) {
+                entry["relay"] = relay.clone();
+            }
             let chan = state.chan(&ch);
             chan.push(entry.clone()).await;
             // Fall back to ciphertext as the search index when no plaintext is provided.

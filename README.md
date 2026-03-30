@@ -21,7 +21,7 @@ Chatify ships three binaries:
 - Append-only event store with versioned schema migrations
 - Credential hardening (PBKDF2), rate limiting, 2FA (TOTP + backup codes)
 - Replay protection (nonce + timestamp validation)
-- Optional Discord bridge with reconnection, health logs, and ping/pong telemetry
+- Optional Discord bridge with mapped bidirectional relay, loop prevention, and health telemetry
 - Windows release artifacts with SHA256 checksums (ZIP + installer)
 - Structured security test report attached per release tag (`.json` + `.md`)
 
@@ -181,6 +181,8 @@ Notes:
 
 ## Discord Bridge (Optional)
 
+Bridge builds are pinned for stability (`serenity = =0.11.7`) and remain optional behind the `discord-bridge` feature flag.
+
 Run bridge binary:
 
 ```bash
@@ -207,14 +209,50 @@ Common bridge settings:
 - `CHATIFY_PING_SECS` (`20`, use `0` to disable)
 - `CHATIFY_HEALTH_LOG_SECS` (`30`)
 - `CHATIFY_BRIDGE_INSTANCE_ID` (optional)
+- `CHATIFY_DISCORD_CHANNEL_MAP_FILE` (optional path, default `bridge-channel-map.json` when present)
 - `CHATIFY_DISCORD_CHANNEL_MAP` (optional `discordChannelId:chatifyChannel,...`)
 - `CHATIFY_LOG=1` enables bridge logs
+
+Route sources are merged in this precedence order:
+
+1. File routes from `CHATIFY_DISCORD_CHANNEL_MAP_FILE` (or `bridge-channel-map.json` by default)
+2. Environment routes from `CHATIFY_DISCORD_CHANNEL_MAP` (override file entries with same Discord channel id)
 
 Channel map example:
 
 ```text
 CHATIFY_DISCORD_CHANNEL_MAP=123456789012345678:general,987654321098765432:ops
 ```
+
+Route file example (`bridge-channel-map.json`):
+
+```json
+{
+  "routes": [
+    {
+      "discord_channel_id": "123456789012345678",
+      "chatify_channel": "general"
+    },
+    { "discord_channel_id": "987654321098765432", "chatify_channel": "ops" }
+  ]
+}
+```
+
+The repository includes a safe template at [bridge-channel-map.json](bridge-channel-map.json) with empty routes; fill it with your real Discord channel IDs before enabling bidirectional relay.
+
+Bridge health command:
+
+- Send `/bridge status` in Discord and the bot replies with current bridge health counters.
+
+Loop prevention:
+
+- Discord ingress frames include `src` and `relay.markers` metadata.
+- Relay to Discord is skipped when the destination marker already exists, preventing normal-operation loops.
+
+Attachments and replies:
+
+- Discord -> Chatify relay preserves attachment URL/metadata and basic reply context.
+- Chatify -> Discord relay consumes preserved metadata and emits attachment/reply context in bridged messages.
 
 ## Security Posture
 

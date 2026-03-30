@@ -47,7 +47,7 @@ rpassword = "7"
 cpal = "0.14"
 rodio = "0.18"
 image = "0.24"
-serenity = { version = "0.11", features = ["client", "gateway", "standard_framework", "model", "rustls_backend"], optional = true }
+serenity = { version = "=0.11.7", features = ["client", "gateway", "standard_framework", "model", "rustls_backend"], optional = true }
 base64 = "0.21"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
