@@ -161,9 +161,37 @@ Generated artifacts:
 
 - `dist/chatify-windows-x64.zip`
 - `dist/chatify-windows-x64.zip.sha256`
+- `dist/chatify-setup-<version>.exe` (when Inno Setup is installed)
+- `dist/chatify-setup-<version>.exe.sha256` (when installer is generated)
 - `dist/chatify-windows-x64/start-chatify.bat`
 - `dist/chatify-windows-x64/start-server.bat`
 - `dist/chatify-windows-x64/start-client.bat`
+- `dist/chatify-windows-x64/chatify-launcher.cmd`
+
+### Windows installer (.exe)
+
+The package script can generate an installer executable that places Chatify in Program Files and creates Start Menu shortcuts.
+
+Installer prerequisites:
+
+- Inno Setup 6 (`ISCC.exe`) installed locally, or pass `-IsccPath` to the script.
+
+Build with installer:
+
+```powershell
+.\build-windows-package.ps1
+```
+
+Build ZIP only:
+
+```powershell
+.\build-windows-package.ps1 -SkipInstaller
+```
+
+After installation, launch `Chatify Launcher` from Start Menu. It prompts:
+
+- `[1] Host on this machine` (starts server + local client)
+- `[2] Join existing server` (asks host/IP and port, then starts client)
 
 Optional checksum verification (PowerShell):
 
@@ -175,7 +203,7 @@ $actual -eq $expected
 
 Release automation:
 
-- On published releases, [.github/workflows/windows-release-package.yml](.github/workflows/windows-release-package.yml) builds and uploads the ZIP plus SHA256 file.
+- On published releases, [.github/workflows/windows-release-package.yml](.github/workflows/windows-release-package.yml) builds and uploads both ZIP and installer artifacts with SHA256 files.
 
 ## Configuration
 

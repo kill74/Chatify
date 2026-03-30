@@ -21,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-attach-windows-zip:
+  build-and-attach-windows-artifacts:
     if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
     runs-on: windows-latest
     timeout-minutes: 45
@@ -46,6 +46,10 @@ jobs:
 
           git rev-parse --verify "refs/tags/$tag" | Out-Null
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
       - name: Build Windows package
         shell: pwsh
         run: .\build-windows-package.ps1
@@ -55,6 +59,7 @@ jobs:
         run: |
           $zipPath = "dist/chatify-windows-x64.zip"
           $shaPath = "dist/chatify-windows-x64.zip.sha256"
+          $setup = Get-ChildItem -Path dist -Filter "chatify-setup-*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
           if (-not (Test-Path -Path $zipPath)) {
             throw "Missing artifact: $zipPath"
@@ -75,6 +80,26 @@ jobs:
             throw "Checksum mismatch for $zipPath. Expected $expectedHash but got $actualHash"
           }
 
+          if (-not $setup) {
+            throw "Missing installer artifact matching dist/chatify-setup-*.exe"
+          }
+
+          $setupPath = $setup.FullName
+          $setupShaPath = "$setupPath.sha256"
+          if (-not (Test-Path -Path $setupShaPath)) {
+            throw "Missing installer checksum: $setupShaPath"
+          }
+
+          $expectedSetupHash = (Get-Content -Path $setupShaPath | Select-Object -First 1).Split(' ')[0].Trim().ToLowerInvariant()
+          if ([string]::IsNullOrWhiteSpace($expectedSetupHash)) {
+            throw "Installer checksum file is empty or invalid: $setupShaPath"
+          }
+
+          $actualSetupHash = (Get-FileHash -Path $setupPath -Algorithm SHA256).Hash.Trim().ToLowerInvariant()
+          if ($actualSetupHash -ne $expectedSetupHash) {
+            throw "Checksum mismatch for $setupPath. Expected $expectedSetupHash but got $actualSetupHash"
+          }
+
       - name: Upload package as release asset
         uses: softprops/action-gh-release@v2
         with:
@@ -83,5 +108,7 @@ jobs:
           files: |
             dist/chatify-windows-x64.zip
             dist/chatify-windows-x64.zip.sha256
+            dist/chatify-setup-*.exe
+            dist/chatify-setup-*.exe.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -4,12 +4,17 @@ Chatify Windows Package
 Files:
 - clicord-server.exe
 - clicord-client.exe
+- chatify-launcher.cmd
 - start-chatify.bat
 - start-server.bat
 - start-client.bat
 
 Quick Start:
-1) Run start-chatify.bat
+1) Run chatify-launcher.cmd
+
+Launcher modes:
+- [1] Host on this machine (starts server + local client)
+- [2] Join existing server (client only)
 
 Manual mode:
 1) Run start-server.bat
