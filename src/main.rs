@@ -73,7 +73,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
 use clicord_server::crypto;
@@ -354,7 +353,10 @@ impl EventStore {
     /// running with a broken event store is worse than one that crashes
     /// at startup — it silently loses data.
     fn new(path: String, encryption_key: Option<Vec<u8>>) -> Self {
-        let store = Self { path, encryption_key };
+        let store = Self {
+            path,
+            encryption_key,
+        };
         store.init().expect("failed to initialise event store — check database path, permissions, and encryption key");
         store
     }
@@ -1561,10 +1563,10 @@ async fn handle_event(
         .map(safe_ch);
 
     if let Some(ch) = event_channel.as_deref() {
-            info!("event user={} type={} channel={}", username, t, ch);
-        } else {
-            info!("event user={} type={}", username, t);
-        }
+        info!("event user={} type={} channel={}", username, t, ch);
+    } else {
+        info!("event user={} type={}", username, t);
+    }
 
     // --- Replay protection (timestamp skew + nonce dedup) ------------------
     // Only applied to mutating events (see requires_fresh_protection).
@@ -2019,7 +2021,10 @@ async fn handle_event(
 
             // Reject files that exceed the maximum size.
             if size > MAX_FILE_SIZE {
-                send_err(out_tx, format!("file size exceeds maximum of {} bytes", MAX_FILE_SIZE));
+                send_err(
+                    out_tx,
+                    format!("file size exceeds maximum of {} bytes", MAX_FILE_SIZE),
+                );
                 return;
             }
 
@@ -2336,7 +2341,6 @@ fn parse_event_query_scope(raw: Option<&str>) -> ChatifyResult<EventQueryScope> 
 fn sys(text: &str) -> String {
     serde_json::json!({"t":"sys","m":text,"ts":now()}).to_string()
 }
-
 
 /// Sends a system message to every public channel's broadcast sender.
 ///
@@ -3091,10 +3095,7 @@ where
     state.recent_nonces.remove(&username);
     state.nonce_last_seen.remove(&username);
     if state.bridges.remove(&username).is_some() {
-        info!(
-            "event=bridge_disconnected user={}",
-            username
-        );
+        info!("event=bridge_disconnected user={}", username);
     }
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     info!("- {}", username);

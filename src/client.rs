@@ -1094,7 +1094,7 @@ impl ClientState {
                 msg_type: MessageType::UnreadMarker,
                 user: None,
                 channel: unread_separator_channel(scope),
-            edited: false,
+                edited: false,
             });
         }
     }
@@ -1209,7 +1209,7 @@ impl ClientState {
             msg_type: MessageType::Sys,
             user: None,
             channel: None,
-        edited: false,
+            edited: false,
         });
     }
 
@@ -1224,7 +1224,7 @@ impl ClientState {
                 msg_type: MessageType::Sys,
                 user: None,
                 channel: None,
-            edited: false,
+                edited: false,
             });
         }
         self.refresh_dashboard();
@@ -2020,7 +2020,12 @@ where
                 let prefix = if group_started { "  > " } else { "    " };
                 let suffix = if msg.edited { " (edited)" } else { "" };
                 let display_text = format!("{}{}", msg.text, suffix);
-                lines.extend(prefixed_wrapped_lines(prefix, &display_text, width, max_lines));
+                lines.extend(prefixed_wrapped_lines(
+                    prefix,
+                    &display_text,
+                    width,
+                    max_lines,
+                ));
                 current_group = Some(key);
             }
             MessageType::Img => {
@@ -2513,7 +2518,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Msg,
                 user: Some(u.to_string()),
                 channel: Some(ch.to_string()),
-            edited: false,
+                edited: false,
             });
             true
         }
@@ -2525,7 +2530,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Sys,
                 user: None,
                 channel: None,
-            edited: false,
+                edited: false,
             });
             true
         }
@@ -2533,10 +2538,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
             let user = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
             let old_text = event.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
             let new_text = event.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
-            let ch = event
-                .get("ch")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let ch = event.get("ch").and_then(|v| v.as_str()).unwrap_or("");
 
             // Try to update the original message in-place.
             if !state.update_message_in_feed(user, ch, old_text, new_text) {
@@ -2596,7 +2598,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Dm,
                 user: Some(from.to_string()),
                 channel: None,
-            edited: false,
+                edited: false,
             });
             true
         }
@@ -2612,7 +2614,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::Sys,
                 user: Some(user.to_string()),
                 channel: Some(ch.to_string()),
-            edited: false,
+                edited: false,
             });
             true
         }
@@ -2651,7 +2653,7 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
                 msg_type: MessageType::FileMeta,
                 user: Some(from.to_string()),
                 channel: Some(ch.to_string()),
-            edited: false,
+                edited: false,
             });
             true
         }
@@ -2687,7 +2689,7 @@ async fn handle_msg_event(state: &SharedState, data: &JsonMap, ts: u64) {
             msg_type: MessageType::Msg,
             user: Some(u.to_string()),
             channel: Some(ch.to_string()),
-        edited: false,
+            edited: false,
         });
     }
 }
@@ -2715,7 +2717,7 @@ async fn handle_img_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Img,
         user: Some(u.to_string()),
         channel: Some(ch.to_string()),
-    edited: false,
+        edited: false,
     });
 }
 
@@ -2813,7 +2815,7 @@ async fn handle_file_meta_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::FileMeta,
         user: Some(from),
         channel: Some(channel),
-    edited: false,
+        edited: false,
     });
 }
 
@@ -2949,7 +2951,7 @@ async fn handle_file_chunk_event(state: &SharedState, data: &JsonMap, ts: u64) {
             msg_type,
             user: Some(transfer.from),
             channel: Some(transfer.channel),
-        edited: false,
+            edited: false,
         });
     }
 }
@@ -2967,7 +2969,7 @@ async fn handle_err_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Err,
         user: None,
         channel: None,
-    edited: false,
+        edited: false,
     });
 }
 
@@ -2980,7 +2982,7 @@ async fn handle_sys_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
-    edited: false,
+        edited: false,
     });
 }
 
@@ -3024,7 +3026,7 @@ async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
             msg_type: MessageType::Dm,
             user: Some(frm.to_string()),
             channel: None,
-        edited: false,
+            edited: false,
         });
     }
 }
@@ -3049,7 +3051,7 @@ async fn handle_users_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
-    edited: false,
+        edited: false,
     });
 }
 
@@ -3068,7 +3070,7 @@ async fn handle_joined_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
-    edited: false,
+        edited: false,
     });
     for event in hist {
         let _ = append_event_to_history(&mut state_lock, &event);
@@ -3107,7 +3109,7 @@ async fn handle_history_or_search_event(state: &SharedState, data: &JsonMap, t: 
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
-    edited: false,
+        edited: false,
     });
 }
 
@@ -3124,7 +3126,7 @@ async fn handle_bridge_status_event(state: &SharedState, data: &JsonMap, ts: u64
             msg_type: MessageType::Sys,
             user: None,
             channel: None,
-        edited: false,
+            edited: false,
         });
         return;
     }
@@ -3135,7 +3137,7 @@ async fn handle_bridge_status_event(state: &SharedState, data: &JsonMap, ts: u64
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
-    edited: false,
+        edited: false,
     });
 
     if let Some(bridge_list) = bridges {
@@ -3177,7 +3179,7 @@ async fn handle_bridge_status_event(state: &SharedState, data: &JsonMap, ts: u64
                 msg_type: MessageType::Sys,
                 user: None,
                 channel: None,
-            edited: false,
+                edited: false,
             });
         }
     }
@@ -3196,7 +3198,7 @@ async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
         msg_type: MessageType::Sys,
         user: None,
         channel: None,
-    edited: false,
+        edited: false,
     });
 }
 
@@ -3803,12 +3805,8 @@ fn handle_slash_command(
             let sub = args.trim().to_lowercase();
             match sub.as_str() {
                 "status" | "" => {
-                    enqueue_timed(
-                        &state.ws_tx,
-                        serde_json::json!({"t": "bridge_status"}),
-                    );
-                    state
-                        .add_notice("Requesting bridge status from server...");
+                    enqueue_timed(&state.ws_tx, serde_json::json!({"t": "bridge_status"}));
+                    state.add_notice("Requesting bridge status from server...");
                 }
                 _ => {
                     state.add_notice("Usage: /bridge [status]");
@@ -4479,7 +4477,7 @@ mod tests {
                 msg_type: MessageType::Msg,
                 user: Some("alice".to_string()),
                 channel: Some("general".to_string()),
-            edited: false,
+                edited: false,
             },
             DisplayedMessage {
                 time: "10:01".to_string(),
@@ -4487,7 +4485,7 @@ mod tests {
                 msg_type: MessageType::Msg,
                 user: Some("alice".to_string()),
                 channel: Some("general".to_string()),
-            edited: false,
+                edited: false,
             },
             DisplayedMessage {
                 time: "10:02".to_string(),
@@ -4495,7 +4493,7 @@ mod tests {
                 msg_type: MessageType::Sys,
                 user: None,
                 channel: None,
-            edited: false,
+                edited: false,
             },
         ];
 

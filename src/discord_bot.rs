@@ -36,7 +36,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-
 use base64::{engine::general_purpose, Engine as _};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -1391,7 +1390,10 @@ async fn run_chatify_session(
 ) -> Result<(), String> {
     let uri = cfg.uri();
     metrics.inc_connect_attempts();
-    info!("event=bridge_connect_attempt uri={} auth_timeout_s={}", uri, cfg.auth_timeout_secs);
+    info!(
+        "event=bridge_connect_attempt uri={} auth_timeout_s={}",
+        uri, cfg.auth_timeout_secs
+    );
     let (ws_stream, _) = connect_async(&uri)
         .await
         .map_err(|e| format!("Failed to connect to Chatify: {e}"))?;
@@ -1435,7 +1437,9 @@ async fn run_chatify_session(
         send_ws_json(&bridge_tx, auth_msg);
         info!(
             "event=bridge_auth_sent username={} instance_id={} routes={}",
-            bot_state.username, bot_state.bridge_src_tag, bot_state.channel_map.len()
+            bot_state.username,
+            bot_state.bridge_src_tag,
+            bot_state.channel_map.len()
         );
     }
 
@@ -1607,7 +1611,11 @@ async fn main() {
 
     info!(
         "event=bridge_start host={} port={} channel={} ws_scheme={} routes={}",
-        cfg.chatify_host, cfg.chatify_port, cfg.chatify_channel, cfg.chatify_ws_scheme, cfg.channel_map.len()
+        cfg.chatify_host,
+        cfg.chatify_port,
+        cfg.chatify_channel,
+        cfg.chatify_ws_scheme,
+        cfg.channel_map.len()
     );
 
     // Initialize bot state.
@@ -1616,7 +1624,10 @@ async fn main() {
     let channel_secret = match pw_hash_client(&cfg.chatify_password) {
         Ok(secret) => secret,
         Err(err) => {
-            error!("event=bridge_start_failed reason=invalid_chatify_password error={}", err);
+            error!(
+                "event=bridge_start_failed reason=invalid_chatify_password error={}",
+                err
+            );
             return;
         }
     };
