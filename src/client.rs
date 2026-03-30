@@ -63,6 +63,10 @@ const TRUST_STORE_FILENAME: &str = "trust-store-v1.json";
 const TRUST_STORE_DIR_WINDOWS: &str = "Chatify";
 const TRUST_STORE_DIR_UNIX: &str = ".chatify";
 const TRUST_AUDIT_MAX_ENTRIES: usize = 64;
+const CLIENT_ID_HEX_LEN: usize = 12;
+const CLIENT_ID_GROUP_SIZE: usize = 4;
+const DEFAULT_GUEST_PREFIX: &str = "guest";
+const DEFAULT_GUEST_SUFFIX_BYTES: usize = 3;
 
 #[derive(Clone, Copy)]
 struct CommandSpec {
@@ -105,8 +109,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/me",
-        usage: "/me <action>",
-        summary: "Send action-style message to current channel.",
+        usage: "/me [action]",
+        summary: "Show your profile or send an action message.",
         example: "/me is reviewing logs",
     },
     CommandSpec {
@@ -755,6 +759,8 @@ struct ClientState {
     ws_tx: mpsc::UnboundedSender<String>,
     /// Current username
     me: String,
+    /// Human-friendly client identifier shown in the dashboard
+    client_id: String,
     /// Password (stored in memory for key derivation)
     pw: String,
     /// Current channel
@@ -1338,7 +1344,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
 
     let profile_lines = vec![
-        format!("{} {}", state.me, state.status.emoji),
+        format!("{} {} [{}]", state.me, state.status.emoji, state.client_id),
         format!("status: {}", state.status.text),
         format!("channel: #{}", state.ch),
         format!("voice: {}", if state.voice_active { "ON" } else { "OFF" }),
@@ -1486,10 +1492,11 @@ fn render_full_dashboard(
         state.message_history.len()
     );
     let subtitle = format!(
-        "#{}   mode:{}   voice:{}",
+        "#{}   mode:{}   voice:{}   client:{}",
         state.ch,
         state.theme,
-        if state.voice_active { "on" } else { "off" }
+        if state.voice_active { "on" } else { "off" },
+        state.client_id
     );
 
     writeln!(
@@ -1560,6 +1567,36 @@ fn fresh_nonce_hex() -> String {
     hex::encode(bytes)
 }
 
+fn generate_guest_username() -> String {
+    let mut bytes = [0u8; DEFAULT_GUEST_SUFFIX_BYTES];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("{}-{}", DEFAULT_GUEST_PREFIX, hex::encode(bytes))
+}
+
+fn build_client_id(username: &str, public_key_b64: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(username.as_bytes());
+    hasher.update(b":");
+    hasher.update(public_key_b64.as_bytes());
+
+    let digest_hex = hex::encode(hasher.finalize());
+    let compact = digest_hex
+        .chars()
+        .take(CLIENT_ID_HEX_LEN)
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    let mut grouped = String::with_capacity(compact.len() + compact.len() / CLIENT_ID_GROUP_SIZE);
+    for (index, ch) in compact.chars().enumerate() {
+        if index > 0 && index % CLIENT_ID_GROUP_SIZE == 0 {
+            grouped.push('-');
+        }
+        grouped.push(ch);
+    }
+
+    format!("CID-{}", grouped)
+}
+
 fn read_username() -> ChatifyResult<String> {
     print!("username: ");
     io::stdout().flush()?;
@@ -1567,8 +1604,9 @@ fn read_username() -> ChatifyResult<String> {
     io::stdin().read_line(&mut input)?;
     let username = input.trim();
     if username.is_empty() {
-        println!("Empty username provided, using 'anon'.");
-        Ok("anon".to_string())
+        let guest_username = generate_guest_username();
+        println!("Empty username provided, using '{}'.", guest_username);
+        Ok(guest_username)
     } else {
         Ok(username.to_string())
     }
@@ -2457,9 +2495,18 @@ fn handle_slash_command(
             }
         }
         "/me" => {
-            if !args.is_empty() {
+            let action = args.trim();
+            if action.is_empty() {
+                state.add_notice(format!(
+                    "You are '{}' [{}] on #{} (voice: {}).",
+                    state.me,
+                    state.client_id,
+                    state.ch,
+                    if state.voice_active { "on" } else { "off" }
+                ));
+            } else {
                 let ch = state.ch.clone();
-                let msg = format!("* {} {}", state.me, args);
+                let msg = format!("* {} {}", state.me, action);
                 queue_channel_message(state, &ch, &msg);
             }
         }
@@ -2658,6 +2705,7 @@ async fn main() -> ChatifyResult<()> {
     let client_priv_key = new_keypair();
     let client_pub_key =
         pub_b64(&client_priv_key).expect("generated keypair must produce valid public key");
+    let client_pub_key_for_id = client_pub_key.clone();
 
     // Set up logging
     if log_enabled {
@@ -2713,6 +2761,7 @@ async fn main() -> ChatifyResult<()> {
             me: auth_me,
             users: auth_users,
         } = auth;
+        let client_id = build_client_id(&auth_me, &client_pub_key_for_id);
         // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
 
@@ -2730,6 +2779,7 @@ async fn main() -> ChatifyResult<()> {
         let state = Arc::new(tokio::sync::Mutex::new(ClientState {
             ws_tx: msg_tx.clone(), // Use mpsc sender instead of WebSocket
             me: auth_me.clone(),
+            client_id: client_id.clone(),
             pw: pw_hash,
             ch: "general".to_string(),
             chs: HashMap::from([("general".to_string(), true)]),
@@ -2755,6 +2805,7 @@ async fn main() -> ChatifyResult<()> {
             let mut state_lock = state.lock().await;
             state_lock.me = auth_me;
             state_lock.add_notice(format!("Connected to {}", uri));
+            state_lock.add_notice(format!("Client ID: {}", client_id));
             state_lock.add_notice("Use /help to list commands.");
 
             let mut online_users = Vec::new();
@@ -2984,5 +3035,23 @@ mod tests {
 
         let typo_suggestions = suggest_commands("/hstory");
         assert!(typo_suggestions.contains(&"/history"));
+    }
+
+    #[test]
+    fn generated_guest_username_is_valid() {
+        let username = generate_guest_username();
+        assert!(username.starts_with("guest-"));
+        assert!(is_valid_username_token(&username));
+        assert!(username.len() <= 32);
+    }
+
+    #[test]
+    fn client_id_is_deterministic_and_grouped() {
+        let first = build_client_id("alice", "cHVibGljLWtleS1iYXNlNjQ=");
+        let second = build_client_id("alice", "cHVibGljLWtleS1iYXNlNjQ=");
+        assert_eq!(first, second);
+        assert!(first.starts_with("CID-"));
+        assert_eq!(first.matches('-').count(), 3);
+        assert_eq!(first.len(), 18);
     }
 }
