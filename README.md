@@ -157,6 +157,8 @@ Secret hygiene:
 | `/switch <channel>`           | Alias for `/join` to switch active channel              |
 | `/dm <user> <message>`        | Send direct message                                     |
 | `/typing [on\|off] [scope]`   | Broadcast typing state to `#channel` or `dm:user`       |
+| `/image <path>`               | Upload an image to the current channel                  |
+| `/video <path>`               | Upload a video to the current channel                   |
 | `/me [action]`                | Show profile or send action-style message               |
 | `/users`                      | List online users                                       |
 | `/channels`                   | List channels                                           |
@@ -170,6 +172,15 @@ Secret hygiene:
 | `/clear`                      | Clear terminal output                                   |
 | `/help`                       | Alias for `/help [command]`                             |
 | `/quit`, `/exit`, `/q`        | Disconnect and exit                                     |
+
+Media transfer behavior:
+
+- Images and videos are sent through `file_meta` + `file_chunk` protocol events.
+- Received media is stored locally in:
+  - Windows: `%APPDATA%/Chatify/media`
+  - Linux/macOS: `$HOME/.chatify/media`
+- Image transfers render an ASCII preview directly in the terminal feed.
+- Video transfers show metadata cards in the feed and the saved local path.
 
 Notes:
 

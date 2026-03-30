@@ -10,7 +10,7 @@ use clicord_server::error::{ChatifyError, ChatifyResult};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,13 +33,14 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use chrono::{DateTime, Utc};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use image::GenericImageView;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
-const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /quit";
+const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /image <path>, /video <path>, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
 const DASHBOARD_HEADER_ROWS: usize = 2;
@@ -71,6 +72,10 @@ const COMPACT_MODE_HINT: &str = "compact mode: expand terminal for side panels";
 const DM_UNREAD_SCOPE_PREFIX: &str = "dm:";
 const ACTIVITY_PULSE_WINDOW_SECS: u64 = 12;
 const TYPING_TTL_SECS: u64 = 6;
+const MAX_MEDIA_TRANSFER_BYTES: u64 = 100 * 1024 * 1024;
+const FILE_CHUNK_BYTES: usize = 8 * 1024;
+const MEDIA_PREVIEW_WIDTH: u16 = 56;
+const MEDIA_STORE_DIR: &str = "media";
 
 #[derive(Clone, Copy)]
 struct CommandSpec {
@@ -116,6 +121,18 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         usage: "/typing [on|off] [#channel|dm:user]",
         summary: "Broadcast typing state for a channel or DM scope.",
         example: "/typing on #general",
+    },
+    CommandSpec {
+        name: "/image",
+        usage: "/image <path>",
+        summary: "Send an image file to the current channel.",
+        example: "/image C:/Users/me/Pictures/screenshot.png",
+    },
+    CommandSpec {
+        name: "/video",
+        usage: "/video <path>",
+        summary: "Send a video file to the current channel.",
+        example: "/video C:/Users/me/Videos/demo.mp4",
     },
     CommandSpec {
         name: "/me",
@@ -212,6 +229,8 @@ fn canonical_command(raw: &str) -> String {
         "/q" | "/exit" => "/quit".to_string(),
         "/w" => "/dm".to_string(),
         "/ty" => "/typing".to_string(),
+        "/img" => "/image".to_string(),
+        "/vid" => "/video".to_string(),
         "/h" => "/history".to_string(),
         "/cmd" | "/palette" => "/commands".to_string(),
         "/c" => "/channels".to_string(),
@@ -711,6 +730,31 @@ struct DisplayedMessage {
     channel: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Video,
+    File,
+}
+
+impl MediaKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Video => "video",
+            MediaKind::File => "file",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            MediaKind::Image => "[IMAGE]",
+            MediaKind::Video => "[VIDEO]",
+            MediaKind::File => "[FILE]",
+        }
+    }
+}
+
 /// File transfer metadata
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -719,10 +763,22 @@ struct FileTransfer {
     filename: String,
     /// Total file size in bytes
     size: u64,
-    /// Received chunks
-    chunks: Vec<String>,
+    /// Sender username
+    from: String,
+    /// Channel where this transfer was announced
+    channel: String,
+    /// Optional MIME type
+    mime: Option<String>,
+    /// Media kind for rendering hints
+    media_kind: MediaKind,
+    /// Temporary path used while receiving chunks
+    temp_path: PathBuf,
+    /// Final path after transfer is complete
+    final_path: PathBuf,
     /// Number of bytes received so far
     received: u64,
+    /// Expected next chunk index
+    next_index: u64,
 }
 
 /// User status information
@@ -1149,9 +1205,270 @@ fn format_time_full(ts: u64) -> String {
     datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 
-/// Placeholder for image to ASCII conversion
-fn img_to_ascii(_: &[u8], _: u16) -> String {
-    "[Image sending not yet implemented in Rust client]".to_string()
+/// Render an image as compact ASCII for terminal preview.
+fn img_to_ascii(bytes: &[u8], width: u16) -> String {
+    let img = match image::load_from_memory(bytes) {
+        Ok(v) => v,
+        Err(_) => return "[image preview unavailable: decode failed]".to_string(),
+    };
+
+    let source_dims = img.dimensions();
+    if source_dims.0 == 0 || source_dims.1 == 0 {
+        return "[image preview unavailable: invalid dimensions]".to_string();
+    }
+
+    let target_w = u32::from(width).clamp(24, 96);
+    let estimated_h =
+        ((source_dims.1 as f32 / source_dims.0 as f32) * target_w as f32 * 0.5).round() as u32;
+    let target_h = estimated_h.clamp(6, 24);
+
+    let grayscale = img
+        .resize_exact(target_w, target_h, image::imageops::FilterType::Triangle)
+        .grayscale()
+        .to_luma8();
+
+    let ramp = b"@%#*+=-:. ";
+    let mut out = String::new();
+    for y in 0..grayscale.height() {
+        for x in 0..grayscale.width() {
+            let lum = usize::from(grayscale.get_pixel(x, y)[0]);
+            let idx = lum.saturating_mul(ramp.len().saturating_sub(1)) / 255;
+            out.push(ramp[idx] as char);
+        }
+        if y + 1 < grayscale.height() {
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn trim_wrapped_quotes(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0];
+        let last = trimmed.as_bytes()[trimmed.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
+}
+
+fn sanitize_filename(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('_');
+        }
+    }
+
+    if out.is_empty() || out.chars().all(|ch| ch == '.') {
+        "file.bin".to_string()
+    } else {
+        out
+    }
+}
+
+fn format_byte_size(size: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let size_f = size as f64;
+    if size_f >= GIB {
+        format!("{:.2} GiB", size_f / GIB)
+    } else if size_f >= MIB {
+        format!("{:.2} MiB", size_f / MIB)
+    } else if size_f >= KIB {
+        format!("{:.2} KiB", size_f / KIB)
+    } else {
+        format!("{} B", size)
+    }
+}
+
+fn media_store_root() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return PathBuf::from(appdata)
+            .join(TRUST_STORE_DIR_WINDOWS)
+            .join(MEDIA_STORE_DIR);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(TRUST_STORE_DIR_UNIX)
+            .join(MEDIA_STORE_DIR);
+    }
+    PathBuf::from(MEDIA_STORE_DIR)
+}
+
+fn media_file_paths(file_id: &str, filename: &str) -> ChatifyResult<(PathBuf, PathBuf)> {
+    let root = media_store_root();
+    fs::create_dir_all(&root).map_err(|e| {
+        ChatifyError::Validation(format!(
+            "failed to create media directory '{}': {}",
+            root.display(),
+            e
+        ))
+    })?;
+
+    let safe_id = sanitize_filename(file_id);
+    let safe_name = sanitize_filename(filename);
+    let final_name = format!("{}-{}", safe_id, safe_name);
+    let final_path = root.join(&final_name);
+    let temp_path = root.join(format!("{}.part", final_name));
+    Ok((temp_path, final_path))
+}
+
+fn guess_mime_from_filename(filename: &str) -> Option<&'static str> {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|v| v.to_str())?
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "mp4" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "avi" => Some("video/x-msvideo"),
+        "mkv" => Some("video/x-matroska"),
+        "webm" => Some("video/webm"),
+        "m4v" => Some("video/x-m4v"),
+        _ => None,
+    }
+}
+
+fn infer_media_kind(filename: &str, mime: Option<&str>) -> MediaKind {
+    if let Some(raw_mime) = mime {
+        let normalized = raw_mime.trim().to_ascii_lowercase();
+        if normalized.starts_with("image/") {
+            return MediaKind::Image;
+        }
+        if normalized.starts_with("video/") {
+            return MediaKind::Video;
+        }
+    }
+
+    match Path::new(filename)
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") => MediaKind::Image,
+        Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v") => MediaKind::Video,
+        _ => MediaKind::File,
+    }
+}
+
+fn parse_media_kind_hint(kind: Option<&str>, filename: &str, mime: Option<&str>) -> MediaKind {
+    match kind.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("image") => MediaKind::Image,
+        Some("video") => MediaKind::Video,
+        Some("file") => MediaKind::File,
+        _ => infer_media_kind(filename, mime),
+    }
+}
+
+fn queue_media_upload(
+    state: &mut ClientState,
+    path_arg: &str,
+    forced_kind: MediaKind,
+) -> ChatifyResult<()> {
+    let raw_path = trim_wrapped_quotes(path_arg);
+    if raw_path.is_empty() {
+        return Err(ChatifyError::Validation(
+            "missing media path (use quoted path if it contains spaces)".to_string(),
+        ));
+    }
+
+    let path = Path::new(raw_path);
+    let metadata = fs::metadata(path).map_err(|e| {
+        ChatifyError::Validation(format!(
+            "unable to read media file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(ChatifyError::Validation(format!(
+            "'{}' is not a file",
+            path.display()
+        )));
+    }
+
+    let file_size = metadata.len();
+    if file_size == 0 {
+        return Err(ChatifyError::Validation("media file is empty".to_string()));
+    }
+    if file_size > MAX_MEDIA_TRANSFER_BYTES {
+        return Err(ChatifyError::Validation(format!(
+            "media file exceeds max size of {} bytes",
+            MAX_MEDIA_TRANSFER_BYTES
+        )));
+    }
+
+    let bytes = fs::read(path).map_err(|e| {
+        ChatifyError::Validation(format!(
+            "failed to read media file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let filename = path
+        .file_name()
+        .map(|v| v.to_string_lossy().to_string())
+        .unwrap_or_else(|| "upload.bin".to_string());
+    let mime = guess_mime_from_filename(&filename);
+    let media_kind = match forced_kind {
+        MediaKind::File => infer_media_kind(&filename, mime),
+        _ => forced_kind,
+    };
+
+    let file_id = format!("{}-{}", state.me.to_lowercase(), fresh_nonce_hex());
+    let channel = state.ch.clone();
+
+    let mut announce = serde_json::json!({
+        "t": "file_meta",
+        "ch": channel.clone(),
+        "filename": filename,
+        "size": file_size,
+        "file_id": file_id.clone(),
+        "media_kind": media_kind.as_str()
+    });
+    if let Some(mime_type) = mime {
+        announce["mime"] = serde_json::json!(mime_type);
+    }
+    enqueue_timed(&state.ws_tx, announce);
+
+    for (index, chunk) in bytes.chunks(FILE_CHUNK_BYTES).enumerate() {
+        enqueue_timed(
+            &state.ws_tx,
+            serde_json::json!({
+                "t": "file_chunk",
+                "ch": channel.clone(),
+                "file_id": file_id.clone(),
+                "index": index as u64,
+                "data": general_purpose::STANDARD.encode(chunk)
+            }),
+        );
+    }
+
+    state.add_notice(format!(
+        "{} upload queued: {} ({})",
+        media_kind.label(),
+        path.display(),
+        format_byte_size(file_size)
+    ));
+
+    Ok(())
 }
 
 /// Normalize channel name to match server rules.
@@ -1548,6 +1865,38 @@ fn prefixed_wrapped_lines(prefix: &str, text: &str, width: usize, max_lines: usi
         .collect()
 }
 
+fn prefixed_preformatted_lines(
+    prefix: &str,
+    text: &str,
+    width: usize,
+    max_lines: usize,
+) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let continuation = " ".repeat(prefix.chars().count());
+    let mut output = Vec::new();
+    let mut seen_any = false;
+
+    for (index, raw_line) in text.lines().enumerate() {
+        if output.len() >= max_lines {
+            break;
+        }
+        let marker = if index == 0 { prefix } else { &continuation };
+        let content_width = width.saturating_sub(marker.chars().count()).max(1);
+        let clipped = truncate_with_ellipsis(raw_line, content_width);
+        output.push(format!("{}{}", marker, clipped));
+        seen_any = true;
+    }
+
+    if !seen_any {
+        output.push(prefix.to_string());
+    }
+
+    output
+}
+
 fn render_grouped_feed_lines<'a, I>(messages: I, width: usize, max_lines: usize) -> Vec<String>
 where
     I: IntoIterator<Item = &'a DisplayedMessage>,
@@ -1574,6 +1923,14 @@ where
                 let prefix = if group_started { "  > " } else { "    " };
                 lines.extend(prefixed_wrapped_lines(prefix, &msg.text, width, max_lines));
                 current_group = Some(key);
+            }
+            MessageType::Img => {
+                let user = msg.user.as_deref().unwrap_or("?");
+                let header = format!("[{}] IMG {} ", msg.time, user);
+                lines.extend(prefixed_preformatted_lines(
+                    &header, &msg.text, width, max_lines,
+                ));
+                current_group = None;
             }
             _ => {
                 lines.extend(wrap_words(&format_feed_entry(msg), width, max_lines));
@@ -1647,6 +2004,8 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
         "/help [command]".to_string(),
         "/join <channel> /switch".to_string(),
         "/dm <user> <msg>".to_string(),
+        "/image <path>".to_string(),
+        "/video <path>".to_string(),
         "/typing on|off [scope]".to_string(),
         "/users /channels".to_string(),
         "/history /search /replay".to_string(),
@@ -2147,6 +2506,44 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
             });
             true
         }
+        "file_meta" => {
+            let ch = event
+                .get("ch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let from = event.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+            let filename = event
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("file.bin");
+            let size = event.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let media_kind = parse_media_kind_hint(
+                event.get("media_kind").and_then(|v| v.as_str()),
+                filename,
+                event.get("mime").and_then(|v| v.as_str()),
+            );
+            let mime_hint = event
+                .get("mime")
+                .and_then(|v| v.as_str())
+                .map(|v| format!(" | {}", v))
+                .unwrap_or_default();
+
+            state.add_message(DisplayedMessage {
+                time: format_time(ts),
+                text: format!(
+                    "{} {} shared '{}' ({}){}",
+                    media_kind.label(),
+                    from,
+                    filename,
+                    format_byte_size(size),
+                    mime_hint
+                ),
+                msg_type: MessageType::FileMeta,
+                user: Some(from.to_string()),
+                channel: Some(ch.to_string()),
+            });
+            true
+        }
         _ => false,
     }
 }
@@ -2187,19 +2584,274 @@ async fn handle_img_event(state: &SharedState, data: &JsonMap, ts: u64) {
     let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
     let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
     let a = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
-    let encrypted = match general_purpose::STANDARD.decode(a) {
+    let image_bytes = match general_purpose::STANDARD.decode(a) {
         Ok(bytes) => bytes,
         Err(_) => return,
     };
-    let ascii_art = img_to_ascii(&encrypted, 70);
+    let ascii_art = img_to_ascii(&image_bytes, MEDIA_PREVIEW_WIDTH);
+
+    let mut state_lock = state.lock().await;
+    if u != state_lock.me {
+        state_lock.note_live_activity(u, &format!("#{}", ch));
+        if ch != state_lock.ch {
+            state_lock.note_unread_scope(ch);
+        }
+    }
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("inline image\n{}", ascii_art),
+        msg_type: MessageType::Img,
+        user: Some(u.to_string()),
+        channel: Some(ch.to_string()),
+    });
+}
+
+async fn handle_file_meta_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let file_id = data
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if file_id.is_empty() {
+        return;
+    }
+
+    let from = data
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let channel = data
+        .get("ch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("general")
+        .to_string();
+    let filename = sanitize_filename(
+        data.get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file.bin"),
+    );
+    let size = data.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    if size > MAX_MEDIA_TRANSFER_BYTES {
+        return;
+    }
+
+    let mime = data
+        .get("mime")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let media_kind = parse_media_kind_hint(
+        data.get("media_kind").and_then(|v| v.as_str()),
+        &filename,
+        mime.as_deref(),
+    );
+
+    let (temp_path, final_path) = match media_file_paths(&file_id, &filename) {
+        Ok(paths) => paths,
+        Err(_) => return,
+    };
+
+    let _ = fs::remove_file(&temp_path);
+    let _ = fs::remove_file(&final_path);
+    if fs::File::create(&temp_path).is_err() {
+        return;
+    }
+
+    let mut state_lock = state.lock().await;
+    if from != state_lock.me {
+        state_lock.note_live_activity(&from, &format!("#{}", channel));
+        if channel != state_lock.ch {
+            state_lock.note_unread_scope(&channel);
+        }
+    }
+
+    state_lock.file_transfers.insert(
+        file_id.clone(),
+        FileTransfer {
+            filename: filename.clone(),
+            size,
+            from: from.clone(),
+            channel: channel.clone(),
+            mime: mime.clone(),
+            media_kind,
+            temp_path,
+            final_path,
+            received: 0,
+            next_index: 0,
+        },
+    );
+
+    let mime_hint = mime
+        .as_deref()
+        .map(|v| format!(" | {}", v))
+        .unwrap_or_default();
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!(
+            "{} {} shared '{}' ({}){} [id:{}]",
+            media_kind.label(),
+            from,
+            filename,
+            format_byte_size(size),
+            mime_hint,
+            file_id
+        ),
+        msg_type: MessageType::FileMeta,
+        user: Some(from),
+        channel: Some(channel),
+    });
+}
+
+async fn handle_file_chunk_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let file_id = data
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if file_id.is_empty() {
+        return;
+    }
+
+    let index = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+    let chunk_data = data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let decoded = match general_purpose::STANDARD.decode(chunk_data) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    if decoded.is_empty() {
+        return;
+    }
+
+    let mut completed: Option<FileTransfer> = None;
+    let mut failure_notice: Option<String> = None;
+    let mut should_remove = false;
+    let mut completed_transfer = false;
+
+    {
+        let mut state_lock = state.lock().await;
+        {
+            let Some(transfer) = state_lock.file_transfers.get_mut(&file_id) else {
+                return;
+            };
+
+            if index != transfer.next_index {
+                return;
+            }
+
+            if transfer.received.saturating_add(decoded.len() as u64)
+                > transfer.size.saturating_add(FILE_CHUNK_BYTES as u64)
+            {
+                should_remove = true;
+                failure_notice = Some(format!(
+                    "dropped transfer '{}' due to size overflow",
+                    transfer.filename
+                ));
+            } else {
+                match fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transfer.temp_path)
+                {
+                    Ok(mut temp_file) => {
+                        if let Err(e) = temp_file.write_all(&decoded) {
+                            should_remove = true;
+                            failure_notice = Some(format!(
+                                "failed to write transfer chunk for '{}': {}",
+                                transfer.filename, e
+                            ));
+                        } else {
+                            transfer.received =
+                                transfer.received.saturating_add(decoded.len() as u64);
+                            transfer.next_index = transfer.next_index.saturating_add(1);
+                            if transfer.received >= transfer.size {
+                                should_remove = true;
+                                completed_transfer = true;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        should_remove = true;
+                        failure_notice = Some(format!(
+                            "failed to append transfer chunk for '{}': {}",
+                            transfer.filename, e
+                        ));
+                    }
+                }
+            }
+        }
+
+        if should_remove {
+            let removed = state_lock.file_transfers.remove(&file_id);
+            if completed_transfer {
+                completed = removed;
+            }
+            if let Some(notice) = failure_notice {
+                state_lock.add_notice(notice);
+            }
+        }
+    }
+
+    if let Some(transfer) = completed {
+        if let Err(e) = fs::rename(&transfer.temp_path, &transfer.final_path) {
+            let mut state_lock = state.lock().await;
+            state_lock.add_notice(format!(
+                "failed to finalize transfer '{}': {}",
+                transfer.filename, e
+            ));
+            return;
+        }
+
+        let image_preview = if transfer.media_kind == MediaKind::Image {
+            fs::read(&transfer.final_path)
+                .ok()
+                .map(|bytes| img_to_ascii(&bytes, MEDIA_PREVIEW_WIDTH))
+        } else {
+            None
+        };
+
+        let mut state_lock = state.lock().await;
+        let mut base_text = format!(
+            "{} saved '{}' ({}): {}",
+            transfer.media_kind.label(),
+            transfer.filename,
+            format_byte_size(transfer.size),
+            transfer.final_path.display()
+        );
+
+        if let Some(mime) = transfer.mime.as_deref() {
+            base_text.push_str(&format!(" | {}", mime));
+        }
+
+        let (msg_type, text) = if let Some(preview) = image_preview {
+            (MessageType::Img, format!("{}\n{}", base_text, preview))
+        } else {
+            (MessageType::FileMeta, base_text)
+        };
+
+        state_lock.add_message(DisplayedMessage {
+            time: format_time(ts),
+            text,
+            msg_type,
+            user: Some(transfer.from),
+            channel: Some(transfer.channel),
+        });
+    }
+}
+
+async fn handle_err_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let message = data
+        .get("m")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown server error");
 
     let mut state_lock = state.lock().await;
     state_lock.add_message(DisplayedMessage {
         time: format_time(ts),
-        text: format!("{} sent an image:\n{}", u, ascii_art),
-        msg_type: MessageType::Img,
-        user: Some(u.to_string()),
-        channel: Some(ch.to_string()),
+        text: format!("server error: {}", message),
+        msg_type: MessageType::Err,
+        user: None,
+        channel: None,
     });
 }
 
@@ -2402,7 +3054,10 @@ async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
     match t {
         "msg" => handle_msg_event(state, data, ts).await,
         "img" => handle_img_event(state, data, ts).await,
+        "file_meta" => handle_file_meta_event(state, data, ts).await,
+        "file_chunk" => handle_file_chunk_event(state, data, ts).await,
         "sys" => handle_sys_event(state, data, ts).await,
+        "err" => handle_err_event(state, data, ts).await,
         "dm" => handle_dm_event(state, data, ts).await,
         "users" => handle_users_event(state, data, ts).await,
         "joined" => handle_joined_event(state, data, ts).await,
@@ -2814,6 +3469,24 @@ fn handle_slash_command(
             );
             enqueue_typing_state(&state.ws_tx, &TypingScope::Dm(target.to_string()), false);
             state.clear_unread_for_dm(target);
+        }
+        "/image" => {
+            if args.trim().is_empty() {
+                state.add_notice("Usage: /image <path>");
+                return CommandFlow::Continue;
+            }
+            if let Err(e) = queue_media_upload(state, args.trim(), MediaKind::Image) {
+                state.add_notice(format!("Image upload failed: {}", e));
+            }
+        }
+        "/video" => {
+            if args.trim().is_empty() {
+                state.add_notice("Usage: /video <path>");
+                return CommandFlow::Continue;
+            }
+            if let Err(e) = queue_media_upload(state, args.trim(), MediaKind::Video) {
+                state.add_notice(format!("Video upload failed: {}", e));
+            }
         }
         "/typing" => {
             let mut parts = args.split_whitespace();
@@ -3642,6 +4315,30 @@ mod tests {
             TypingScope::Dm(peer) => assert_eq!(peer, "bob"),
             TypingScope::Channel(_) => panic!("expected dm scope"),
         }
+    }
+
+    #[test]
+    fn media_kind_inference_detects_image_and_video() {
+        assert_eq!(infer_media_kind("preview.png", None), MediaKind::Image);
+        assert_eq!(infer_media_kind("clip.mp4", None), MediaKind::Video);
+        assert_eq!(infer_media_kind("payload.bin", None), MediaKind::File);
+        assert_eq!(
+            parse_media_kind_hint(Some("image"), "payload.bin", None),
+            MediaKind::Image
+        );
+    }
+
+    #[test]
+    fn media_helpers_sanitize_and_unquote_paths() {
+        assert_eq!(
+            trim_wrapped_quotes("\"C:/Users/me/test image.png\""),
+            "C:/Users/me/test image.png"
+        );
+        assert_eq!(trim_wrapped_quotes("'demo.mp4'"), "demo.mp4");
+        assert_eq!(
+            sanitize_filename(" ../My Clip (v1).mp4 "),
+            "..My_Clip_v1.mp4"
+        );
     }
 
     #[test]

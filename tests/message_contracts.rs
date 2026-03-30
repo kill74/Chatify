@@ -1336,6 +1336,69 @@ async fn file_contract_rejects_oversized_file_metadata() {
     );
 }
 
+/// Verifies that media transfer metadata and chunk frames are relayed with
+/// stable fields required by clients to reconstruct files.
+#[tokio::test]
+async fn file_contract_relays_media_metadata_and_chunks() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    let file_id = "media-contract-1";
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"file_meta",
+                "ch":"general",
+                "filename":"preview.png",
+                "size": 64_u64,
+                "file_id": file_id,
+                "media_kind": "image",
+                "mime": "image/png"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send media metadata");
+
+    let meta = recv_by_type(&mut bob, "file_meta").await;
+    assert_eq!(meta.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(meta.get("ch").and_then(|v| v.as_str()), Some("general"));
+    assert_eq!(meta.get("file_id").and_then(|v| v.as_str()), Some(file_id));
+    assert_eq!(
+        meta.get("filename").and_then(|v| v.as_str()),
+        Some("preview.png")
+    );
+    assert_eq!(meta.get("size").and_then(|v| v.as_u64()), Some(64_u64));
+    assert_eq!(
+        meta.get("media_kind").and_then(|v| v.as_str()),
+        Some("image")
+    );
+    assert_eq!(meta.get("mime").and_then(|v| v.as_str()), Some("image/png"));
+
+    let chunk_data = "aGVsbG8td29ybGQ=";
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"file_chunk",
+                "ch":"general",
+                "file_id": file_id,
+                "index": 0,
+                "data": chunk_data
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send media chunk");
+
+    let chunk = recv_by_type(&mut bob, "file_chunk").await;
+    assert_eq!(chunk.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(chunk.get("ch").and_then(|v| v.as_str()), Some("general"));
+    assert_eq!(chunk.get("file_id").and_then(|v| v.as_str()), Some(file_id));
+    assert_eq!(chunk.get("index").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(chunk.get("data").and_then(|v| v.as_str()), Some(chunk_data));
+}
+
 // ---------------------------------------------------------------------------
 // Voice contract tests
 // ---------------------------------------------------------------------------

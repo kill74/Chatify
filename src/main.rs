@@ -245,6 +245,15 @@ const AUTH_RATE_LIMIT_SECS: f64 = 0.5;
 /// Maximum file transfer size in bytes (100 MB).
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
+/// Maximum filename length accepted in `file_meta` announcements.
+const MAX_FILE_NAME_LEN: usize = 256;
+
+/// Maximum transfer identifier length accepted in `file_meta` announcements.
+const MAX_FILE_ID_LEN: usize = 128;
+
+/// Maximum MIME type length accepted in `file_meta` announcements.
+const MAX_MEDIA_MIME_LEN: usize = 128;
+
 /// Maximum allowed length for a status text field.
 const MAX_STATUS_TEXT_LEN: usize = 128;
 
@@ -1899,7 +1908,20 @@ async fn handle_event(
             // Announce a pending file transfer to the channel. The `file_id`
             // acts as a correlation key for subsequent `file_chunk` frames.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let filename = d["filename"].as_str().unwrap_or("unknown").to_string();
+            let filename = d["filename"]
+                .as_str()
+                .unwrap_or("unknown")
+                .trim()
+                .chars()
+                .take(MAX_FILE_NAME_LEN)
+                .collect::<String>();
+            if filename.is_empty() {
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({"t":"err","m":"filename is required"}),
+                );
+                return;
+            }
             let size = d["size"].as_u64().unwrap_or(0);
 
             // Reject files that exceed the maximum size.
@@ -1911,24 +1933,49 @@ async fn handle_event(
                 return;
             }
 
-            let file_id = d["file_id"]
+            let file_id_raw = d["file_id"].as_str().unwrap_or("").trim();
+            let file_id = if file_id_raw.is_empty() {
+                format!("{}_{}", username, now())
+            } else {
+                file_id_raw
+                    .chars()
+                    .take(MAX_FILE_ID_LEN)
+                    .collect::<String>()
+            };
+
+            let media_kind = match d["media_kind"]
                 .as_str()
-                .unwrap_or(&format!("{}_{}", username, now()))
-                .to_string();
-            let file_announce = serde_json::json!({
+                .unwrap_or("file")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "image" => "image",
+                "video" => "video",
+                _ => "file",
+            };
+            let mime = d
+                .get("mime")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.chars().take(MAX_MEDIA_MIME_LEN).collect::<String>());
+
+            let mut file_announce = serde_json::json!({
                 "t":"file_meta","from":username,"filename":filename,
-                "size":size,"file_id":file_id,"ch":ch,"ts":now()
+                "size":size,"file_id":file_id,"ch":ch,
+                "media_kind":media_kind,"ts":now()
             });
+            if let Some(mime_value) = mime {
+                file_announce["mime"] = Value::String(mime_value);
+            }
             state.store.persist(
                 "file_meta",
                 &ch,
                 username,
                 None,
                 &file_announce,
-                file_announce
-                    .get("filename")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
+                &format!("{} {}", media_kind, filename),
             );
             let _ = state.chan(&ch).tx.send(file_announce.to_string());
         }
@@ -1936,8 +1983,11 @@ async fn handle_event(
             // Relay a single chunk of a file transfer to the channel.
             // Chunks are not persisted — they are ephemeral relay frames.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let file_id = d["file_id"].as_str().unwrap_or("").to_string();
+            let file_id = d["file_id"].as_str().unwrap_or("").trim().to_string();
             let chunk_data = d["data"].as_str().unwrap_or("").to_string();
+            if file_id.is_empty() || chunk_data.is_empty() {
+                return;
+            }
             let index = d["index"].as_u64().unwrap_or(0);
             let chunk_msg = serde_json::json!({
                 "t":"file_chunk","from":username,"file_id":file_id,
