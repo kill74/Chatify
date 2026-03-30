@@ -67,6 +67,7 @@ const CLIENT_ID_HEX_LEN: usize = 12;
 const CLIENT_ID_GROUP_SIZE: usize = 4;
 const DEFAULT_GUEST_PREFIX: &str = "guest";
 const DEFAULT_GUEST_SUFFIX_BYTES: usize = 3;
+const COMPACT_MODE_HINT: &str = "compact mode: expand terminal for side panels";
 
 #[derive(Clone, Copy)]
 struct CommandSpec {
@@ -1300,25 +1301,82 @@ fn format_feed_entry(msg: &DisplayedMessage) -> String {
     }
 }
 
-fn collect_recent_feed_lines(state: &ClientState, width: usize, max_lines: usize) -> Vec<String> {
+fn feed_empty_state_lines() -> Vec<String> {
+    vec![
+        "No messages yet in this room.".to_string(),
+        "Start with a hello or switch rooms using /join <channel>.".to_string(),
+        "Tip: use /commands to discover power actions quickly.".to_string(),
+    ]
+}
+
+fn prefixed_wrapped_lines(prefix: &str, text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let prefix_width = prefix.chars().count();
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    wrap_words(text, content_width, max_lines)
+        .into_iter()
+        .map(|line| format!("{}{}", prefix, line))
+        .collect()
+}
+
+fn render_grouped_feed_lines<'a, I>(messages: I, width: usize, max_lines: usize) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a DisplayedMessage>,
+{
     if width == 0 || max_lines == 0 {
         return Vec::new();
     }
 
     let mut lines = Vec::new();
+    let mut current_group: Option<(String, String)> = None;
+
+    for msg in messages {
+        match msg.msg_type {
+            MessageType::Msg => {
+                let user = msg.user.as_deref().unwrap_or("?");
+                let channel = msg.channel.as_deref().unwrap_or("general");
+                let key = (user.to_string(), channel.to_string());
+                let group_started = current_group.as_ref() != Some(&key);
+
+                if group_started {
+                    lines.push(format!("[{}] {}  #{}", msg.time, user, channel));
+                }
+
+                let prefix = if group_started { "  > " } else { "    " };
+                lines.extend(prefixed_wrapped_lines(prefix, &msg.text, width, max_lines));
+                current_group = Some(key);
+            }
+            _ => {
+                lines.extend(wrap_words(&format_feed_entry(msg), width, max_lines));
+                current_group = None;
+            }
+        }
+    }
+
+    if lines.len() > max_lines {
+        lines.split_off(lines.len() - max_lines)
+    } else {
+        lines
+    }
+}
+
+fn collect_recent_feed_lines(state: &ClientState, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
     let start = state
         .message_history
         .len()
         .saturating_sub(FEED_LOOKBACK_MESSAGES);
-    for msg in state.message_history.iter().skip(start) {
-        let wrapped = wrap_words(&format_feed_entry(msg), width, max_lines);
-        for line in wrapped {
-            lines.push(line);
-        }
-    }
+    let mut lines =
+        render_grouped_feed_lines(state.message_history.iter().skip(start), width, max_lines);
 
     if lines.is_empty() {
-        lines.push("No messages yet. Join a channel and start chatting.".to_string());
+        lines = feed_empty_state_lines();
     }
 
     if lines.len() > max_lines {
@@ -1370,7 +1428,10 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     let mut online_users: Vec<String> = state.users.keys().cloned().collect();
     online_users.sort_unstable();
     let online_lines = if online_users.is_empty() {
-        vec!["(waiting for users feed)".to_string()]
+        vec![
+            "No peers online yet.".to_string(),
+            "Use /users to refresh live roster.".to_string(),
+        ]
     } else {
         online_users
             .into_iter()
@@ -1381,7 +1442,10 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     let mut channels: Vec<String> = state.chs.keys().cloned().collect();
     channels.sort_unstable();
     let channel_lines = if channels.is_empty() {
-        vec!["(none)".to_string()]
+        vec![
+            "No channels tracked yet.".to_string(),
+            "Join one: /join general".to_string(),
+        ]
     } else {
         channels
             .into_iter()
@@ -1404,7 +1468,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     ));
     if out.len() < height {
         out.extend(build_panel(
-            "MESSAGES",
+            "QUICK ACTIONS",
             &command_lines,
             width,
             commands_h.min(height.saturating_sub(out.len())),
@@ -1412,7 +1476,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     }
     if out.len() < height {
         out.extend(build_panel(
-            "NOW ONLINE",
+            "LIVE ROSTER",
             &online_lines,
             width,
             online_h.min(height.saturating_sub(out.len())),
@@ -1420,7 +1484,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     }
     if out.len() < height {
         out.extend(build_panel(
-            "YOUR CHANNELS",
+            "CHANNEL DOCK",
             &channel_lines,
             width,
             channels_h
@@ -1442,33 +1506,26 @@ fn render_compact_dashboard(
     width: usize,
     height: usize,
 ) -> io::Result<()> {
+    let (header_line, status_line) = dashboard_header_lines(state);
     writeln!(
         out,
         "{}{}{}",
         ANSI_HEADER,
-        fit_to_width("// CHATIFY //", width),
+        fit_to_width(&header_line, width),
         ANSI_RESET
     )?;
     writeln!(
         out,
         "{}{}{}",
         ANSI_DIM,
-        fit_to_width(
-            "Terminal is small. Expand window for full dashboard mode.",
-            width
-        ),
+        fit_to_width(&format!("{} | {}", status_line, COMPACT_MODE_HINT), width,),
         ANSI_RESET
     )?;
 
     let max_feed_lines = height.saturating_sub(DASHBOARD_HEADER_ROWS + DASHBOARD_FOOTER_ROWS);
-    for msg in state
-        .message_history
-        .iter()
-        .rev()
-        .take(max_feed_lines)
-        .rev()
-    {
-        writeln!(out, "{}", fit_to_width(&format_feed_entry(msg), width))?;
+    let feed_lines = collect_recent_feed_lines(state, width, max_feed_lines);
+    for line in feed_lines {
+        writeln!(out, "{}", fit_to_width(&line, width))?;
     }
 
     writeln!(
@@ -1485,19 +1542,7 @@ fn render_full_dashboard(
     state: &ClientState,
     geom: DashboardGeometry,
 ) -> io::Result<()> {
-    let header = format!(
-        "[ {} online ] [ {} channels ] [ {} events ]   // CHATIFY RETRO FEED //",
-        state.users.len(),
-        state.chs.len(),
-        state.message_history.len()
-    );
-    let subtitle = format!(
-        "#{}   mode:{}   voice:{}   client:{}",
-        state.ch,
-        state.theme,
-        if state.voice_active { "on" } else { "off" },
-        state.client_id
-    );
+    let (header, subtitle) = dashboard_header_lines(state);
 
     writeln!(
         out,
@@ -1559,6 +1604,38 @@ fn render_terminal_dashboard(state: &ClientState) -> io::Result<()> {
     }
 
     out.flush()
+}
+
+fn status_chip(label: &str, value: impl std::fmt::Display) -> String {
+    format!("[{}:{}]", label, value)
+}
+
+fn dashboard_header_lines(state: &ClientState) -> (String, String) {
+    let mut known_users: Vec<String> = state.users.keys().cloned().collect();
+    known_users.sort_unstable();
+    let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
+
+    let header = format!(
+        "// CHATIFY // {} {} {} {}",
+        status_chip("ONLINE", state.users.len()),
+        status_chip("CHANNELS", state.chs.len()),
+        status_chip("EVENTS", state.message_history.len()),
+        status_chip("THEME", &state.theme),
+    );
+
+    let subtitle = format!(
+        "{} {} {} {} {}",
+        status_chip("ROOM", format!("#{}", state.ch)),
+        status_chip("VOICE", if state.voice_active { "ON" } else { "OFF" }),
+        status_chip("TRUST", format!("T{}/U{}/C{}", trusted, unknown, changed)),
+        status_chip(
+            "STATUS",
+            format!("{} {}", state.status.emoji, state.status.text)
+        ),
+        status_chip("CLIENT", &state.client_id),
+    );
+
+    (header, subtitle)
 }
 
 fn fresh_nonce_hex() -> String {
@@ -3053,5 +3130,84 @@ mod tests {
         assert!(first.starts_with("CID-"));
         assert_eq!(first.matches('-').count(), 3);
         assert_eq!(first.len(), 18);
+    }
+
+    #[test]
+    fn grouped_feed_collapses_consecutive_channel_messages() {
+        let messages = vec![
+            DisplayedMessage {
+                time: "10:00".to_string(),
+                text: "first line".to_string(),
+                msg_type: MessageType::Msg,
+                user: Some("alice".to_string()),
+                channel: Some("general".to_string()),
+            },
+            DisplayedMessage {
+                time: "10:01".to_string(),
+                text: "second line".to_string(),
+                msg_type: MessageType::Msg,
+                user: Some("alice".to_string()),
+                channel: Some("general".to_string()),
+            },
+            DisplayedMessage {
+                time: "10:02".to_string(),
+                text: "system note".to_string(),
+                msg_type: MessageType::Sys,
+                user: None,
+                channel: None,
+            },
+        ];
+
+        let rendered = render_grouped_feed_lines(messages.iter(), 80, 20);
+        let header_count = rendered
+            .iter()
+            .filter(|line| line.contains("alice  #general"))
+            .count();
+        assert_eq!(header_count, 1);
+        assert!(rendered
+            .iter()
+            .any(|line| line.starts_with("  > ") && line.contains("first line")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.starts_with("    ") && line.contains("second line")));
+    }
+
+    #[test]
+    fn dashboard_header_lines_include_key_chips() {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let state = ClientState {
+            ws_tx: tx,
+            me: "alice".to_string(),
+            client_id: "CID-ABCD-1234-EF90".to_string(),
+            pw: "hash".to_string(),
+            ch: "general".to_string(),
+            chs: HashMap::from([("general".to_string(), true)]),
+            users: HashMap::from([("alice".to_string(), "pk".to_string())]),
+            trust_store: TrustStore {
+                path: PathBuf::from("test-trust.json"),
+                peers: HashMap::new(),
+            },
+            chan_keys: HashMap::new(),
+            dm_keys: HashMap::new(),
+            priv_key: vec![],
+            running: true,
+            voice_active: false,
+            voice_session: None,
+            theme: "retro-grid".to_string(),
+            file_transfers: HashMap::new(),
+            message_history: VecDeque::new(),
+            status: Status {
+                text: "Online".to_string(),
+                emoji: '🟢',
+            },
+            reactions: HashMap::new(),
+            log_enabled: false,
+        };
+
+        let (header, subtitle) = dashboard_header_lines(&state);
+        assert!(header.contains("[ONLINE:1]"));
+        assert!(header.contains("[CHANNELS:1]"));
+        assert!(subtitle.contains("[ROOM:#general]"));
+        assert!(subtitle.contains("[CLIENT:CID-ABCD-1234-EF90]"));
     }
 }
