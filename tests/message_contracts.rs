@@ -967,6 +967,89 @@ async fn status_contract_broadcasts_status_update_to_other_clients() {
     );
 }
 
+/// Verifies that channel-scoped typing state is broadcast to channel members.
+#[tokio::test]
+async fn typing_contract_broadcasts_channel_scope_updates() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"join","ch":"typing-room"}).to_string(),
+        ))
+        .await
+        .expect("alice joins typing-room");
+    let _ = recv_by_type(&mut alice, "joined").await;
+
+    bob.send(Message::Text(
+        json!({"t":"join","ch":"typing-room"}).to_string(),
+    ))
+    .await
+    .expect("bob joins typing-room");
+    let _ = recv_by_type(&mut bob, "joined").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"typing","ch":"typing-room","typing":true}).to_string(),
+        ))
+        .await
+        .expect("alice sends typing on");
+
+    let typing_on = recv_by_type(&mut bob, "typing").await;
+    assert_eq!(
+        typing_on.get("ch").and_then(|v| v.as_str()),
+        Some("typing-room")
+    );
+    assert_eq!(typing_on.get("u").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(
+        typing_on.get("typing").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    alice
+        .send(Message::Text(
+            json!({"t":"typing","ch":"typing-room","typing":false}).to_string(),
+        ))
+        .await
+        .expect("alice sends typing off");
+
+    let typing_off = recv_by_type(&mut bob, "typing").await;
+    assert_eq!(
+        typing_off.get("typing").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+}
+
+/// Verifies that DM-scoped typing state is routed to the intended DM peer.
+#[tokio::test]
+async fn typing_contract_routes_dm_scope_updates() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    // Subscribe Bob to his DM route so DM typing relay can be observed.
+    bob.send(Message::Text(
+        json!({"t":"join","ch":"__dm__bob"}).to_string(),
+    ))
+    .await
+    .expect("bob joins dm route");
+    let _ = recv_by_type(&mut bob, "joined").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"typing","to":"bob","typing":true}).to_string(),
+        ))
+        .await
+        .expect("alice sends dm typing on");
+
+    let typing = recv_by_type(&mut bob, "typing").await;
+    assert_eq!(typing.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(typing.get("to").and_then(|v| v.as_str()), Some("bob"));
+    assert_eq!(typing.get("scope").and_then(|v| v.as_str()), Some("dm:bob"));
+    assert_eq!(typing.get("typing").and_then(|v| v.as_bool()), Some(true));
+}
+
 // ---------------------------------------------------------------------------
 // Messaging contract tests
 // ---------------------------------------------------------------------------

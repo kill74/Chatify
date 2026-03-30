@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
-const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /quit";
+const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
 const DASHBOARD_HEADER_ROWS: usize = 2;
@@ -50,7 +50,7 @@ const SIDEBAR_MIN_WIDTH: usize = 28;
 const SIDEBAR_MAX_WIDTH: usize = 46;
 const MAIN_MIN_WIDTH: usize = 24;
 const FEED_LOOKBACK_MESSAGES: usize = 48;
-const PROFILE_PANEL_ROWS: usize = 7;
+const PROFILE_PANEL_ROWS: usize = 8;
 const COMMANDS_PANEL_ROWS: usize = 6;
 const MIN_CHANNEL_PANEL_ROWS: usize = 3;
 const ANSI_RESET: &str = "\x1b[0m";
@@ -70,6 +70,7 @@ const DEFAULT_GUEST_SUFFIX_BYTES: usize = 3;
 const COMPACT_MODE_HINT: &str = "compact mode: expand terminal for side panels";
 const DM_UNREAD_SCOPE_PREFIX: &str = "dm:";
 const ACTIVITY_PULSE_WINDOW_SECS: u64 = 12;
+const TYPING_TTL_SECS: u64 = 6;
 
 #[derive(Clone, Copy)]
 struct CommandSpec {
@@ -109,6 +110,12 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         usage: "/dm <user> <message>",
         summary: "Send direct encrypted message.",
         example: "/dm alice hello",
+    },
+    CommandSpec {
+        name: "/typing",
+        usage: "/typing [on|off] [#channel|dm:user]",
+        summary: "Broadcast typing state for a channel or DM scope.",
+        example: "/typing on #general",
     },
     CommandSpec {
         name: "/me",
@@ -204,6 +211,7 @@ fn canonical_command(raw: &str) -> String {
     match token.as_str() {
         "/q" | "/exit" => "/quit".to_string(),
         "/w" => "/dm".to_string(),
+        "/ty" => "/typing".to_string(),
         "/h" => "/history".to_string(),
         "/cmd" | "/palette" => "/commands".to_string(),
         "/c" => "/channels".to_string(),
@@ -341,9 +349,10 @@ fn footer_hint_line(state: &ClientState, width: usize) -> String {
             changed
         )
     } else if state.voice_active {
-        "-> Voice ON | /voice to stop | /commands for full palette | /quit".to_string()
+        "-> Voice ON | /voice to stop | /typing on #room | /quit".to_string()
     } else {
-        "-> /commands | /help <command> | /switch #channel | /dm user msg | /quit".to_string()
+        "-> /commands | /help <command> | /switch #channel | /typing on #channel | /quit"
+            .to_string()
     };
     fit_to_width(&raw, width)
 }
@@ -673,6 +682,7 @@ enum MessageType {
     Dm,
     Sys,
     UnreadMarker,
+    Typing,
     Users,
     Joined,
     Info,
@@ -723,6 +733,13 @@ struct Status {
     text: String,
     /// Status emoji (e.g., '🟢')
     emoji: char,
+}
+
+#[derive(Debug, Clone)]
+struct TypingPresence {
+    user: String,
+    scope: String,
+    expires_at: u64,
 }
 
 /// Voice frame transferred over WebSocket.
@@ -803,6 +820,8 @@ struct ClientState {
     unread_separator_scopes: HashSet<String>,
     /// Recent live activity hint `(label, timestamp_secs)`
     activity_hint: Option<(String, u64)>,
+    /// Active typing indicators for peers
+    typing_presence: HashMap<String, TypingPresence>,
     /// Enable debug logging
     log_enabled: bool,
 }
@@ -1000,6 +1019,78 @@ impl ClientState {
         "idle".to_string()
     }
 
+    fn prune_typing_presence(&mut self) {
+        let now = now_secs();
+        self.typing_presence
+            .retain(|_, entry| entry.expires_at > now);
+    }
+
+    fn set_typing_presence(&mut self, user: &str, scope: &str, typing: bool) {
+        if user.trim().is_empty() || scope.trim().is_empty() {
+            return;
+        }
+
+        self.prune_typing_presence();
+        let key = format!("{}|{}", scope.to_lowercase(), user.to_lowercase());
+
+        if typing {
+            self.typing_presence.insert(
+                key,
+                TypingPresence {
+                    user: user.to_string(),
+                    scope: scope.to_string(),
+                    expires_at: now_secs().saturating_add(TYPING_TTL_SECS),
+                },
+            );
+        } else {
+            self.typing_presence.remove(&key);
+        }
+    }
+
+    fn typing_count(&self) -> usize {
+        let now = now_secs();
+        self.typing_presence
+            .values()
+            .filter(|entry| entry.expires_at > now)
+            .count()
+    }
+
+    fn active_typing_users(&self) -> HashSet<String> {
+        let now = now_secs();
+        self.typing_presence
+            .values()
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.user.clone())
+            .collect()
+    }
+
+    fn typing_summary(&self, max_entries: usize) -> String {
+        if max_entries == 0 {
+            return "none".to_string();
+        }
+
+        let now = now_secs();
+        let mut labels: Vec<String> = self
+            .typing_presence
+            .values()
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| format!("{}@{}", entry.user, entry.scope))
+            .collect();
+        labels.sort();
+
+        if labels.is_empty() {
+            return "none".to_string();
+        }
+
+        if labels.len() <= max_entries {
+            return labels.join(", ");
+        }
+
+        let extra = labels.len().saturating_sub(max_entries);
+        let visible = labels.into_iter().take(max_entries).collect::<Vec<_>>();
+        format!("{} +{}", visible.join(", "), extra)
+    }
+
     /// Add a message to the history, keeping only the last 100 messages
     #[allow(dead_code)]
     fn push_message(&mut self, msg: DisplayedMessage) {
@@ -1102,6 +1193,54 @@ fn normalize_event_scope(raw: &str, current_channel: &str) -> Option<String> {
     }
 
     normalize_channel(candidate)
+}
+
+#[derive(Debug, Clone)]
+enum TypingScope {
+    Channel(String),
+    Dm(String),
+}
+
+impl TypingScope {
+    fn label(&self) -> String {
+        match self {
+            TypingScope::Channel(ch) => format!("#{}", ch),
+            TypingScope::Dm(peer) => format!("dm:{}", peer),
+        }
+    }
+}
+
+fn parse_typing_scope(raw: &str, current_channel: &str) -> Option<TypingScope> {
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return Some(TypingScope::Channel(current_channel.to_string()));
+    }
+
+    if let Some(peer_raw) = candidate.strip_prefix("dm:") {
+        let peer = peer_raw.trim().to_lowercase();
+        if is_valid_username_token(&peer) {
+            return Some(TypingScope::Dm(peer));
+        }
+        return None;
+    }
+
+    normalize_channel(candidate).map(TypingScope::Channel)
+}
+
+fn enqueue_typing_state(ws_tx: &mpsc::UnboundedSender<String>, scope: &TypingScope, typing: bool) {
+    let payload = match scope {
+        TypingScope::Channel(ch) => serde_json::json!({
+            "t": "typing",
+            "ch": ch,
+            "typing": typing
+        }),
+        TypingScope::Dm(peer) => serde_json::json!({
+            "t": "typing",
+            "to": peer,
+            "typing": typing
+        }),
+    };
+    enqueue_timed(ws_tx, payload);
 }
 
 fn dm_unread_scope(peer: &str) -> String {
@@ -1489,6 +1628,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
     let unread_total = state.unread_total();
     let unread_dm = state.unread_dm_total();
+    let typing_summary = state.typing_summary(2);
 
     let profile_lines = vec![
         format!("{} {} [{}]", state.me, state.status.emoji, state.client_id),
@@ -1499,6 +1639,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
             "trust T:{} U:{} C:{} | unread:{} (dm:{})",
             trusted, unknown, changed, unread_total, unread_dm
         ),
+        format!("typing: {}", typing_summary),
     ];
 
     let mut command_lines = vec![
@@ -1506,6 +1647,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
         "/help [command]".to_string(),
         "/join <channel> /switch".to_string(),
         "/dm <user> <msg>".to_string(),
+        "/typing on|off [scope]".to_string(),
         "/users /channels".to_string(),
         "/history /search /replay".to_string(),
         "/fingerprint /trust /quit".to_string(),
@@ -1519,6 +1661,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
 
     let mut online_users: Vec<String> = state.users.keys().cloned().collect();
     online_users.sort_unstable();
+    let typing_users = state.active_typing_users();
     let online_lines = if online_users.is_empty() {
         vec![
             "No peers online yet.".to_string(),
@@ -1527,7 +1670,13 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     } else {
         online_users
             .into_iter()
-            .map(|u| format!("• {}", u))
+            .map(|u| {
+                if typing_users.contains(&u) {
+                    format!("• {} (typing)", u)
+                } else {
+                    format!("• {}", u)
+                }
+            })
             .collect()
     };
 
@@ -1714,11 +1863,12 @@ fn dashboard_header_lines(state: &ClientState) -> (String, String) {
     let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
 
     let header = format!(
-        "// CHATIFY // {} {} {} {} {}",
+        "// CHATIFY // {} {} {} {} {} {}",
         status_chip("ONLINE", state.users.len()),
         status_chip("CHANNELS", state.chs.len()),
         status_chip("EVENTS", state.message_history.len()),
         status_chip("UNREAD", state.unread_total()),
+        status_chip("TYPING", state.typing_count()),
         status_chip("THEME", &state.theme),
     );
 
@@ -2204,6 +2354,29 @@ async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
     });
 }
 
+async fn handle_typing_event(state: &SharedState, data: &JsonMap) {
+    let typing = data.get("typing").and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut state_lock = state.lock().await;
+
+    if let Some(user) = data.get("u").and_then(|v| v.as_str()) {
+        if user != state_lock.me {
+            let ch =
+                normalize_channel(data.get("ch").and_then(|v| v.as_str()).unwrap_or("general"))
+                    .unwrap_or_else(|| "general".to_string());
+            state_lock.set_typing_presence(user, &format!("#{}", ch), typing);
+            state_lock.refresh_dashboard();
+        }
+        return;
+    }
+
+    if let Some(from) = data.get("from").and_then(|v| v.as_str()) {
+        if from != state_lock.me {
+            state_lock.set_typing_presence(from, &format!("dm:{}", from.to_lowercase()), typing);
+            state_lock.refresh_dashboard();
+        }
+    }
+}
+
 async fn handle_vdata_event(state: &SharedState, data: &JsonMap) {
     let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
     let payload = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
@@ -2235,6 +2408,7 @@ async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
         "joined" => handle_joined_event(state, data, ts).await,
         "history" | "search" | "replay" => handle_history_or_search_event(state, data, t, ts).await,
         "info" => handle_info_event(state, data, ts).await,
+        "typing" => handle_typing_event(state, data).await,
         "vdata" => handle_vdata_event(state, data).await,
         _ => {}
     }
@@ -2545,6 +2719,11 @@ fn stop_voice_session(state: &mut ClientState, feedback: SessionStopFeedback) {
 }
 
 fn queue_channel_message(state: &mut ClientState, channel: &str, plaintext: &str) {
+    enqueue_typing_state(
+        &state.ws_tx,
+        &TypingScope::Channel(channel.to_string()),
+        false,
+    );
     let encrypted = match enc_bytes(&state.ckey(channel), plaintext.as_bytes()) {
         Ok(v) => v,
         Err(e) => {
@@ -2577,6 +2756,14 @@ fn handle_slash_command(
     match effective_cmd.as_str() {
         "/join" | "/switch" => {
             if let Some(ch) = normalize_channel(args.trim()) {
+                let previous_channel = state.ch.clone();
+                if previous_channel != ch {
+                    enqueue_typing_state(
+                        &state.ws_tx,
+                        &TypingScope::Channel(previous_channel),
+                        false,
+                    );
+                }
                 state.ch = ch.clone();
                 state.chs.insert(ch.clone(), true);
                 state.clear_unread_for_channel(&ch);
@@ -2625,7 +2812,38 @@ fn handle_slash_command(
                 &state.ws_tx,
                 serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
             );
+            enqueue_typing_state(&state.ws_tx, &TypingScope::Dm(target.to_string()), false);
             state.clear_unread_for_dm(target);
+        }
+        "/typing" => {
+            let mut parts = args.split_whitespace();
+            let mode = parts.next().unwrap_or("on").to_lowercase();
+            let scope_raw = parts.next().unwrap_or("");
+            if parts.next().is_some() {
+                state.add_notice("Usage: /typing [on|off] [#channel|dm:user]");
+                return CommandFlow::Continue;
+            }
+
+            let typing_enabled = match mode.as_str() {
+                "on" | "start" => true,
+                "off" | "stop" => false,
+                _ => {
+                    state.add_notice("Usage: /typing [on|off] [#channel|dm:user]");
+                    return CommandFlow::Continue;
+                }
+            };
+
+            let Some(scope) = parse_typing_scope(scope_raw, &state.ch) else {
+                state.add_notice("Usage: /typing [on|off] [#channel|dm:user]");
+                return CommandFlow::Continue;
+            };
+
+            enqueue_typing_state(&state.ws_tx, &scope, typing_enabled);
+            state.add_notice(format!(
+                "Typing {} for {}.",
+                if typing_enabled { "ON" } else { "OFF" },
+                scope.label()
+            ));
         }
         "/fingerprint" => {
             let target = args.trim();
@@ -2738,6 +2956,7 @@ fn handle_slash_command(
             state.unread_counts.clear();
             state.unread_separator_scopes.clear();
             state.activity_hint = None;
+            state.typing_presence.clear();
             state.refresh_dashboard();
         }
         "/commands" => {
@@ -2827,6 +3046,7 @@ fn handle_slash_command(
             );
         }
         "/quit" => {
+            enqueue_typing_state(&state.ws_tx, &TypingScope::Channel(state.ch.clone()), false);
             stop_voice_session(state, SessionStopFeedback::Silent);
             state.running = false;
             let _ = shutdown_tx.send(true);
@@ -2999,6 +3219,7 @@ async fn main() -> ChatifyResult<()> {
             unread_counts: HashMap::new(),
             unread_separator_scopes: HashSet::new(),
             activity_hint: None,
+            typing_presence: HashMap::new(),
             log_enabled,
         }));
         {
@@ -3327,6 +3548,7 @@ mod tests {
             unread_counts: HashMap::new(),
             unread_separator_scopes: HashSet::new(),
             activity_hint: None,
+            typing_presence: HashMap::new(),
             log_enabled: false,
         };
 
@@ -3334,6 +3556,7 @@ mod tests {
         assert!(header.contains("[ONLINE:1]"));
         assert!(header.contains("[CHANNELS:1]"));
         assert!(header.contains("[UNREAD:0]"));
+        assert!(header.contains("[TYPING:0]"));
         assert!(subtitle.contains("[ROOM:#general]"));
         assert!(subtitle.contains("[LIVE:idle]"));
         assert!(subtitle.contains("[CLIENT:CID-ABCD-1234-EF90]"));
@@ -3371,6 +3594,7 @@ mod tests {
             unread_counts: HashMap::new(),
             unread_separator_scopes: HashSet::new(),
             activity_hint: None,
+            typing_presence: HashMap::new(),
             log_enabled: false,
         };
 
@@ -3403,5 +3627,65 @@ mod tests {
         state.clear_unread_for_dm("bob");
         assert_eq!(state.unread_total(), 0);
         assert!(state.unread_separator_scopes.is_empty());
+    }
+
+    #[test]
+    fn parse_typing_scope_supports_channel_and_dm() {
+        let ch_scope = parse_typing_scope("#Ops", "general").expect("channel typing scope");
+        match ch_scope {
+            TypingScope::Channel(ch) => assert_eq!(ch, "ops"),
+            TypingScope::Dm(_) => panic!("expected channel scope"),
+        }
+
+        let dm_scope = parse_typing_scope("dm:Bob", "general").expect("dm typing scope");
+        match dm_scope {
+            TypingScope::Dm(peer) => assert_eq!(peer, "bob"),
+            TypingScope::Channel(_) => panic!("expected dm scope"),
+        }
+    }
+
+    #[test]
+    fn typing_presence_summary_tracks_active_entries() {
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let mut state = ClientState {
+            ws_tx: tx,
+            me: "alice".to_string(),
+            client_id: "CID-ABCD-1234-EF90".to_string(),
+            pw: "hash".to_string(),
+            ch: "general".to_string(),
+            chs: HashMap::from([("general".to_string(), true)]),
+            users: HashMap::new(),
+            trust_store: TrustStore {
+                path: PathBuf::from("test-trust.json"),
+                peers: HashMap::new(),
+            },
+            chan_keys: HashMap::new(),
+            dm_keys: HashMap::new(),
+            priv_key: vec![],
+            running: true,
+            voice_active: false,
+            voice_session: None,
+            theme: "retro-grid".to_string(),
+            file_transfers: HashMap::new(),
+            message_history: VecDeque::new(),
+            status: Status {
+                text: "Online".to_string(),
+                emoji: '🟢',
+            },
+            reactions: HashMap::new(),
+            unread_counts: HashMap::new(),
+            unread_separator_scopes: HashSet::new(),
+            activity_hint: None,
+            typing_presence: HashMap::new(),
+            log_enabled: false,
+        };
+
+        state.set_typing_presence("bob", "#ops", true);
+        assert_eq!(state.typing_count(), 1);
+        assert!(state.typing_summary(2).contains("bob@#ops"));
+
+        state.set_typing_presence("bob", "#ops", false);
+        assert_eq!(state.typing_count(), 0);
+        assert_eq!(state.typing_summary(2), "none");
     }
 }

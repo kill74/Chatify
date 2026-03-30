@@ -156,7 +156,8 @@ Secret hygiene:
 | `/join <channel>`             | Join or create a channel                                |
 | `/switch <channel>`           | Alias for `/join` to switch active channel              |
 | `/dm <user> <message>`        | Send direct message                                     |
-| `/me <action>`                | Send action-style message                               |
+| `/typing [on\|off] [scope]`   | Broadcast typing state to `#channel` or `dm:user`       |
+| `/me [action]`                | Show profile or send action-style message               |
 | `/users`                      | List online users                                       |
 | `/channels`                   | List channels                                           |
 | `/voice [room]`               | Toggle voice in room                                    |

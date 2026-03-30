@@ -1446,6 +1446,7 @@ fn spawn_broadcast_forwarder(
 /// | `edit`        | Edit a previously sent message (in-memory only)     |
 /// | `file_meta`   | Announce a file transfer to a channel               |
 /// | `file_chunk`  | Stream a chunk of a file transfer                   |
+/// | `typing`      | Broadcast typing state for channel or DM scope      |
 /// | `status`      | Update the caller's presence status                 |
 /// | `reaction`    | Add an emoji reaction to a message                  |
 /// | `2fa_setup`   | Begin the TOTP enrollment flow                      |
@@ -1944,6 +1945,59 @@ async fn handle_event(
             })
             .to_string();
             let _ = state.chan(&ch).tx.send(chunk_msg);
+        }
+        "typing" => {
+            // Broadcast ephemeral typing state updates.
+            //
+            // Channel scope payload:
+            //   {"t":"typing","ch":"general","typing":true}
+            // DM scope payload:
+            //   {"t":"typing","to":"bob","typing":true}
+            //
+            // Typing events are intentionally not persisted.
+            let typing = d.get("typing").and_then(|v| v.as_bool()).unwrap_or(true);
+
+            if let Some(target) = d.get("to").and_then(|v| v.as_str()) {
+                let target = target.trim().to_lowercase();
+                if target.is_empty() || !is_valid_username(&target) {
+                    send_out_json(
+                        out_tx,
+                        serde_json::json!({"t":"err","m":"typing to requires valid username"}),
+                    );
+                    return;
+                }
+
+                let target_scope = format!("dm:{}", target);
+                let target_channel = target.clone();
+
+                let event = serde_json::json!({
+                    "t": "typing",
+                    "from": username,
+                    "to": target,
+                    "typing": typing,
+                    "scope": target_scope,
+                    "ts": now()
+                })
+                .to_string();
+
+                let _ = state
+                    .chan(&format!("__dm__{}", target_channel))
+                    .tx
+                    .send(event.clone());
+                let _ = state.chan(&format!("__dm__{}", username)).tx.send(event);
+            } else {
+                let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+                let event = serde_json::json!({
+                    "t": "typing",
+                    "ch": ch,
+                    "u": username,
+                    "typing": typing,
+                    "ts": now()
+                })
+                .to_string();
+
+                let _ = state.chan(&ch).tx.send(event);
+            }
         }
         "status" => {
             // Broadcast a presence update to all channels so every connected
