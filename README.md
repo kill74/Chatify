@@ -6,19 +6,23 @@
 [![Release](https://img.shields.io/github/v/release/kill74/Chatify)](https://github.com/kill74/Chatify/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Terminal-first, self-hosted chat built with Rust.
+Terminal-first, self-hosted chat built with Rust, with a real-time dashboard UX in the CLI.
 
 Chatify ships three binaries:
 
 - `clicord-server`: WebSocket chat server with SQLite persistence.
-- `clicord-client`: terminal client for channels, DM, history, search, and rewind.
+- `clicord-client`: terminal dashboard client for channels, DM, typing, trust verification, media transfer, history, search, and rewind.
 - `discord_bot` (optional feature): Discord <-> Chatify bridge.
 
 ## Highlights
 
 - Multi-channel chat + direct messages
+- Live typing indicators and unread activity tracking
+- In-terminal dashboard UI with grouped feed and operational side panels
+- Image/video transfer in channels with in-app rendering metadata and image ASCII preview
 - SQLite persistence (`history`, `search`, `rewind`)
 - Append-only event store with versioned schema migrations
+- Explicit peer trust workflow (`/fingerprint`, `/trust`) with key-change detection
 - Credential hardening (PBKDF2), rate limiting, 2FA (TOTP + backup codes)
 - Replay protection (nonce + timestamp validation)
 - Optional Discord bridge with mapped bidirectional relay, loop prevention, and health telemetry
@@ -176,11 +180,50 @@ Secret hygiene:
 Media transfer behavior:
 
 - Images and videos are sent through `file_meta` + `file_chunk` protocol events.
+- Transfer size is capped at 100 MB per file.
+- Media is uploaded in chunked frames to keep protocol behavior stable under load.
 - Received media is stored locally in:
   - Windows: `%APPDATA%/Chatify/media`
   - Linux/macOS: `$HOME/.chatify/media`
 - Image transfers render an ASCII preview directly in the terminal feed.
 - Video transfers show metadata cards in the feed and the saved local path.
+
+Media quick usage:
+
+```text
+/image "C:/Users/you/Pictures/screenshot.png"
+/video "C:/Users/you/Videos/demo.mp4"
+```
+
+Receiver-side behavior:
+
+- The receiver gets a media card in the feed with sender, filename, size, and saved local path.
+- Image transfers additionally show an ASCII preview in the feed itself.
+
+## CLI Dashboard UX
+
+The client UI is a live dashboard rendered directly in the terminal with:
+
+- Header chips (`ONLINE`, `CHANNELS`, `UNREAD`, `TYPING`, `THEME`, `CLIENT`)
+- Grouped global feed on the left (message streams + media cards/previews)
+- Operational panels on the right (`PROFILE`, `QUICK ACTIONS`, `LIVE ROSTER`, `CHANNEL DOCK`)
+- Compact mode fallback when terminal size is small
+
+Example dashboard layout:
+
+```text
+// CHATIFY // [ONLINE:3] [CHANNELS:2] [EVENTS:18] [UNREAD:1] [TYPING:0] [THEME:retro-grid]
+[ROOM:#general] [VOICE:OFF] [TRUST:T2/U1/C0] [STATUS:Online] [LIVE:alice@#general] [CLIENT:CID-ABCD-1234-EF90]
+
+┌GLOBAL_FEED──────────────────────────────────────────────┐   ┌PROFILE───────────────────────────┐
+│[14:31] alice  #general                                  │   │alice [CID-ABCD-1234-EF90]       │
+│  > oi time, testando upload de mídia                    │   │status: Online                    │
+│[14:32] [VIDEO] alice shared 'demo.mp4' (12.40 MiB)     │   │channel: #general                 │
+│      saved: .../Chatify/media/alice-...-demo.mp4       │   │voice: OFF                        │
+│[14:33] IMG alice inline image                           │   │typing: none                      │
+│@@@@%%%###**++==--::..                                   │   └QUICK ACTIONS────────────────────┘
+└──────────────────────────────────────────────────────────┘
+```
 
 Notes:
 
@@ -302,9 +345,14 @@ Recommended checks:
 
 ```bash
 cargo check --bins
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked --test message_contracts auth_contract_returns_expected_fields
+cargo test --locked --test message_contracts compatibility_contract_client_bootstrap_flow_stays_stable
+cargo test --locked --test message_contracts protocol_contract_advertises_backward_compatible_version
+cargo test --locked --test message_contracts file_contract_relays_media_metadata_and_chunks
+cargo test --workspace --all-targets --locked
+cargo check --features discord-bridge --bin discord_bot --locked
 cargo test --features discord-bridge --bin discord_bot
 ```
 
