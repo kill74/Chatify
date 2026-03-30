@@ -38,8 +38,8 @@ Track at least the following per test run:
 
 1. Seed 100,000 local events in a single channel.
 2. Measure end-to-end RPC latency for:
-	- `history` with bounded limit.
-	- `search` with bounded limit and non-empty hit set.
+   - `history` with bounded limit.
+   - `search` with bounded limit and non-empty hit set.
 3. Run after a process restart to include cold-start and migration effects.
 
 ## Environment Recording

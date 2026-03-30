@@ -8,7 +8,9 @@ use clicord_server::crypto::{
 };
 use clicord_server::error::{ChatifyError, ChatifyResult};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,10 +34,12 @@ use chrono::{DateTime, Utc};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
-const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /clear, /edit, /help, /quit";
+const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /help, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
 const DASHBOARD_HEADER_ROWS: usize = 2;
@@ -55,6 +59,10 @@ const ANSI_LEFT: &str = "\x1b[38;5;117m";
 const ANSI_RIGHT: &str = "\x1b[38;5;120m";
 const ANSI_HINT: &str = "\x1b[38;5;220m";
 const ANSI_DIM: &str = "\x1b[38;5;245m";
+const TRUST_STORE_FILENAME: &str = "trust-store-v1.json";
+const TRUST_STORE_DIR_WINDOWS: &str = "Chatify";
+const TRUST_STORE_DIR_UNIX: &str = ".chatify";
+const TRUST_AUDIT_MAX_ENTRIES: usize = 64;
 type SharedState = Arc<tokio::sync::Mutex<ClientState>>;
 type JsonMap = HashMap<String, serde_json::Value>;
 
@@ -95,6 +103,280 @@ impl DashboardGeometry {
 struct AuthContext {
     me: String,
     users: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum TrustState {
+    #[default]
+    Unknown,
+    Trusted,
+    Changed,
+}
+
+impl TrustState {
+    fn label(self) -> &'static str {
+        match self {
+            TrustState::Unknown => "unknown",
+            TrustState::Trusted => "trusted",
+            TrustState::Changed => "changed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrustAuditEntry {
+    ts: u64,
+    event: String,
+    fingerprint: String,
+    details: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerTrustRecord {
+    state: TrustState,
+    current_fingerprint: String,
+    trusted_fingerprint: Option<String>,
+    first_seen_ts: u64,
+    last_seen_ts: u64,
+    last_change_ts: Option<u64>,
+    audit: Vec<TrustAuditEntry>,
+}
+
+impl PeerTrustRecord {
+    fn new(fingerprint: String, ts: u64, source: &str) -> Self {
+        let mut record = Self {
+            state: TrustState::Unknown,
+            current_fingerprint: fingerprint.clone(),
+            trusted_fingerprint: None,
+            first_seen_ts: ts,
+            last_seen_ts: ts,
+            last_change_ts: None,
+            audit: Vec::new(),
+        };
+        record.push_audit(ts, "first_seen", &fingerprint, source);
+        record
+    }
+
+    fn push_audit(&mut self, ts: u64, event: &str, fingerprint: &str, details: &str) {
+        self.audit.push(TrustAuditEntry {
+            ts,
+            event: event.to_string(),
+            fingerprint: fingerprint.to_string(),
+            details: details.to_string(),
+        });
+        if self.audit.len() > TRUST_AUDIT_MAX_ENTRIES {
+            let drop_count = self.audit.len().saturating_sub(TRUST_AUDIT_MAX_ENTRIES);
+            self.audit.drain(0..drop_count);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrustStoreFile {
+    version: u32,
+    peers: HashMap<String, PeerTrustRecord>,
+}
+
+impl Default for TrustStoreFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            peers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TrustStore {
+    path: PathBuf,
+    peers: HashMap<String, PeerTrustRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct TrustObserveResult {
+    warning: Option<String>,
+    changed: bool,
+    persist_required: bool,
+}
+
+impl TrustStore {
+    fn default_path() -> PathBuf {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata)
+                .join(TRUST_STORE_DIR_WINDOWS)
+                .join(TRUST_STORE_FILENAME);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(TRUST_STORE_DIR_UNIX)
+                .join(TRUST_STORE_FILENAME);
+        }
+        PathBuf::from(TRUST_STORE_FILENAME)
+    }
+
+    fn load_default() -> Self {
+        Self::load(Self::default_path())
+    }
+
+    fn load(path: PathBuf) -> Self {
+        let peers = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<TrustStoreFile>(&raw).ok())
+            .map(|file| file.peers)
+            .unwrap_or_default();
+        Self { path, peers }
+    }
+
+    fn persist(&self) -> ChatifyResult<()> {
+        let file = TrustStoreFile {
+            version: 1,
+            peers: self.peers.clone(),
+        };
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    ChatifyError::Validation(format!(
+                        "failed to create trust store directory '{}': {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+        let encoded = serde_json::to_string_pretty(&file).map_err(|e| {
+            ChatifyError::Validation(format!("failed to encode trust store JSON: {}", e))
+        })?;
+        fs::write(&self.path, encoded).map_err(|e| {
+            ChatifyError::Validation(format!(
+                "failed to write trust store '{}': {}",
+                self.path.display(),
+                e
+            ))
+        })
+    }
+
+    fn state_for(&self, username: &str) -> TrustState {
+        self.peers
+            .get(username)
+            .map(|r| r.state)
+            .unwrap_or(TrustState::Unknown)
+    }
+
+    fn observe(
+        &mut self,
+        username: &str,
+        fingerprint: &str,
+        source: &str,
+        ts: u64,
+    ) -> TrustObserveResult {
+        let Some(record) = self.peers.get_mut(username) else {
+            self.peers.insert(
+                username.to_string(),
+                PeerTrustRecord::new(fingerprint.to_string(), ts, source),
+            );
+            return TrustObserveResult {
+                warning: None,
+                changed: false,
+                persist_required: true,
+            };
+        };
+
+        record.last_seen_ts = ts;
+        if record.current_fingerprint == fingerprint {
+            if record.state == TrustState::Changed
+                && record.trusted_fingerprint.as_deref() == Some(fingerprint)
+            {
+                record.state = TrustState::Trusted;
+                record.push_audit(ts, "key_restored", fingerprint, source);
+                return TrustObserveResult {
+                    warning: Some(format!(
+                        "Key for '{}' returned to trusted fingerprint {}.",
+                        username, fingerprint
+                    )),
+                    changed: false,
+                    persist_required: true,
+                };
+            }
+            return TrustObserveResult {
+                warning: None,
+                changed: false,
+                persist_required: false,
+            };
+        }
+
+        let old = record.current_fingerprint.clone();
+        record.current_fingerprint = fingerprint.to_string();
+        record.last_change_ts = Some(ts);
+        if record.trusted_fingerprint.as_deref() == Some(fingerprint) {
+            record.state = TrustState::Trusted;
+            record.push_audit(ts, "key_restored", fingerprint, source);
+            TrustObserveResult {
+                warning: Some(format!(
+                    "Key for '{}' rotated back to trusted fingerprint {}.",
+                    username, fingerprint
+                )),
+                changed: true,
+                persist_required: true,
+            }
+        } else {
+            record.state = TrustState::Changed;
+            record.push_audit(
+                ts,
+                "key_changed",
+                fingerprint,
+                &format!("{}; previous={}", source, old),
+            );
+            TrustObserveResult {
+                warning: Some(format!(
+                    "SECURITY WARNING: key for '{}' changed ({} -> {}). Run /fingerprint {} then /trust {} <fingerprint>.",
+                    username, old, fingerprint, username, username
+                )),
+                changed: true,
+                persist_required: true,
+            }
+        }
+    }
+
+    fn trust_current_fingerprint(
+        &mut self,
+        username: &str,
+        provided_fingerprint: &str,
+        ts: u64,
+    ) -> ChatifyResult<String> {
+        let normalized = normalize_fingerprint_input(provided_fingerprint).ok_or_else(|| {
+            ChatifyError::Validation(
+                "invalid fingerprint format (expected 64 hex chars, with or without ':')"
+                    .to_string(),
+            )
+        })?;
+
+        let record = self.peers.get_mut(username).ok_or_else(|| {
+            ChatifyError::Validation(format!("no observed key for user '{}'", username))
+        })?;
+
+        let expected =
+            normalize_fingerprint_input(&record.current_fingerprint).ok_or_else(|| {
+                ChatifyError::Validation(format!(
+                    "stored fingerprint for '{}' is invalid; request /users and retry",
+                    username
+                ))
+            })?;
+
+        if normalized != expected {
+            return Err(ChatifyError::Validation(format!(
+                "fingerprint mismatch for '{}': expected {}",
+                username, record.current_fingerprint
+            )));
+        }
+
+        record.trusted_fingerprint = Some(record.current_fingerprint.clone());
+        record.state = TrustState::Trusted;
+        record.last_seen_ts = ts;
+        let trusted_fp = record.current_fingerprint.clone();
+        record.push_audit(ts, "trusted", &trusted_fp, "manual trust confirmation");
+        Ok(record.current_fingerprint.clone())
+    }
 }
 
 // Enumeration of supported message types in the protocol
@@ -203,6 +485,8 @@ struct ClientState {
     chs: HashMap<String, bool>,
     /// Known users and their public keys
     users: HashMap<String, String>,
+    /// Persisted trust state and fingerprints for peers
+    trust_store: TrustStore,
     /// Cached channel-specific encryption keys
     chan_keys: HashMap<String, Vec<u8>>,
     /// Cached DM-specific encryption keys
@@ -254,6 +538,13 @@ impl ClientState {
     }
 
     fn dmkey(&mut self, name: &str) -> ChatifyResult<Vec<u8>> {
+        if self.trust_store.state_for(name) == TrustState::Changed {
+            return Err(ChatifyError::Validation(format!(
+                "key for '{}' is marked as changed; run /fingerprint {} and /trust {} <fingerprint>",
+                name, name, name
+            )));
+        }
+
         if !self.dm_keys.contains_key(name) {
             let pk = self
                 .users
@@ -267,6 +558,94 @@ impl ClientState {
         } else {
             Ok(self.dm_keys[name].clone())
         }
+    }
+
+    fn observe_peer_pubkey(&mut self, username: &str, pubkey: &str, source: &str) {
+        if username.is_empty() || username == self.me || pubkey.is_empty() {
+            return;
+        }
+
+        let fingerprint = match fingerprint_from_pubkey(pubkey) {
+            Ok(v) => v,
+            Err(e) => {
+                self.log(
+                    "WARN",
+                    &format!("Failed to fingerprint key for '{}': {}", username, e),
+                );
+                return;
+            }
+        };
+
+        let key_changed = self
+            .users
+            .get(username)
+            .map(|existing| existing != pubkey)
+            .unwrap_or(false);
+
+        self.users.insert(username.to_string(), pubkey.to_string());
+        if key_changed {
+            self.dm_keys.remove(username);
+        }
+
+        let result = self
+            .trust_store
+            .observe(username, &fingerprint, source, now_secs());
+
+        if result.changed {
+            self.dm_keys.remove(username);
+        }
+
+        if let Some(msg) = result.warning {
+            self.add_notice(msg);
+        }
+
+        if result.persist_required {
+            if let Err(e) = self.trust_store.persist() {
+                self.add_notice(format!("Failed to persist trust store: {}", e));
+            }
+        }
+    }
+
+    fn trust_peer(&mut self, username: &str, fingerprint: &str) -> ChatifyResult<String> {
+        let confirmed =
+            self.trust_store
+                .trust_current_fingerprint(username, fingerprint, now_secs())?;
+        self.dm_keys.remove(username);
+        self.trust_store.persist()?;
+        Ok(format!("Trusted '{}' fingerprint {}.", username, confirmed))
+    }
+
+    fn trust_record_line(&self, username: &str) -> Option<String> {
+        self.trust_store.peers.get(username).map(|record| {
+            let trusted = record.trusted_fingerprint.as_deref().unwrap_or("-");
+            let changed_at = record
+                .last_change_ts
+                .map(format_time_full)
+                .unwrap_or_else(|| "never".to_string());
+            format!(
+                "{} [{}] current={} trusted={} last_change={} audit_entries={}",
+                username,
+                record.state.label(),
+                record.current_fingerprint,
+                trusted,
+                changed_at,
+                record.audit.len()
+            )
+        })
+    }
+
+    fn trust_counts_for_users(&self, users: &[String]) -> (usize, usize, usize) {
+        let mut unknown = 0usize;
+        let mut trusted = 0usize;
+        let mut changed = 0usize;
+        for user in users {
+            match self.trust_store.state_for(user) {
+                TrustState::Unknown => unknown += 1,
+                TrustState::Trusted => trusted += 1,
+                TrustState::Changed => changed += 1,
+            }
+        }
+        (unknown, trusted, changed)
     }
 
     /// Add a message to the history, keeping only the last 100 messages
@@ -296,6 +675,11 @@ impl ClientState {
 fn format_time(ts: u64) -> String {
     let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(Utc::now);
     datetime.format("%H:%M").to_string()
+}
+
+fn format_time_full(ts: u64) -> String {
+    let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(Utc::now);
+    datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 
 /// Placeholder for image to ASCII conversion
@@ -405,6 +789,38 @@ fn format_scope_label(scope: &str) -> String {
     } else {
         format!("#{}", scope)
     }
+}
+
+fn normalize_fingerprint_input(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if cleaned.len() == 64 {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+fn canonical_fingerprint_from_hex(hex: &str) -> String {
+    hex.as_bytes()
+        .chunks(2)
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn fingerprint_from_pubkey(pubkey_b64: &str) -> ChatifyResult<String> {
+    let bytes = general_purpose::STANDARD.decode(pubkey_b64).map_err(|e| {
+        ChatifyError::Validation(format!(
+            "invalid public key base64 while fingerprinting: {}",
+            e
+        ))
+    })?;
+    let digest = Sha256::digest(bytes);
+    Ok(canonical_fingerprint_from_hex(&hex::encode(digest)))
 }
 
 fn parse_limit(input: &str, default: usize, max: usize) -> usize {
@@ -627,6 +1043,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
         "/dm <user> <msg>".to_string(),
         "/users /channels".to_string(),
         "/history /search /replay".to_string(),
+        "/fingerprint /trust".to_string(),
     ];
     if let Some(last) = state.message_history.last() {
         command_lines.push(truncate_with_ellipsis(
@@ -807,7 +1224,7 @@ fn render_full_dashboard(
         "{}{}{}",
         ANSI_HINT,
         fit_to_width(
-            "-> Type + Enter | /join #channel | /dm user msg | /help | /quit",
+            "-> Type + Enter | /join #channel | /dm user msg | /fingerprint user | /help | /quit",
             geom.width
         ),
         ANSI_RESET
@@ -1002,11 +1419,6 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
         "dm" => {
             let from = event.get("from").and_then(|v| v.as_str()).unwrap_or("?");
             let to = event.get("to").and_then(|v| v.as_str()).unwrap_or("?");
-            if let Some(pk) = event.get("pk").and_then(|v| v.as_str()) {
-                if !pk.is_empty() {
-                    state.users.insert(from.to_string(), pk.to_string());
-                }
-            }
 
             let c = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
             let encrypted = match general_purpose::STANDARD.decode(c) {
@@ -1015,9 +1427,23 @@ fn append_event_to_history(state: &mut ClientState, event: &serde_json::Value) -
             };
 
             let peer = if from == state.me { to } else { from };
-            let dm_key = match state.dmkey(peer) {
-                Ok(key) => key,
-                Err(_) => return false,
+            let dm_key = if let Some(pk) = event.get("pk").and_then(|v| v.as_str()) {
+                if pk.is_empty() {
+                    match state.dmkey(peer) {
+                        Ok(key) => key,
+                        Err(_) => return false,
+                    }
+                } else {
+                    match dh_key(&state.priv_key, pk) {
+                        Ok(key) => key,
+                        Err(_) => return false,
+                    }
+                }
+            } else {
+                match state.dmkey(peer) {
+                    Ok(key) => key,
+                    Err(_) => return false,
+                }
             };
             let content = match dec_bytes(&dm_key, &encrypted) {
                 Ok(content) => String::from_utf8(content)
@@ -1113,13 +1539,8 @@ async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
     let frm = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
     let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("?");
     if let Some(pk) = data.get("pk").and_then(|v| v.as_str()) {
-        if !pk.is_empty() {
-            state
-                .lock()
-                .await
-                .users
-                .insert(frm.to_string(), pk.to_string());
-        }
+        let mut state_lock = state.lock().await;
+        state_lock.observe_peer_pubkey(frm, pk, "dm_live");
     }
     let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
     let encrypted = match general_purpose::STANDARD.decode(c) {
@@ -1128,23 +1549,28 @@ async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
     };
     let mut state_lock = state.lock().await;
     let peer = if frm == state_lock.me { to } else { frm };
-    if let Ok(dm_key) = state_lock.dmkey(peer) {
-        if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
-            let arrow = if frm == state_lock.me { "→" } else { "←" };
-            state_lock.add_message(DisplayedMessage {
-                time: format_time(ts),
-                text: format!(
-                    "{} {} {}",
-                    frm,
-                    arrow,
-                    String::from_utf8(content)
-                        .unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string())
-                ),
-                msg_type: MessageType::Dm,
-                user: Some(frm.to_string()),
-                channel: None,
-            });
+    let dm_key = match state_lock.dmkey(peer) {
+        Ok(key) => key,
+        Err(e) => {
+            state_lock.add_notice(format!("DM trust check failed for '{}': {}", peer, e));
+            return;
         }
+    };
+
+    if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
+        let arrow = if frm == state_lock.me { "→" } else { "←" };
+        state_lock.add_message(DisplayedMessage {
+            time: format_time(ts),
+            text: format!(
+                "{} {} {}",
+                frm,
+                arrow,
+                String::from_utf8(content).unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string())
+            ),
+            msg_type: MessageType::Dm,
+            user: Some(frm.to_string()),
+            channel: None,
+        });
     }
 }
 
@@ -1158,9 +1584,7 @@ async fn handle_users_event(state: &SharedState, data: &JsonMap, ts: u64) {
         if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
             names.push(name.to_string());
             if let Some(pk) = user.get("pk").and_then(|v| v.as_str()) {
-                if !pk.is_empty() {
-                    state_lock.users.insert(name.to_string(), pk.to_string());
-                }
+                state_lock.observe_peer_pubkey(name, pk, "users_event");
             }
         }
     }
@@ -1628,6 +2052,13 @@ fn handle_slash_command(
                 return CommandFlow::Continue;
             }
 
+            if state.trust_store.state_for(target) == TrustState::Unknown {
+                state.add_notice(format!(
+                    "Trust for '{}' is unknown. Use /fingerprint {} and /trust {} <fingerprint>.",
+                    target, target, target
+                ));
+            }
+
             let encrypted = match state.dmkey(target) {
                 Ok(key) => match enc_bytes(&key, msg.as_bytes()) {
                     Ok(v) => v,
@@ -1646,6 +2077,67 @@ fn handle_slash_command(
                 &state.ws_tx,
                 serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
             );
+        }
+        "/fingerprint" => {
+            let target = args.trim();
+            if target.is_empty() {
+                let mut peers: Vec<String> = state.trust_store.peers.keys().cloned().collect();
+                peers.sort_unstable();
+                if peers.is_empty() {
+                    state.add_notice("No peer fingerprints observed yet.");
+                } else {
+                    state.add_notice(format!("Known fingerprints: {} peer(s)", peers.len()));
+                    for peer in peers.iter().take(20) {
+                        if let Some(line) = state.trust_record_line(peer) {
+                            state.add_notice(line);
+                        }
+                    }
+                    if peers.len() > 20 {
+                        state.add_notice(format!("... and {} more", peers.len() - 20));
+                    }
+                }
+                return CommandFlow::Continue;
+            }
+
+            if !is_valid_username_token(target) {
+                state.add_notice("Usage: /fingerprint [user]");
+                return CommandFlow::Continue;
+            }
+
+            if let Some(pk) = state.users.get(target).cloned() {
+                state.observe_peer_pubkey(target, &pk, "fingerprint_cmd");
+            }
+
+            if let Some(line) = state.trust_record_line(target) {
+                state.add_notice(line);
+            } else {
+                state.add_notice(format!(
+                    "No fingerprint known for '{}'. Request /users or receive a DM first.",
+                    target
+                ));
+            }
+        }
+        "/trust" => {
+            let mut parts = args.split_whitespace();
+            let user = parts.next().unwrap_or("");
+            let fingerprint = parts.next().unwrap_or("");
+            if user.is_empty() || fingerprint.is_empty() || parts.next().is_some() {
+                state.add_notice("Usage: /trust <user> <fingerprint>");
+                return CommandFlow::Continue;
+            }
+            if !is_valid_username_token(user) {
+                state.add_notice("Usage: /trust <user> <fingerprint>");
+                return CommandFlow::Continue;
+            }
+
+            if let Some(pk) = state.users.get(user).cloned() {
+                state.observe_peer_pubkey(user, &pk, "trust_cmd");
+            }
+
+            match state.trust_peer(user, fingerprint) {
+                Ok(msg) => state.add_notice(msg),
+                Err(e) => state.add_notice(format!("Trust failed: {}", e)),
+            }
         }
         "/me" => {
             if !args.is_empty() {
@@ -1776,6 +2268,56 @@ fn handle_slash_command(
     CommandFlow::Continue
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_fingerprint_accepts_hex_and_colon_formats() {
+        let raw = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        let normalized = normalize_fingerprint_input(raw).expect("normalized fingerprint");
+        assert_eq!(normalized.len(), 64);
+        assert!(normalized.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn trust_store_transitions_unknown_trusted_changed() {
+        let mut store = TrustStore {
+            path: PathBuf::from("trust-store-test.json"),
+            peers: HashMap::new(),
+        };
+        let fp1 = canonical_fingerprint_from_hex(&"11".repeat(32));
+        let fp2 = canonical_fingerprint_from_hex(&"22".repeat(32));
+
+        let first = store.observe("alice", &fp1, "test", 100);
+        assert!(first.persist_required);
+        assert_eq!(store.state_for("alice"), TrustState::Unknown);
+
+        store
+            .trust_current_fingerprint("alice", &fp1, 110)
+            .expect("trust initial key");
+        assert_eq!(store.state_for("alice"), TrustState::Trusted);
+
+        let changed = store.observe("alice", &fp2, "test", 120);
+        assert!(changed.changed);
+        assert_eq!(store.state_for("alice"), TrustState::Changed);
+
+        store
+            .trust_current_fingerprint("alice", &fp2, 130)
+            .expect("trust rotated key");
+        assert_eq!(store.state_for("alice"), TrustState::Trusted);
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_for_same_public_key() {
+        let keypair = new_keypair();
+        let pk = pub_b64(&keypair).expect("public key base64");
+        let fp1 = fingerprint_from_pubkey(&pk).expect("first fingerprint");
+        let fp2 = fingerprint_from_pubkey(&pk).expect("second fingerprint");
+        assert_eq!(fp1, fp2);
+    }
+}
+
 /// Main entry point for the WebSocket client
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
@@ -1877,6 +2419,10 @@ async fn main() -> ChatifyResult<()> {
                 return Ok(());
             }
         };
+        let AuthContext {
+            me: auth_me,
+            users: auth_users,
+        } = auth;
         // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
 
@@ -1893,11 +2439,12 @@ async fn main() -> ChatifyResult<()> {
         // The hash was already computed before password zeroization
         let state = Arc::new(tokio::sync::Mutex::new(ClientState {
             ws_tx: msg_tx.clone(), // Use mpsc sender instead of WebSocket
-            me: auth.me.clone(),
+            me: auth_me.clone(),
             pw: pw_hash,
             ch: "general".to_string(),
             chs: HashMap::from([("general".to_string(), true)]),
-            users: auth.users,
+            users: HashMap::new(),
+            trust_store: TrustStore::load_default(),
             chan_keys: HashMap::new(),
             dm_keys: HashMap::new(),
             priv_key: client_priv_key,
@@ -1916,9 +2463,34 @@ async fn main() -> ChatifyResult<()> {
         }));
         {
             let mut state_lock = state.lock().await;
-            state_lock.me = auth.me;
+            state_lock.me = auth_me;
             state_lock.add_notice(format!("Connected to {}", uri));
             state_lock.add_notice("Use /help to list commands.");
+
+            let mut online_users = Vec::new();
+            for (name, pk) in auth_users {
+                online_users.push(name.clone());
+                state_lock.observe_peer_pubkey(&name, &pk, "auth_ok");
+            }
+            let (unknown, trusted, changed) = state_lock.trust_counts_for_users(&online_users);
+            if changed > 0 {
+                state_lock.add_notice(format!(
+                    "SECURITY WARNING: {} online peer key(s) changed. Use /fingerprint <user>.",
+                    changed
+                ));
+            }
+            if unknown > 0 {
+                state_lock.add_notice(format!(
+                    "Trust pending for {} peer(s). Use /fingerprint [user] and /trust <user> <fingerprint>.",
+                    unknown
+                ));
+            }
+            if !online_users.is_empty() {
+                state_lock.add_notice(format!(
+                    "Trust summary: trusted={}, unknown={}, changed={}",
+                    trusted, unknown, changed
+                ));
+            }
         }
 
         // Spawn tasks for reading from WebSocket and from stdin

@@ -161,6 +161,8 @@ Secret hygiene:
 | `/search <query>`             | Search persisted events in current channel              |
 | `/replay <timestamp>`         | Reconstruct state from an absolute timestamp            |
 | `/rewind <time> [n]`          | Replay events from a time window (example: `15m`, `2h`) |
+| `/fingerprint [user]`         | Show trust state and key fingerprint(s)                 |
+| `/trust <user> <fingerprint>` | Mark a peer key fingerprint as trusted                  |
 | `/clear`                      | Clear terminal output                                   |
 | `/help`                       | Show command help                                       |
 | `/quit`, `/exit`, `/q`        | Disconnect and exit                                     |
@@ -168,6 +170,14 @@ Secret hygiene:
 Notes:
 
 - `/edit` is currently a placeholder command.
+
+## Identity and Trust UX
+
+- Trust states are explicit: `unknown`, `trusted`, `changed`.
+- Peer fingerprints are persisted in a local trust store on the client machine.
+- Key rotation is never silent: if a peer key changes, state becomes `changed` and DM encryption/decryption is blocked until you explicitly trust the new fingerprint.
+- Recommended flow: run `/fingerprint <user>` to verify current key material out of band.
+- After manual verification, run `/trust <user> <fingerprint>`.
 
 ## Discord Bridge (Optional)
 
