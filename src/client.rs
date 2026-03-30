@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
-const HELP_TEXT: &str = "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /help, /quit";
+const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
 const DASHBOARD_HEADER_ROWS: usize = 2;
@@ -63,6 +63,284 @@ const TRUST_STORE_FILENAME: &str = "trust-store-v1.json";
 const TRUST_STORE_DIR_WINDOWS: &str = "Chatify";
 const TRUST_STORE_DIR_UNIX: &str = ".chatify";
 const TRUST_AUDIT_MAX_ENTRIES: usize = 64;
+
+#[derive(Clone, Copy)]
+struct CommandSpec {
+    name: &'static str,
+    usage: &'static str,
+    summary: &'static str,
+    example: &'static str,
+}
+
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "/commands",
+        usage: "/commands [filter]",
+        summary: "Show command palette with optional filter.",
+        example: "/commands dm",
+    },
+    CommandSpec {
+        name: "/help",
+        usage: "/help [command]",
+        summary: "Show overview or details for one command.",
+        example: "/help replay",
+    },
+    CommandSpec {
+        name: "/join",
+        usage: "/join <channel>",
+        summary: "Join and focus a channel.",
+        example: "/join general",
+    },
+    CommandSpec {
+        name: "/switch",
+        usage: "/switch <channel>",
+        summary: "Alias for /join to switch active channel.",
+        example: "/switch ops",
+    },
+    CommandSpec {
+        name: "/dm",
+        usage: "/dm <user> <message>",
+        summary: "Send direct encrypted message.",
+        example: "/dm alice hello",
+    },
+    CommandSpec {
+        name: "/me",
+        usage: "/me <action>",
+        summary: "Send action-style message to current channel.",
+        example: "/me is reviewing logs",
+    },
+    CommandSpec {
+        name: "/users",
+        usage: "/users",
+        summary: "Refresh online users and public keys.",
+        example: "/users",
+    },
+    CommandSpec {
+        name: "/channels",
+        usage: "/channels",
+        summary: "List channels and online count.",
+        example: "/channels",
+    },
+    CommandSpec {
+        name: "/voice",
+        usage: "/voice [room]",
+        summary: "Toggle voice session in a room.",
+        example: "/voice general",
+    },
+    CommandSpec {
+        name: "/history",
+        usage: "/history [#channel|dm:user] [window]",
+        summary: "Load persisted history by scope and optional time window.",
+        example: "/history #general 24h",
+    },
+    CommandSpec {
+        name: "/search",
+        usage: "/search <query>",
+        summary: "Search persisted events in current channel.",
+        example: "/search incident",
+    },
+    CommandSpec {
+        name: "/replay",
+        usage: "/replay <timestamp>",
+        summary: "Replay events from timestamp.",
+        example: "/replay 2026-03-30 12:00:00",
+    },
+    CommandSpec {
+        name: "/rewind",
+        usage: "/rewind <Ns|Nm|Nh|Nd> [limit]",
+        summary: "Fetch events from recent duration.",
+        example: "/rewind 2h 150",
+    },
+    CommandSpec {
+        name: "/fingerprint",
+        usage: "/fingerprint [user]",
+        summary: "Inspect trust fingerprint(s).",
+        example: "/fingerprint alice",
+    },
+    CommandSpec {
+        name: "/trust",
+        usage: "/trust <user> <fingerprint>",
+        summary: "Trust currently observed peer fingerprint.",
+        example: "/trust alice aa:bb:...",
+    },
+    CommandSpec {
+        name: "/clear",
+        usage: "/clear",
+        summary: "Clear current local dashboard feed.",
+        example: "/clear",
+    },
+    CommandSpec {
+        name: "/edit",
+        usage: "/edit ...",
+        summary: "Placeholder for edit workflow in Rust client.",
+        example: "/edit",
+    },
+    CommandSpec {
+        name: "/quit",
+        usage: "/quit",
+        summary: "Exit client gracefully.",
+        example: "/quit",
+    },
+];
+
+fn normalize_command_token(raw: &str) -> String {
+    let token = raw.trim().to_lowercase();
+    if token.starts_with('/') {
+        token
+    } else {
+        format!("/{}", token)
+    }
+}
+
+fn canonical_command(raw: &str) -> String {
+    let token = normalize_command_token(raw);
+    match token.as_str() {
+        "/q" | "/exit" => "/quit".to_string(),
+        "/w" => "/dm".to_string(),
+        "/h" => "/history".to_string(),
+        "/cmd" | "/palette" => "/commands".to_string(),
+        "/c" => "/channels".to_string(),
+        "/u" => "/users".to_string(),
+        _ => token,
+    }
+}
+
+fn find_command_spec(name: &str) -> Option<CommandSpec> {
+    COMMAND_SPECS.iter().copied().find(|spec| spec.name == name)
+}
+
+fn unique_autocomplete_command(raw: &str) -> Option<&'static str> {
+    let token = normalize_command_token(raw);
+    let mut matches = COMMAND_SPECS
+        .iter()
+        .filter(|spec| spec.name.starts_with(&token))
+        .map(|spec| spec.name);
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    if a.is_empty() {
+        return b.chars().count();
+    }
+    if b.is_empty() {
+        return a.chars().count();
+    }
+
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b_chars.len() + 1];
+
+    for (i, a_ch) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, b_ch) in b_chars.iter().enumerate() {
+            let cost = if a_ch == *b_ch { 0 } else { 1 };
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b_chars.len()]
+}
+
+fn suggest_commands(raw: &str) -> Vec<&'static str> {
+    let token = normalize_command_token(raw);
+
+    let mut prefix_matches: Vec<&'static str> = COMMAND_SPECS
+        .iter()
+        .filter(|spec| spec.name.starts_with(&token))
+        .map(|spec| spec.name)
+        .collect();
+    prefix_matches.sort_unstable();
+    if !prefix_matches.is_empty() {
+        prefix_matches.truncate(4);
+        return prefix_matches;
+    }
+
+    let mut fuzzy: Vec<(usize, &'static str)> = COMMAND_SPECS
+        .iter()
+        .map(|spec| (edit_distance(&token, spec.name), spec.name))
+        .filter(|(dist, _)| *dist <= 4)
+        .collect();
+    fuzzy.sort_by(|(da, na), (db, nb)| da.cmp(db).then_with(|| na.cmp(nb)));
+    fuzzy.into_iter().map(|(_, name)| name).take(4).collect()
+}
+
+fn command_palette_lines(filter_raw: &str) -> Vec<String> {
+    let filter = filter_raw.trim().to_lowercase();
+    let mut filtered: Vec<CommandSpec> = COMMAND_SPECS
+        .iter()
+        .copied()
+        .filter(|spec| {
+            if filter.is_empty() {
+                return true;
+            }
+            spec.name.contains(&filter)
+                || spec.usage.to_lowercase().contains(&filter)
+                || spec.summary.to_lowercase().contains(&filter)
+        })
+        .collect();
+    filtered.sort_by(|a, b| a.name.cmp(b.name));
+
+    let mut lines = vec![format!("Command palette: {} command(s)", filtered.len())];
+    if !filter.is_empty() {
+        lines.push(format!("Filter: '{}'", filter));
+    }
+    for spec in filtered {
+        lines.push(format!("{} — {}", spec.usage, spec.summary));
+    }
+    lines
+}
+
+fn command_help_lines(raw_command: &str) -> Vec<String> {
+    let token = canonical_command(raw_command);
+    if let Some(spec) = find_command_spec(&token) {
+        vec![
+            format!("{}", spec.usage),
+            format!("Summary: {}", spec.summary),
+            format!("Example: {}", spec.example),
+        ]
+    } else {
+        let suggestions = suggest_commands(raw_command);
+        if suggestions.is_empty() {
+            vec![
+                format!("Unknown command '{}'.", raw_command.trim()),
+                "Use /commands to browse available commands.".to_string(),
+            ]
+        } else {
+            vec![
+                format!("Unknown command '{}'.", raw_command.trim()),
+                format!("Did you mean: {}", suggestions.join(", ")),
+            ]
+        }
+    }
+}
+
+fn footer_hint_line(state: &ClientState, width: usize) -> String {
+    let mut users: Vec<String> = state.users.keys().cloned().collect();
+    users.sort_unstable();
+    let (_unknown, _trusted, changed) = state.trust_counts_for_users(&users);
+
+    let raw = if changed > 0 {
+        format!(
+            "-> SECURITY: {} changed key(s) detected. Run /fingerprint <user> and /trust <user> <fingerprint>",
+            changed
+        )
+    } else if state.voice_active {
+        "-> Voice ON | /voice to stop | /commands for full palette | /quit".to_string()
+    } else {
+        "-> /commands | /help <command> | /switch #channel | /dm user msg | /quit".to_string()
+    };
+    fit_to_width(&raw, width)
+}
+
 type SharedState = Arc<tokio::sync::Mutex<ClientState>>;
 type JsonMap = HashMap<String, serde_json::Value>;
 
@@ -504,7 +782,7 @@ struct ClientState {
     /// Active file transfers
     file_transfers: HashMap<String, FileTransfer>,
     /// Message history for display
-    message_history: Vec<DisplayedMessage>,
+    message_history: VecDeque<DisplayedMessage>,
     /// Current user status
     status: Status,
     /// Message reactions (msg_id -> emoji -> count)
@@ -650,12 +928,20 @@ impl ClientState {
 
     /// Add a message to the history, keeping only the last 100 messages
     #[allow(dead_code)]
-    fn add_message(&mut self, msg: DisplayedMessage) {
-        self.message_history.push(msg);
+    fn push_message(&mut self, msg: DisplayedMessage) {
+        self.message_history.push_back(msg);
         if self.message_history.len() > MAX_HISTORY {
-            self.message_history.remove(0);
+            let _ = self.message_history.pop_front();
         }
+    }
+
+    fn refresh_dashboard(&self) {
         let _ = render_terminal_dashboard(self);
+    }
+
+    fn add_message(&mut self, msg: DisplayedMessage) {
+        self.push_message(msg);
+        self.refresh_dashboard();
     }
 
     fn add_notice(&mut self, text: impl Into<String>) {
@@ -666,6 +952,22 @@ impl ClientState {
             user: None,
             channel: None,
         });
+    }
+
+    fn add_notice_batch<I>(&mut self, lines: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for line in lines {
+            self.push_message(DisplayedMessage {
+                time: format_time(now_secs()),
+                text: line,
+                msg_type: MessageType::Sys,
+                user: None,
+                channel: None,
+            });
+        }
+        self.refresh_dashboard();
     }
 }
 
@@ -1002,7 +1304,7 @@ fn collect_recent_feed_lines(state: &ClientState, width: usize, max_lines: usize
         .message_history
         .len()
         .saturating_sub(FEED_LOOKBACK_MESSAGES);
-    for msg in &state.message_history[start..] {
+    for msg in state.message_history.iter().skip(start) {
         let wrapped = wrap_words(&format_feed_entry(msg), width, max_lines);
         for line in wrapped {
             lines.push(line);
@@ -1031,21 +1333,28 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     let online_h = remaining.saturating_mul(2) / 3;
     let channels_h = remaining.saturating_sub(online_h);
 
+    let mut known_users: Vec<String> = state.users.keys().cloned().collect();
+    known_users.sort_unstable();
+    let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
+
     let profile_lines = vec![
         format!("{} {}", state.me, state.status.emoji),
         format!("status: {}", state.status.text),
         format!("channel: #{}", state.ch),
         format!("voice: {}", if state.voice_active { "ON" } else { "OFF" }),
+        format!("trust T:{} U:{} C:{}", trusted, unknown, changed),
     ];
 
     let mut command_lines = vec![
-        "/join <channel>".to_string(),
+        "/commands [filter]".to_string(),
+        "/help [command]".to_string(),
+        "/join <channel> /switch".to_string(),
         "/dm <user> <msg>".to_string(),
         "/users /channels".to_string(),
         "/history /search /replay".to_string(),
-        "/fingerprint /trust".to_string(),
+        "/fingerprint /trust /quit".to_string(),
     ];
-    if let Some(last) = state.message_history.last() {
+    if let Some(last) = state.message_history.back() {
         command_lines.push(truncate_with_ellipsis(
             &format!("last: {}", format_feed_entry(last)),
             width.saturating_sub(2),
@@ -1160,7 +1469,7 @@ fn render_compact_dashboard(
         out,
         "{}{}{}",
         ANSI_HINT,
-        fit_to_width("-> /help for commands", width),
+        footer_hint_line(state, width),
         ANSI_RESET
     )
 }
@@ -1223,10 +1532,7 @@ fn render_full_dashboard(
         out,
         "{}{}{}",
         ANSI_HINT,
-        fit_to_width(
-            "-> Type + Enter | /join #channel | /dm user msg | /fingerprint user | /help | /quit",
-            geom.width
-        ),
+        footer_hint_line(state, geom.width),
         ANSI_RESET
     )
 }
@@ -2029,14 +2335,25 @@ fn handle_slash_command(
     args: &str,
     shutdown_tx: &watch::Sender<bool>,
 ) -> CommandFlow {
-    match cmd {
-        "/join" => {
+    let original_cmd = cmd.trim();
+    let mut effective_cmd = canonical_command(original_cmd);
+    if find_command_spec(&effective_cmd).is_none() {
+        if let Some(auto) = unique_autocomplete_command(&effective_cmd) {
+            state.add_notice(format!("Auto-completed '{}' -> '{}'.", original_cmd, auto));
+            effective_cmd = auto.to_string();
+        }
+    }
+
+    match effective_cmd.as_str() {
+        "/join" | "/switch" => {
             if let Some(ch) = normalize_channel(args.trim()) {
                 state.ch = ch.clone();
                 state.chs.insert(ch.clone(), true);
                 enqueue_timed(&state.ws_tx, serde_json::json!({"t": "join", "ch": ch}));
             } else {
-                state.add_notice("Usage: /join <channel>. Allowed: letters, digits, -, _");
+                state.add_notice(
+                    "Usage: /join <channel> (or /switch <channel>). Allowed: letters, digits, -, _",
+                );
             }
         }
         "/dm" => {
@@ -2177,10 +2494,21 @@ fn handle_slash_command(
         }
         "/clear" => {
             state.message_history.clear();
-            let _ = render_terminal_dashboard(state);
+            state.refresh_dashboard();
+        }
+        "/commands" => {
+            let lines = command_palette_lines(args);
+            state.add_notice_batch(lines);
         }
         "/help" => {
-            state.add_notice(HELP_TEXT);
+            let requested = args.trim();
+            if requested.is_empty() {
+                state.add_notice(HELP_TEXT);
+                state.add_notice("Tip: /commands for full palette or /help <command> for details.");
+            } else {
+                let lines = command_help_lines(requested);
+                state.add_notice_batch(lines);
+            }
         }
         "/edit" => {
             state.add_notice("Edit command not yet implemented in Rust client");
@@ -2254,14 +2582,26 @@ fn handle_slash_command(
                 serde_json::json!({"t": "rewind", "ch": ch, "seconds": seconds, "limit": limit}),
             );
         }
-        "/quit" | "/exit" | "/q" => {
+        "/quit" => {
             stop_voice_session(state, SessionStopFeedback::Silent);
             state.running = false;
             let _ = shutdown_tx.send(true);
             return CommandFlow::Exit;
         }
         _ => {
-            state.add_notice(format!("Unknown command: {}", cmd));
+            let suggestions = suggest_commands(original_cmd);
+            if suggestions.is_empty() {
+                state.add_notice(format!(
+                    "Unknown command: {}. Use /commands to browse available commands.",
+                    original_cmd
+                ));
+            } else {
+                state.add_notice(format!(
+                    "Unknown command: {}. Did you mean: {}",
+                    original_cmd,
+                    suggestions.join(", ")
+                ));
+            }
         }
     }
 
@@ -2403,7 +2743,7 @@ async fn main() -> ChatifyResult<()> {
             voice_session: None,
             theme: "retro-grid".to_string(),
             file_transfers: HashMap::new(),
-            message_history: Vec::new(),
+            message_history: VecDeque::new(),
             status: Status {
                 text: "Online".to_string(),
                 emoji: '🟢',
@@ -2622,5 +2962,27 @@ mod tests {
         let fp1 = fingerprint_from_pubkey(&pk).expect("first fingerprint");
         let fp2 = fingerprint_from_pubkey(&pk).expect("second fingerprint");
         assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn command_aliases_resolve_to_canonical_names() {
+        assert_eq!(canonical_command("/q"), "/quit");
+        assert_eq!(canonical_command("/w"), "/dm");
+        assert_eq!(canonical_command("palette"), "/commands");
+    }
+
+    #[test]
+    fn command_autocomplete_resolves_unique_prefix() {
+        assert_eq!(unique_autocomplete_command("/swi"), Some("/switch"));
+        assert_eq!(unique_autocomplete_command("/re"), None);
+    }
+
+    #[test]
+    fn command_suggestions_return_useful_matches() {
+        let suggestions = suggest_commands("/his");
+        assert!(suggestions.contains(&"/history"));
+
+        let typo_suggestions = suggest_commands("/hstory");
+        assert!(typo_suggestions.contains(&"/history"));
     }
 }

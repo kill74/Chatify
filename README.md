@@ -151,7 +151,10 @@ Secret hygiene:
 
 | Command                       | Description                                             |
 | ----------------------------- | ------------------------------------------------------- |
+| `/commands [filter]`          | Show command palette (optionally filtered)              |
+| `/help [command]`             | Show general help or detailed help for one command      |
 | `/join <channel>`             | Join or create a channel                                |
+| `/switch <channel>`           | Alias for `/join` to switch active channel              |
 | `/dm <user> <message>`        | Send direct message                                     |
 | `/me <action>`                | Send action-style message                               |
 | `/users`                      | List online users                                       |
@@ -164,7 +167,7 @@ Secret hygiene:
 | `/fingerprint [user]`         | Show trust state and key fingerprint(s)                 |
 | `/trust <user> <fingerprint>` | Mark a peer key fingerprint as trusted                  |
 | `/clear`                      | Clear terminal output                                   |
-| `/help`                       | Show command help                                       |
+| `/help`                       | Alias for `/help [command]`                             |
 | `/quit`, `/exit`, `/q`        | Disconnect and exit                                     |
 
 Notes:
