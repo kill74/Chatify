@@ -14,9 +14,12 @@ Thanks for contributing to Chatify.
 
 Run all checks before opening a pull request:
 
-1. cargo fmt --check
-2. cargo clippy --all-targets --all-features -- -D warnings
-3. cargo test --all
+1. cargo fmt --all --check
+2. cargo clippy --all-targets --all-features --locked -- -D warnings
+3. cargo test --locked --test message_contracts auth_contract_returns_expected_fields
+4. cargo test --locked --test message_contracts compatibility_contract_client_bootstrap_flow_stays_stable
+5. cargo test --locked --test message_contracts protocol_contract_advertises_backward_compatible_version
+6. cargo test --workspace --all-targets --locked
 
 Optional feature check for Discord bridge:
 

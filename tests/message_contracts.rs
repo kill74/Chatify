@@ -102,6 +102,9 @@ impl TestServer {
 /// Convenience type alias for an authenticated, ready-to-use WebSocket stream.
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Protocol version this test suite expects to remain backward-compatible.
+const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
+
 // ---------------------------------------------------------------------------
 // Server / database helpers
 // ---------------------------------------------------------------------------
@@ -501,6 +504,8 @@ async fn auth_contract_accepts_backup_code_and_consumes_it() {
 /// | `channels` | array          | May be empty        |
 /// | `hist`     | array          | May be empty        |
 /// | `users`    | non-empty array| Each entry: `u`, `pk` |
+/// | `proto.v`  | integer        | Must match supported version |
+/// | `proto.max_payload_bytes` | integer | Must be present and positive |
 ///
 /// Also verifies that the `"info"` command returns a frame with a numeric
 /// `"online"` field, ensuring basic post-auth RPC works.
@@ -552,6 +557,124 @@ async fn auth_contract_returns_expected_fields() {
         assert!(user.get("u").and_then(|v| v.as_str()).is_some());
         assert!(user.get("pk").and_then(|v| v.as_str()).is_some());
     }
+
+    let proto = ok
+        .get("proto")
+        .and_then(|v| v.as_object())
+        .expect("ok payload must include proto object");
+    assert_eq!(
+        proto.get("v").and_then(|v| v.as_u64()),
+        Some(SUPPORTED_PROTOCOL_VERSION)
+    );
+    let max_payload = proto
+        .get("max_payload_bytes")
+        .and_then(|v| v.as_u64())
+        .expect("proto.max_payload_bytes must be numeric");
+    assert!(max_payload > 0, "proto.max_payload_bytes must be positive");
+}
+
+/// Verifies server/client bootstrap compatibility for the runtime startup flow.
+///
+/// This mirrors the minimum interaction pattern expected by the Rust client:
+/// authenticate, fetch users, fetch info, join a channel, and receive message
+/// broadcasts with the expected schema.
+#[tokio::test]
+async fn compatibility_contract_client_bootstrap_flow_stays_stable() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(json!({"t":"users"}).to_string()))
+        .await
+        .expect("send users rpc");
+    let users_msg = recv_by_type(&mut alice, "users").await;
+    let users = users_msg
+        .get("users")
+        .and_then(|v| v.as_array())
+        .expect("users response must contain users array");
+    assert!(!users.is_empty(), "users list should not be empty");
+    for user in users {
+        assert!(user.get("u").and_then(|v| v.as_str()).is_some());
+        assert!(user.get("pk").and_then(|v| v.as_str()).is_some());
+    }
+
+    alice
+        .send(Message::Text(json!({"t":"info"}).to_string()))
+        .await
+        .expect("send info rpc");
+    let info_msg = recv_by_type(&mut alice, "info").await;
+    assert!(
+        info_msg.get("chs").and_then(|v| v.as_array()).is_some(),
+        "info response must contain channels array"
+    );
+    assert!(
+        info_msg.get("online").and_then(|v| v.as_u64()).is_some(),
+        "info response must contain online count"
+    );
+
+    alice
+        .send(Message::Text(
+            json!({"t":"join","ch":"compat-room"}).to_string(),
+        ))
+        .await
+        .expect("join compatibility room");
+    let joined = recv_by_type(&mut alice, "joined").await;
+    assert_eq!(
+        joined.get("ch").and_then(|v| v.as_str()),
+        Some("compat-room")
+    );
+    assert!(joined.get("hist").and_then(|v| v.as_array()).is_some());
+
+    alice
+        .send(Message::Text(
+            json!({"t":"msg","ch":"compat-room","c":"compat-cipher"}).to_string(),
+        ))
+        .await
+        .expect("send compatibility message");
+    let msg = recv_by_type(&mut alice, "msg").await;
+    assert_eq!(msg.get("ch").and_then(|v| v.as_str()), Some("compat-room"));
+    assert_eq!(msg.get("u").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(msg.get("c").and_then(|v| v.as_str()), Some("compat-cipher"));
+}
+
+/// Verifies that auth responses advertise a backward-compatible protocol
+/// version for clients that gate behavior by `proto.v`.
+#[tokio::test]
+async fn protocol_contract_advertises_backward_compatible_version() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for protocol version test");
+
+    ws.send(Message::Text(
+        json!({
+            "t": "auth", "u": "proto-check",
+            "pw": "test-password-hash",
+            "pk": pub_b64(&new_keypair()).unwrap(),
+            "status": {"text":"Online","emoji":"🟢"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send auth for protocol version test");
+
+    let ok = recv_by_type(&mut ws, "ok").await;
+    let proto = ok
+        .get("proto")
+        .and_then(|v| v.as_object())
+        .expect("ok payload must include proto object");
+
+    assert_eq!(
+        proto.get("v").and_then(|v| v.as_u64()),
+        Some(SUPPORTED_PROTOCOL_VERSION)
+    );
+    assert!(
+        proto
+            .get("max_payload_bytes")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| v >= 1024),
+        "proto.max_payload_bytes should remain present and reasonable"
+    );
 }
 
 /// Verifies that usernames containing whitespace are rejected during auth.

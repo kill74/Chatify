@@ -3478,7 +3478,7 @@ mod tests {
 
     #[test]
     fn grouped_feed_collapses_consecutive_channel_messages() {
-        let messages = vec![
+        let messages = [
             DisplayedMessage {
                 time: "10:00".to_string(),
                 text: "first line".to_string(),

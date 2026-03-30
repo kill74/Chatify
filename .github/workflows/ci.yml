@@ -52,7 +52,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Tests
+      - name: Contract schema gate
+        run: cargo test --locked --test message_contracts auth_contract_returns_expected_fields
+
+      - name: Server/client compatibility gate
+        run: cargo test --locked --test message_contracts compatibility_contract_client_bootstrap_flow_stays_stable
+
+      - name: Protocol backward compatibility gate
+        run: cargo test --locked --test message_contracts protocol_contract_advertises_backward_compatible_version
+
+      - name: Workspace tests
         run: cargo test --workspace --all-targets --locked
 
       - name: Bridge feature compile check
