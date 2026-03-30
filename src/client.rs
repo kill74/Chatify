@@ -7,7 +7,7 @@ use clicord_server::crypto::{
     channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash_client,
 };
 use clicord_server::error::{ChatifyError, ChatifyResult};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -68,7 +68,6 @@ const CLIENT_ID_GROUP_SIZE: usize = 4;
 const DEFAULT_GUEST_PREFIX: &str = "guest";
 const DEFAULT_GUEST_SUFFIX_BYTES: usize = 3;
 const COMPACT_MODE_HINT: &str = "compact mode: expand terminal for side panels";
-const UNREAD_SEPARATOR_TEXT: &str = "----- new activity -----";
 const DM_UNREAD_SCOPE_PREFIX: &str = "dm:";
 const ACTIVITY_PULSE_WINDOW_SECS: u64 = 12;
 
@@ -673,6 +672,7 @@ enum MessageType {
     Img,
     Dm,
     Sys,
+    UnreadMarker,
     Users,
     Joined,
     Info,
@@ -799,8 +799,8 @@ struct ClientState {
     reactions: HashMap<String, HashMap<String, u32>>,
     /// Unread counters keyed by scope (`channel` or `dm:<user>`)
     unread_counts: HashMap<String, usize>,
-    /// Whether an unread separator has been injected in the feed
-    unread_separator_active: bool,
+    /// Scopes that already received an unread separator in the current cycle
+    unread_separator_scopes: HashSet<String>,
     /// Recent live activity hint `(label, timestamp_secs)`
     activity_hint: Option<(String, u64)>,
     /// Enable debug logging
@@ -960,31 +960,30 @@ impl ClientState {
 
     fn clear_unread_for_channel(&mut self, channel: &str) {
         self.unread_counts.remove(channel);
-        if self.unread_total() == 0 {
-            self.unread_separator_active = false;
-        }
+        self.unread_separator_scopes.remove(channel);
     }
 
     fn clear_unread_for_dm(&mut self, peer: &str) {
         let scope = dm_unread_scope(peer);
         self.unread_counts.remove(&scope);
-        if self.unread_total() == 0 {
-            self.unread_separator_active = false;
-        }
+        self.unread_separator_scopes.remove(&scope);
     }
 
     fn note_unread_scope(&mut self, scope: &str) {
+        if scope.trim().is_empty() {
+            return;
+        }
+
         *self.unread_counts.entry(scope.to_string()).or_insert(0) += 1;
 
-        if !self.unread_separator_active {
+        if self.unread_separator_scopes.insert(scope.to_string()) {
             self.push_message(DisplayedMessage {
                 time: format_time(now_secs()),
-                text: UNREAD_SEPARATOR_TEXT.to_string(),
-                msg_type: MessageType::Sys,
+                text: unread_separator_text(scope),
+                msg_type: MessageType::UnreadMarker,
                 user: None,
-                channel: None,
+                channel: unread_separator_channel(scope),
             });
-            self.unread_separator_active = true;
         }
     }
 
@@ -1107,6 +1106,21 @@ fn normalize_event_scope(raw: &str, current_channel: &str) -> Option<String> {
 
 fn dm_unread_scope(peer: &str) -> String {
     format!("{}{}", DM_UNREAD_SCOPE_PREFIX, peer.trim().to_lowercase())
+}
+
+fn unread_separator_channel(scope: &str) -> Option<String> {
+    if scope.starts_with(DM_UNREAD_SCOPE_PREFIX) {
+        None
+    } else {
+        Some(scope.to_string())
+    }
+}
+
+fn unread_separator_text(scope: &str) -> String {
+    if let Some(peer) = scope.strip_prefix(DM_UNREAD_SCOPE_PREFIX) {
+        return format!("----- new DM from {} -----", peer);
+    }
+    format!("----- new activity in #{} -----", scope)
 }
 
 fn parse_history_args(args: &str, current_channel: &str) -> Result<(String, Option<u64>), String> {
@@ -1368,7 +1382,7 @@ fn format_feed_entry(msg: &DisplayedMessage) -> String {
             format!("{} DM {} {}", stamp, user, msg.text)
         }
         MessageType::Edit => format!("{} edit {}", stamp, msg.text),
-        MessageType::Sys if msg.text == UNREAD_SEPARATOR_TEXT => msg.text.clone(),
+        MessageType::UnreadMarker => msg.text.clone(),
         MessageType::Sys => format!("{} • {}", stamp, msg.text),
         _ => format!("{} {}", stamp, msg.text),
     }
@@ -2722,7 +2736,7 @@ fn handle_slash_command(
         "/clear" => {
             state.message_history.clear();
             state.unread_counts.clear();
-            state.unread_separator_active = false;
+            state.unread_separator_scopes.clear();
             state.activity_hint = None;
             state.refresh_dashboard();
         }
@@ -2983,7 +2997,7 @@ async fn main() -> ChatifyResult<()> {
             },
             reactions: HashMap::new(),
             unread_counts: HashMap::new(),
-            unread_separator_active: false,
+            unread_separator_scopes: HashSet::new(),
             activity_hint: None,
             log_enabled,
         }));
@@ -3311,7 +3325,7 @@ mod tests {
             },
             reactions: HashMap::new(),
             unread_counts: HashMap::new(),
-            unread_separator_active: false,
+            unread_separator_scopes: HashSet::new(),
             activity_hint: None,
             log_enabled: false,
         };
@@ -3355,7 +3369,7 @@ mod tests {
             },
             reactions: HashMap::new(),
             unread_counts: HashMap::new(),
-            unread_separator_active: false,
+            unread_separator_scopes: HashSet::new(),
             activity_hint: None,
             log_enabled: false,
         };
@@ -3367,12 +3381,27 @@ mod tests {
         assert_eq!(state.unread_total(), 3);
         assert_eq!(state.unread_for_channel("ops"), 2);
         assert_eq!(state.unread_dm_total(), 1);
-        assert!(state.unread_separator_active);
+        assert!(state.unread_separator_scopes.contains("ops"));
+        assert!(state.unread_separator_scopes.contains("dm:bob"));
+
+        let markers: Vec<&DisplayedMessage> = state
+            .message_history
+            .iter()
+            .filter(|m| m.msg_type == MessageType::UnreadMarker)
+            .collect();
+        assert_eq!(markers.len(), 2);
+        assert!(markers
+            .iter()
+            .any(|m| m.text == "----- new activity in #ops -----"));
+        assert!(markers
+            .iter()
+            .any(|m| m.text == "----- new DM from bob -----"));
 
         state.clear_unread_for_channel("ops");
         assert_eq!(state.unread_total(), 1);
+        assert!(!state.unread_separator_scopes.contains("ops"));
         state.clear_unread_for_dm("bob");
         assert_eq!(state.unread_total(), 0);
-        assert!(!state.unread_separator_active);
+        assert!(state.unread_separator_scopes.is_empty());
     }
 }
