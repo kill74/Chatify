@@ -75,6 +75,50 @@ cargo run --bin clicord-server
 cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 ```
 
+Windows auto-clean run commands (recommended for local dev):
+
+```powershell
+# Run server (dev profile) with automatic old-artifact cleanup
+.\run-server.ps1
+
+# Run client (dev profile) with automatic old-artifact cleanup
+.\run-client.ps1 -ProgramArgs @('--host','127.0.0.1','--port','8765')
+
+# Cleanup only (no run), dry-run mode
+.\run-client.ps1 -CleanupOnly -WhatIf
+```
+
+Advanced runner (full control):
+
+```powershell
+# Run server (dev profile) with automatic old-artifact cleanup
+.\scripts\run-with-auto-clean.ps1 -Mode server
+
+# Run client and pass normal program arguments
+.\scripts\run-with-auto-clean.ps1 -Mode client -ProgramArgs @('--host','127.0.0.1','--port','8765')
+
+# Cleanup only (no run), with custom retention and budget
+.\scripts\run-with-auto-clean.ps1 -CleanupOnly -MaxAgeDays 2 -MaxTargetSizeGB 3
+```
+
+Build footprint (important):
+
+- Rust build artifacts can grow quickly in [target](target), especially after many test/build cycles.
+- This project uses lean dev/test profile settings in [Cargo.toml](Cargo.toml) to reduce disk growth.
+- If your workspace gets large, reclaim space with:
+
+```bash
+cargo clean
+```
+
+- To remove only one profile cache:
+
+```bash
+cargo clean --profile dev
+cargo clean --profile test
+cargo clean --profile release
+```
+
 ## Windows Packaging (Maintainers)
 
 Build ZIP + installer (if Inno Setup 6 is available):

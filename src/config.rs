@@ -2,6 +2,7 @@
 //!
 //! Provides persistent settings storage with sensible defaults and cross-platform support.
 
+use crate::ui::theme::{CustomTheme, OwnedTheme};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -45,6 +46,64 @@ pub struct UiConfig {
     pub enable_emoji: bool,
     #[serde(default)]
     pub compact_mode: bool,
+    #[serde(default)]
+    pub custom_themes: Vec<CustomThemeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomThemeConfig {
+    pub name: String,
+    #[serde(default = "default_custom_header")]
+    pub header: String,
+    #[serde(default = "default_custom_subtitle")]
+    pub subtitle: String,
+    #[serde(default = "default_custom_feed_text")]
+    pub feed_text: String,
+    #[serde(default = "default_custom_sidebar_text")]
+    pub sidebar_text: String,
+    #[serde(default = "default_custom_hint")]
+    pub hint: String,
+    #[serde(default = "default_custom_dim")]
+    pub dim: String,
+    #[serde(default = "default_custom_accent")]
+    pub accent: String,
+    #[serde(default = "default_custom_border")]
+    pub border: String,
+    #[serde(default = "default_custom_error")]
+    pub error: String,
+    #[serde(default = "default_custom_success")]
+    pub success: String,
+}
+
+fn default_custom_header() -> String {
+    "147".into()
+}
+fn default_custom_subtitle() -> String {
+    "245".into()
+}
+fn default_custom_feed_text() -> String {
+    "117".into()
+}
+fn default_custom_sidebar_text() -> String {
+    "120".into()
+}
+fn default_custom_hint() -> String {
+    "220".into()
+}
+fn default_custom_dim() -> String {
+    "245".into()
+}
+fn default_custom_accent() -> String {
+    "147".into()
+}
+fn default_custom_border() -> String {
+    "240".into()
+}
+fn default_custom_error() -> String {
+    "196".into()
+}
+fn default_custom_success() -> String {
+    "82".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +192,7 @@ impl Default for UiConfig {
             enable_syntax_highlighting: true,
             enable_emoji: true,
             compact_mode: false,
+            custom_themes: Vec::new(),
         }
     }
 }
@@ -216,7 +276,10 @@ impl Config {
                         }
                     }
                 } else {
-                    log::info!("No config file found at {}. Using defaults.", path.display());
+                    log::info!(
+                        "No config file found at {}. Using defaults.",
+                        path.display()
+                    );
                     Self::default()
                 }
             }
@@ -241,8 +304,7 @@ impl Config {
         let contents = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-        fs::write(&path, contents)
-            .map_err(|e| format!("Failed to write config file: {}", e))?;
+        fs::write(&path, contents).map_err(|e| format!("Failed to write config file: {}", e))?;
 
         log::info!("Saved configuration to {}", path.display());
         Ok(())
@@ -331,6 +393,12 @@ impl Config {
 
     /// Returns a human-readable summary of the current configuration
     pub fn summary(&self) -> String {
+        let custom_theme_names: Vec<&str> = self
+            .ui
+            .custom_themes
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
         format!(
             r#"Current Configuration:
 
@@ -346,6 +414,7 @@ impl Config {
   enable_syntax_highlighting = {}
   enable_emoji = {}
   compact_mode = {}
+  custom_themes = [{}]
 
 [notifications]
   enabled = {}
@@ -374,6 +443,7 @@ Config file: {}"#,
             self.ui.enable_syntax_highlighting,
             self.ui.enable_emoji,
             self.ui.compact_mode,
+            custom_theme_names.join(", "),
             self.notifications.enabled,
             self.notifications.on_dm,
             self.notifications.on_mention,
@@ -389,6 +459,29 @@ Config file: {}"#,
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(unknown)".to_string())
         )
+    }
+
+    /// Resolves the active theme from config, checking custom themes first.
+    pub fn resolve_theme(&self) -> OwnedTheme {
+        let custom: Vec<CustomTheme> = self
+            .ui
+            .custom_themes
+            .iter()
+            .map(|ct| CustomTheme {
+                name: ct.name.clone(),
+                header: ct.header.clone(),
+                subtitle: ct.subtitle.clone(),
+                feed_text: ct.feed_text.clone(),
+                sidebar_text: ct.sidebar_text.clone(),
+                hint: ct.hint.clone(),
+                dim: ct.dim.clone(),
+                accent: ct.accent.clone(),
+                border: ct.border.clone(),
+                error: ct.error.clone(),
+                success: ct.success.clone(),
+            })
+            .collect();
+        OwnedTheme::resolve(&self.ui.theme, &custom)
     }
 }
 
@@ -441,7 +534,68 @@ mod tests {
         let config = Config::default();
         let serialized = toml::to_string(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(config.connection.default_host, deserialized.connection.default_host);
+        assert_eq!(
+            config.connection.default_host,
+            deserialized.connection.default_host
+        );
         assert_eq!(config.ui.theme, deserialized.ui.theme);
+    }
+
+    #[test]
+    fn test_custom_theme_serialization() {
+        let config_str = r#"
+[ui]
+theme = "my-theme"
+
+[[ui.custom_themes]]
+name = "my-theme"
+header = "99"
+subtitle = "100"
+feed_text = "101"
+sidebar_text = "102"
+hint = "103"
+dim = "104"
+accent = "105"
+border = "106"
+error = "107"
+success = "108"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        assert_eq!(config.ui.theme, "my-theme");
+        assert_eq!(config.ui.custom_themes.len(), 1);
+        assert_eq!(config.ui.custom_themes[0].name, "my-theme");
+        assert_eq!(config.ui.custom_themes[0].header, "99");
+    }
+
+    #[test]
+    fn test_resolve_theme_builtin() {
+        let config = Config::default();
+        let theme = config.resolve_theme();
+        assert_eq!(theme.name, "retro-grid");
+    }
+
+    #[test]
+    fn test_resolve_theme_custom() {
+        let config_str = r#"
+[ui]
+theme = "my-theme"
+
+[[ui.custom_themes]]
+name = "my-theme"
+header = "200"
+subtitle = "201"
+feed_text = "202"
+sidebar_text = "203"
+hint = "204"
+dim = "205"
+accent = "206"
+border = "207"
+error = "208"
+success = "209"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let theme = config.resolve_theme();
+        assert_eq!(theme.name, "my-theme");
+        assert_eq!(theme.header, "\x1b[38;5;200m");
     }
 }

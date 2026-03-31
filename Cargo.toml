@@ -72,3 +72,20 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.dev]
+# Keep local debugging useful while avoiding huge PDB/debuginfo output.
+debug = 1
+incremental = false
+codegen-units = 16
+
+[profile.dev.package."*"]
+# Dependencies dominate artifact size; keep them lean in day-to-day builds.
+debug = 0
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.test.package."*"]
+debug = 0

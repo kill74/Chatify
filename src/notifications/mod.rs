@@ -5,21 +5,25 @@
 
 use crate::config::NotificationConfig;
 use notify_rust::{Notification, Timeout};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 // Ensure we don't spam the user with too many notifications too quickly
-static LAST_NOTIFICATION_TIME: OnceLock<std::sync::Mutex<std::time::Instant>> = OnceLock::new();
+static LAST_NOTIFICATION_TIME: OnceLock<Mutex<Instant>> = OnceLock::new();
 
 /// The core notification service.
 pub struct NotificationService;
 
 impl NotificationService {
+    fn rate_limit_clock() -> &'static Mutex<Instant> {
+        LAST_NOTIFICATION_TIME.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(10)))
+    }
+
     /// Initializes the notification service state.
     pub fn init() {
-        let _ = LAST_NOTIFICATION_TIME.set(std::sync::Mutex::new(
-            std::time::Instant::now() - Duration::from_secs(10), // start in the past
-        ));
+        if let Ok(mut last_time) = Self::rate_limit_clock().lock() {
+            *last_time = Instant::now() - Duration::from_secs(10);
+        }
     }
 
     /// Sends a desktop notification if conditions are met.
@@ -58,15 +62,13 @@ impl NotificationService {
     /// Checks if we should drop a notification to avoid spamming the user.
     /// Rate limit is currently 1 notification every 2 seconds.
     fn is_rate_limited() -> bool {
-        if let Some(mutex) = LAST_NOTIFICATION_TIME.get() {
-            if let Ok(mut last_time) = mutex.lock() {
-                let now = std::time::Instant::now();
-                if now.duration_since(*last_time) < Duration::from_secs(2) {
-                    return true;
-                }
-                *last_time = now;
-                return false;
+        if let Ok(mut last_time) = Self::rate_limit_clock().lock() {
+            let now = Instant::now();
+            if now.duration_since(*last_time) < Duration::from_secs(2) {
+                return true;
             }
+            *last_time = now;
+            return false;
         }
         false
     }

@@ -4,13 +4,15 @@
 //! file transfers, message editing, reactions, and user status tracking.
 
 use clicord_server::config::Config;
-use clicord_server::ui::ansi::{strip_ansi, visible_width};
-use clicord_server::ui::markdown::render_markdown;
-use clicord_server::notifications::NotificationService;
 use clicord_server::crypto::{
     channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash_client,
 };
 use clicord_server::error::{ChatifyError, ChatifyResult};
+use clicord_server::notifications::NotificationService;
+use clicord_server::ui::ansi::{strip_ansi, visible_width};
+use clicord_server::ui::emoji;
+use clicord_server::ui::markdown::render_markdown;
+use clicord_server::ui::theme::{self as theme_mod, OwnedTheme, RESET as THEME_RESET};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
@@ -44,7 +46,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_HISTORY: usize = 100;
 const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
-const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /image <path>, /video <path>, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit [#N] <new text>, /quit";
+const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /status [presence|text], /theme [name|list], /emoji [on|off|list [query]], /image <path>, /video <path>, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit [#N] <new text>, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
 const DASHBOARD_HEADER_ROWS: usize = 2;
@@ -58,12 +60,6 @@ const FEED_LOOKBACK_MESSAGES: usize = 48;
 const PROFILE_PANEL_ROWS: usize = 8;
 const COMMANDS_PANEL_ROWS: usize = 6;
 const MIN_CHANNEL_PANEL_ROWS: usize = 3;
-const ANSI_RESET: &str = "\x1b[0m";
-const ANSI_HEADER: &str = "\x1b[38;5;147m";
-const ANSI_LEFT: &str = "\x1b[38;5;117m";
-const ANSI_RIGHT: &str = "\x1b[38;5;120m";
-const ANSI_HINT: &str = "\x1b[38;5;220m";
-const ANSI_DIM: &str = "\x1b[38;5;245m";
 const TRUST_STORE_FILENAME: &str = "trust-store-v1.json";
 const TRUST_STORE_DIR_WINDOWS: &str = "Chatify";
 const TRUST_STORE_DIR_UNIX: &str = ".chatify";
@@ -125,6 +121,24 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         usage: "/typing [on|off] [#channel|dm:user]",
         summary: "Broadcast typing state for a channel or DM scope.",
         example: "/typing on #general",
+    },
+    CommandSpec {
+        name: "/status",
+        usage: "/status [online|away|busy|invisible] [text]",
+        summary: "Update your local presence and broadcast text/emoji status.",
+        example: "/status away grabbing coffee",
+    },
+    CommandSpec {
+        name: "/theme",
+        usage: "/theme [name|list]",
+        summary: "List available themes or switch to a new one.",
+        example: "/theme dracula",
+    },
+    CommandSpec {
+        name: "/emoji",
+        usage: "/emoji [on|off|list [query]]",
+        summary: "Toggle shortcode expansion and browse emoji shortcodes.",
+        example: "/emoji list heart",
     },
     CommandSpec {
         name: "/image",
@@ -239,6 +253,9 @@ fn canonical_command(raw: &str) -> String {
         "/q" | "/exit" => "/quit".to_string(),
         "/w" => "/dm".to_string(),
         "/ty" => "/typing".to_string(),
+        "/st" => "/status".to_string(),
+        "/th" => "/theme".to_string(),
+        "/em" => "/emoji".to_string(),
         "/img" => "/image".to_string(),
         "/vid" => "/video".to_string(),
         "/h" => "/history".to_string(),
@@ -364,6 +381,45 @@ fn command_help_lines(raw_command: &str) -> Vec<String> {
                 format!("Did you mean: {}", suggestions.join(", ")),
             ]
         }
+    }
+}
+
+fn theme_name_exists(state: &ClientState, requested: &str) -> bool {
+    if theme_mod::find_builtin(requested).is_some() {
+        return true;
+    }
+    state
+        .config
+        .ui
+        .custom_themes
+        .iter()
+        .any(|theme| theme.name.eq_ignore_ascii_case(requested))
+}
+
+fn list_available_themes(state: &ClientState) -> (Vec<String>, Vec<String>) {
+    let mut builtin: Vec<String> = theme_mod::builtin_names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect();
+    builtin.sort_unstable();
+
+    let mut custom: Vec<String> = state
+        .config
+        .ui
+        .custom_themes
+        .iter()
+        .map(|theme| theme.name.clone())
+        .collect();
+    custom.sort_unstable_by_key(|name| name.to_lowercase());
+
+    (builtin, custom)
+}
+
+fn maybe_expand_emoji(state: &ClientState, text: &str) -> String {
+    if state.config.ui.enable_emoji {
+        emoji::expand_shortcodes(text)
+    } else {
+        text.to_string()
     }
 }
 
@@ -819,14 +875,73 @@ struct FileTransfer {
     next_index: u64,
 }
 
-/// User status information
-#[derive(Debug, Clone)]
+/// User presence state.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PresenceState {
+    Online,
+    Away,
+    Busy,
+    Invisible,
+}
+
+impl PresenceState {
+    fn from_token(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "online" | "on" => Some(PresenceState::Online),
+            "away" | "idle" => Some(PresenceState::Away),
+            "busy" | "dnd" => Some(PresenceState::Busy),
+            "invisible" | "offline" | "off" => Some(PresenceState::Invisible),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            PresenceState::Online => "online",
+            PresenceState::Away => "away",
+            PresenceState::Busy => "busy",
+            PresenceState::Invisible => "invisible",
+        }
+    }
+
+    fn indicator(&self) -> char {
+        match self {
+            PresenceState::Online => '🟢',
+            PresenceState::Away => '🟡',
+            PresenceState::Busy => '🔴',
+            PresenceState::Invisible => '⚫',
+        }
+    }
+}
+
+impl Default for PresenceState {
+    fn default() -> Self {
+        PresenceState::Online
+    }
+}
+
+/// User status information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct Status {
-    /// Status text (e.g., "Online", "Away")
+    /// Status text (e.g., "Online", "Away", "Coding")
     text: String,
     /// Status emoji (e.g., '🟢')
     emoji: char,
+    /// Presence state
+    #[serde(default)]
+    presence: PresenceState,
+    /// Short bio / description
+    #[serde(default)]
+    bio: String,
+    /// Avatar emoji (single emoji displayed prominently)
+    #[serde(default = "default_avatar")]
+    avatar: String,
+}
+
+fn default_avatar() -> String {
+    "😎".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -898,8 +1013,8 @@ struct ClientState {
     voice_active: bool,
     /// Active voice session runtime (if any)
     voice_session: Option<VoiceSession>,
-    /// Current theme
-    theme: String,
+    /// Current theme (resolved from config)
+    theme: OwnedTheme,
     /// Active file transfers
     file_transfers: HashMap<String, FileTransfer>,
     /// Message history for display
@@ -1305,6 +1420,23 @@ fn format_time(ts: u64) -> String {
 fn format_time_full(ts: u64) -> String {
     let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(Utc::now);
     datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+fn parse_status_payload(status: Option<&serde_json::Value>) -> (String, char) {
+    let text = status
+        .and_then(|value| value.get("text"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("Online")
+        .trim()
+        .to_string();
+
+    let emoji = status
+        .and_then(|value| value.get("emoji"))
+        .and_then(|value| value.as_str())
+        .and_then(|raw| raw.chars().next())
+        .unwrap_or(PresenceState::Online.indicator());
+
+    (text, emoji)
 }
 
 /// Formats a duration in seconds as a compact human-readable string
@@ -2054,7 +2186,8 @@ where
                 let display_text = format!("{}{}", msg.text, suffix);
 
                 // Markdown applied AFTER structural logic, BEFORE wrapping
-                let styled_text = render_markdown(&display_text, enable_markdown, enable_syntax_highlighting);
+                let styled_text =
+                    render_markdown(&display_text, enable_markdown, enable_syntax_highlighting);
 
                 lines.extend(prefixed_wrapped_lines(
                     prefix,
@@ -2133,8 +2266,23 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     let typing_summary = state.typing_summary(2);
 
     let profile_lines = vec![
-        format!("{} {} [{}]", state.me, state.status.emoji, state.client_id),
-        format!("status: {}", state.status.text),
+        format!(
+            "{} {} {} [{}]",
+            state.status.avatar, state.me, state.status.emoji, state.client_id
+        ),
+        format!(
+            "status: {} ({})",
+            state.status.text,
+            state.status.presence.as_str()
+        ),
+        format!(
+            "bio: {}",
+            if state.status.bio.trim().is_empty() {
+                "(none)"
+            } else {
+                state.status.bio.as_str()
+            }
+        ),
         format!("channel: #{}", state.ch),
         format!("voice: {}", if state.voice_active { "ON" } else { "OFF" }),
         format!(
@@ -2149,6 +2297,9 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
         "/help [command]".to_string(),
         "/join <channel> /switch".to_string(),
         "/dm <user> <msg>".to_string(),
+        "/status [presence] [text]".to_string(),
+        "/theme [name|list]".to_string(),
+        "/emoji [on|off|list]".to_string(),
         "/image <path>".to_string(),
         "/video <path>".to_string(),
         "/typing on|off [scope]".to_string(),
@@ -2261,16 +2412,16 @@ fn render_compact_dashboard(
     writeln!(
         out,
         "{}{}{}",
-        ANSI_HEADER,
+        state.theme.header,
         fit_to_width(&header_line, width),
-        ANSI_RESET
+        THEME_RESET
     )?;
     writeln!(
         out,
         "{}{}{}",
-        ANSI_DIM,
+        state.theme.dim,
         fit_to_width(&format!("{} | {}", status_line, COMPACT_MODE_HINT), width,),
-        ANSI_RESET
+        THEME_RESET
     )?;
 
     let max_feed_lines = height.saturating_sub(DASHBOARD_HEADER_ROWS + DASHBOARD_FOOTER_ROWS);
@@ -2282,9 +2433,9 @@ fn render_compact_dashboard(
     writeln!(
         out,
         "{}{}{}",
-        ANSI_HINT,
+        state.theme.hint,
         footer_hint_line(state, width),
-        ANSI_RESET
+        THEME_RESET
     )
 }
 
@@ -2298,16 +2449,16 @@ fn render_full_dashboard(
     writeln!(
         out,
         "{}{}{}",
-        ANSI_HEADER,
+        state.theme.header,
         fit_to_width(&header, geom.width),
-        ANSI_RESET
+        THEME_RESET
     )?;
     writeln!(
         out,
         "{}{}{}",
-        ANSI_DIM,
+        state.theme.dim,
         fit_to_width(&subtitle, geom.width),
-        ANSI_RESET
+        THEME_RESET
     )?;
 
     let left_feed_lines =
@@ -2327,16 +2478,21 @@ fn render_full_dashboard(
         writeln!(
             out,
             "{}{}{}   {}{}{}",
-            ANSI_LEFT, left_line, ANSI_RESET, ANSI_RIGHT, right_line, ANSI_RESET
+            state.theme.feed_text,
+            left_line,
+            THEME_RESET,
+            state.theme.sidebar_text,
+            right_line,
+            THEME_RESET
         )?;
     }
 
     writeln!(
         out,
         "{}{}{}",
-        ANSI_HINT,
+        state.theme.hint,
         footer_hint_line(state, geom.width),
-        ANSI_RESET
+        THEME_RESET
     )
 }
 
@@ -2373,7 +2529,7 @@ fn dashboard_header_lines(state: &ClientState) -> (String, String) {
         status_chip("EVENTS", state.message_history.len()),
         status_chip("UNREAD", state.unread_total()),
         status_chip("TYPING", state.typing_count()),
-        status_chip("THEME", &state.theme),
+        status_chip("THEME", &state.theme.name),
     );
 
     let subtitle = format!(
@@ -2383,7 +2539,12 @@ fn dashboard_header_lines(state: &ClientState) -> (String, String) {
         status_chip("TRUST", format!("T{}/U{}/C{}", trusted, unknown, changed)),
         status_chip(
             "STATUS",
-            format!("{} {}", state.status.emoji, state.status.text)
+            format!(
+                "{} {} ({})",
+                state.status.emoji,
+                state.status.text,
+                state.status.presence.as_str()
+            )
         ),
         status_chip("LIVE", state.live_activity_label()),
         status_chip("CLIENT", &state.client_id),
@@ -2724,7 +2885,10 @@ async fn handle_msg_event(state: &SharedState, data: &JsonMap, ts: u64) {
             }
 
             let mentioned = message.contains(&format!("@{}", state_lock.me));
-            if state_lock.config.notifications.enabled && (state_lock.config.notifications.on_all_messages || (mentioned && state_lock.config.notifications.on_mention)) {
+            if state_lock.config.notifications.enabled
+                && (state_lock.config.notifications.on_all_messages
+                    || (mentioned && state_lock.config.notifications.on_mention))
+            {
                 NotificationService::send(
                     &state_lock.config.notifications,
                     &format!("New message in #{}", ch),
@@ -3060,7 +3224,8 @@ async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
     };
 
     if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
-        let msg_text = String::from_utf8(content).unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string());
+        let msg_text =
+            String::from_utf8(content).unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string());
         let arrow = if frm == state_lock.me { "→" } else { "←" };
 
         if frm != state_lock.me {
@@ -3260,6 +3425,26 @@ async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
     });
 }
 
+async fn handle_status_update_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let user = data.get("user").and_then(|v| v.as_str()).unwrap_or("?");
+    let (text, emoji) = parse_status_payload(data.get("status"));
+
+    let mut state_lock = state.lock().await;
+    if user == state_lock.me {
+        state_lock.status.text = text.clone();
+        state_lock.status.emoji = emoji;
+    }
+
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("{} is now {} {}", user, emoji, text),
+        msg_type: MessageType::StatusUpdate,
+        user: Some(user.to_string()),
+        channel: None,
+        edited: false,
+    });
+}
+
 async fn handle_typing_event(state: &SharedState, data: &JsonMap) {
     let typing = data.get("typing").and_then(|v| v.as_bool()).unwrap_or(true);
     let mut state_lock = state.lock().await;
@@ -3317,6 +3502,7 @@ async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
         "joined" => handle_joined_event(state, data, ts).await,
         "history" | "search" | "replay" => handle_history_or_search_event(state, data, t, ts).await,
         "info" => handle_info_event(state, data, ts).await,
+        "status_update" => handle_status_update_event(state, data, ts).await,
         "bridge_status" => handle_bridge_status_event(state, data, ts).await,
         "typing" => handle_typing_event(state, data).await,
         "vdata" => handle_vdata_event(state, data).await,
@@ -3629,6 +3815,8 @@ fn stop_voice_session(state: &mut ClientState, feedback: SessionStopFeedback) {
 }
 
 fn queue_channel_message(state: &mut ClientState, channel: &str, plaintext: &str) {
+    let plaintext = maybe_expand_emoji(state, plaintext);
+
     enqueue_typing_state(
         &state.ws_tx,
         &TypingScope::Channel(channel.to_string()),
@@ -3642,7 +3830,7 @@ fn queue_channel_message(state: &mut ClientState, channel: &str, plaintext: &str
         }
     };
     let encoded = general_purpose::STANDARD.encode(&encrypted);
-    state.record_sent(channel, plaintext);
+    state.record_sent(channel, &plaintext);
     enqueue_timed(
         &state.ws_tx,
         serde_json::json!({"t": "msg", "ch": channel, "c": encoded, "p": plaintext}),
@@ -3705,8 +3893,10 @@ fn handle_slash_command(
                 ));
             }
 
+            let outbound_msg = maybe_expand_emoji(state, msg);
+
             let encrypted = match state.dmkey(target) {
-                Ok(key) => match enc_bytes(&key, msg.as_bytes()) {
+                Ok(key) => match enc_bytes(&key, outbound_msg.as_bytes()) {
                     Ok(v) => v,
                     Err(e) => {
                         state.add_notice(format!("encryption failed: {}", e));
@@ -3719,10 +3909,10 @@ fn handle_slash_command(
                 }
             };
             let encoded = general_purpose::STANDARD.encode(&encrypted);
-            state.record_sent(&format!("dm:{}", target), msg);
+            state.record_sent(&format!("dm:{}", target), &outbound_msg);
             enqueue_timed(
                 &state.ws_tx,
-                serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": msg}),
+                serde_json::json!({"t": "dm", "to": target, "c": encoded, "p": outbound_msg}),
             );
             enqueue_typing_state(&state.ws_tx, &TypingScope::Dm(target.to_string()), false);
             state.clear_unread_for_dm(target);
@@ -3774,6 +3964,194 @@ fn handle_slash_command(
                 if typing_enabled { "ON" } else { "OFF" },
                 scope.label()
             ));
+        }
+        "/status" => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() {
+                state.add_notice(format!(
+                    "Current status: {} {} ({})",
+                    state.status.emoji,
+                    state.status.text,
+                    state.status.presence.as_str()
+                ));
+                state.add_notice(format!("Avatar: {}", state.status.avatar));
+                state.add_notice(format!(
+                    "Bio: {}",
+                    if state.status.bio.trim().is_empty() {
+                        "(none)"
+                    } else {
+                        state.status.bio.as_str()
+                    }
+                ));
+                state.add_notice("Usage: /status [online|away|busy|invisible] [text]");
+                return CommandFlow::Continue;
+            }
+
+            let mut parts = trimmed.splitn(2, ' ');
+            let first = parts.next().unwrap_or("");
+            let tail = parts.next().unwrap_or("").trim();
+
+            if let Some(presence) = PresenceState::from_token(first) {
+                state.status.presence = presence;
+                state.status.emoji = presence.indicator();
+                if !tail.is_empty() {
+                    let expanded = maybe_expand_emoji(state, tail);
+                    state.status.text = expanded;
+                }
+            } else {
+                let expanded = maybe_expand_emoji(state, trimmed);
+                state.status.text = expanded;
+            }
+
+            let status_text = state.status.text.clone();
+            let status_emoji = state.status.emoji.to_string();
+
+            enqueue_timed(
+                &state.ws_tx,
+                serde_json::json!({
+                    "t": "status",
+                    "status": {
+                        "text": status_text,
+                        "emoji": status_emoji
+                    }
+                }),
+            );
+            state.add_notice(format!(
+                "Status updated: {} {} ({})",
+                state.status.emoji,
+                state.status.text,
+                state.status.presence.as_str()
+            ));
+            state.refresh_dashboard();
+        }
+        "/theme" => {
+            let requested = args.trim();
+            if requested.is_empty() || requested.eq_ignore_ascii_case("list") {
+                let (builtin, custom) = list_available_themes(state);
+                state.add_notice(format!("Current theme: {}", state.theme.name));
+                state.add_notice(format!("Built-in themes: {}", builtin.join(", ")));
+                if custom.is_empty() {
+                    state.add_notice("Custom themes: (none)");
+                } else {
+                    state.add_notice(format!("Custom themes: {}", custom.join(", ")));
+                }
+                state.add_notice("Usage: /theme <name> | /theme list");
+                return CommandFlow::Continue;
+            }
+
+            if !theme_name_exists(state, requested) {
+                let requested_lower = requested.to_lowercase();
+                let (builtin, custom) = list_available_themes(state);
+                let mut suggestions: Vec<String> = builtin
+                    .into_iter()
+                    .chain(custom)
+                    .filter(|name| name.to_lowercase().contains(&requested_lower))
+                    .take(6)
+                    .collect();
+                suggestions.sort_unstable();
+
+                if suggestions.is_empty() {
+                    state.add_notice(format!(
+                        "Unknown theme '{}'. Use /theme list to see available names.",
+                        requested
+                    ));
+                } else {
+                    state.add_notice(format!(
+                        "Unknown theme '{}'. Did you mean: {}",
+                        requested,
+                        suggestions.join(", ")
+                    ));
+                }
+                return CommandFlow::Continue;
+            }
+
+            state.config.ui.theme = requested.to_string();
+            state.theme = state.config.resolve_theme();
+            match state.config.save() {
+                Ok(()) => state.add_notice(format!("Theme switched to '{}'.", state.theme.name)),
+                Err(e) => state.add_notice(format!(
+                    "Theme switched to '{}' (save failed: {}).",
+                    state.theme.name, e
+                )),
+            }
+            state.refresh_dashboard();
+        }
+        "/emoji" => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() {
+                state.add_notice(format!(
+                    "Emoji shortcodes are {}.",
+                    if state.config.ui.enable_emoji {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    }
+                ));
+                state.add_notice("Usage: /emoji [on|off|list [query]]");
+                return CommandFlow::Continue;
+            }
+
+            let mut parts = trimmed.splitn(2, ' ');
+            let sub = parts.next().unwrap_or("").to_lowercase();
+            let tail = parts.next().unwrap_or("").trim();
+
+            match sub.as_str() {
+                "on" => {
+                    state.config.ui.enable_emoji = true;
+                    match state.config.save() {
+                        Ok(()) => state.add_notice("Emoji shortcode expansion enabled."),
+                        Err(e) => state
+                            .add_notice(format!("Emoji enabled, but failed to save config: {}", e)),
+                    }
+                }
+                "off" => {
+                    state.config.ui.enable_emoji = false;
+                    match state.config.save() {
+                        Ok(()) => state.add_notice("Emoji shortcode expansion disabled."),
+                        Err(e) => state.add_notice(format!(
+                            "Emoji disabled, but failed to save config: {}",
+                            e
+                        )),
+                    }
+                }
+                "list" => {
+                    let entries = if tail.is_empty() {
+                        emoji::emoji_list()
+                    } else {
+                        emoji::search_emoji(tail)
+                    };
+
+                    if entries.is_empty() {
+                        state.add_notice("No emoji shortcodes matched your query.");
+                        return CommandFlow::Continue;
+                    }
+
+                    let shown = entries.len().min(24);
+                    if tail.is_empty() {
+                        state.add_notice(format!(
+                            "Emoji shortcodes: showing {} of {}",
+                            shown,
+                            entries.len()
+                        ));
+                    } else {
+                        state.add_notice(format!(
+                            "Emoji search '{}': showing {} of {}",
+                            tail,
+                            shown,
+                            entries.len()
+                        ));
+                    }
+                    for (shortcode, emoji_char) in entries.iter().take(shown) {
+                        state.add_notice(format!("{} {}", shortcode, emoji_char));
+                    }
+                    if entries.len() > shown {
+                        state.add_notice(format!("... and {} more", entries.len() - shown));
+                    }
+                }
+                _ => {
+                    state.add_notice("Usage: /emoji [on|off|list [query]]");
+                }
+            }
         }
         "/fingerprint" => {
             let target = args.trim();
@@ -3947,6 +4325,8 @@ fn handle_slash_command(
                 return CommandFlow::Continue;
             }
 
+            let expanded_new_text = maybe_expand_emoji(state, new_text);
+
             let old_text = match state.find_recent_sent(&ch, index) {
                 Some(sent) => sent.plaintext.clone(),
                 None => {
@@ -3974,13 +4354,13 @@ fn handle_slash_command(
                     "t": "edit",
                     "ch": ch,
                     "old_text": old_text,
-                    "new_text": new_text
+                    "new_text": expanded_new_text
                 }),
             );
 
             // Update local feed optimistically.
             let me = state.me.clone();
-            if state.update_message_in_feed(&me, &ch, &old_text, new_text) {
+            if state.update_message_in_feed(&me, &ch, &old_text, &expanded_new_text) {
                 state.add_notice(format!("Edited message #{}.", index));
             }
             state.refresh_dashboard();
@@ -4086,6 +4466,7 @@ fn handle_slash_command(
 async fn main() -> ChatifyResult<()> {
     // Load configuration from file (with defaults if not found)
     let config = Config::load();
+    NotificationService::init();
 
     // Parse command line arguments (will override config values)
     let matches = clap::Command::new("chatify-client")
@@ -4261,12 +4642,15 @@ async fn main() -> ChatifyResult<()> {
             running: true,
             voice_active: false,
             voice_session: None,
-            theme: config_to_save.ui.theme.clone(),
+            theme: config_to_save.resolve_theme(),
             file_transfers: HashMap::new(),
             message_history: VecDeque::new(),
             status: Status {
                 text: "Online".to_string(),
-                emoji: '🟢',
+                emoji: PresenceState::Online.indicator(),
+                presence: PresenceState::Online,
+                bio: String::new(),
+                avatar: default_avatar(),
             },
             reactions: HashMap::new(),
             unread_counts: HashMap::new(),
@@ -4450,6 +4834,8 @@ mod tests {
     /// The returned sender can be used to read outbound messages if needed.
     fn test_client_state() -> (mpsc::UnboundedSender<String>, ClientState) {
         let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let config = Config::default();
+        let theme = config.resolve_theme();
         let state = ClientState {
             ws_tx: tx.clone(),
             me: "alice".to_string(),
@@ -4468,12 +4854,15 @@ mod tests {
             running: true,
             voice_active: false,
             voice_session: None,
-            theme: "retro-grid".to_string(),
+            theme,
             file_transfers: HashMap::new(),
             message_history: VecDeque::new(),
             status: Status {
                 text: "Online".to_string(),
-                emoji: '🟢',
+                emoji: PresenceState::Online.indicator(),
+                presence: PresenceState::Online,
+                bio: String::new(),
+                avatar: default_avatar(),
             },
             reactions: HashMap::new(),
             unread_counts: HashMap::new(),
@@ -4482,7 +4871,7 @@ mod tests {
             typing_presence: HashMap::new(),
             recent_sents: VecDeque::new(),
             log_enabled: false,
-            config: Config::default(),
+            config,
         };
         (tx, state)
     }
@@ -4716,5 +5105,36 @@ mod tests {
         state.set_typing_presence("bob", "#ops", false);
         assert_eq!(state.typing_count(), 0);
         assert_eq!(state.typing_summary(2), "none");
+    }
+
+    #[test]
+    fn edit_command_expands_shortcodes_when_emoji_enabled() {
+        let (_tx, mut state) = test_client_state();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+        state.ws_tx = ws_tx;
+        state.config.ui.enable_emoji = true;
+
+        state.record_sent("general", "hello");
+        state.push_message(DisplayedMessage {
+            time: "10:00".to_string(),
+            text: "hello".to_string(),
+            msg_type: MessageType::Msg,
+            user: Some(state.me.clone()),
+            channel: Some("general".to_string()),
+            edited: false,
+        });
+
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let flow = handle_slash_command(&mut state, "/edit", "updated :rocket:", &shutdown_tx);
+        assert!(matches!(flow, CommandFlow::Continue));
+
+        let payload = ws_rx.try_recv().expect("missing outbound edit payload");
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("invalid JSON");
+        assert_eq!(json["t"], "edit");
+        assert_eq!(json["new_text"], "updated 🚀");
+        assert!(state
+            .message_history
+            .iter()
+            .any(|msg| msg.user.as_deref() == Some("alice") && msg.text == "updated 🚀"));
     }
 }
