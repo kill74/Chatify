@@ -17,7 +17,9 @@ This project is actively evolving and should currently be treated as experimenta
 
 - Multi-channel messaging
 - Direct messages
-- Basic presence/status propagation
+- Custom user status messages
+- Live roster with online/idle state detection
+- Automatic idle timeout (5 minutes)
 - Join/channel info/user listing commands
 - In-memory channel history relay
 
@@ -93,18 +95,19 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ## CLI Commands (Current)
 
-| Command              | Description               |
-| -------------------- | ------------------------- |
-| /join <channel>      | Join or create a channel  |
-| /dm <user> <message> | Send a direct message     |
-| /me <action>         | Send action-style message |
-| /users               | List online users         |
-| /channels            | List channels             |
-| /voice [room]        | Toggle voice in room      |
-| /edit <text>         | Placeholder command       |
-| /clear               | Clear terminal output     |
-| /help                | Show command help         |
-| /quit, /exit, /q     | Disconnect and exit       |
+| Command              | Description                         |
+| -------------------- | ----------------------------------- |
+| /join <channel>      | Join or create a channel            |
+| /dm <user> <message> | Send a direct message               |
+| /me <action>         | Send action-style message           |
+| /users               | List online users with live status  |
+| /status <message>    | Set custom status (e.g., "AFK")     |
+| /channels            | List channels                       |
+| /voice [room]        | Toggle voice in room                |
+| /edit <text>         | Placeholder command                 |
+| /clear               | Clear terminal output               |
+| /help                | Show command help                   |
+| /quit, /exit, /q     | Disconnect and exit                 |
 
 ## UI Example (Terminal)
 
@@ -132,8 +135,15 @@ Connected to server
 
 Hello team, build passed on my side.
 
+/status In a meeting
+
 /users
-Online users: alice, bob, carol
+━━━ LIVE ROSTER ━━━
+Online (2):
+  🟢 alice (In a meeting)
+  🟢 bob
+Away (1):
+  💤 carol
 
 /dm bob Can you review the auth patch?
 
@@ -145,6 +155,29 @@ Voice stopped
 
 /quit
 ```
+
+## Status Management
+
+Chatify includes intelligent presence tracking:
+
+### Custom Status
+Set a custom status message visible to all users:
+```bash
+/status In a meeting
+/status AFK - back in 10 min
+/status Working on the database migration
+```
+
+### Live Roster
+The `/users` command shows an enhanced roster with:
+- 🟢 **Online** - Active users
+- 💤 **Away** - Users idle for 5+ minutes
+- Custom status messages displayed alongside usernames
+
+### Automatic Idle Detection
+- Users are automatically marked as "away" after 5 minutes of inactivity
+- Any message or command resets the idle timer
+- Idle detection runs in the background on the server
 
 ## Feature Maturity
 

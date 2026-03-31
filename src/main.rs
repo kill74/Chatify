@@ -52,9 +52,51 @@ impl Channel {
     }
 }
 
+/// User presence information
+#[derive(Clone, Debug)]
+struct UserPresence {
+    /// Custom status message set by the user
+    status_message: Option<String>,
+    /// Current online state: "online", "idle", "offline"
+    state: String,
+    /// Timestamp of last activity (for idle detection)
+    last_activity: f64,
+    /// Public key for encryption
+    public_key: Option<String>,
+}
+
+impl UserPresence {
+    fn new(public_key: Option<String>) -> Self {
+        Self {
+            status_message: None,
+            state: "online".to_string(),
+            last_activity: now(),
+            public_key,
+        }
+    }
+
+    fn update_activity(&mut self) {
+        self.last_activity = now();
+        if self.state == "idle" {
+            self.state = "online".to_string();
+        }
+    }
+
+    fn to_json(&self, username: &str) -> Value {
+        serde_json::json!({
+            "u": username,
+            "state": self.state,
+            "status": self.status_message,
+            "pk": self.public_key.as_ref().unwrap_or(&String::new())
+        })
+    }
+}
+
 struct State {
     channels: DashMap<String, Channel>,
     voice: DashMap<String, broadcast::Sender<String>>,
+    /// Maps username -> UserPresence
+    user_presence: DashMap<String, UserPresence>,
     user_statuses: DashMap<String, Value>,
     user_pubkeys: DashMap<String, String>,
     file_transfers: DashMap<String, Value>,
@@ -66,6 +108,7 @@ impl State {
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
+            user_presence: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
             file_transfers: DashMap::new(),
@@ -94,7 +137,7 @@ impl State {
 
     /// Get the count of online users
     fn online_count(&self) -> usize {
-        self.user_statuses.len()
+        self.user_presence.len()
     }
 
     /// Get all channels as JSON array (excluding DM channels)
@@ -108,14 +151,21 @@ impl State {
         )
     }
 
-    /// Get online users and their public keys as JSON array.
+    /// Get online users with their presence info as JSON array
     fn users_with_keys_json(&self) -> Value {
         Value::Array(
-            self.user_pubkeys
+            self.user_presence
                 .iter()
-                .map(|e| serde_json::json!({"u": e.key().clone(), "pk": e.value().clone()}))
+                .map(|entry| entry.value().to_json(entry.key()))
                 .collect(),
         )
+    }
+
+    /// Update user activity timestamp
+    fn touch_user(&self, username: &str) {
+        if let Some(mut presence) = self.user_presence.get_mut(username) {
+            presence.update_activity();
+        }
     }
 }
 
@@ -240,17 +290,27 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         .unwrap_or("anon")
         .to_string();
 
-    // Track user status
+    // Extract public key and initialize user presence
+    let pk = d.get("pk").and_then(|v| v.as_str()).map(String::from);
+    let presence = UserPresence::new(pk.clone());
+
+    // Legacy status support (for backward compatibility)
     let status = d
         .get("status")
         .cloned()
         .unwrap_or(serde_json::json!({"text": "Online", "emoji": "🟢"}));
     state.user_statuses.insert(username.clone(), status);
-    if let Some(pk) = d.get("pk").and_then(|v| v.as_str()) {
-        if !pk.is_empty() {
-            state.user_pubkeys.insert(username.clone(), pk.to_string());
+
+    if let Some(ref public_key) = pk {
+        if !public_key.is_empty() {
+            state
+                .user_pubkeys
+                .insert(username.clone(), public_key.clone());
         }
     }
+
+    // Insert user presence
+    state.user_presence.insert(username.clone(), presence);
 
     // Get general channel and send welcome response
     let general = state.chan("general");
@@ -309,6 +369,9 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Update user activity timestamp for idle detection
+        state.touch_user(&username);
 
         let t = d["t"].as_str().unwrap_or("");
 
@@ -484,19 +547,31 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let _ = state.chan(&ch).tx.send(chunk_msg);
             }
             "status" => {
+                // Handle custom status message update
+                let status_msg = d.get("msg").and_then(|v| v.as_str()).map(String::from);
+
+                if let Some(mut presence) = state.user_presence.get_mut(&username) {
+                    presence.status_message = status_msg.clone();
+                }
+
+                // Legacy status support
                 if let Some(status_val) = d.get("status") {
                     state
                         .user_statuses
                         .insert(username.clone(), status_val.clone());
-                    let status_update = serde_json::json!({
-                        "t": "status_update",
-                        "user": username,
-                        "status": status_val
-                    })
-                    .to_string();
-                    for chan_entry in state.channels.iter() {
-                        let _ = chan_entry.tx.send(status_update.clone());
-                    }
+                }
+
+                // Broadcast status update to all channels
+                let status_update = serde_json::json!({
+                    "t": "status_update",
+                    "user": username,
+                    "msg": status_msg,
+                    "users": state.users_with_keys_json()
+                })
+                .to_string();
+
+                for chan_entry in state.channels.iter() {
+                    let _ = chan_entry.tx.send(status_update.clone());
                 }
             }
             "reaction" => {
@@ -519,10 +594,55 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     }
 
     // User disconnected - cleanup
+    state.user_presence.remove(&username);
     state.user_statuses.remove(&username);
     state.user_pubkeys.remove(&username);
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     log(&state, &format!("- {}", username));
+}
+
+/// Idle detection background task
+/// Checks every 30 seconds for users who haven't been active in 5+ minutes
+async fn idle_detection_loop(state: Arc<State>) {
+    const IDLE_THRESHOLD: f64 = 300.0; // 5 minutes in seconds
+    const CHECK_INTERVAL: u64 = 30; // Check every 30 seconds
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(CHECK_INTERVAL)).await;
+
+        let current_time = now();
+        let mut updates = Vec::new();
+
+        // Check each user's last activity
+        for mut entry in state.user_presence.iter_mut() {
+            let username = entry.key().clone();
+            let presence = entry.value_mut();
+
+            let time_since_activity = current_time - presence.last_activity;
+
+            // Mark as idle if inactive for more than threshold and currently online
+            if time_since_activity >= IDLE_THRESHOLD && presence.state == "online" {
+                presence.state = "idle".to_string();
+                updates.push((username.clone(), presence.clone()));
+            }
+        }
+
+        // Broadcast idle state updates
+        for (username, presence) in updates {
+            let status_update = serde_json::json!({
+                "t": "status_update",
+                "user": username,
+                "msg": presence.status_message,
+                "state": presence.state,
+                "users": state.users_with_keys_json()
+            })
+            .to_string();
+
+            for chan_entry in state.channels.iter() {
+                let _ = chan_entry.tx.send(status_update.clone());
+            }
+        }
+    }
 }
 
 /// Main entry point
@@ -540,6 +660,12 @@ async fn main() {
     };
 
     let state = State::new(args.log);
+
+    // Spawn idle detection background task
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        idle_detection_loop(state_clone).await;
+    });
 
     println!("📡 Chatify running on ws://{}", addr);
     println!("🔒 Encryption: None (testing) | 🛡️  IP Privacy: On");

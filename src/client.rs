@@ -222,6 +222,7 @@ fn normalize_channel(raw: &str) -> Option<String> {
     }
 }
 
+/// Parse users payload and format for display with status
 fn parse_users_payload(users_val: &serde_json::Value) -> (Vec<String>, HashMap<String, String>) {
     let users: Vec<serde_json::Value> =
         serde_json::from_value(users_val.clone()).unwrap_or_default();
@@ -241,6 +242,62 @@ fn parse_users_payload(users_val: &serde_json::Value) -> (Vec<String>, HashMap<S
     }
 
     (names, keys)
+}
+
+/// Format user roster with state and status information
+fn format_user_roster(users_val: &serde_json::Value) -> String {
+    let users: Vec<serde_json::Value> =
+        serde_json::from_value(users_val.clone()).unwrap_or_default();
+
+    if users.is_empty() {
+        return "No users online".to_string();
+    }
+
+    let mut online_users = Vec::new();
+    let mut idle_users = Vec::new();
+
+    for user in users {
+        if let Some(name) = user.get("u").and_then(|v| v.as_str()) {
+            let state = user
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("online");
+            let status = user.get("status").and_then(|v| v.as_str());
+
+            let display = if let Some(status_msg) = status {
+                if !status_msg.is_empty() {
+                    format!("{} ({})", name, status_msg)
+                } else {
+                    name.to_string()
+                }
+            } else {
+                name.to_string()
+            };
+
+            match state {
+                "idle" => idle_users.push(format!("💤 {}", display)),
+                _ => online_users.push(format!("🟢 {}", display)),
+            }
+        }
+    }
+
+    let mut result = String::from("━━━ LIVE ROSTER ━━━\n");
+
+    if !online_users.is_empty() {
+        result.push_str(&format!("Online ({}):\n", online_users.len()));
+        for user in online_users {
+            result.push_str(&format!("  {}\n", user));
+        }
+    }
+
+    if !idle_users.is_empty() {
+        result.push_str(&format!("Away ({}):\n", idle_users.len()));
+        for user in idle_users {
+            result.push_str(&format!("  {}\n", user));
+        }
+    }
+
+    result.trim_end().to_string()
 }
 
 fn encode_voice_frame(frame: &VoiceFrame) -> String {
@@ -813,13 +870,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut state = state_clone.lock().await;
                                 let empty_users = serde_json::json!([]);
                                 let users_val = data.get("users").unwrap_or(&empty_users);
-                                let (names, key_map) = parse_users_payload(users_val);
+                                let (_names, key_map) = parse_users_payload(users_val);
                                 for (name, pk) in key_map {
                                     state.users.insert(name, pk);
                                 }
                                 state.message_history.push(DisplayedMessage {
                                     time: format_time(ts),
-                                    text: format!("Online users: {}", names.join(", ")),
+                                    text: format_user_roster(users_val),
                                     msg_type: MessageType::Sys,
                                     user: None,
                                     channel: None,
@@ -898,6 +955,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     (playback_tx, decode_voice_frame(payload))
                                 {
                                     let _ = tx.send(VoiceEvent::Playback(frame));
+                                }
+                            }
+                            "status_update" => {
+                                // Handle user status updates and refresh user list
+                                let mut state = state_clone.lock().await;
+                                let empty_users = serde_json::json!([]);
+                                let users_val = data.get("users").unwrap_or(&empty_users);
+                                let (_, key_map) = parse_users_payload(users_val);
+
+                                // Update user keys cache
+                                for (name, pk) in key_map {
+                                    state.users.insert(name, pk);
+                                }
+
+                                // Optionally show notification when someone changes status
+                                if let Some(user) = data.get("user").and_then(|v| v.as_str()) {
+                                    if let Some(msg) = data.get("msg").and_then(|v| v.as_str()) {
+                                        if !msg.is_empty() {
+                                            state.message_history.push(DisplayedMessage {
+                                                time: format_time(ts),
+                                                text: format!("📍 {} → {}", user, msg),
+                                                msg_type: MessageType::Sys,
+                                                user: None,
+                                                channel: None,
+                                            });
+                                            if state.message_history.len() > 100 {
+                                                state.message_history.remove(0);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             _ => {}
@@ -1095,8 +1182,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!();
                             }
                         }
+                        "/status" => {
+                            let status_msg = args.trim();
+                            if status_msg.is_empty() {
+                                state.log(
+                                    "INFO",
+                                    "Usage: /status <message> (e.g., 'In a meeting', 'AFK')",
+                                );
+                            } else {
+                                let _ = state.ws_tx.send(
+                                    serde_json::json!({
+                                        "t": "status",
+                                        "msg": status_msg,
+                                        "ts": SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    })
+                                    .to_string(),
+                                );
+                                state.log("INFO", &format!("Status updated to: {}", status_msg));
+                            }
+                        }
                         "/help" => {
-                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /clear, /edit, /help, /quit");
+                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /status <msg>, /clear, /edit, /help, /quit");
                         }
                         "/edit" => {
                             // Placeholder for edit

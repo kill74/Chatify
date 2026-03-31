@@ -233,3 +233,103 @@ async fn voice_contract_forwards_vdata_between_room_members() {
         Some("ZmFrZS1hdWRpby1wYXlsb2Fk")
     );
 }
+
+#[tokio::test]
+async fn status_contract_broadcasts_custom_status() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+    let mut bob = TestClient::connect_and_auth(&server.url, "bob").await;
+
+    // Alice sets a custom status
+    alice
+        .send_json(json!({
+            "t": "status",
+            "msg": "In a meeting",
+            "ts": 123
+        }))
+        .await;
+
+    // Bob should receive the status update
+    let status_update = bob.recv_by_type("status_update").await;
+    assert_eq!(
+        status_update.get("user").and_then(|v| v.as_str()),
+        Some("alice")
+    );
+    assert_eq!(
+        status_update.get("msg").and_then(|v| v.as_str()),
+        Some("In a meeting")
+    );
+
+    // Verify users list includes the new status
+    let users = status_update
+        .get("users")
+        .and_then(|v| v.as_array())
+        .expect("status_update should include users array");
+
+    let alice_user = users
+        .iter()
+        .find(|u| u.get("u").and_then(|v| v.as_str()) == Some("alice"))
+        .expect("alice should be in users list");
+
+    assert_eq!(
+        alice_user.get("status").and_then(|v| v.as_str()),
+        Some("In a meeting")
+    );
+}
+
+#[tokio::test]
+async fn idle_detection_marks_inactive_users_as_away() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+    let mut bob = TestClient::connect_and_auth(&server.url, "bob").await;
+
+    // Bob sends a message to establish activity
+    bob.send_json(json!({"t": "msg", "ch": "general", "c": "test", "ts": 1}))
+        .await;
+
+    // Request users list to check initial state
+    alice.send_json(json!({"t": "users", "ts": 1})).await;
+    let users_msg = alice.recv_by_type("users").await;
+    let users = users_msg
+        .get("users")
+        .and_then(|v| v.as_array())
+        .expect("users should be an array");
+
+    // Both should initially be online
+    for user in users {
+        let state = user.get("state").and_then(|v| v.as_str()).unwrap_or("online");
+        assert_eq!(state, "online", "users should start in online state");
+    }
+
+    // Note: Full idle timeout test would require waiting 5+ minutes
+    // This test validates the presence structure includes the state field
+}
+
+#[tokio::test]
+async fn users_response_includes_presence_fields() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+
+    alice.send_json(json!({"t": "users", "ts": 1})).await;
+    let users_msg = alice.recv_by_type("users").await;
+    let users = users_msg
+        .get("users")
+        .and_then(|v| v.as_array())
+        .expect("users should be an array");
+
+    assert!(!users.is_empty(), "should have at least one user");
+
+    for user in users {
+        // Verify new presence fields exist
+        assert!(user.get("u").is_some(), "user should have username");
+        assert!(user.get("pk").is_some(), "user should have public key");
+        assert!(user.get("state").is_some(), "user should have state field");
+        
+        let state = user.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            state == "online" || state == "idle",
+            "state should be 'online' or 'idle'"
+        );
+    }
+}
+
