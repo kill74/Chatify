@@ -59,6 +59,13 @@ subtle = "2.6"
 zeroize = { version = "1.7", features = ["derive"] }
 ring = "0.17"
 rustls-webpki = "0.103"
+toml = "0.8"
+dirs = "5.0"
+rustyline = "13.0"
+pulldown-cmark = "0.9"
+syntect = "5.1"
+notify-rust = "4.10"
+regex = "1.10"
 
 [profile.release]
 opt-level = 3

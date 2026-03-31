@@ -6,11 +6,15 @@
 //! - `crypto`: key derivation and encryption helpers used by runtime components.
 //! - `error`: shared error/result types used by binaries.
 //! - `totp`: two-factor authentication implementation.
+//! - `config`: configuration management for persistent settings.
 //! - utility functions for channel normalization, timestamps, and nonces.
 
+pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod notifications;
 pub mod totp;
+pub mod ui;
 
 use rand::RngCore;
 use std::time::{SystemTime, UNIX_EPOCH};

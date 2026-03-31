@@ -3,6 +3,10 @@
 //! A real-time chat client with support for channels, direct messages, voice,
 //! file transfers, message editing, reactions, and user status tracking.
 
+use clicord_server::config::Config;
+use clicord_server::ui::ansi::{strip_ansi, visible_width};
+use clicord_server::ui::markdown::render_markdown;
+use clicord_server::notifications::NotificationService;
 use clicord_server::crypto::{
     channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash_client,
 };
@@ -917,6 +921,8 @@ struct ClientState {
     recent_sents: VecDeque<SentMessage>,
     /// Enable debug logging
     log_enabled: bool,
+    /// Configuration (for runtime access and persistence)
+    config: Config,
 }
 
 impl ClientState {
@@ -1815,6 +1821,18 @@ fn truncate_with_ellipsis(input: &str, width: usize) -> String {
         return String::new();
     }
 
+    let vis_len = visible_width(input);
+    if vis_len <= width {
+        return input.to_string();
+    }
+
+    // For rich ANSI strings, truncation is unsafe for terminal state,
+    // so we return it intact (or we could strip it).
+    if input.contains('\x1b') {
+        let stripped = strip_ansi(input);
+        return truncate_with_ellipsis(&stripped, width);
+    }
+
     let mut out = String::new();
     let mut chars = input.chars();
     for _ in 0..width {
@@ -1837,7 +1855,7 @@ fn truncate_with_ellipsis(input: &str, width: usize) -> String {
 
 fn fit_to_width(input: &str, width: usize) -> String {
     let clipped = truncate_with_ellipsis(input, width);
-    let clipped_len = clipped.chars().count();
+    let clipped_len = visible_width(&clipped);
     if clipped_len >= width {
         clipped
     } else {
@@ -1852,10 +1870,10 @@ fn wrap_words(input: &str, width: usize, max_lines: usize) -> Vec<String> {
 
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut current_len = 0;
 
     for word in input.split_whitespace() {
-        let current_len = current.chars().count();
-        let word_len = word.chars().count();
+        let word_len = visible_width(word);
         let next_len = if current_len == 0 {
             word_len
         } else {
@@ -1866,12 +1884,19 @@ fn wrap_words(input: &str, width: usize, max_lines: usize) -> Vec<String> {
             if !current.is_empty() {
                 lines.push(current);
             }
-            current = truncate_with_ellipsis(word, width);
+            if word_len > width {
+                current = truncate_with_ellipsis(word, width);
+                current_len = visible_width(&current);
+            } else {
+                current = word.to_string();
+                current_len = word_len;
+            }
         } else {
             if !current.is_empty() {
                 current.push(' ');
             }
             current.push_str(word);
+            current_len = next_len;
         }
     }
 
@@ -1995,7 +2020,13 @@ fn prefixed_preformatted_lines(
     output
 }
 
-fn render_grouped_feed_lines<'a, I>(messages: I, width: usize, max_lines: usize) -> Vec<String>
+fn render_grouped_feed_lines<'a, I>(
+    messages: I,
+    width: usize,
+    max_lines: usize,
+    enable_markdown: bool,
+    enable_syntax_highlighting: bool,
+) -> Vec<String>
 where
     I: IntoIterator<Item = &'a DisplayedMessage>,
 {
@@ -2021,9 +2052,13 @@ where
                 let prefix = if group_started { "  > " } else { "    " };
                 let suffix = if msg.edited { " (edited)" } else { "" };
                 let display_text = format!("{}{}", msg.text, suffix);
+
+                // Markdown applied AFTER structural logic, BEFORE wrapping
+                let styled_text = render_markdown(&display_text, enable_markdown, enable_syntax_highlighting);
+
                 lines.extend(prefixed_wrapped_lines(
                     prefix,
-                    &display_text,
+                    &styled_text,
                     width,
                     max_lines,
                 ));
@@ -2060,8 +2095,13 @@ fn collect_recent_feed_lines(state: &ClientState, width: usize, max_lines: usize
         .message_history
         .len()
         .saturating_sub(FEED_LOOKBACK_MESSAGES);
-    let mut lines =
-        render_grouped_feed_lines(state.message_history.iter().skip(start), width, max_lines);
+    let mut lines = render_grouped_feed_lines(
+        state.message_history.iter().skip(start),
+        width,
+        max_lines,
+        state.config.ui.enable_markdown,
+        state.config.ui.enable_syntax_highlighting,
+    );
 
     if lines.is_empty() {
         lines = feed_empty_state_lines();
@@ -2682,6 +2722,16 @@ async fn handle_msg_event(state: &SharedState, data: &JsonMap, ts: u64) {
             if ch != state_lock.ch {
                 state_lock.note_unread_scope(ch);
             }
+
+            let mentioned = message.contains(&format!("@{}", state_lock.me));
+            if state_lock.config.notifications.enabled && (state_lock.config.notifications.on_all_messages || (mentioned && state_lock.config.notifications.on_mention)) {
+                NotificationService::send(
+                    &state_lock.config.notifications,
+                    &format!("New message in #{}", ch),
+                    &format!("{}: {}", u, message),
+                    mentioned, // force if mentioned
+                );
+            }
         }
 
         state_lock.add_message(DisplayedMessage {
@@ -3010,20 +3060,27 @@ async fn handle_dm_event(state: &SharedState, data: &JsonMap, ts: u64) {
     };
 
     if let Ok(content) = dec_bytes(&dm_key, &encrypted) {
+        let msg_text = String::from_utf8(content).unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string());
         let arrow = if frm == state_lock.me { "→" } else { "←" };
+
         if frm != state_lock.me {
             state_lock.note_live_activity(frm, &format!("dm:{}", frm));
             let dm_scope = dm_unread_scope(frm);
             state_lock.note_unread_scope(&dm_scope);
+
+            if state_lock.config.notifications.enabled && state_lock.config.notifications.on_dm {
+                NotificationService::send(
+                    &state_lock.config.notifications,
+                    &format!("Direct message from {}", frm),
+                    &msg_text,
+                    true, // Always force DM notifications
+                );
+            }
         }
+
         state_lock.add_message(DisplayedMessage {
             time: format_time(ts),
-            text: format!(
-                "{} {} {}",
-                frm,
-                arrow,
-                String::from_utf8(content).unwrap_or_else(|_| INVALID_UTF8_PLACEHOLDER.to_string())
-            ),
+            text: format!("{} {} {}", frm, arrow, msg_text),
             msg_type: MessageType::Dm,
             user: Some(frm.to_string()),
             channel: None,
@@ -4027,7 +4084,10 @@ fn handle_slash_command(
 /// Main entry point for the WebSocket client
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
-    // Parse command line arguments
+    // Load configuration from file (with defaults if not found)
+    let config = Config::load();
+
+    // Parse command line arguments (will override config values)
     let matches = clap::Command::new("chatify-client")
         .version("1.0")
         .author("Chatify Team")
@@ -4036,21 +4096,19 @@ async fn main() -> ChatifyResult<()> {
             clap::Arg::new("host")
                 .long("host")
                 .value_name("HOST")
-                .default_value("127.0.0.1")
-                .help("Server host"),
+                .help("Server host (overrides config)"),
         )
         .arg(
             clap::Arg::new("port")
                 .long("port")
                 .value_name("PORT")
-                .default_value("8765")
-                .help("Server port"),
+                .help("Server port (overrides config)"),
         )
         .arg(
             clap::Arg::new("tls")
                 .long("tls")
                 .action(clap::ArgAction::SetTrue)
-                .help("Use TLS for secure connection"),
+                .help("Use TLS for secure connection (overrides config)"),
         )
         .arg(
             clap::Arg::new("log")
@@ -4058,17 +4116,45 @@ async fn main() -> ChatifyResult<()> {
                 .action(clap::ArgAction::SetTrue)
                 .help("Enable debug logging"),
         )
+        .arg(
+            clap::Arg::new("no-markdown")
+                .long("no-markdown")
+                .action(clap::ArgAction::SetTrue)
+                .help("Disable markdown rendering"),
+        )
         .get_matches();
 
-    let host = matches.get_one::<String>("host").unwrap();
-    let port = matches.get_one::<String>("port").unwrap();
-    let tls = matches.get_flag("tls");
+    // Merge config with CLI args (CLI takes precedence)
+    let host = matches
+        .get_one::<String>("host")
+        .map(|s| s.as_str())
+        .unwrap_or(&config.connection.default_host);
+    let port = matches
+        .get_one::<String>("port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(config.connection.default_port);
+    let tls = matches.get_flag("tls") || config.connection.use_tls;
     let log_enabled = matches.get_flag("log");
+    let markdown_enabled = !matches.get_flag("no-markdown") && config.ui.enable_markdown;
 
     let scheme = if tls { "wss" } else { "ws" };
     let uri = format!("{}://{}:{}", scheme, host, port);
 
-    let username = read_username()?;
+    // Use remembered username if available
+    let username = if config.session.remember_username && !config.session.last_username.is_empty() {
+        print!("username [{}]: ", config.session.last_username);
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+        if input.is_empty() {
+            config.session.last_username.clone()
+        } else {
+            input.to_string()
+        }
+    } else {
+        read_username()?
+    };
 
     let mut password = rpassword::prompt_password("password: ")?;
     let client_priv_key = new_keypair();
@@ -4131,6 +4217,21 @@ async fn main() -> ChatifyResult<()> {
             users: auth_users,
         } = auth;
         let client_id = build_client_id(&auth_me, &client_pub_key_for_id);
+
+        // Update config with successful connection details
+        let mut config_to_save = config.clone();
+        config_to_save.ui.enable_markdown = markdown_enabled;
+
+        if config_to_save.session.remember_username {
+            config_to_save.session.last_username = username.clone();
+        }
+        if config_to_save.session.remember_channel {
+            config_to_save.session.last_channel = config_to_save.session.last_channel.clone();
+        }
+        if let Err(e) = config_to_save.save() {
+            log::warn!("Failed to save config: {}", e);
+        }
+
         // Create an mpsc channel for outgoing messages to be queued and sent via WebSocket
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<String>();
 
@@ -4150,8 +4251,8 @@ async fn main() -> ChatifyResult<()> {
             me: auth_me.clone(),
             client_id: client_id.clone(),
             pw: pw_hash,
-            ch: "general".to_string(),
-            chs: HashMap::from([("general".to_string(), true)]),
+            ch: config_to_save.session.last_channel.clone(),
+            chs: HashMap::from([(config_to_save.session.last_channel.clone(), true)]),
             users: HashMap::new(),
             trust_store: TrustStore::load_default(),
             chan_keys: HashMap::new(),
@@ -4160,7 +4261,7 @@ async fn main() -> ChatifyResult<()> {
             running: true,
             voice_active: false,
             voice_session: None,
-            theme: "retro-grid".to_string(),
+            theme: config_to_save.ui.theme.clone(),
             file_transfers: HashMap::new(),
             message_history: VecDeque::new(),
             status: Status {
@@ -4174,6 +4275,7 @@ async fn main() -> ChatifyResult<()> {
             typing_presence: HashMap::new(),
             recent_sents: VecDeque::new(),
             log_enabled,
+            config: config_to_save,
         }));
         {
             let mut state_lock = state.lock().await;
@@ -4380,6 +4482,7 @@ mod tests {
             typing_presence: HashMap::new(),
             recent_sents: VecDeque::new(),
             log_enabled: false,
+            config: Config::default(),
         };
         (tx, state)
     }
@@ -4498,7 +4601,7 @@ mod tests {
             },
         ];
 
-        let rendered = render_grouped_feed_lines(messages.iter(), 80, 20);
+        let rendered = render_grouped_feed_lines(messages.iter(), 80, 20, false, false);
         let header_count = rendered
             .iter()
             .filter(|line| line.contains("alice  #general"))
