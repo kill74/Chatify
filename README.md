@@ -85,7 +85,7 @@ Most self-hosted chat systems are web-first and treat the protocol as a second-c
 ┌GLOBAL_FEED───────────────────────────────────────────────┐  ┌PROFILE──────────────────────────┐
 │ [14:31] alice  #general                                  │  │ alice [CID-ABCD-1234-EF90]      │
 │   > testing media upload                                 │  │ status:  Online                 │
-│ [14:32] [VIDEO] alice shared 'demo.mp4' (12.40 MiB)     │  │ channel: #general               │
+│ [14:32] [VIDEO] alice shared 'demo.mp4' (12.40 MiB)      │  │ channel: #general               │
 │        saved: ~/.chatify/media/alice-...-demo.mp4        │  │ voice:   OFF                    │
 │ [14:33] IMG alice inline image (ASCII preview below)     │  └QUICK ACTIONS────────────────────┘
 │ @@@@%%%###**++==--::..                                   │  ┌LIVE ROSTER──────────────────────┐
