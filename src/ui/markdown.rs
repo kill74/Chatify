@@ -4,11 +4,11 @@
 //! Uses `pulldown-cmark` for parsing and `syntect` for syntax highlighting of code blocks.
 
 use pulldown_cmark::{Event, Parser, Tag};
+use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
-use std::sync::OnceLock;
 
 // Global syntax and theme sets to avoid reloading them on every message
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -105,7 +105,9 @@ fn highlight_code(lang: &str, code: &str) -> String {
     let ts = get_theme_set();
 
     // Default to plain text if syntax not found or not specified
-    let syntax = ps.find_syntax_by_token(lang).unwrap_or_else(|| ps.find_syntax_plain_text());
+    let syntax = ps
+        .find_syntax_by_token(lang)
+        .unwrap_or_else(|| ps.find_syntax_plain_text());
 
     // "base16-ocean.dark" is a nice default dark theme in syntect
     let theme = &ts.themes["base16-ocean.dark"];

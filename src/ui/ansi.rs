@@ -3,15 +3,13 @@
 //! Provides utilities for calculating terminal geometry correctly by ignoring
 //! ANSI escape sequences.
 
-use std::sync::OnceLock;
 use regex::Regex;
+use std::sync::OnceLock;
 
 /// Get the singleton regex for matching ANSI sequences
 fn get_ansi_regex() -> &'static Regex {
     static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
-    ANSI_REGEX.get_or_init(|| {
-        Regex::new(r"\x1b\[[0-9;]*m").expect("Valid regex")
-    })
+    ANSI_REGEX.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*m").expect("Valid regex"))
 }
 
 /// Strips ANSI escape codes from a string
