@@ -8,19 +8,75 @@
 [![Release](https://img.shields.io/github/v/release/kill74/Chatify)](https://github.com/kill74/Chatify/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Terminal-first, self-hosted chat — built in Rust.**
-
-Real-time WebSocket server · Live terminal dashboard · SQLite persistence · Optional Discord bridge
-
-[Quick Start](#quick-start) · [Commands](#client-commands) · [Configuration](#configuration) · [Security](#security-posture) · [Discord Bridge](#discord-bridge-optional)
-
 </div>
+
+Self-hosted, terminal-native chat server written in Rust. Ships a WebSocket server, a terminal dashboard client, and an optional Discord relay bridge. Designed for controlled deployments where operational transparency and protocol correctness matter more than UI polish.
 
 ---
 
-## What Is Chatify?
+## Table of Contents
 
-Chatify is a self-hosted chat system designed for developers and local teams who want full control over their infrastructure. It ships three binaries: a WebSocket server, a terminal dashboard client, and an optional Discord bridge — all written in Rust with minimal dependencies and predictable runtime behavior.
+- [Design Rationale](#design-rationale)
+- [System Overview](#system-overview)
+- [Quick Start](#quick-start)
+- [Configuration Reference](#configuration-reference)
+- [Client Command Reference](#client-command-reference)
+- [Persistence Model](#persistence-model)
+- [Trust & Identity Model](#trust--identity-model)
+- [Security Posture](#security-posture)
+- [Discord Bridge](#discord-bridge)
+- [Windows Packaging](#windows-packaging)
+- [Development & CI](#development--ci)
+- [Known Limitations](#known-limitations)
+- [Project Docs](#project-docs)
+- [Contributing](#contributing)
+
+---
+
+## Design Rationale
+
+Most self-hosted chat systems are web-first and treat the protocol as a second-class concern. Chatify takes the opposite approach: the message contract is the specification, and the UI is a thin layer on top.
+
+**Key decisions and their tradeoffs:**
+
+**Append-only SQLite event store.** All state is derived from an ordered event log. This simplifies correctness reasoning — no partial updates, no in-place mutation — and makes history replay fully deterministic. The tradeoff is that search requires a linear scan over encrypted payloads, which is acceptable at single-tenant scale but not suitable for high-volume deployments without an external index.
+
+**Chunked binary protocol over WebSocket.** Media transfer uses `file_meta` + `file_chunk` framing rather than HTTP multipart. This keeps the transport uniform: a single WebSocket connection handles all message types, eliminating the need for a separate file server or a second authenticated channel. The tradeoff is that the server holds chunk reassembly state in memory per active transfer, and the 100 MB cap is enforced at the application layer with no backpressure to the sender.
+
+**Explicit peer trust rather than TOFU.** Key fingerprints require out-of-band verification and an explicit `/trust` confirmation. Key rotation transitions trust state to `changed` and blocks DM encryption until re-verified. This is intentionally stricter than Trust On First Use and prevents silent MITM via key rotation at the cost of operational friction on legitimate rotations.
+
+**Discord bridge behind a Cargo feature flag.** Keeping the bridge opt-in (`--features discord-bridge`) avoids pulling Discord SDK dependencies into the default build surface and keeps the default binary footprint minimal.
+
+---
+
+## System Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        clicord-server                        │
+│                                                              │
+│  WebSocket listener → Auth / rate-limit → Message router     │
+│         ↓                                                    │
+│  Event store (SQLite, append-only, encrypted payload col)    │
+│         ↓                                                    │
+│  Broadcast fanout → connected client sessions                │
+└────────────────────────┬─────────────────────────────────────┘
+                         │ ws:// or wss://
+          ┌──────────────┴──────────────┐
+          │                             │
+   clicord-client                  discord_bot
+   (terminal dashboard)        (optional bridge)
+                                        │
+                                 Discord API (serenity)
+```
+
+| Binary | Purpose |
+|---|---|
+| `clicord-server` | WebSocket server, event persistence, auth, rate limiting |
+| `clicord-client` | Terminal dashboard: channels, DMs, media, search, trust |
+| `discord_bot` | Discord ↔ Chatify relay bridge (feature-gated) |
+
+**Terminal dashboard layout:**
 
 ```text
 // CHATIFY // [ONLINE:3] [CHANNELS:2] [EVENTS:18] [UNREAD:1] [TYPING:0] [THEME:retro-grid]
@@ -30,57 +86,42 @@ Chatify is a self-hosted chat system designed for developers and local teams who
 │ [14:31] alice  #general                                  │  │ alice [CID-ABCD-1234-EF90]      │
 │   > testing media upload                                 │  │ status:  Online                 │
 │ [14:32] [VIDEO] alice shared 'demo.mp4' (12.40 MiB)     │  │ channel: #general               │
-│        saved: .../Chatify/media/alice-...-demo.mp4       │  │ voice:   OFF                    │
-│ [14:33] IMG alice inline image                           │  └QUICK ACTIONS────────────────────┘
+│        saved: ~/.chatify/media/alice-...-demo.mp4        │  │ voice:   OFF                    │
+│ [14:33] IMG alice inline image (ASCII preview below)     │  └QUICK ACTIONS────────────────────┘
 │ @@@@%%%###**++==--::..                                   │  ┌LIVE ROSTER──────────────────────┐
-│                                                          │  │ alice · bob · carol             │
+│                                                          │  │ ● alice  ● bob  ○ carol         │
 └──────────────────────────────────────────────────────────┘  └─────────────────────────────────┘
 ```
 
 ---
 
-## Features
-
-| Category | Capabilities |
-|---|---|
-| **Messaging** | Multi-channel chat, direct messages, live typing indicators, unread tracking, message editing |
-| **Media** | Image & video transfer via chunked protocol, ASCII image preview in terminal, 100 MB cap |
-| **Persistence** | SQLite append-only event store, `/history`, `/search`, `/rewind` |
-| **Security** | TLS (rustls), PBKDF2 credential hashing, TOTP 2FA + backup codes, replay protection, rate limiting |
-| **Trust** | Explicit peer fingerprint workflow, key-change detection, encrypted DM payloads |
-| **Discord Bridge** | Bidirectional relay, loop prevention, multi-channel mapping, health telemetry |
-| **Releases** | Windows ZIP + installer artifacts, SHA256 checksums, per-release security report |
-
----
-
 ## Quick Start
 
-### Option A — Windows Installer
+### Windows — Installer
 
 1. Download `chatify-setup-<version>.exe` from [Releases](https://github.com/kill74/Chatify/releases).
-2. Run the installer and open **Chatify Launcher** from the Start Menu.
-3. Choose a mode:
-   - `1` **Host** — starts the server and a local client on this machine.
-   - `2` **Join** — prompts for a remote host/IP and port.
+2. Run the installer. Open **Chatify Launcher** from the Start Menu.
+3. Select a mode:
+   - `1` — Host on this machine (starts server + local client).
+   - `2` — Join an existing server (prompts for host and port).
 
-### Option B — Build from Source
+### From Source
 
-**Prerequisites:** Rust toolchain (`cargo`)
+Requires the Rust stable toolchain.
 
 ```bash
-# Build all release binaries
 cargo build --release
 
-# Start the server
+# Server — binds all interfaces by default
 ./target/release/clicord-server --host 0.0.0.0 --port 8765
 
-# Start the client (separate terminal)
+# Client — separate terminal
 ./target/release/clicord-client --host 127.0.0.1 --port 8765
 ```
 
-> **Windows (PowerShell):** replace `./` with `.\` and append `.exe` to binary names.
+> **Windows:** substitute `.\` for `./` and append `.exe` to binary names.
 
-**Development mode (auto-rebuild):**
+**Dev mode (incremental rebuild):**
 
 ```bash
 # Terminal 1
@@ -90,213 +131,209 @@ cargo run --bin clicord-server
 cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 ```
 
-**Windows dev helpers (with automatic artifact cleanup):**
+**Windows dev scripts with automatic artifact cleanup:**
 
 ```powershell
 .\run-server.ps1
 .\run-client.ps1 -ProgramArgs @('--host','127.0.0.1','--port','8765')
 
-# Advanced: full control over cleanup budget and retention
+# Full control over cleanup budget and retention window
 .\scripts\run-with-auto-clean.ps1 -Mode server
 .\scripts\run-with-auto-clean.ps1 -Mode client -ProgramArgs @('--host','127.0.0.1','--port','8765')
 .\scripts\run-with-auto-clean.ps1 -CleanupOnly -MaxAgeDays 2 -MaxTargetSizeGB 3
 ```
 
-> Rust build artifacts can accumulate quickly. Reclaim space with `cargo clean` or `cargo clean --profile dev`.
+> Lean dev/test profile settings in `Cargo.toml` reduce artifact growth, but `cargo clean` remains the reliable escape hatch after extended build cycles.
 
 ---
 
-## Configuration
+## Configuration Reference
 
 ### Server — `clicord-server`
 
-| Flag | Default | Description |
+| Flag | Default | Notes |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8765` | Bind port |
 | `--db` | `chatify.db` | SQLite database path |
-| `--db-key` | *(auto)* | Hex-encoded 32-byte encryption key (64 hex chars) |
-| `--tls` | `false` | Enable TLS (`wss://`) |
-| `--tls-cert` | `cert.pem` | TLS certificate path (PEM) |
-| `--tls-key` | `key.pem` | TLS private key path (PEM) |
-| `--log` | `false` | Enable structured logging |
+| `--db-key` | *(auto)* | 32-byte encryption key, hex-encoded (64 chars). See resolution order below. |
+| `--tls` | `false` | Enable TLS (`wss://`). Requires `--tls-cert` and `--tls-key`. |
+| `--tls-cert` | `cert.pem` | PEM certificate path |
+| `--tls-key` | `key.pem` | PEM private key path |
+| `--log` | `false` | Structured logging to stderr |
 
-**DB key resolution order:** `--db-key` flag → `<db>.key` file (auto-generated on first run) → no encryption for `:memory:`.
+**DB key resolution order:**
+1. `--db-key` CLI flag
+2. `<db>.key` file — auto-generated on first run if absent
+3. No encryption when `--db :memory:`
 
-> **Secret hygiene:** never commit `<db>.key`, `cert.pem`, or `key.pem`. Rotate immediately if exposed.
+> Never commit `*.db.key`, `cert.pem`, or `key.pem`. Rotate immediately on exposure. Keep runtime secrets out of shell history and version control.
 
 ### Client — `clicord-client`
 
-| Flag | Default | Description |
+| Flag | Default | Notes |
 |---|---|---|
 | `--host` | `127.0.0.1` | Server host |
 | `--port` | `8765` | Server port |
-| `--tls` | `false` | Use `wss://` |
-| `--log` | `false` | Enable debug logging |
+| `--tls` | `false` | Connect via `wss://` |
+| `--log` | `false` | Debug logging to stderr |
 
 ---
 
-## Client Commands
+## Client Command Reference
 
 | Command | Description |
 |---|---|
-| `/commands [filter]` | Show command palette, optionally filtered |
-| `/help [command]` | General help or detailed help for a specific command |
+| `/commands [filter]` | List all commands, optionally filtered by prefix |
+| `/help [command]` | General help, or detailed usage for a specific command |
 | `/join <channel>` | Join or create a channel |
 | `/switch <channel>` | Alias for `/join` |
-| `/dm <user> <message>` | Send a direct message |
-| `/typing [on\|off] [scope]` | Broadcast typing state to `#channel` or `dm:user` |
-| `/image <path>` | Upload an image to the current channel |
-| `/video <path>` | Upload a video to the current channel |
-| `/me [action]` | Show your profile or send an action-style message |
-| `/users` | List online users |
+| `/dm <user> <message>` | Send an encrypted direct message |
+| `/typing [on\|off] [scope]` | Broadcast typing indicator to `#channel` or `dm:<user>` |
+| `/image <path>` | Transfer an image to the current channel (chunked, ≤100 MB) |
+| `/video <path>` | Transfer a video to the current channel (chunked, ≤100 MB) |
+| `/me [action]` | Display your profile or send an action-style message |
+| `/users` | List currently online users |
 | `/channels` | List available channels |
-| `/voice [room]` | Toggle voice in a room |
-| `/history [channel] [window]` | Load persisted history for a channel or DM scope |
+| `/voice [room]` | Toggle voice presence in a room |
+| `/history [channel] [window]` | Load persisted event history for a channel or DM scope |
 | `/search <query>` | Search persisted events in the current channel |
-| `/replay <timestamp>` | Reconstruct state from an absolute timestamp |
-| `/rewind <time> [n]` | Replay events from a relative time window (`15m`, `2h`) |
-| `/fingerprint [user]` | Show trust state and key fingerprint(s) |
-| `/trust <user> <fingerprint>` | Mark a peer fingerprint as trusted |
-| `/edit [#N] <new text>` | Edit your last (or Nth most recent) message |
+| `/replay <timestamp>` | Reconstruct channel state from an absolute timestamp |
+| `/rewind <time> [n]` | Replay the last N events within a relative window (`15m`, `2h`) |
+| `/fingerprint [user]` | Inspect trust state and key fingerprint for a peer |
+| `/trust <user> <fingerprint>` | Record a peer fingerprint as trusted after out-of-band verification |
+| `/edit [#N] <new text>` | Edit your most recent (or Nth) message. Renders `(edited)` suffix in feed. |
 | `/clear` | Clear terminal output |
-| `/quit`, `/exit`, `/q` | Disconnect and exit |
+| `/quit` `/exit` `/q` | Disconnect and exit |
 
 ### Media Transfer
 
-Images and videos are sent over a `file_meta` + `file_chunk` chunked protocol. Transfers are capped at **100 MB**.
+Transfer uses `file_meta` + `file_chunk` framing over the existing WebSocket connection — no separate HTTP endpoint, no second auth context.
 
 ```text
-/image "C:/Users/you/Pictures/screenshot.png"
-/video "C:/Users/you/Videos/demo.mp4"
+/image "/path/to/screenshot.png"
+/video "/path/to/demo.mp4"
 ```
 
-Received media is saved locally:
-- **Windows:** `%APPDATA%/Chatify/media`
-- **Linux/macOS:** `$HOME/.chatify/media`
+Received files are written to:
+- **Windows:** `%APPDATA%\Chatify\media\`
+- **Linux/macOS:** `$HOME/.chatify/media/`
 
-Image transfers render an **ASCII preview** directly in the terminal feed. Video transfers display a metadata card with sender, filename, size, and saved path.
-
----
-
-## Persistence & Event Store
-
-Chatify uses an **append-only SQLite event store** — events are inserted, never mutated or deleted.
-
-- Schema is versioned (`schema_meta`) and migrated sequentially on server startup.
-- Channel history is indexed on `(channel, ts DESC)`.
-- DM history uses route-aware indexes on `(event_type, sender, target, ts DESC)`.
-- Encryption at rest covers `payload` and `search_text` columns.
-- Contract tests verify history survives restarts and that `/history` and `/search` stay responsive under a 100k-event local dataset.
+Image transfers render an ASCII preview inline in the terminal feed. Video transfers produce a metadata card (sender, filename, size, local path). The 100 MB cap is enforced at the application layer on the sender side.
 
 ---
 
-## Identity & Trust
+## Persistence Model
 
-Chatify uses an **explicit peer trust workflow** rather than silent key acceptance:
+The event store is **append-only**. Events are inserted once; they are never updated or deleted. All readable state — channel feeds, DM history, search results — is derived from this log.
 
-1. Run `/fingerprint <user>` to inspect a peer's current key material out-of-band.
-2. After manual verification, run `/trust <user> <fingerprint>` to mark the key as trusted.
+**Schema management:** versioned via a `schema_meta` table. Migrations run sequentially on server startup. A no-downgrade policy is enforced: a server will refuse to start against a database created by a newer schema version.
 
-Trust states: `unknown` → `trusted` → `changed` (blocks DM encryption if a peer's key rotates without re-verification). Fingerprints are persisted in a local trust store on the client machine.
+**Indexes:**
+- Channel history: `(channel, ts DESC)`
+- DM history: `(event_type, sender, target, ts DESC)`
+
+**Encryption at rest:** `payload` and `search_text` columns are encrypted with the key resolved at startup. The `/search` command decrypts rows in a linear scan — O(n) in stored event count. This is acceptable for single-tenant use; it is not suitable for large corpora without an external index or a separate plaintext search field with access controls.
+
+**CI-verified guarantees:**
+- Event history survives server restart (store durability)
+- `/history` and `/search` complete within acceptable timeout on a 100k-event local dataset
+
+---
+
+## Trust & Identity Model
+
+Chatify uses **explicit fingerprint verification** rather than TOFU.
+
+**Verification flow:**
+1. Run `/fingerprint <user>` to retrieve the peer's current key fingerprint.
+2. Verify the fingerprint out-of-band (voice call, secure side-channel, etc.).
+3. Run `/trust <user> <fingerprint>` to record it in the local trust store.
+
+**Trust states:**
+
+| State | Meaning | DM encryption |
+|---|---|---|
+| `unknown` | No fingerprint on record | Blocked |
+| `trusted` | Fingerprint verified and stored locally | Allowed |
+| `changed` | Peer key rotated since last verification | Blocked until re-verified |
+
+Key changes are never silent. A rotation transitions the peer to `changed` and immediately blocks encrypted DM traffic in both directions. The operator must re-run the full verification flow. This prevents MITM via silent key rotation but adds friction to any legitimate rotation — a deliberate tradeoff.
 
 ---
 
 ## Security Posture
 
-**Implemented:**
-- TLS support via `rustls`
-- PBKDF2 credential hashing (salted, per-user)
-- TOTP-based 2FA with backup codes
-- Session token lifecycle management
-- Replay protection (nonce + timestamp window validation)
-- Automatic nonce cache eviction for ghost connections
-- Rate limiting on connections and auth attempts
-- Input validation and payload size limits
-- SQLite parameterized queries with schema no-downgrade policy
-- Encryption at rest for message payload and search text
+**Implemented controls:**
 
-**Known limitations:**
-- No certificate pinning on the client
-- Session tokens are not persisted across server restarts
-- Encrypted search uses linear scan
-
-See [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md) for full details and threat model scope.
-
----
-
-## Windows Packaging
-
-Build a Windows ZIP + installer (requires [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
-
-```powershell
-# Build ZIP + installer
-.\build-windows-package.ps1
-
-# Build ZIP only (no installer)
-.\build-windows-package.ps1 -SkipInstaller
-
-# Specify custom ISCC path
-.\build-windows-package.ps1 -IsccPath "C:\Path\To\ISCC.exe"
-```
-
-**Generated artifacts:**
-
-| File | Description |
+| Control | Implementation |
 |---|---|
-| `dist/chatify-windows-x64.zip` | Binary package |
-| `dist/chatify-windows-x64.zip.sha256` | SHA256 checksum |
-| `dist/chatify-setup-<version>.exe` | Installer (when available) |
-| `dist/chatify-setup-<version>.exe.sha256` | Installer checksum |
-| `dist/chatify-windows-x64/chatify-launcher.cmd` | Launch helper |
+| Transport encryption | TLS via `rustls` |
+| Credential storage | PBKDF2, salted, per-user |
+| Two-factor authentication | TOTP + backup codes |
+| Session management | Token lifecycle with expiry; tokens do not survive server restart |
+| Replay protection | Nonce + timestamp window; periodic nonce cache eviction for ghost connections |
+| Rate limiting | Per-IP limits on connection establishment and auth attempts |
+| Input validation | Payload size limits enforced; parameterized queries throughout |
+| Encryption at rest | `payload` and `search_text` columns encrypted with the server DB key |
+| Schema integrity | No-downgrade policy enforced at startup |
 
-The [windows-release-package workflow](.github/workflows/windows-release-package.yml) publishes ZIP + installer + checksums automatically on release. A structured security report (`.json` + `.md`) is also attached per release tag via the [release-security-report workflow](.github/workflows/release-security-report.yml).
+**Known gaps — do not deploy in adversarial environments without addressing these:**
+
+- No certificate pinning. A valid CA-signed cert is sufficient for a successful TLS handshake. A compromised CA is not detected.
+- Session tokens are ephemeral. All clients must re-authenticate after a server restart.
+- Encrypted search is a linear scan. Timing side-channels are possible on large corpora.
+- No RBAC, audit log, or account lockout beyond connection-level rate limiting.
+- No independent third-party security audit.
+
+See [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md) for the full threat model and scope boundaries.
 
 ---
 
-## Discord Bridge (Optional)
+## Discord Bridge
 
-The Discord bridge is opt-in behind the `discord-bridge` Cargo feature flag, keeping default builds lean.
+The bridge is compiled only when `--features discord-bridge` is passed. It is absent from the default server and client binaries.
 
 ```bash
-# Build with bridge support
 cargo build --release --features discord-bridge
-
-# Run the bridge
 cargo run --features discord-bridge --bin discord_bot
 ```
 
 **Required environment variables:**
 
 ```bash
-DISCORD_TOKEN=<your-discord-bot-token>
+DISCORD_TOKEN=<bot-token>
 CHATIFY_PASSWORD=<server-password>
 ```
 
-**Common settings:**
+**Full configuration:**
 
 | Variable | Default | Description |
 |---|---|---|
 | `CHATIFY_HOST` | `127.0.0.1` | Chatify server host |
 | `CHATIFY_PORT` | `8765` | Chatify server port |
 | `CHATIFY_CHANNEL` | `general` | Default relay channel |
-| `CHATIFY_BOT_USERNAME` | `DiscordBot` | Bridge username on Chatify |
+| `CHATIFY_BOT_USERNAME` | `DiscordBot` | Bridge identity on Chatify |
 | `CHATIFY_WS_SCHEME` | `ws` | `ws` or `wss` |
-| `CHATIFY_RECONNECT_BASE_SECS` | `1` | Reconnect backoff base |
-| `CHATIFY_RECONNECT_MAX_SECS` | `30` | Reconnect backoff ceiling |
+| `CHATIFY_AUTH_TIMEOUT_SECS` | `15` | Auth handshake timeout |
+| `CHATIFY_RECONNECT_BASE_SECS` | `1` | Exponential backoff base (seconds) |
+| `CHATIFY_RECONNECT_MAX_SECS` | `30` | Exponential backoff ceiling (seconds) |
+| `CHATIFY_RECONNECT_JITTER_PCT` | `20` | Jitter applied to reconnect interval |
+| `CHATIFY_RECONNECT_WARN_THRESHOLD` | `5` | Consecutive reconnects before log warning |
 | `CHATIFY_PING_SECS` | `20` | Keepalive interval (`0` to disable) |
 | `CHATIFY_HEALTH_LOG_SECS` | `30` | Health telemetry log interval |
-| `CHATIFY_DISCORD_CHANNEL_MAP` | — | Inline channel map: `discordId:chatifyChannel,...` |
-| `CHATIFY_DISCORD_CHANNEL_MAP_FILE` | `bridge-channel-map.json` | Path to channel map file |
-| `CHATIFY_LOG` | — | Set to `1` to enable bridge logs |
+| `CHATIFY_BRIDGE_INSTANCE_ID` | — | Optional stable source identifier for multi-instance deployments |
+| `CHATIFY_DISCORD_CHANNEL_MAP` | — | Inline route map: `discordId:chatifyChannel,...` |
+| `CHATIFY_DISCORD_CHANNEL_MAP_FILE` | `bridge-channel-map.json` | Path to route map file |
+| `CHATIFY_LOG` | — | Set to `1` to enable bridge logging |
 
-**Channel map — inline:**
+**Route map — inline:**
 
 ```bash
 CHATIFY_DISCORD_CHANNEL_MAP=123456789012345678:general,987654321098765432:ops
 ```
 
-**Channel map — file (`bridge-channel-map.json`):**
+**Route map — file (`bridge-channel-map.json`):**
 
 ```json
 {
@@ -307,58 +344,113 @@ CHATIFY_DISCORD_CHANNEL_MAP=123456789012345678:general,987654321098765432:ops
 }
 ```
 
-Route sources are merged in precedence order: file routes first, then `CHATIFY_DISCORD_CHANNEL_MAP` (overrides matching Discord channel IDs).
+Merge precedence: file routes load first; `CHATIFY_DISCORD_CHANNEL_MAP` entries override matching Discord channel IDs.
 
-**Bridge features:**
-- Bidirectional message relay with loop prevention via `relay.markers` metadata
-- Discord attachment URL and reply context preserved across the bridge
-- Discord outbound relay disables parsed mentions (`@everyone`, `@here`, role/user pings)
-- `/bridge status` from Discord or the Rust client reports uptime, route count, and health counters
+**Operational notes:**
+- **Loop prevention:** relay frames carry `src` and `relay.markers`. A frame is not re-relayed to Discord if the destination marker already appears in `relay.markers`. This handles the common loop on normal operation; it is not a guarantee against all loop topologies in complex multi-bridge configurations.
+- **Mention safety:** Discord outbound relay sets `allowed_mentions` to suppress `@everyone`, `@here`, role, and user pings.
+- **Attachment and reply preservation:** Discord → Chatify relay includes attachment URL metadata and reply context. Chatify → Discord relay reconstructs and emits that context on the Discord side.
+- **Health observability:** run `/bridge status` from Discord or from the Rust client (requires `bridge-client` feature) to see connected bridge instances, their uptime, route count, and health counters.
+- **Dependency pinning:** `serenity` is pinned at `=0.11.7` for build reproducibility.
 
 ---
 
-## Development Workflow
+## Windows Packaging
+
+Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer target.
+
+```powershell
+# ZIP + installer
+.\build-windows-package.ps1
+
+# ZIP only
+.\build-windows-package.ps1 -SkipInstaller
+
+# Explicit ISCC path
+.\build-windows-package.ps1 -IsccPath "C:\Tools\InnoSetup\ISCC.exe"
+```
+
+**Output artifacts:**
+
+| Artifact | Description |
+|---|---|
+| `dist/chatify-windows-x64.zip` | Portable binary package |
+| `dist/chatify-windows-x64.zip.sha256` | SHA256 checksum |
+| `dist/chatify-setup-<version>.exe` | Installer (when Inno Setup is available) |
+| `dist/chatify-setup-<version>.exe.sha256` | Installer checksum |
+| `dist/chatify-windows-x64/chatify-launcher.cmd` | Interactive launch helper |
+
+**Checksum verification (PowerShell):**
+
+```powershell
+$actual   = (Get-FileHash .\dist\chatify-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+$expected = (Get-Content .\dist\chatify-windows-x64.zip.sha256).Split(' ')[0].ToLower()
+if ($actual -eq $expected) { "OK" } else { "MISMATCH — do not execute" }
+```
+
+The [windows-release-package](.github/workflows/windows-release-package.yml) workflow builds and uploads ZIP, installer, and checksums on every published release. A structured security report (`.json` + `.md`) is attached per release tag via the [release-security-report](.github/workflows/release-security-report.yml) workflow.
+
+---
+
+## Development & CI
+
+**Required checks — all must pass before merge:**
 
 ```bash
-# Type-check all binaries
 cargo check --bins
-
-# Format check
 cargo fmt --all --check
-
-# Lint (strict)
 cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
 
-# Core contract tests
+**Protocol contract tests — run independently:**
+
+```bash
 cargo test --locked --test message_contracts auth_contract_returns_expected_fields
 cargo test --locked --test message_contracts compatibility_contract_client_bootstrap_flow_stays_stable
 cargo test --locked --test message_contracts protocol_contract_advertises_backward_compatible_version
 cargo test --locked --test message_contracts file_contract_relays_media_metadata_and_chunks
+```
 
-# Full workspace tests
-cargo test --workspace --all-targets --locked
+**Feature-gated compile checks:**
 
-# Feature-gated compile checks
+```bash
 cargo check --features discord-bridge --bin discord_bot --locked
 cargo check --features bridge-client --bin clicord-client --locked
 ```
+
+All checks above are enforced in CI on every push to `main`. A failing check blocks merge.
+
+---
+
+## Known Limitations
+
+Tracked explicitly rather than omitted:
+
+- **`/edit` is incomplete.** The command is parsed but the end-to-end edit flow is not fully implemented. Do not depend on it in current releases.
+- **No certificate pinning.** The client does not pin the server certificate. A valid CA-signed cert is sufficient for a successful TLS handshake.
+- **Ephemeral session tokens.** All clients must re-authenticate after a server restart. There is no token persistence or refresh mechanism.
+- **Linear search.** `/search` decrypts and scans all stored events. Performance degrades linearly with event count. Not suitable for large corpora without architectural changes.
+- **Single-node only.** The server is single-process with no shared state backend. Horizontal scaling is not supported.
+- **Minimal auth model.** No RBAC, no audit log, no account lockout beyond connection-level rate limiting.
+- **No independent security audit.**
 
 ---
 
 ## Project Docs
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-- [docs/ENGINEERING_CASE_STUDY.md](docs/ENGINEERING_CASE_STUDY.md)
-- [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md)
-- [docs/UNIQUE_ROADMAP.md](docs/UNIQUE_ROADMAP.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — component design, message flow, data model
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — benchmark methodology and baseline results
+- [docs/ENGINEERING_CASE_STUDY.md](docs/ENGINEERING_CASE_STUDY.md) — design decisions and tradeoff analysis
+- [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md) — threat model, controls, scope boundaries
+- [docs/UNIQUE_ROADMAP.md](docs/UNIQUE_ROADMAP.md) — near and long-term direction
 - [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality gates, and the PR checklist.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. It covers dev setup, quality gates, and the PR checklist. All submissions must pass CI. By contributing, you agree your code is licensed under MIT.
 
 ## License
 
