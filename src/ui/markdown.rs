@@ -71,7 +71,7 @@ pub fn render_markdown(
                 in_code_block = false;
                 if enable_syntax_highlighting {
                     let highlighted = highlight_code(&code_lang, &code_buffer);
-                    out.push_str("\n");
+                    out.push('\n');
                     out.push_str(&highlighted);
                     if !highlighted.ends_with('\n') {
                         out.push('\n');

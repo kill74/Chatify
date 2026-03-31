@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Main configuration structure for Chatify client
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub connection: ConnectionConfig,
@@ -159,18 +159,6 @@ fn default_channel() -> String {
 
 fn default_true() -> bool {
     true
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            connection: ConnectionConfig::default(),
-            ui: UiConfig::default(),
-            notifications: NotificationConfig::default(),
-            completion: CompletionConfig::default(),
-            session: SessionConfig::default(),
-        }
-    }
 }
 
 impl Default for ConnectionConfig {

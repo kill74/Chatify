@@ -424,11 +424,10 @@ pub fn expand_shortcodes(text: &str) -> String {
 
     let map = emoji_map();
     let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
     let mut token = String::new();
     let mut in_token = false;
 
-    while let Some(ch) = chars.next() {
+    for ch in text.chars() {
         if ch == ':' {
             if in_token {
                 // End of potential shortcode

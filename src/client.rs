@@ -876,9 +876,10 @@ struct FileTransfer {
 }
 
 /// User presence state.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 enum PresenceState {
+    #[default]
     Online,
     Away,
     Busy,
@@ -912,12 +913,6 @@ impl PresenceState {
             PresenceState::Busy => '🔴',
             PresenceState::Invisible => '⚫',
         }
-    }
-}
-
-impl Default for PresenceState {
-    fn default() -> Self {
-        PresenceState::Online
     }
 }
 
