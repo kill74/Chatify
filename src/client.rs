@@ -13,6 +13,10 @@ use clicord_server::ui::ansi::{strip_ansi, visible_width};
 use clicord_server::ui::emoji;
 use clicord_server::ui::markdown::render_markdown;
 use clicord_server::ui::theme::{self as theme_mod, OwnedTheme, RESET as THEME_RESET};
+use clicord_server::screen_share::{
+    ScreenShareManager, ScreenShareOptions, ScreenShareState, QualityPreset,
+};
+use clicord_server::voice::VoiceMemberInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
@@ -181,6 +185,12 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         usage: "/voice [room]",
         summary: "Toggle voice session in a room.",
         example: "/voice general",
+    },
+    CommandSpec {
+        name: "/screen",
+        usage: "/screen [start|stop|list|quality] [options]",
+        summary: "Toggle screen sharing in a voice room.",
+        example: "/screen start --audio",
     },
     CommandSpec {
         name: "/history",
@@ -428,11 +438,17 @@ fn footer_hint_line(state: &ClientState, width: usize) -> String {
     users.sort_unstable();
     let (_unknown, _trusted, changed) = state.trust_counts_for_users(&users);
 
+    let is_sharing = state.screen_share.as_ref()
+        .map(|ss| ss.session().map(|s| s.state == ScreenShareState::Sharing).unwrap_or(false))
+        .unwrap_or(false);
+
     let raw = if changed > 0 {
         format!(
             "-> SECURITY: {} changed key(s) detected. Run /fingerprint <user> and /trust <user> <fingerprint>",
             changed
         )
+    } else if is_sharing {
+        "-> SCREEN sharing | /screen stop | /voice to stop | /quit".to_string()
     } else if state.voice_active {
         "-> Voice ON | /voice to stop | /typing on #room | /quit".to_string()
     } else {
@@ -964,6 +980,10 @@ struct VoiceSession {
 enum VoiceEvent {
     Captured(VoiceFrame),
     Playback(VoiceFrame),
+    #[allow(dead_code)]
+    MuteState(bool),
+    #[allow(dead_code)]
+    SpeakingState(bool),
     Stop,
 }
 
@@ -1033,6 +1053,18 @@ struct ClientState {
     log_enabled: bool,
     /// Configuration (for runtime access and persistence)
     config: Config,
+    /// Screen sharing manager
+    screen_share: Option<ScreenShareManager>,
+    /// Whether we're viewing someone else's screen
+    screen_viewing: bool,
+    /// Voice channel members (for UI display)
+    voice_members: Vec<String>,
+    /// Whether we're muted in voice
+    voice_muted: bool,
+    /// Whether we're deafened in voice
+    voice_deafened: bool,
+    /// Whether we're currently speaking
+    voice_speaking: bool,
 }
 
 impl ClientState {
@@ -1410,6 +1442,16 @@ impl ClientState {
 fn format_time(ts: u64) -> String {
     let datetime = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(Utc::now);
     datetime.format("%H:%M").to_string()
+}
+
+fn format_num(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}MB", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}KB", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn format_time_full(ts: u64) -> String {
@@ -3420,6 +3462,33 @@ async fn handle_info_event(state: &SharedState, data: &JsonMap, ts: u64) {
     });
 }
 
+async fn handle_metrics_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let msgs_sent = data.get("messages_sent").and_then(|v| v.as_u64()).unwrap_or(0);
+    let msgs_recv = data.get("messages_received").and_then(|v| v.as_u64()).unwrap_or(0);
+    let bytes_sent = data.get("bytes_sent").and_then(|v| v.as_u64()).unwrap_or(0);
+    let bytes_recv = data.get("bytes_received").and_then(|v| v.as_u64()).unwrap_or(0);
+    let errors = data.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
+    let conn_accepted = data.get("connections_accepted").and_then(|v| v.as_u64()).unwrap_or(0);
+    let conn_closed = data.get("connections_closed").and_then(|v| v.as_u64()).unwrap_or(0);
+    let active = data.get("active_connections").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!(
+            "📊 Metrics: sent={} recv={} | bytes: {} ↔ {} | errors={} | conn: {} accepted, {} closed, {} active",
+            msgs_sent, msgs_recv,
+            format_num(bytes_sent), format_num(bytes_recv),
+            errors,
+            conn_accepted, conn_closed, active
+        ),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+        edited: false,
+    });
+}
+
 async fn handle_status_update_event(state: &SharedState, data: &JsonMap, ts: u64) {
     let user = data.get("user").and_then(|v| v.as_str()).unwrap_or("?");
     let (text, emoji) = parse_status_payload(data.get("status"));
@@ -3482,6 +3551,104 @@ async fn handle_vdata_event(state: &SharedState, data: &JsonMap) {
     }
 }
 
+async fn handle_vusers_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let room = data.get("room").and_then(|v| v.as_str()).unwrap_or("");
+    let members: Vec<VoiceMemberInfo> = data
+        .get("members")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let joined = data.get("joined").and_then(|v| v.as_bool()).unwrap_or(false);
+    
+    let mut state_lock = state.lock().await;
+    
+    if !room.is_empty() {
+        state_lock.voice_members = members.iter().map(|m| m.user.clone()).collect();
+    }
+    
+    let member_list: Vec<String> = members.iter().map(|m| {
+        let status = if m.muted { "🔇" } else if m.deafened { "🔊" } else { "🎤" };
+        format!("{}{}", status, m.user)
+    }).collect();
+    
+    if !member_list.is_empty() {
+        state_lock.add_message(DisplayedMessage {
+            time: format_time(ts),
+            text: if joined {
+                format!("🎙 Voice members: {}", member_list.join(", "))
+            } else {
+                format!("🎙 Voice updated: {}", member_list.join(", "))
+            },
+            msg_type: MessageType::Sys,
+            user: None,
+            channel: None,
+            edited: false,
+        });
+    }
+}
+
+async fn handle_vstate_event(state: &SharedState, data: &JsonMap) {
+    let user = data.get("user").and_then(|v| v.as_str()).unwrap_or("");
+    let muted = data.get("muted").and_then(|v| v.as_bool());
+    let deafened = data.get("deafened").and_then(|v| v.as_bool());
+    
+    let mut state_lock = state.lock().await;
+    if user == state_lock.me {
+        if let Some(m) = muted {
+            state_lock.voice_muted = m;
+        }
+        if let Some(d) = deafened {
+            state_lock.voice_deafened = d;
+        }
+    }
+    
+    if let Some(m) = muted {
+        let _ = state_lock.voice_session.as_ref().map(|s| {
+            let _ = s.event_tx.send(VoiceEvent::MuteState(m));
+        });
+    }
+}
+
+async fn handle_vspeaking_event(state: &SharedState, data: &JsonMap) {
+    let user = data.get("user").and_then(|v| v.as_str()).unwrap_or("");
+    let speaking = data.get("speaking").and_then(|v| v.as_bool()).unwrap_or(false);
+    
+    let mut state_lock = state.lock().await;
+    if user == state_lock.me {
+        state_lock.voice_speaking = speaking;
+        let _ = state_lock.voice_session.as_ref().map(|s| {
+            let _ = s.event_tx.send(VoiceEvent::SpeakingState(speaking));
+        });
+    }
+}
+
+async fn handle_vjoin_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let user = data.get("user").and_then(|v| v.as_str()).unwrap_or("");
+    
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("🎙 {} joined voice", user),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+        edited: false,
+    });
+}
+
+async fn handle_vleave_event(state: &SharedState, data: &JsonMap, ts: u64) {
+    let user = data.get("user").and_then(|v| v.as_str()).unwrap_or("");
+    
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        time: format_time(ts),
+        text: format!("🎙 {} left voice", user),
+        msg_type: MessageType::Sys,
+        user: None,
+        channel: None,
+        edited: false,
+    });
+}
+
 async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
     let t = data.get("t").and_then(|v| v.as_str()).unwrap_or("");
     let ts = data.get("ts").map(ts_value).unwrap_or(0);
@@ -3497,10 +3664,16 @@ async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
         "joined" => handle_joined_event(state, data, ts).await,
         "history" | "search" | "replay" => handle_history_or_search_event(state, data, t, ts).await,
         "info" => handle_info_event(state, data, ts).await,
+        "metrics" => handle_metrics_event(state, data, ts).await,
         "status_update" => handle_status_update_event(state, data, ts).await,
         "bridge_status" => handle_bridge_status_event(state, data, ts).await,
         "typing" => handle_typing_event(state, data).await,
         "vdata" => handle_vdata_event(state, data).await,
+        "vusers" => handle_vusers_event(state, data, ts).await,
+        "vstate" => handle_vstate_event(state, data).await,
+        "vspeaking" => handle_vspeaking_event(state, data).await,
+        "vjoin" => handle_vjoin_event(state, data, ts).await,
+        "vleave" => handle_vleave_event(state, data, ts).await,
         _ => {}
     }
 }
@@ -3769,6 +3942,7 @@ fn start_voice_session(
                         frame.samples,
                     ));
                 }
+                VoiceEvent::MuteState(_) | VoiceEvent::SpeakingState(_) => {}
                 VoiceEvent::Stop => break,
             }
         }
@@ -4244,6 +4418,84 @@ fn handle_slash_command(
                 }
             }
         }
+        "/screen" => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let first = parts.first().copied();
+            match first {
+                Some("list") | Some("sources") => {
+                    state.add_notice("Fetching available screen sources...");
+                    enqueue_timed(&state.ws_tx, serde_json::json!({"t": "ss_list_sources"}));
+                }
+                Some("start") => {
+                    let mut options = ScreenShareOptions::default();
+                    let mut has_audio = false;
+                    for part in parts.iter().skip(1) {
+                        match *part {
+                            "--audio" | "-a" => has_audio = true,
+                            "--no-audio" => has_audio = false,
+                            "low" => options.quality = QualityPreset::Low,
+                            "medium" | "med" => options.quality = QualityPreset::Medium,
+                            "high" => options.quality = QualityPreset::High,
+                            _ if part.starts_with("source:") => {
+                                options.source_id = Some(part.strip_prefix("source:").unwrap().to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                    options.audio = has_audio;
+
+                    if !state.voice_active {
+                        state.add_notice("Join a voice room first with /voice before screen sharing.");
+                        return CommandFlow::Continue;
+                    }
+
+                    state.add_notice(format!("Starting screen share (quality: {:?}, audio: {})...", options.quality, options.audio));
+                    enqueue_timed(&state.ws_tx, serde_json::json!({
+                        "t": "ss_start",
+                        "q": options.quality,
+                        "a": options.audio,
+                        "s": options.source_id
+                    }));
+                }
+                Some("stop") => {
+                    state.add_notice("Stopping screen share...");
+                    enqueue_timed(&state.ws_tx, serde_json::json!({"t": "ss_stop"}));
+                }
+                Some("quality") => {
+                    if let Some(quality) = parts.get(1) {
+                        state.add_notice(format!("Quality preset: {}", quality));
+                    } else {
+                        state.add_notice("Usage: /screen quality [low|medium|high]");
+                    }
+                }
+                Some("status") => {
+                    if let Some(ref ss) = state.screen_share {
+                        let sess = ss.session();
+                        if let Some(s) = sess {
+                            state.add_notice(format!(
+                                "Screen sharing: {:?} | Room: {} | {} viewers",
+                                s.state, s.room, s.viewer_count
+                            ));
+                        } else {
+                            state.add_notice("No active screen share");
+                        }
+                    } else {
+                        state.add_notice("No active screen share");
+                    }
+                }
+                None | Some("") | Some("help") => {
+                    state.add_notice("Screen sharing commands:");
+                    state.add_notice("  /screen list        - List available sources");
+                    state.add_notice("  /screen start      - Start screen sharing (in voice room)");
+                    state.add_notice("  /screen start --audio  - Start with audio");
+                    state.add_notice("  /screen stop       - Stop screen sharing");
+                    state.add_notice("  /screen quality [low|medium|high]");
+                }
+                _ => {
+                    state.add_notice("Usage: /screen [start|stop|list|quality|status]");
+                }
+            }
+        }
         "/voice" => {
             if state.voice_session.is_some() {
                 stop_voice_session(state, SessionStopFeedback::Notify);
@@ -4288,6 +4540,10 @@ fn handle_slash_command(
                 let lines = command_help_lines(requested);
                 state.add_notice_batch(lines);
             }
+        }
+        "/metrics" => {
+            state.add_notice("Fetching server metrics...");
+            enqueue_timed(&state.ws_tx, serde_json::json!({"t": "metrics"}));
         }
         "/edit" => {
             let trimmed = args.trim();
@@ -4655,6 +4911,12 @@ async fn main() -> ChatifyResult<()> {
             recent_sents: VecDeque::new(),
             log_enabled,
             config: config_to_save,
+            screen_share: None,
+            screen_viewing: false,
+            voice_members: Vec::new(),
+            voice_muted: false,
+            voice_deafened: false,
+            voice_speaking: false,
         }));
         {
             let mut state_lock = state.lock().await;
@@ -4867,6 +5129,12 @@ mod tests {
             recent_sents: VecDeque::new(),
             log_enabled: false,
             config,
+            screen_share: None,
+            screen_viewing: false,
+            voice_members: Vec::new(),
+            voice_muted: false,
+            voice_deafened: false,
+            voice_speaking: false,
         };
         (tx, state)
     }

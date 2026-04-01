@@ -15,6 +15,9 @@ pub mod error;
 pub mod notifications;
 pub mod totp;
 pub mod ui;
+pub mod screen_share;
+pub mod performance;
+pub mod voice;
 
 use rand::RngCore;
 use std::time::{SystemTime, UNIX_EPOCH};
