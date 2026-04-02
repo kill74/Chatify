@@ -16,6 +16,7 @@ use clicord_server::ui::theme::{self as theme_mod, OwnedTheme, RESET as THEME_RE
 use clicord_server::screen_share::{
     ScreenShareManager, ScreenShareOptions, ScreenShareState, QualityPreset,
 };
+use clicord_server::voice::AudioProcessor;
 use clicord_server::voice::VoiceMemberInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -3721,6 +3722,7 @@ async fn dispatch_incoming_event(state: &SharedState, data: &JsonMap) {
     }
 }
 
+#[allow(dead_code)]
 fn encode_voice_frame(frame: &VoiceFrame) -> String {
     let mut out = Vec::with_capacity(6 + frame.samples.len() * 2);
     out.extend_from_slice(&frame.sample_rate.to_le_bytes());
@@ -3732,6 +3734,54 @@ fn encode_voice_frame(frame: &VoiceFrame) -> String {
 }
 
 fn decode_voice_frame(payload_b64: &str) -> Option<VoiceFrame> {
+    let raw = general_purpose::STANDARD.decode(payload_b64).ok()?;
+    if raw.len() < 6 {
+        return None;
+    }
+    let sample_rate = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let channels = u16::from_le_bytes([raw[4], raw[5]]);
+    if channels == 0 {
+        return None;
+    }
+    let compressed_data = &raw[6..];
+    
+    let mut samples = Vec::with_capacity(compressed_data.len() * 2);
+    let mut i = 0;
+    let mut is_compressed = false;
+    
+    while i < compressed_data.len() {
+        if i + 1 < compressed_data.len() && compressed_data[i] == 0xFF && compressed_data[i + 1] == 0x00 {
+            is_compressed = true;
+            if i + 5 < compressed_data.len() {
+                let length = u16::from_le_bytes([compressed_data[i + 2], compressed_data[i + 3]]) as usize;
+                let sample = i16::from_le_bytes([compressed_data[i + 4], compressed_data[i + 5]]);
+                for _ in 0..length {
+                    samples.push(sample);
+                }
+                i += 6;
+            } else {
+                break;
+            }
+        } else if i + 1 < compressed_data.len() {
+            samples.push(i16::from_le_bytes([compressed_data[i], compressed_data[i + 1]]));
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    
+    if is_compressed {
+        Some(VoiceFrame {
+            sample_rate,
+            channels,
+            samples,
+        })
+    } else {
+        decode_voice_frame_legacy(payload_b64)
+    }
+}
+
+fn decode_voice_frame_legacy(payload_b64: &str) -> Option<VoiceFrame> {
     let raw = general_purpose::STANDARD.decode(payload_b64).ok()?;
     if raw.len() < 6 {
         return None;
@@ -3941,6 +3991,8 @@ fn start_voice_session(
             }
         };
 
+        let mut audio_processor = AudioProcessor::new(sample_rate, channels.into());
+
         let input_stream = match build_input_stream(
             &input_device,
             &input_config,
@@ -3968,7 +4020,9 @@ fn start_voice_session(
         while let Ok(event) = event_rx.recv() {
             match event {
                 VoiceEvent::Captured(frame) => {
-                    let payload = encode_voice_frame(&frame);
+                    let processed = audio_processor.process_capture(&frame.samples);
+                    let encoded = audio_processor.encode(&processed);
+                    let payload = general_purpose::STANDARD.encode(&encoded);
                     enqueue_timed(
                         &ws_tx_task,
                         serde_json::json!({
@@ -3979,10 +4033,11 @@ fn start_voice_session(
                     );
                 }
                 VoiceEvent::Playback(frame) => {
+                    let processed = audio_processor.process_playback(&frame.samples);
                     sink.append(SamplesBuffer::new(
                         frame.channels,
                         frame.sample_rate,
-                        frame.samples,
+                        processed,
                     ));
                 }
                 VoiceEvent::MuteState(_) | VoiceEvent::SpeakingState(_) => {}
