@@ -2253,6 +2253,7 @@ async fn handle_event(
             {
                 "image" => "image",
                 "video" => "video",
+                "audio" => "audio",
                 _ => "file",
             };
             let mime = d

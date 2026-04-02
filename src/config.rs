@@ -44,6 +44,8 @@ pub struct UiConfig {
     pub enable_syntax_highlighting: bool,
     #[serde(default = "default_true")]
     pub enable_emoji: bool,
+    #[serde(default = "default_true")]
+    pub enable_media: bool,
     #[serde(default)]
     pub compact_mode: bool,
     #[serde(default)]
@@ -179,6 +181,7 @@ impl Default for UiConfig {
             enable_markdown: true,
             enable_syntax_highlighting: true,
             enable_emoji: true,
+            enable_media: true,
             compact_mode: false,
             custom_themes: Vec::new(),
         }

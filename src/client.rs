@@ -780,6 +780,7 @@ impl TrustStore {
 enum MessageType {
     Msg,
     Img,
+    Audio,
     Dm,
     Sys,
     UnreadMarker,
@@ -844,6 +845,7 @@ struct SentMessage {
 enum MediaKind {
     Image,
     Video,
+    Audio,
     File,
 }
 
@@ -852,6 +854,7 @@ impl MediaKind {
         match self {
             MediaKind::Image => "image",
             MediaKind::Video => "video",
+            MediaKind::Audio => "audio",
             MediaKind::File => "file",
         }
     }
@@ -860,6 +863,7 @@ impl MediaKind {
         match self {
             MediaKind::Image => "[IMAGE]",
             MediaKind::Video => "[VIDEO]",
+            MediaKind::Audio => "[AUDIO]",
             MediaKind::File => "[FILE]",
         }
     }
@@ -1065,6 +1069,8 @@ struct ClientState {
     voice_deafened: bool,
     /// Whether we're currently speaking
     voice_speaking: bool,
+    /// Whether rich media rendering is enabled
+    media_enabled: bool,
 }
 
 impl ClientState {
@@ -1655,6 +1661,7 @@ fn parse_media_kind_hint(kind: Option<&str>, filename: &str, mime: Option<&str>)
     match kind.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("image") => MediaKind::Image,
         Some("video") => MediaKind::Video,
+        Some("audio") => MediaKind::Audio,
         Some("file") => MediaKind::File,
         _ => infer_media_kind(filename, mime),
     }
@@ -2237,6 +2244,14 @@ where
             MessageType::Img => {
                 let user = msg.user.as_deref().unwrap_or("?");
                 let header = format!("[{}] IMG {} ", msg.time, user);
+                lines.extend(prefixed_preformatted_lines(
+                    &header, &msg.text, width, max_lines,
+                ));
+                current_group = None;
+            }
+            MessageType::Audio => {
+                let user = msg.user.as_deref().unwrap_or("?");
+                let header = format!("[{}] AUDIO {} ", msg.time, user);
                 lines.extend(prefixed_preformatted_lines(
                     &header, &msg.text, width, max_lines,
                 ));
@@ -2950,27 +2965,40 @@ async fn handle_img_event(state: &SharedState, data: &JsonMap, ts: u64) {
     let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
     let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
     let a = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
-    let image_bytes = match general_purpose::STANDARD.decode(a) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    let ascii_art = img_to_ascii(&image_bytes, MEDIA_PREVIEW_WIDTH);
 
     let mut state_lock = state.lock().await;
+    
     if u != state_lock.me {
         state_lock.note_live_activity(u, &format!("#{}", ch));
         if ch != state_lock.ch {
             state_lock.note_unread_scope(ch);
         }
     }
-    state_lock.add_message(DisplayedMessage {
-        time: format_time(ts),
-        text: format!("inline image\n{}", ascii_art),
-        msg_type: MessageType::Img,
-        user: Some(u.to_string()),
-        channel: Some(ch.to_string()),
-        edited: false,
-    });
+    
+    if state_lock.media_enabled {
+        let image_bytes = match general_purpose::STANDARD.decode(a) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let ascii_art = img_to_ascii(&image_bytes, MEDIA_PREVIEW_WIDTH);
+        state_lock.add_message(DisplayedMessage {
+            time: format_time(ts),
+            text: format!("inline image\n{}", ascii_art),
+            msg_type: MessageType::Img,
+            user: Some(u.to_string()),
+            channel: Some(ch.to_string()),
+            edited: false,
+        });
+    } else {
+        state_lock.add_message(DisplayedMessage {
+            time: format_time(ts),
+            text: format!("[📷 Image from {}]", u),
+            msg_type: MessageType::Sys,
+            user: Some(u.to_string()),
+            channel: Some(ch.to_string()),
+            edited: false,
+        });
+    }
 }
 
 async fn handle_file_meta_event(state: &SharedState, data: &JsonMap, ts: u64) {
@@ -3170,14 +3198,6 @@ async fn handle_file_chunk_event(state: &SharedState, data: &JsonMap, ts: u64) {
             return;
         }
 
-        let image_preview = if transfer.media_kind == MediaKind::Image {
-            fs::read(&transfer.final_path)
-                .ok()
-                .map(|bytes| img_to_ascii(&bytes, MEDIA_PREVIEW_WIDTH))
-        } else {
-            None
-        };
-
         let mut state_lock = state.lock().await;
         let mut base_text = format!(
             "{} saved '{}' ({}): {}",
@@ -3191,8 +3211,31 @@ async fn handle_file_chunk_event(state: &SharedState, data: &JsonMap, ts: u64) {
             base_text.push_str(&format!(" | {}", mime));
         }
 
-        let (msg_type, text) = if let Some(preview) = image_preview {
-            (MessageType::Img, format!("{}\n{}", base_text, preview))
+        let (msg_type, text) = if transfer.media_kind == MediaKind::Image && state_lock.media_enabled {
+            let image_preview = fs::read(&transfer.final_path)
+                .ok()
+                .map(|bytes| img_to_ascii(&bytes, MEDIA_PREVIEW_WIDTH));
+            if let Some(preview) = image_preview {
+                (MessageType::Img, format!("{}\n{}", base_text, preview))
+            } else {
+                (MessageType::FileMeta, base_text)
+            }
+        } else if transfer.media_kind == MediaKind::Audio {
+            let audio_info = if state_lock.media_enabled {
+                format!("{} | {}", format_byte_size(transfer.size), transfer.filename)
+            } else {
+                format!("[AUDIO] {} from {}", format_byte_size(transfer.size), transfer.from)
+            };
+            (MessageType::Audio, audio_info)
+        } else if transfer.media_kind == MediaKind::Video && state_lock.media_enabled {
+            let video_preview = fs::read(&transfer.final_path)
+                .ok()
+                .map(|bytes| img_to_ascii(&bytes, MEDIA_PREVIEW_WIDTH));
+            if let Some(preview) = video_preview {
+                (MessageType::Img, format!("{}\n{}", base_text, preview))
+            } else {
+                (MessageType::FileMeta, base_text)
+            }
         } else {
             (MessageType::FileMeta, base_text)
         };
@@ -4754,6 +4797,12 @@ async fn main() -> ChatifyResult<()> {
                 .action(clap::ArgAction::SetTrue)
                 .help("Disable markdown rendering"),
         )
+        .arg(
+            clap::Arg::new("no-media")
+                .long("no-media")
+                .action(clap::ArgAction::SetTrue)
+                .help("Disable rich media rendering (images, audio)"),
+        )
         .get_matches();
 
     // Merge config with CLI args (CLI takes precedence)
@@ -4768,6 +4817,7 @@ async fn main() -> ChatifyResult<()> {
     let tls = matches.get_flag("tls") || config.connection.use_tls;
     let log_enabled = matches.get_flag("log");
     let markdown_enabled = !matches.get_flag("no-markdown") && config.ui.enable_markdown;
+    let media_enabled = !matches.get_flag("no-media") && config.ui.enable_media;
 
     let scheme = if tls { "wss" } else { "ws" };
     let uri = format!("{}://{}:{}", scheme, host, port);
@@ -4917,6 +4967,7 @@ async fn main() -> ChatifyResult<()> {
             voice_muted: false,
             voice_deafened: false,
             voice_speaking: false,
+            media_enabled,
         }));
         {
             let mut state_lock = state.lock().await;
@@ -5135,6 +5186,7 @@ mod tests {
             voice_muted: false,
             voice_deafened: false,
             voice_speaking: false,
+            media_enabled: true,
         };
         (tx, state)
     }

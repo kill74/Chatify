@@ -69,15 +69,19 @@ pub fn render_markdown(
             }
             Event::End(Tag::CodeBlock(_)) => {
                 in_code_block = false;
+                if !code_lang.is_empty() {
+                    out.push_str("\x1b[35m["); // Magenta for language label
+                    out.push_str(&code_lang);
+                    out.push_str("]\x1b[0m\n");
+                }
                 if enable_syntax_highlighting {
                     let highlighted = highlight_code(&code_lang, &code_buffer);
-                    out.push('\n');
                     out.push_str(&highlighted);
                     if !highlighted.ends_with('\n') {
                         out.push('\n');
                     }
                 } else {
-                    out.push_str("\n\x1b[2m"); // Dim for plain code blocks
+                    out.push_str("\x1b[2m"); // Dim for plain code blocks
                     out.push_str(&code_buffer);
                     out.push_str("\x1b[0m\n");
                 }
