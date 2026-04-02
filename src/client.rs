@@ -3,21 +3,21 @@
 //! A real-time chat client with support for channels, direct messages, voice,
 //! file transfers, message editing, reactions, and user status tracking.
 
-use clicord_server::config::Config;
-use clicord_server::crypto::{
+use clifford::config::Config;
+use clifford::crypto::{
     channel_key, dec_bytes, dh_key, enc_bytes, new_keypair, pub_b64, pw_hash_client,
 };
-use clicord_server::error::{ChatifyError, ChatifyResult};
-use clicord_server::notifications::NotificationService;
-use clicord_server::ui::ansi::{strip_ansi, visible_width};
-use clicord_server::ui::emoji;
-use clicord_server::ui::markdown::render_markdown;
-use clicord_server::ui::theme::{self as theme_mod, OwnedTheme, RESET as THEME_RESET};
-use clicord_server::screen_share::{
+use clifford::error::{ChatifyError, ChatifyResult};
+use clifford::notifications::NotificationService;
+use clifford::ui::ansi::{strip_ansi, visible_width};
+use clifford::ui::emoji;
+use clifford::ui::markdown::render_markdown;
+use clifford::ui::theme::{self as theme_mod, OwnedTheme, RESET as THEME_RESET};
+use clifford::screen_share::{
     ScreenShareManager, ScreenShareOptions, ScreenShareState, QualityPreset,
 };
-use clicord_server::voice::AudioProcessor;
-use clicord_server::voice::VoiceMemberInfo;
+use clifford::voice::AudioProcessor;
+use clifford::voice::VoiceMemberInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};

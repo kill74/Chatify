@@ -1,6 +1,6 @@
 [package]
-name = "clicord-server"
-version = "0.1.0"
+name = "clifford"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
@@ -10,17 +10,21 @@ discord-bridge = ["dep:serenity"]
 bridge-client = []
 
 [[bin]]
-name = "clicord-server"
+name = "clifford-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "clicord-client"
+name = "clifford-client"
 path = "src/client.rs"
 
 [[bin]]
 name = "discord_bot"
 path = "src/discord_bot.rs"
 required-features = ["discord-bridge"]
+
+[lib]
+name = "clifford"
+path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -87,13 +91,11 @@ codegen-units = 1
 strip = true
 
 [profile.dev]
-# Keep local debugging useful while avoiding huge PDB/debuginfo output.
 debug = 1
 incremental = false
 codegen-units = 16
 
 [profile.dev.package."*"]
-# Dependencies dominate artifact size; keep them lean in day-to-day builds.
 debug = 0
 
 [profile.test]

@@ -75,11 +75,11 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
-use clicord_server::crypto;
-use clicord_server::error::{ChatifyError, ChatifyResult};
-use clicord_server::performance::{Metrics, MessageCache};
-use clicord_server::voice::VoiceRelay;
-use clicord_server::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
+use clifford::crypto;
+use clifford::error::{ChatifyError, ChatifyResult};
+use clifford::performance::{Metrics, MessageCache};
+use clifford::voice::VoiceRelay;
+use clifford::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
