@@ -849,6 +849,27 @@ fn read_stdin_line(prompt: &str) -> io::Result<String> {
     Ok(input.trim().to_string())
 }
 
+fn read_non_empty_env(var_name: &str) -> Option<String> {
+    std::env::var(var_name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn prompt_for_password() -> io::Result<String> {
+    println!("Password input is hidden. Type it and press Enter.");
+    match rpassword::prompt_password("password: ") {
+        Ok(password) => Ok(password),
+        Err(err) => {
+            eprintln!(
+                "Hidden password prompt unavailable: {}. Falling back to visible input.",
+                err
+            );
+            read_stdin_line("password (visible): ")
+        }
+    }
+}
+
 /// Main entry point for the WebSocket client
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -887,13 +908,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clap::Arg::new("username")
                 .long("username")
                 .value_name("USER")
-                .help("Username (skip prompt)"),
+                .help("Username (skip prompt; fallback env CHATIFY_USERNAME)"),
         )
         .arg(
             clap::Arg::new("password")
                 .long("password")
                 .value_name("PASSWORD")
-                .help("Password (skip hidden prompt; use only for local testing)"),
+                .help("Password (skip prompt; prefer env CHATIFY_PASSWORD to avoid shell history)"),
         )
         .get_matches();
 
@@ -905,37 +926,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheme = if tls { "wss" } else { "ws" };
     let uri = format!("{}://{}:{}", scheme, host, port);
 
-    let username = match matches.get_one::<String>("username") {
-        Some(user) if !user.trim().is_empty() => user.trim().to_string(),
-        Some(_) => {
+    let username = if let Some(user) = matches.get_one::<String>("username") {
+        let trimmed = user.trim();
+        if trimmed.is_empty() {
             println!("Empty username provided, using 'anon'.");
             "anon".to_string()
+        } else {
+            trimmed.to_string()
         }
-        None => {
-            let u = read_stdin_line("username: ")?;
-            if u.is_empty() {
-                println!("Empty username provided, using 'anon'.");
-                "anon".to_string()
-            } else {
-                u
-            }
+    } else if let Some(user) = read_non_empty_env("CHATIFY_USERNAME") {
+        user
+    } else {
+        let u = read_stdin_line("username: ")?;
+        if u.is_empty() {
+            println!("Empty username provided, using 'anon'.");
+            "anon".to_string()
+        } else {
+            u
         }
     };
 
     let password = if let Some(password) = matches.get_one::<String>("password") {
-        password.clone()
-    } else {
-        println!("Password input is hidden. Type it and press Enter.");
-        match rpassword::prompt_password("password: ") {
-            Ok(password) => password,
-            Err(err) => {
-                eprintln!(
-                    "Hidden password prompt unavailable: {}. Falling back to visible input.",
-                    err
-                );
-                read_stdin_line("password (visible): ")?
-            }
+        if password.is_empty() {
+            eprintln!("Empty --password value provided; falling back to prompt.");
+            prompt_for_password()?
+        } else {
+            eprintln!(
+                "Warning: passing --password may leak secrets in shell history. Prefer CHATIFY_PASSWORD env var."
+            );
+            password.clone()
         }
+    } else if let Some(password) = read_non_empty_env("CHATIFY_PASSWORD") {
+        password
+    } else {
+        prompt_for_password()?
     };
     let client_priv_key = new_keypair();
     let client_pub_key = pub_b64(&client_priv_key);
@@ -1040,7 +1064,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Spawn tasks for reading from WebSocket and from stdin
         let state_clone = state.clone();
-        let rx_task = tokio::spawn(async move {
+        let mut rx_task = tokio::spawn(async move {
             loop {
                 let msg = match ws_rx.next().await {
                     Some(Ok(msg)) => msg,
@@ -1212,18 +1236,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if state.message_history.len() > 100 {
                                     state.message_history.remove(0);
                                 }
-                                // Send request for history
-                                let _ = state.ws_tx.send(
-                                    serde_json::json!({
-                                        "t": "join",
-                                        "ch": ch,
-                                        "ts": SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                    })
-                                    .to_string(),
-                                );
                             }
                             "info" => {
                                 let mut state = state_clone.lock().await;
@@ -1455,7 +1467,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         let state_clone2 = state.clone();
-        let stdin_task = tokio::spawn(async move {
+        let mut stdin_task = tokio::spawn(async move {
             let stdin = BufReader::new(tokio::io::stdin());
             let mut lines = stdin.lines();
             loop {
@@ -1639,6 +1651,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let action = words.next().unwrap_or("");
 
                             if action.eq_ignore_ascii_case("stop") {
+                                let was_sharing =
+                                    state.screen_session.is_some() || state.screen_active;
                                 let mut room_to_leave = state.screen_room.take();
                                 if let Some(session) = state.screen_session.take() {
                                     if room_to_leave.is_none() {
@@ -1659,7 +1673,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         })
                                         .to_string(),
                                     );
-                                    println!("Screen share stopped");
+                                    if was_sharing {
+                                        println!("Screen share stopped");
+                                    } else {
+                                        println!("Screen stream unsubscribed");
+                                    }
                                 } else {
                                     state.log(
                                         "INFO",
@@ -1711,6 +1729,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 serde_json::json!({
                                     "t": "sjoin",
                                     "r": room,
+                                    "mode": if viewing_only { "view" } else { "share" },
                                     "ts": SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -1855,9 +1874,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // Wait for tasks to complete
-        let _ = rx_task.await;
-        let _ = stdin_task.await;
+        // Exit cleanly when either task finishes first.
+        tokio::select! {
+            _ = &mut rx_task => {
+                stdin_task.abort();
+                let _ = stdin_task.await;
+            }
+            _ = &mut stdin_task => {
+                rx_task.abort();
+                let _ = rx_task.await;
+            }
+        }
 
         // Clean up
         let mut state = state.lock().await;

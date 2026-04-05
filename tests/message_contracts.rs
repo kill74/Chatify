@@ -60,6 +60,10 @@ impl TestClient {
     async fn recv_by_type(&mut self, expected_type: &str) -> Value {
         recv_by_type(&mut self.ws, expected_type).await
     }
+
+    async fn try_recv_by_type(&mut self, expected_type: &str, wait: Duration) -> Option<Value> {
+        try_recv_by_type(&mut self.ws, expected_type, wait).await
+    }
 }
 
 fn allocate_port() -> u16 {
@@ -139,6 +143,32 @@ async fn recv_by_type(ws: &mut Ws, expected_type: &str) -> Value {
     panic!("did not receive message type '{}'", expected_type);
 }
 
+async fn try_recv_by_type(ws: &mut Ws, expected_type: &str, wait: Duration) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let msg = match timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(Some(Err(_))) => return None,
+            Ok(None) => return None,
+            Err(_) => return None,
+        };
+
+        if let Message::Text(text) = msg {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                if value.get("t").and_then(|v| v.as_str()) == Some(expected_type) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn auth_contract_returns_expected_fields() {
     let server = start_server().await;
@@ -212,6 +242,49 @@ async fn msg_contract_roundtrips_channel_payload() {
 }
 
 #[tokio::test]
+async fn join_contract_rejoin_same_channel_does_not_duplicate_messages() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+    let mut bob = TestClient::connect_and_auth(&server.url, "bob").await;
+
+    alice.send_json(json!({"t":"join","ch":"room-a"})).await;
+    let _ = alice.recv_by_type("joined").await;
+
+    // Rejoin the same channel; this should not create duplicate subscriptions.
+    alice.send_json(json!({"t":"join","ch":"room-a"})).await;
+    let _ = alice.recv_by_type("joined").await;
+
+    bob.send_json(json!({"t":"join","ch":"room-a"})).await;
+    let _ = bob.recv_by_type("joined").await;
+
+    sleep(Duration::from_millis(150)).await;
+
+    bob.send_json(json!({
+        "t": "msg",
+        "ch": "room-a",
+        "c": "dedupe-check",
+        "ts": 1
+    }))
+    .await;
+
+    let first = alice.recv_by_type("msg").await;
+    assert_eq!(first.get("u").and_then(|v| v.as_str()), Some("bob"));
+    assert_eq!(first.get("ch").and_then(|v| v.as_str()), Some("room-a"));
+    assert_eq!(
+        first.get("c").and_then(|v| v.as_str()),
+        Some("dedupe-check")
+    );
+
+    let duplicate = alice
+        .try_recv_by_type("msg", Duration::from_millis(700))
+        .await;
+    assert!(
+        duplicate.is_none(),
+        "rejoining the same channel should not duplicate forwarded messages"
+    );
+}
+
+#[tokio::test]
 async fn voice_contract_forwards_vdata_between_room_members() {
     let server = start_server().await;
     let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
@@ -231,6 +304,31 @@ async fn voice_contract_forwards_vdata_between_room_members() {
     assert_eq!(
         vdata.get("a").and_then(|v| v.as_str()),
         Some("ZmFrZS1hdWRpby1wYXlsb2Fk")
+    );
+}
+
+#[tokio::test]
+async fn voice_contract_switch_room_stops_old_forwarding() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+    let mut bob = TestClient::connect_and_auth(&server.url, "bob").await;
+
+    bob.send_json(json!({"t":"vjoin","r":"room-a"})).await;
+    bob.send_json(json!({"t":"vjoin","r":"room-b"})).await;
+    alice.send_json(json!({"t":"vjoin","r":"room-a"})).await;
+
+    sleep(Duration::from_millis(150)).await;
+
+    alice
+        .send_json(json!({"t":"vdata","r":"room-a","a":"ZmFrZS1hdWRpby1wYXlsb2Fk"}))
+        .await;
+
+    let leaked = bob
+        .try_recv_by_type("vdata", Duration::from_millis(700))
+        .await;
+    assert!(
+        leaked.is_none(),
+        "bob should not receive vdata from old room after switching voice rooms"
     );
 }
 
@@ -272,6 +370,102 @@ async fn screen_contract_forwards_sdata_between_room_members() {
     assert_eq!(
         sdata.get("a").and_then(|v| v.as_str()).map(|v| v.len()),
         Some(24_000)
+    );
+}
+
+#[tokio::test]
+async fn screen_contract_view_mode_receives_but_cannot_publish() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+    let mut bob = TestClient::connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send_json(json!({"t":"sjoin","r":"room-a","mode":"share"}))
+        .await;
+    bob.send_json(json!({"t":"sjoin","r":"room-a","mode":"view"}))
+        .await;
+
+    sleep(Duration::from_millis(150)).await;
+
+    bob.send_json(json!({
+        "t": "sdata",
+        "r": "room-a",
+        "a": "AAAA",
+        "codec": "h264",
+        "seq": 11,
+        "chunk": 0,
+        "total": 1,
+        "w": 640,
+        "h": 360,
+        "kf": false
+    }))
+    .await;
+
+    let leaked = alice
+        .try_recv_by_type("sdata", Duration::from_millis(700))
+        .await;
+    assert!(
+        leaked.is_none(),
+        "viewer mode should not be allowed to publish sdata"
+    );
+
+    alice
+        .send_json(json!({
+            "t": "sdata",
+            "r": "room-a",
+            "a": "BBBB",
+            "codec": "h264",
+            "seq": 12,
+            "chunk": 0,
+            "total": 1,
+            "w": 640,
+            "h": 360,
+            "kf": true
+        }))
+        .await;
+
+    let sdata = bob.recv_by_type("sdata").await;
+    assert_eq!(sdata.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(sdata.get("seq").and_then(|v| v.as_u64()), Some(12));
+}
+
+#[tokio::test]
+async fn screen_contract_switch_room_stops_old_forwarding() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+    let mut bob = TestClient::connect_and_auth(&server.url, "bob").await;
+
+    bob.send_json(json!({"t":"sjoin","r":"room-a","mode":"view"}))
+        .await;
+    bob.send_json(json!({"t":"sjoin","r":"room-b","mode":"view"}))
+        .await;
+    alice
+        .send_json(json!({"t":"sjoin","r":"room-a","mode":"share"}))
+        .await;
+
+    sleep(Duration::from_millis(150)).await;
+
+    alice
+        .send_json(json!({
+            "t": "sdata",
+            "r": "room-a",
+            "a": "CCCC",
+            "codec": "h264",
+            "seq": 21,
+            "chunk": 0,
+            "total": 1,
+            "w": 320,
+            "h": 240,
+            "kf": false
+        }))
+        .await;
+
+    let leaked = bob
+        .try_recv_by_type("sdata", Duration::from_millis(700))
+        .await;
+    assert!(
+        leaked.is_none(),
+        "viewer should not keep receiving sdata from previous screen room"
     );
 }
 

@@ -93,22 +93,41 @@ Terminal 2:
 cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 ```
 
+Credential input options:
+
+- Interactive (default): prompts for username and hidden password
+- Environment variables (recommended for scripts):
+
+```bash
+export CHATIFY_USERNAME=alice
+export CHATIFY_PASSWORD='your-secret'
+cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
+```
+
+- CLI override (local testing only; can leak in shell history):
+
+```bash
+cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765 --username alice --password 'your-secret'
+```
+
+Credential precedence is: CLI flags > environment variables > interactive prompt.
+
 ## CLI Commands (Current)
 
-| Command              | Description                         |
-| -------------------- | ----------------------------------- |
-| /join <channel>      | Join or create a channel            |
-| /dm <user> <message> | Send a direct message               |
-| /me <action>         | Send action-style message           |
-| /users               | List online users with live status  |
-| /status <message>    | Set custom status (e.g., "AFK")     |
-| /channels            | List channels                       |
-| /voice [room]        | Toggle voice in room                |
-| /screen ...          | Start/view/stop screen stream       |
-| /edit <text>         | Placeholder command                 |
-| /clear               | Clear terminal output               |
-| /help                | Show command help                   |
-| /quit, /exit, /q     | Disconnect and exit                 |
+| Command              | Description                        |
+| -------------------- | ---------------------------------- |
+| /join <channel>      | Join or create a channel           |
+| /dm <user> <message> | Send a direct message              |
+| /me <action>         | Send action-style message          |
+| /users               | List online users with live status |
+| /status <message>    | Set custom status (e.g., "AFK")    |
+| /channels            | List channels                      |
+| /voice [room]        | Toggle voice in room               |
+| /screen ...          | Start/view/stop screen stream      |
+| /edit <text>         | Placeholder command                |
+| /clear               | Clear terminal output              |
+| /help                | Show command help                  |
+| /quit, /exit, /q     | Disconnect and exit                |
 
 Screen command forms:
 
@@ -133,9 +152,9 @@ $ cargo run --bin clicord-server
 Client window (user Alice):
 
 ```text
+$ export CHATIFY_USERNAME=alice
+$ export CHATIFY_PASSWORD='your-secret'
 $ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
-username: alice
-password:
 Connected to server
 
 /join dev
@@ -169,7 +188,9 @@ Voice stopped
 Chatify includes intelligent presence tracking:
 
 ### Custom Status
+
 Set a custom status message visible to all users:
+
 ```bash
 /status In a meeting
 /status AFK - back in 10 min
@@ -177,12 +198,15 @@ Set a custom status message visible to all users:
 ```
 
 ### Live Roster
+
 The `/users` command shows an enhanced roster with:
+
 - 🟢 **Online** - Active users
 - 💤 **Away** - Users idle for 5+ minutes
 - Custom status messages displayed alongside usernames
 
 ### Automatic Idle Detection
+
 - Users are automatically marked as "away" after 5 minutes of inactivity
 - Any message or command resets the idle timer
 - Idle detection runs in the background on the server

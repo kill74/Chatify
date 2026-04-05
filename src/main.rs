@@ -400,7 +400,7 @@ async fn broadcast_system_msg(state: &Arc<State>, msg: &str) {
 fn spawn_broadcast_forwarder(
     mut rx: broadcast::Receiver<String>,
     out_tx: tokio::sync::mpsc::UnboundedSender<String>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -413,7 +413,7 @@ fn spawn_broadcast_forwarder(
                 Err(_) => {}
             }
         }
-    });
+    })
 }
 
 /// Create JSON response for successful connection
@@ -493,8 +493,12 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     // Create channel for sending messages to client
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // Spawn task to forward general channel messages to output channel
-    spawn_broadcast_forwarder(gen_rx, out_tx.clone());
+    // Track per-channel forwarders to avoid duplicate subscriptions on repeated joins.
+    let mut channel_forwarders: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    channel_forwarders.insert(
+        "general".to_string(),
+        spawn_broadcast_forwarder(gen_rx, out_tx.clone()),
+    );
 
     // Spawn task to send queued messages to WebSocket
     tokio::spawn(async move {
@@ -506,7 +510,10 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     });
 
     let mut voice_room: Option<String> = None;
-    let mut screen_room: Option<String> = None;
+    let mut voice_forwarder: Option<tokio::task::JoinHandle<()>> = None;
+    let mut screen_sub_room: Option<String> = None;
+    let mut screen_share_room: Option<String> = None;
+    let mut screen_forwarder: Option<tokio::task::JoinHandle<()>> = None;
 
     // Main message handling loop
     loop {
@@ -588,8 +595,11 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let chan = state.chan(&ch);
                 let hist = chan.hist().await;
-                let rx = chan.tx.subscribe();
-                spawn_broadcast_forwarder(rx, out_tx.clone());
+                if !channel_forwarders.contains_key(&ch) {
+                    let rx = chan.tx.subscribe();
+                    let handle = spawn_broadcast_forwarder(rx, out_tx.clone());
+                    channel_forwarders.insert(ch.clone(), handle);
+                }
                 let _ =
                     out_tx.send(serde_json::json!({"t":"joined","ch":ch,"hist":hist}).to_string());
                 let _ = chan.tx.send(sys(&format!("→ {} joined #{}", username, ch)));
@@ -614,9 +624,22 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             }
             "vjoin" => {
                 let room = safe_ch(d["r"].as_str().unwrap_or("general"));
+                if voice_room.as_deref() == Some(room.as_str()) {
+                    continue;
+                }
+                if let Some(ref old_room) = voice_room {
+                    let _ = state
+                        .chan(old_room)
+                        .tx
+                        .send(sys(&format!("🎙 {} left voice #{}", username, old_room)));
+                }
+                if let Some(handle) = voice_forwarder.take() {
+                    handle.abort();
+                }
+
                 let vtx = state.voice_tx(&room);
                 let vrx = vtx.subscribe();
-                spawn_broadcast_forwarder(vrx, out_tx.clone());
+                voice_forwarder = Some(spawn_broadcast_forwarder(vrx, out_tx.clone()));
                 voice_room = Some(room.clone());
                 let _ = state
                     .chan(&room)
@@ -624,6 +647,9 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     .send(sys(&format!("🎙 {} joined voice #{}", username, room)));
             }
             "vleave" => {
+                if let Some(handle) = voice_forwarder.take() {
+                    handle.abort();
+                }
                 if let Some(ref room) = voice_room.take() {
                     let _ = state
                         .chan(room)
@@ -646,28 +672,49 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             }
             "sjoin" => {
                 let room = safe_ch(d["r"].as_str().unwrap_or("general"));
-                if screen_room.as_deref() == Some(room.as_str()) {
+                let mode = d.get("mode").and_then(|v| v.as_str()).unwrap_or("share");
+                let viewing_only = mode.eq_ignore_ascii_case("view");
+
+                let current_sub = screen_sub_room.as_deref();
+                let is_currently_sharing = screen_share_room.is_some();
+                if current_sub == Some(room.as_str())
+                    && ((viewing_only && !is_currently_sharing)
+                        || (!viewing_only && is_currently_sharing))
+                {
                     continue;
                 }
 
-                if let Some(ref old_room) = screen_room {
+                if let Some(ref old_room) = screen_share_room.take() {
                     let _ = state.chan(old_room).tx.send(sys(&format!(
                         "🖥 {} stopped screen share #{}",
                         username, old_room
                     )));
                 }
 
-                let stx = state.screen_tx(&room);
-                let srx = stx.subscribe();
-                spawn_broadcast_forwarder(srx, out_tx.clone());
-                screen_room = Some(room.clone());
-                let _ = state.chan(&room).tx.send(sys(&format!(
-                    "🖥 {} started screen share #{}",
-                    username, room
-                )));
+                if screen_sub_room.as_deref() != Some(room.as_str()) {
+                    if let Some(handle) = screen_forwarder.take() {
+                        handle.abort();
+                    }
+                    let stx = state.screen_tx(&room);
+                    let srx = stx.subscribe();
+                    screen_forwarder = Some(spawn_broadcast_forwarder(srx, out_tx.clone()));
+                    screen_sub_room = Some(room.clone());
+                }
+
+                if !viewing_only {
+                    screen_share_room = Some(room.clone());
+                    let _ = state.chan(&room).tx.send(sys(&format!(
+                        "🖥 {} started screen share #{}",
+                        username, room
+                    )));
+                }
             }
             "sleave" => {
-                if let Some(ref room) = screen_room.take() {
+                if let Some(handle) = screen_forwarder.take() {
+                    handle.abort();
+                }
+                screen_sub_room = None;
+                if let Some(ref room) = screen_share_room.take() {
                     let _ = state.chan(room).tx.send(sys(&format!(
                         "🖥 {} stopped screen share #{}",
                         username, room
@@ -679,7 +726,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                 if a.is_empty() {
                     continue;
                 }
-                if let Some(ref room) = screen_room {
+                if let Some(ref room) = screen_share_room {
                     if let Some(stx) = state.screens.get(room) {
                         let codec = d["codec"].as_str().unwrap_or("raw");
                         let seq = d["seq"].as_u64().unwrap_or(0);
@@ -828,10 +875,25 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     }
 
     // User disconnected - cleanup
+    if let Some(handle) = voice_forwarder.take() {
+        handle.abort();
+    }
+    if let Some(handle) = screen_forwarder.take() {
+        handle.abort();
+    }
+    for (_, handle) in channel_forwarders.drain() {
+        handle.abort();
+    }
     state.user_presence.remove(&username);
     state.user_statuses.remove(&username);
     state.user_pubkeys.remove(&username);
-    if let Some(ref room) = screen_room {
+    if let Some(ref room) = voice_room {
+        let _ = state
+            .chan(room)
+            .tx
+            .send(sys(&format!("🎙 {} left voice #{}", username, room)));
+    }
+    if let Some(ref room) = screen_share_room {
         let _ = state.chan(room).tx.send(sys(&format!(
             "🖥 {} stopped screen share #{}",
             username, room
