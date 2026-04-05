@@ -104,10 +104,18 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 | /status <message>    | Set custom status (e.g., "AFK")     |
 | /channels            | List channels                       |
 | /voice [room]        | Toggle voice in room                |
+| /screen ...          | Start/view/stop screen stream       |
 | /edit <text>         | Placeholder command                 |
 | /clear               | Clear terminal output               |
 | /help                | Show command help                   |
 | /quit, /exit, /q     | Disconnect and exit                 |
+
+Screen command forms:
+
+- /screen start [room]
+- /screen view [room]
+- /screen stop
+- /screen [room] (shortcut for start)
 
 ## UI Example (Terminal)
 
@@ -197,9 +205,26 @@ The `/users` command shows an enhanced roster with:
 
 - The current protocol is functional but not yet hardened for hostile public environments.
 - Security hardening is still required before production use.
-- There is no persistent storage layer yet; state is memory-first.
+- Channel history is persisted in cache, but there is no durable database-backed storage.
 - Test coverage is light and mostly build/lint-driven; integration coverage is planned.
 - The Discord bridge source exists, but the binary target is disabled due to dependency conflicts.
+
+## Screen Capture Backend
+
+Screen relay protocol is enabled by default. Live desktop capture requires an optional feature flag
+and Linux capture libraries.
+
+Enable capture backend:
+
+```bash
+cargo run --bin clicord-client --features screen-capture -- --host 127.0.0.1 --port 8765
+```
+
+If your system is missing XCB development libs, install:
+
+```bash
+sudo apt-get install libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+```
 
 ## Architecture
 

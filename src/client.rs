@@ -10,13 +10,22 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
+#[cfg(feature = "screen-capture")]
+use std::time::{Duration as StdDuration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{self, engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+#[cfg(feature = "screen-capture")]
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+#[cfg(feature = "screen-capture")]
+use image::{DynamicImage, RgbImage};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
+#[cfg(feature = "screen-capture")]
+use scrap::{Capturer, Display};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -44,6 +53,7 @@ enum MessageType {
     StatusUpdate,
     Reaction,
     Edit,
+    Sdata,
 }
 
 /// A displayed message in the client UI
@@ -101,11 +111,41 @@ struct VoiceSession {
     task: thread::JoinHandle<()>,
 }
 
+/// Runtime state for an active screen sharing session.
+struct ScreenSession {
+    room: String,
+    stop_tx: std_mpsc::Sender<()>,
+    task: thread::JoinHandle<()>,
+}
+
 enum VoiceEvent {
     Captured(VoiceFrame),
     Playback(VoiceFrame),
     Stop,
 }
+
+#[derive(Debug, Clone)]
+struct PendingScreenFrame {
+    codec: String,
+    width: u32,
+    height: u32,
+    total: usize,
+    keyframe: bool,
+    created_at: u64,
+    chunks: Vec<Option<String>>,
+}
+
+#[cfg(feature = "screen-capture")]
+const SCREEN_TARGET_WIDTH: u32 = 960;
+#[cfg(feature = "screen-capture")]
+const SCREEN_FPS: u64 = 8;
+#[cfg(feature = "screen-capture")]
+const SCREEN_CHUNK_BYTES: usize = 32 * 1024;
+#[cfg(feature = "screen-capture")]
+const SCREEN_JPEG_QUALITY: u8 = 55;
+const SCREEN_PREVIEW_WIDTH: u16 = 56;
+const SCREEN_MAX_PENDING_FRAMES: usize = 64;
+const SCREEN_PENDING_TTL_SECS: u64 = 8;
 
 /// Client connection state and data
 #[allow(dead_code)]
@@ -134,6 +174,14 @@ struct ClientState {
     voice_active: bool,
     /// Active voice session runtime (if any)
     voice_session: Option<VoiceSession>,
+    /// Whether we're actively sharing screen
+    screen_active: bool,
+    /// Room currently used for screen stream subscription
+    screen_room: Option<String>,
+    /// Active screen capture runtime (if any)
+    screen_session: Option<ScreenSession>,
+    /// Reassembly cache for incoming chunked screen frames
+    pending_screen_frames: HashMap<String, PendingScreenFrame>,
     /// Current theme
     theme: String,
     /// Active file transfers
@@ -201,9 +249,231 @@ fn format_time(ts: u64) -> String {
     datetime.format("%H:%M").to_string()
 }
 
-/// Placeholder for image to ASCII conversion
-fn img_to_ascii(_: &[u8], _: u16) -> String {
-    "[Image sending not yet implemented in Rust client]".to_string()
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Convert an image payload to a compact ASCII preview for terminal rendering.
+fn img_to_ascii(bytes: &[u8], width: u16) -> String {
+    let img = match image::load_from_memory(bytes) {
+        Ok(img) => img,
+        Err(_) => return "[invalid image frame]".to_string(),
+    };
+    let gray = img.grayscale().to_luma8();
+    let (src_w, src_h) = gray.dimensions();
+    if src_w == 0 || src_h == 0 {
+        return "[empty image frame]".to_string();
+    }
+
+    let target_w = u32::from(width).max(1).min(src_w.max(1));
+    // Approximate terminal character aspect ratio.
+    let target_h = ((src_h as f32 / src_w as f32) * target_w as f32 * 0.5)
+        .round()
+        .max(1.0) as u32;
+
+    let resized = image::imageops::resize(&gray, target_w, target_h, FilterType::Triangle);
+    let chars: &[u8] = b" .:-=+*#%@";
+    let mut out = String::with_capacity((target_w as usize + 1) * target_h as usize);
+    for y in 0..target_h {
+        for x in 0..target_w {
+            let px = resized.get_pixel(x, y)[0] as usize;
+            let idx = px * (chars.len() - 1) / 255;
+            out.push(chars[idx] as char);
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+#[cfg(feature = "screen-capture")]
+fn encode_screen_frame_jpeg(
+    frame_bgra: &[u8],
+    width: usize,
+    height: usize,
+) -> Option<(Vec<u8>, u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let px_count = width.checked_mul(height)?;
+    if frame_bgra.len() < px_count.checked_mul(4)? {
+        return None;
+    }
+
+    let mut rgb = Vec::with_capacity(px_count * 3);
+    for px in frame_bgra.chunks_exact(4).take(px_count) {
+        // scrap provides BGRA.
+        rgb.push(px[2]);
+        rgb.push(px[1]);
+        rgb.push(px[0]);
+    }
+
+    let rgb_image = RgbImage::from_raw(width as u32, height as u32, rgb)?;
+    let target_w = SCREEN_TARGET_WIDTH.min(rgb_image.width()).max(1);
+    let target_h = ((rgb_image.height() as f32 / rgb_image.width() as f32) * target_w as f32)
+        .round()
+        .max(1.0) as u32;
+    let resized = image::imageops::resize(&rgb_image, target_w, target_h, FilterType::Triangle);
+
+    let mut encoded = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut encoded, SCREEN_JPEG_QUALITY);
+    let dyn_img = DynamicImage::ImageRgb8(resized);
+    if encoder.encode_image(&dyn_img).is_err() {
+        return None;
+    }
+
+    Some((encoded, target_w, target_h))
+}
+
+#[cfg(feature = "screen-capture")]
+fn send_screen_frame_chunks(
+    ws_tx: &mpsc::UnboundedSender<String>,
+    room: &str,
+    frame: &[u8],
+    seq: u64,
+    width: u32,
+    height: u32,
+) {
+    if frame.is_empty() {
+        return;
+    }
+    let total = (frame.len() + SCREEN_CHUNK_BYTES - 1) / SCREEN_CHUNK_BYTES;
+    for (idx, chunk) in frame.chunks(SCREEN_CHUNK_BYTES).enumerate() {
+        let payload = general_purpose::STANDARD.encode(chunk);
+        let _ = ws_tx.send(
+            serde_json::json!({
+                "t": "sdata",
+                "r": room,
+                "a": payload,
+                "codec": "jpeg",
+                "seq": seq,
+                "chunk": idx,
+                "total": total,
+                "w": width,
+                "h": height,
+                "kf": seq % 24 == 0,
+                "ts": unix_now_secs()
+            })
+            .to_string(),
+        );
+    }
+}
+
+#[cfg(feature = "screen-capture")]
+fn start_screen_session(
+    room: String,
+    ws_tx: mpsc::UnboundedSender<String>,
+) -> Result<ScreenSession, String> {
+    let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
+    let room_task = room.clone();
+
+    let task = thread::spawn(move || {
+        let display = match Display::primary() {
+            Ok(display) => display,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("failed to get primary display: {}", e)));
+                return;
+            }
+        };
+
+        let mut capturer = match Capturer::new(display) {
+            Ok(capturer) => capturer,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("failed to initialize capture: {}", e)));
+                return;
+            }
+        };
+
+        let (cap_w, cap_h) = (capturer.width(), capturer.height());
+        let _ = ready_tx.send(Ok(()));
+
+        let frame_interval = StdDuration::from_millis((1000 / SCREEN_FPS.max(1)).max(1));
+        let mut next_tick = Instant::now();
+        let mut seq: u64 = 0;
+
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
+            let now_tick = Instant::now();
+            if now_tick < next_tick {
+                thread::sleep(next_tick - now_tick);
+            }
+            next_tick = Instant::now() + frame_interval;
+
+            let frame = match capturer.frame() {
+                Ok(frame) => frame,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        thread::sleep(StdDuration::from_millis(6));
+                        continue;
+                    }
+                    eprintln!("screen capture error: {}", e);
+                    break;
+                }
+            };
+
+            if let Some((jpeg, out_w, out_h)) = encode_screen_frame_jpeg(&frame, cap_w, cap_h) {
+                send_screen_frame_chunks(&ws_tx, &room_task, &jpeg, seq, out_w, out_h);
+                seq = seq.wrapping_add(1);
+            }
+        }
+    });
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(ScreenSession {
+            room,
+            stop_tx,
+            task,
+        }),
+        Ok(Err(e)) => {
+            let _ = task.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = task.join();
+            Err("screen runtime failed to initialize".to_string())
+        }
+    }
+}
+
+#[cfg(not(feature = "screen-capture"))]
+fn start_screen_session(
+    _room: String,
+    _ws_tx: mpsc::UnboundedSender<String>,
+) -> Result<ScreenSession, String> {
+    Err(
+        "screen capture backend not enabled. Rebuild with --features screen-capture and install xcb development libraries"
+            .to_string(),
+    )
+}
+
+fn stop_screen_session(session: ScreenSession) {
+    let _ = session.stop_tx.send(());
+    let _ = session.task.join();
+}
+
+fn cleanup_pending_screen_frames(pending: &mut HashMap<String, PendingScreenFrame>) {
+    let now = unix_now_secs();
+    pending.retain(|_, frame| now.saturating_sub(frame.created_at) <= SCREEN_PENDING_TTL_SECS);
+
+    if pending.len() <= SCREEN_MAX_PENDING_FRAMES {
+        return;
+    }
+
+    let mut keys_by_age: Vec<(String, u64)> = pending
+        .iter()
+        .map(|(k, v)| (k.clone(), v.created_at))
+        .collect();
+    keys_by_age.sort_by_key(|(_, created_at)| *created_at);
+    let overflow = pending.len().saturating_sub(SCREEN_MAX_PENDING_FRAMES);
+    for (key, _) in keys_by_age.into_iter().take(overflow) {
+        pending.remove(&key);
+    }
 }
 
 /// Normalize channel name to match server rules.
@@ -571,6 +841,14 @@ fn start_voice_session(
     }
 }
 
+fn read_stdin_line(prompt: &str) -> io::Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
 /// Main entry point for the WebSocket client
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -605,6 +883,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .action(clap::ArgAction::SetTrue)
                 .help("Enable debug logging"),
         )
+        .arg(
+            clap::Arg::new("username")
+                .long("username")
+                .value_name("USER")
+                .help("Username (skip prompt)"),
+        )
+        .arg(
+            clap::Arg::new("password")
+                .long("password")
+                .value_name("PASSWORD")
+                .help("Password (skip hidden prompt; use only for local testing)"),
+        )
         .get_matches();
 
     let host = matches.get_one::<String>("host").unwrap();
@@ -615,21 +905,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheme = if tls { "wss" } else { "ws" };
     let uri = format!("{}://{}:{}", scheme, host, port);
 
-    let username = {
-        print!("username: ");
-        io::stdout().flush().unwrap();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let u = input.trim().to_string();
-        if u.is_empty() {
+    let username = match matches.get_one::<String>("username") {
+        Some(user) if !user.trim().is_empty() => user.trim().to_string(),
+        Some(_) => {
             println!("Empty username provided, using 'anon'.");
             "anon".to_string()
-        } else {
-            u
+        }
+        None => {
+            let u = read_stdin_line("username: ")?;
+            if u.is_empty() {
+                println!("Empty username provided, using 'anon'.");
+                "anon".to_string()
+            } else {
+                u
+            }
         }
     };
 
-    let password = rpassword::prompt_password("password: ").unwrap();
+    let password = if let Some(password) = matches.get_one::<String>("password") {
+        password.clone()
+    } else {
+        println!("Password input is hidden. Type it and press Enter.");
+        match rpassword::prompt_password("password: ") {
+            Ok(password) => password,
+            Err(err) => {
+                eprintln!(
+                    "Hidden password prompt unavailable: {}. Falling back to visible input.",
+                    err
+                );
+                read_stdin_line("password (visible): ")?
+            }
+        }
+    };
     let client_priv_key = new_keypair();
     let client_pub_key = pub_b64(&client_priv_key);
 
@@ -715,6 +1022,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             running: true,
             voice_active: false,
             voice_session: None,
+            screen_active: false,
+            screen_room: None,
+            screen_session: None,
+            pending_screen_frames: HashMap::new(),
             theme: "default".to_string(),
             file_transfers: HashMap::new(),
             message_history: Vec::new(),
@@ -957,6 +1268,152 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = tx.send(VoiceEvent::Playback(frame));
                                 }
                             }
+                            "sdata" => {
+                                let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+                                let room = data
+                                    .get("r")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("general")
+                                    .to_string();
+                                let codec = data
+                                    .get("codec")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("raw")
+                                    .to_string();
+                                let width =
+                                    data.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let height =
+                                    data.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let chunk_idx =
+                                    data.get("chunk").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let total_chunks =
+                                    data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let keyframe =
+                                    data.get("kf").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let payload = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
+
+                                if payload.is_empty() || total_chunks == 0 {
+                                    continue;
+                                }
+                                let total_chunks = total_chunks as usize;
+                                let chunk_idx = chunk_idx as usize;
+                                if total_chunks > 256 || chunk_idx >= total_chunks {
+                                    continue;
+                                }
+
+                                let frame_key = format!("{}:{}:{}", from, room, seq);
+                                let completed = {
+                                    let mut state = state_clone.lock().await;
+                                    if from == state.me {
+                                        continue;
+                                    }
+                                    cleanup_pending_screen_frames(&mut state.pending_screen_frames);
+
+                                    let entry = state
+                                        .pending_screen_frames
+                                        .entry(frame_key.clone())
+                                        .or_insert_with(|| PendingScreenFrame {
+                                            codec: codec.clone(),
+                                            width,
+                                            height,
+                                            total: total_chunks,
+                                            keyframe,
+                                            created_at: unix_now_secs(),
+                                            chunks: vec![None; total_chunks],
+                                        });
+
+                                    if entry.total != total_chunks
+                                        || entry.codec != codec
+                                        || entry.width != width
+                                        || entry.height != height
+                                    {
+                                        *entry = PendingScreenFrame {
+                                            codec: codec.clone(),
+                                            width,
+                                            height,
+                                            total: total_chunks,
+                                            keyframe,
+                                            created_at: unix_now_secs(),
+                                            chunks: vec![None; total_chunks],
+                                        };
+                                    }
+
+                                    if entry.chunks[chunk_idx].is_none() {
+                                        entry.chunks[chunk_idx] = Some(payload.to_string());
+                                    }
+                                    entry.chunks.iter().all(|part| part.is_some())
+                                };
+
+                                if !completed {
+                                    continue;
+                                }
+
+                                let pending = {
+                                    let mut state = state_clone.lock().await;
+                                    state.pending_screen_frames.remove(&frame_key)
+                                };
+                                let Some(pending) = pending else {
+                                    continue;
+                                };
+
+                                let mut bytes = Vec::new();
+                                let mut decode_ok = true;
+                                for chunk in pending.chunks {
+                                    let Some(chunk_b64) = chunk else {
+                                        decode_ok = false;
+                                        break;
+                                    };
+                                    match general_purpose::STANDARD.decode(chunk_b64) {
+                                        Ok(decoded) => bytes.extend_from_slice(&decoded),
+                                        Err(_) => {
+                                            decode_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !decode_ok || bytes.is_empty() {
+                                    continue;
+                                }
+
+                                // Throttle textual preview updates to keep terminal usable.
+                                if !(pending.keyframe || seq % 6 == 0) {
+                                    continue;
+                                }
+
+                                let preview = if pending.codec == "jpeg" {
+                                    img_to_ascii(&bytes, SCREEN_PREVIEW_WIDTH)
+                                } else {
+                                    format!(
+                                        "[{} frame | {} bytes | {} chunks]",
+                                        pending.codec,
+                                        bytes.len(),
+                                        pending.total
+                                    )
+                                };
+
+                                let mut state = state_clone.lock().await;
+                                state.message_history.push(DisplayedMessage {
+                                    time: format_time(ts),
+                                    text: format!(
+                                        "🖥 {} streaming #{} [{} {}x{} frame={}{}]\n{}",
+                                        from,
+                                        room,
+                                        pending.codec,
+                                        pending.width,
+                                        pending.height,
+                                        seq,
+                                        if pending.keyframe { " keyframe" } else { "" },
+                                        preview
+                                    ),
+                                    msg_type: MessageType::Sdata,
+                                    user: Some(from.to_string()),
+                                    channel: Some(room),
+                                });
+                                if state.message_history.len() > 100 {
+                                    state.message_history.remove(0);
+                                }
+                            }
                             "status_update" => {
                                 // Handle user status updates and refresh user list
                                 let mut state = state_clone.lock().await;
@@ -1176,6 +1633,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
+                        "/screen" => {
+                            let args_trimmed = args.trim();
+                            let mut words = args_trimmed.split_whitespace();
+                            let action = words.next().unwrap_or("");
+
+                            if action.eq_ignore_ascii_case("stop") {
+                                let mut room_to_leave = state.screen_room.take();
+                                if let Some(session) = state.screen_session.take() {
+                                    if room_to_leave.is_none() {
+                                        room_to_leave = Some(session.room.clone());
+                                    }
+                                    stop_screen_session(session);
+                                }
+
+                                if let Some(room) = room_to_leave {
+                                    let _ = state.ws_tx.send(
+                                        serde_json::json!({
+                                            "t": "sleave",
+                                            "r": room,
+                                            "ts": SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs()
+                                        })
+                                        .to_string(),
+                                    );
+                                    println!("Screen share stopped");
+                                } else {
+                                    state.log(
+                                        "INFO",
+                                        "No active screen stream. Use /screen start [room]",
+                                    );
+                                }
+                                state.screen_active = false;
+                                continue;
+                            }
+
+                            let viewing_only = action.eq_ignore_ascii_case("view");
+                            let room_hint = if action.eq_ignore_ascii_case("start")
+                                || action.eq_ignore_ascii_case("view")
+                            {
+                                words.next().unwrap_or("")
+                            } else {
+                                args_trimmed
+                            };
+                            let room = if room_hint.is_empty() {
+                                state.ch.clone()
+                            } else {
+                                normalize_channel(room_hint).unwrap_or_else(|| state.ch.clone())
+                            };
+
+                            let mut room_to_leave = state.screen_room.clone();
+                            if let Some(session) = state.screen_session.take() {
+                                room_to_leave = Some(session.room.clone());
+                                stop_screen_session(session);
+                            }
+
+                            if let Some(current_room) = room_to_leave {
+                                if current_room != room {
+                                    let _ = state.ws_tx.send(
+                                        serde_json::json!({
+                                            "t": "sleave",
+                                            "r": current_room,
+                                            "ts": SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs()
+                                        })
+                                        .to_string(),
+                                    );
+                                }
+                            }
+
+                            state.screen_room = Some(room.clone());
+                            let _ = state.ws_tx.send(
+                                serde_json::json!({
+                                    "t": "sjoin",
+                                    "r": room,
+                                    "ts": SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                })
+                                .to_string(),
+                            );
+
+                            if viewing_only {
+                                state.screen_active = false;
+                                println!("Subscribed to screen stream in #{}", room);
+                            } else {
+                                let ws_tx = state.ws_tx.clone();
+                                match start_screen_session(room.clone(), ws_tx.clone()) {
+                                    Ok(session) => {
+                                        state.screen_active = true;
+                                        state.screen_session = Some(session);
+                                        println!("Screen share started in #{}", room);
+                                    }
+                                    Err(e) => {
+                                        state.screen_active = false;
+                                        state.screen_room = None;
+                                        let _ = ws_tx.send(
+                                            serde_json::json!({
+                                                "t": "sleave",
+                                                "r": room,
+                                                "ts": SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs()
+                                            })
+                                            .to_string(),
+                                        );
+                                        state.log("WARN", &format!("Screen share failed: {}", e));
+                                        eprintln!("Screen share failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
                         "/clear" => {
                             // Clear the terminal by printing many newlines
                             for _ in 0..50 {
@@ -1205,13 +1779,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         "/help" => {
-                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /status <msg>, /clear, /edit, /help, /quit");
+                            state.log("INFO", "Available commands: /join, /dm, /me, /users, /channels, /voice [room], /screen [room]|start [room]|view [room]|stop, /status <msg>, /clear, /edit, /help, /quit");
                         }
                         "/edit" => {
                             // Placeholder for edit
                             state.log("INFO", "Edit command not yet implemented in Rust client");
                         }
                         "/quit" | "/exit" | "/q" => {
+                            let mut room_to_leave = state.screen_room.take();
+                            if let Some(session) = state.screen_session.take() {
+                                if room_to_leave.is_none() {
+                                    room_to_leave = Some(session.room.clone());
+                                }
+                                stop_screen_session(session);
+                            }
+
                             if let Some(session) = state.voice_session.take() {
                                 let _ = state.ws_tx.send(
                                     serde_json::json!({
@@ -1227,7 +1809,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = session.event_tx.send(VoiceEvent::Stop);
                                 let _ = session.task.join();
                             }
+                            if let Some(room) = room_to_leave {
+                                let _ = state.ws_tx.send(
+                                    serde_json::json!({
+                                        "t": "sleave",
+                                        "r": room,
+                                        "ts": SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                    })
+                                    .to_string(),
+                                );
+                            }
                             state.voice_active = false;
+                            state.screen_active = false;
                             state.running = false;
                             break;
                         }

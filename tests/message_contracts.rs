@@ -235,6 +235,47 @@ async fn voice_contract_forwards_vdata_between_room_members() {
 }
 
 #[tokio::test]
+async fn screen_contract_forwards_sdata_between_room_members() {
+    let server = start_server().await;
+    let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
+    let mut bob = TestClient::connect_and_auth(&server.url, "bob").await;
+
+    alice.send_json(json!({"t":"sjoin","r":"room-a"})).await;
+    bob.send_json(json!({"t":"sjoin","r":"room-a"})).await;
+
+    sleep(Duration::from_millis(150)).await;
+
+    let payload = "A".repeat(24_000);
+    alice
+        .send_json(json!({
+            "t": "sdata",
+            "r": "room-a",
+            "a": payload,
+            "codec": "h264",
+            "seq": 7,
+            "chunk": 0,
+            "total": 1,
+            "w": 1280,
+            "h": 720,
+            "kf": true
+        }))
+        .await;
+
+    let sdata = bob.recv_by_type("sdata").await;
+    assert_eq!(sdata.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(sdata.get("r").and_then(|v| v.as_str()), Some("room-a"));
+    assert_eq!(sdata.get("codec").and_then(|v| v.as_str()), Some("h264"));
+    assert_eq!(sdata.get("seq").and_then(|v| v.as_u64()), Some(7));
+    assert_eq!(sdata.get("w").and_then(|v| v.as_u64()), Some(1280));
+    assert_eq!(sdata.get("h").and_then(|v| v.as_u64()), Some(720));
+    assert_eq!(sdata.get("kf").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        sdata.get("a").and_then(|v| v.as_str()).map(|v| v.len()),
+        Some(24_000)
+    );
+}
+
+#[tokio::test]
 async fn status_contract_broadcasts_custom_status() {
     let server = start_server().await;
     let mut alice = TestClient::connect_and_auth(&server.url, "alice").await;
@@ -297,7 +338,10 @@ async fn idle_detection_marks_inactive_users_as_away() {
 
     // Both should initially be online
     for user in users {
-        let state = user.get("state").and_then(|v| v.as_str()).unwrap_or("online");
+        let state = user
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("online");
         assert_eq!(state, "online", "users should start in online state");
     }
 
@@ -324,7 +368,7 @@ async fn users_response_includes_presence_fields() {
         assert!(user.get("u").is_some(), "user should have username");
         assert!(user.get("pk").is_some(), "user should have public key");
         assert!(user.get("state").is_some(), "user should have state field");
-        
+
         let state = user.get("state").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             state == "online" || state == "idle",
@@ -332,4 +376,3 @@ async fn users_response_includes_presence_fields() {
         );
     }
 }
-

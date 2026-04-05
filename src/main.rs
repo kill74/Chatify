@@ -1,11 +1,14 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
@@ -24,7 +27,27 @@ struct Args {
 }
 
 const HISTORY_CAP: usize = 50;
-const MAX_BYTES: usize = 16_000;
+const MAX_CONTROL_BYTES: usize = 16_000;
+const MAX_SCREEN_BYTES: usize = 512_000;
+const SNAPSHOT_VERSION: u32 = 1;
+const AUTOSAVE_INTERVAL_SECS: u64 = 5;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedState {
+    version: u32,
+    saved_at: f64,
+    channels: HashMap<String, Vec<Value>>,
+}
+
+impl PersistedState {
+    fn new(channels: HashMap<String, Vec<Value>>) -> Self {
+        Self {
+            version: SNAPSHOT_VERSION,
+            saved_at: now(),
+            channels,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Channel {
@@ -95,6 +118,7 @@ impl UserPresence {
 struct State {
     channels: DashMap<String, Channel>,
     voice: DashMap<String, broadcast::Sender<String>>,
+    screens: DashMap<String, broadcast::Sender<String>>,
     /// Maps username -> UserPresence
     user_presence: DashMap<String, UserPresence>,
     user_statuses: DashMap<String, Value>,
@@ -108,6 +132,7 @@ impl State {
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
+            screens: DashMap::new(),
             user_presence: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
@@ -130,6 +155,16 @@ impl State {
             .entry(room.into())
             .or_insert_with(|| {
                 let (tx, _) = broadcast::channel(128);
+                tx
+            })
+            .clone()
+    }
+
+    fn screen_tx(&self, room: &str) -> broadcast::Sender<String> {
+        self.screens
+            .entry(room.into())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(64);
                 tx
             })
             .clone()
@@ -216,6 +251,135 @@ fn hms() -> String {
         (s % 3600) / 60,
         s % 60
     )
+}
+
+fn sanitize_cache_component(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "default".into()
+    } else {
+        cleaned
+    }
+}
+
+fn cache_file_path(args: &Args) -> PathBuf {
+    let base_cache = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        PathBuf::from(xdg)
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".cache")
+    } else {
+        std::env::temp_dir()
+    };
+
+    let host = sanitize_cache_component(&args.host);
+    let filename = format!("server-state-{}-{}.json", host, args.port);
+    base_cache.join("chatify").join(filename)
+}
+
+async fn build_snapshot(state: &Arc<State>) -> PersistedState {
+    let channel_entries: Vec<(String, Channel)> = state
+        .channels
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+
+    let mut channels = HashMap::with_capacity(channel_entries.len());
+    for (name, channel) in channel_entries {
+        channels.insert(name, channel.hist().await);
+    }
+
+    PersistedState::new(channels)
+}
+
+async fn write_snapshot(path: &Path, snapshot: &PersistedState) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let payload = serde_json::to_vec(snapshot)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let tmp_path = path.with_extension("tmp");
+    tokio::fs::write(&tmp_path, payload).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
+async fn persist_state_to_disk(state: &Arc<State>, path: &Path) -> io::Result<()> {
+    let snapshot = build_snapshot(state).await;
+    write_snapshot(path, &snapshot).await
+}
+
+async fn restore_state_from_disk(state: &Arc<State>, path: &Path) {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            eprintln!("Failed to read cache file {}: {}", path.display(), err);
+            return;
+        }
+    };
+
+    let snapshot: PersistedState = match serde_json::from_str(&raw) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            eprintln!("Failed to parse cache file {}: {}", path.display(), err);
+            return;
+        }
+    };
+
+    if snapshot.version != SNAPSHOT_VERSION {
+        eprintln!(
+            "Ignoring cache file {} due to version mismatch (found {}, expected {})",
+            path.display(),
+            snapshot.version,
+            SNAPSHOT_VERSION
+        );
+        return;
+    }
+
+    for (name, mut history) in snapshot.channels {
+        if history.len() > HISTORY_CAP {
+            let keep_from = history.len().saturating_sub(HISTORY_CAP);
+            history.drain(0..keep_from);
+        }
+
+        let channel = state.chan(&name);
+        let mut stored = channel.history.write().await;
+        stored.clear();
+        stored.extend(history.into_iter());
+    }
+
+    log(
+        state,
+        &format!("Restored server state cache from {}", path.display()),
+    );
+}
+
+async fn autosave_loop(state: Arc<State>, path: PathBuf) {
+    let mut interval =
+        tokio::time::interval(tokio::time::Duration::from_secs(AUTOSAVE_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+        if let Err(err) = persist_state_to_disk(&state, &path).await {
+            log(
+                &state,
+                &format!("State autosave failed at {}: {}", path.display(), err),
+            );
+        }
+    }
 }
 
 /// Log a message with timestamp if logging is enabled
@@ -342,6 +506,7 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     });
 
     let mut voice_room: Option<String> = None;
+    let mut screen_room: Option<String> = None;
 
     // Main message handling loop
     loop {
@@ -359,8 +524,8 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
             _ => continue,
         };
 
-        // Validate message size
-        if raw.len() > MAX_BYTES {
+        // Validate message size. Screen payloads are allowed to be larger than control messages.
+        if raw.len() > MAX_SCREEN_BYTES {
             continue;
         }
 
@@ -374,6 +539,10 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
         state.touch_user(&username);
 
         let t = d["t"].as_str().unwrap_or("");
+
+        if t != "sdata" && raw.len() > MAX_CONTROL_BYTES {
+            continue;
+        }
 
         // Route message to appropriate handlers
         match t {
@@ -471,6 +640,71 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
                     if let Some(vtx) = state.voice.get(room) {
                         let _ = vtx.send(
                             serde_json::json!({"t":"vdata","from":username,"a":a}).to_string(),
+                        );
+                    }
+                }
+            }
+            "sjoin" => {
+                let room = safe_ch(d["r"].as_str().unwrap_or("general"));
+                if screen_room.as_deref() == Some(room.as_str()) {
+                    continue;
+                }
+
+                if let Some(ref old_room) = screen_room {
+                    let _ = state.chan(old_room).tx.send(sys(&format!(
+                        "🖥 {} stopped screen share #{}",
+                        username, old_room
+                    )));
+                }
+
+                let stx = state.screen_tx(&room);
+                let srx = stx.subscribe();
+                spawn_broadcast_forwarder(srx, out_tx.clone());
+                screen_room = Some(room.clone());
+                let _ = state.chan(&room).tx.send(sys(&format!(
+                    "🖥 {} started screen share #{}",
+                    username, room
+                )));
+            }
+            "sleave" => {
+                if let Some(ref room) = screen_room.take() {
+                    let _ = state.chan(room).tx.send(sys(&format!(
+                        "🖥 {} stopped screen share #{}",
+                        username, room
+                    )));
+                }
+            }
+            "sdata" => {
+                let a = d["a"].as_str().unwrap_or("").to_string();
+                if a.is_empty() {
+                    continue;
+                }
+                if let Some(ref room) = screen_room {
+                    if let Some(stx) = state.screens.get(room) {
+                        let codec = d["codec"].as_str().unwrap_or("raw");
+                        let seq = d["seq"].as_u64().unwrap_or(0);
+                        let chunk = d["chunk"].as_u64().unwrap_or(0);
+                        let total = d["total"].as_u64().unwrap_or(1);
+                        let width = d["w"].as_u64().unwrap_or(0);
+                        let height = d["h"].as_u64().unwrap_or(0);
+                        let keyframe = d["kf"].as_bool().unwrap_or(false);
+
+                        let _ = stx.send(
+                            serde_json::json!({
+                                "t": "sdata",
+                                "from": username,
+                                "r": room,
+                                "a": a,
+                                "codec": codec,
+                                "seq": seq,
+                                "chunk": chunk,
+                                "total": total,
+                                "w": width,
+                                "h": height,
+                                "kf": keyframe,
+                                "ts": now()
+                            })
+                            .to_string(),
                         );
                     }
                 }
@@ -597,6 +831,12 @@ async fn handle(stream: TcpStream, _addr: SocketAddr, state: Arc<State>) {
     state.user_presence.remove(&username);
     state.user_statuses.remove(&username);
     state.user_pubkeys.remove(&username);
+    if let Some(ref room) = screen_room {
+        let _ = state.chan(room).tx.send(sys(&format!(
+            "🖥 {} stopped screen share #{}",
+            username, room
+        )));
+    }
     broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
     log(&state, &format!("- {}", username));
 }
@@ -650,6 +890,7 @@ async fn idle_detection_loop(state: Arc<State>) {
 async fn main() {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port);
+    let cache_path = cache_file_path(&args);
 
     let listener = match TcpListener::bind(&addr).await {
         Ok(listener) => listener,
@@ -660,6 +901,7 @@ async fn main() {
     };
 
     let state = State::new(args.log);
+    restore_state_from_disk(&state, &cache_path).await;
 
     // Spawn idle detection background task
     let state_clone = state.clone();
@@ -667,17 +909,56 @@ async fn main() {
         idle_detection_loop(state_clone).await;
     });
 
+    // Periodically persist server state so restarts can restore channel history.
+    let autosave_state = state.clone();
+    let autosave_path = cache_path.clone();
+    tokio::spawn(async move {
+        autosave_loop(autosave_state, autosave_path).await;
+    });
+
     println!("📡 Chatify running on ws://{}", addr);
     println!("🔒 Encryption: None (testing) | 🛡️  IP Privacy: On");
     println!("⏹️  Press Ctrl+C to stop\n");
 
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let s = state.clone();
-                tokio::spawn(handle(stream, addr, s));
+        tokio::select! {
+            _ = &mut shutdown => {
+                println!("\n⏻ Shutdown requested, saving server cache...");
+                break;
             }
-            Err(_) => continue,
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        let s = state.clone();
+                        tokio::spawn(handle(stream, addr, s));
+                    }
+                    Err(_) => continue,
+                }
+            }
         }
     }
+
+    if let Err(err) = persist_state_to_disk(&state, &cache_path).await {
+        eprintln!(
+            "Failed to persist server cache at shutdown ({}): {}",
+            cache_path.display(),
+            err
+        );
+    } else {
+        log(
+            &state,
+            &format!("Saved server state cache to {}", cache_path.display()),
+        );
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        println!("💾 State cache directory: {}", parent.display());
+    } else {
+        println!("💾 State cache file: {}", cache_path.display());
+    }
+
+    println!("👋 Chatify server stopped.");
 }
