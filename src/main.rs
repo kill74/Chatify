@@ -72,21 +72,25 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
 use clifford::crypto;
 use clifford::error::{ChatifyError, ChatifyResult};
-use clifford::performance::{Metrics, VecCache};
+use clifford::performance::{Metrics as PerfMetrics, VecCache};
+use clifford::metrics::PrometheusMetrics;
 use clifford::voice::{VoiceRelay, relay::VoiceBroadcast};
 use clifford::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
+use prometheus::Encoder;
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::time::{sleep, Duration};
@@ -153,6 +157,15 @@ struct Args {
     /// Used when `--tls` is enabled.
     #[arg(long, default_value = "key.pem")]
     tls_key: String,
+
+    /// TCP port for health check and metrics endpoints.
+    /// Set to 0 to disable the HTTP server.
+    #[arg(long, default_value_t = 8080)]
+    health_port: u16,
+
+    /// Enable Prometheus metrics endpoint.
+    #[arg(long, default_value_t = true)]
+    metrics_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +201,7 @@ const MAX_HANDSHAKE_HEADERS: usize = 64;
 /// The migration path in [`EventStore::migrate`] upgrades from any lower
 /// version to this one. If the stored version is *higher*, the server logs a
 /// warning and continues without modifying the schema (no downgrade).
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 /// Default number of events returned by a `history` request.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -635,6 +648,14 @@ impl EventStore {
         self.pool.encryption_key.is_some()
     }
 
+    fn health_check(&self) -> bool {
+        if let Some(conn) = self.get_connection() {
+            conn.query_row("SELECT 1", [], |_| Ok(())).is_ok()
+        } else {
+            false
+        }
+    }
+
     fn init(&self) -> rusqlite::Result<()> {
         let conn = self.get_connection()
             .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
@@ -865,6 +886,61 @@ impl EventStore {
                 "Database schema version {} is newer than supported version {}",
                 version, CURRENT_SCHEMA_VERSION
             );
+        }
+
+        if version < 6 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action      TEXT NOT NULL,
+                    actor       TEXT NOT NULL,
+                    target      TEXT,
+                    channel     TEXT,
+                    reason      TEXT,
+                    metadata    TEXT,
+                    ts          REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_action
+                    ON audit_logs(action, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_actor
+                    ON audit_logs(actor, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_target
+                    ON audit_logs(target, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_channel
+                    ON audit_logs(channel, ts DESC);
+
+                CREATE TABLE IF NOT EXISTS suspicious_activity (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_username TEXT NOT NULL,
+                    activity_type   TEXT NOT NULL,
+                    severity        TEXT NOT NULL DEFAULT 'low',
+                    details         TEXT,
+                    resolved        BOOLEAN NOT NULL DEFAULT FALSE,
+                    resolved_by     TEXT,
+                    resolved_at     REAL,
+                    ts              REAL NOT NULL,
+                    UNIQUE(target_username, activity_type, ts)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_suspicious_activity_lookup
+                    ON suspicious_activity(target_username, activity_type, ts DESC);
+                ",
+            )?;
+
+            conn.execute(
+                "ALTER TABLE user_credentials ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
+                [],
+            ).ok();
+
+            conn.execute(
+                "ALTER TABLE user_credentials ADD COLUMN locked_until REAL NOT NULL DEFAULT 0",
+                [],
+            ).ok();
+
+            version = 6;
+            Self::set_schema_version(conn, version)?;
         }
 
         Ok(())
@@ -1495,6 +1571,202 @@ impl EventStore {
             Err(_) => None,
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Audit Logging
+    // -------------------------------------------------------------------------
+
+    fn log_audit(&self, action: &str, actor: &str, target: Option<&str>, channel: Option<&str>, reason: Option<&str>, metadata: Option<&str>) {
+        if let Some(conn) = self.get_connection() {
+            let ts = crate::now();
+            if let Err(e) = conn.execute(
+                "INSERT INTO audit_logs (action, actor, target, channel, reason, metadata, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![action, actor, target, channel, reason, metadata, ts],
+            ) {
+                warn!("audit log insert failed: {}", e);
+            }
+        }
+    }
+
+    fn get_audit_logs(&self, filter: Option<&str>, limit: i64) -> Vec<AuditLog> {
+        let conn = match self.get_connection() {
+            Some(c) => c,
+            None => return vec![],
+        };
+
+        let query = match filter {
+            Some("channel") => "SELECT action, actor, target, channel, reason, metadata, ts FROM audit_logs WHERE channel IS NOT NULL ORDER BY ts DESC LIMIT ?1",
+            Some("user") => "SELECT action, actor, target, channel, reason, metadata, ts FROM audit_logs WHERE actor = ?2 OR target = ?2 ORDER BY ts DESC LIMIT ?1",
+            _ => "SELECT action, actor, target, channel, reason, metadata, ts FROM audit_logs ORDER BY ts DESC LIMIT ?1",
+        };
+
+        let mut stmt = match conn.prepare(query) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let mut results = Vec::new();
+
+        match filter {
+            Some("user") => {
+                let target_user = filter.unwrap_or("");
+                if let Ok(mut rows) = stmt.query(params![limit, target_user]) {
+                    loop {
+                        match rows.next() {
+                            Ok(Some(row)) => {
+                                if let Ok(log) = row_to_audit_log(row) {
+                                    results.push(log);
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Ok(mut rows) = stmt.query(params![limit]) {
+                    loop {
+                        match rows.next() {
+                            Ok(Some(row)) => {
+                                if let Ok(log) = row_to_audit_log(row) {
+                                    results.push(log);
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    // -------------------------------------------------------------------------
+    // Account Lockout
+    // -------------------------------------------------------------------------
+
+    fn get_lockout_status(&self, username: &str) -> Option<(i32, f64)> {
+        let conn = self.get_connection()?;
+        let result: rusqlite::Result<(i32, f64)> = conn.query_row(
+            "SELECT failed_attempts, locked_until FROM user_credentials WHERE username = ?1",
+            params![username],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, f64>(1)?)),
+        );
+        match result {
+            Ok((failed, locked)) => Some((failed, locked)),
+            Err(_) => None,
+        }
+    }
+
+    fn record_failed_login(&self, username: &str, max_attempts: i32) -> (bool, i32) {
+        let conn = match self.get_connection() {
+            Some(c) => c,
+            None => return (false, 0),
+        };
+
+        let current = self.get_lockout_status(username);
+        let (failed_attempts, _) = current.unwrap_or((0, 0.0));
+        let new_attempts = failed_attempts + 1;
+
+        let locked = if new_attempts >= max_attempts {
+            crate::now() + 900.0
+        } else {
+            0.0
+        };
+
+        if let Err(e) = conn.execute(
+            "UPDATE user_credentials SET failed_attempts = ?1, locked_until = ?2 WHERE username = ?3",
+            params![new_attempts, locked, username],
+        ) {
+            warn!("failed to record failed login: {}", e);
+        }
+
+        (locked > 0.0, new_attempts)
+    }
+
+    fn clear_failed_logins(&self, username: &str) {
+        if let Some(conn) = self.get_connection() {
+            if let Err(e) = conn.execute(
+                "UPDATE user_credentials SET failed_attempts = 0, locked_until = 0 WHERE username = ?1",
+                params![username],
+            ) {
+                warn!("failed to clear failed logins: {}", e);
+            }
+        }
+    }
+
+    fn unlock_account(&self, username: &str) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+
+        conn.execute(
+            "UPDATE user_credentials SET failed_attempts = 0, locked_until = 0 WHERE username = ?1",
+            params![username],
+        ).map_err(|e| format!("failed to unlock account: {}", e))?;
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Suspicious Activity
+    // -------------------------------------------------------------------------
+
+    fn log_suspicious_activity(&self, target: &str, activity_type: &str, severity: &str, details: Option<&str>) {
+        if let Some(conn) = self.get_connection() {
+            let ts = crate::now();
+            if let Err(e) = conn.execute(
+                "INSERT INTO suspicious_activity (target_username, activity_type, severity, details, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![target, activity_type, severity, details, ts],
+            ) {
+                warn!("suspicious activity log failed: {}", e);
+            }
+        }
+    }
+
+    fn get_recent_activity_count(&self, username: &str, activity_type: &str, window_secs: f64) -> i64 {
+        let conn = match self.get_connection() {
+            Some(c) => c,
+            None => return 0,
+        };
+
+        let cutoff = crate::now() - window_secs;
+        let result: rusqlite::Result<i64> = conn.query_row(
+            "SELECT COUNT(*) FROM suspicious_activity WHERE target_username = ?1 AND activity_type = ?2 AND ts > ?3",
+            params![username, activity_type, cutoff],
+            |row| row.get(0),
+        );
+
+        result.unwrap_or(0)
+    }
+
+    #[allow(dead_code)]
+    fn resolve_suspicious_activity(&self, id: i64, resolved_by: &str) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+
+        conn.execute(
+            "UPDATE suspicious_activity SET resolved = TRUE, resolved_by = ?1, resolved_at = ?2 WHERE id = ?3",
+            params![resolved_by, crate::now(), id],
+        ).map_err(|e| format!("failed to resolve suspicious activity: {}", e))?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditLog {
+    pub action: String,
+    pub actor: String,
+    pub target: Option<String>,
+    pub channel: Option<String>,
+    pub reason: Option<String>,
+    pub metadata: Option<String>,
+    pub ts: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1634,8 +1906,11 @@ struct State {
     /// Populated during auth when the client sends `"bridge": true`.
     bridges: DashMap<String, BridgeInfo>,
 
-    /// Server metrics for monitoring and performance tracking.
-    metrics: Metrics,
+    /// Internal metrics for runtime stats and debugging.
+    metrics: PerfMetrics,
+
+    /// Prometheus metrics for export.
+    prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
 
     message_cache: VecCache<Value>,
 
@@ -1645,7 +1920,7 @@ struct State {
 
 impl State {
     /// Creates the initial server state, pre-populating the `"general"` channel.
-    fn new(db_path: String, db_key: Option<Vec<u8>>) -> Arc<Self> {
+    fn new(db_path: String, db_key: Option<Vec<u8>>, prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>) -> Arc<Self> {
         let store = EventStore::new(db_path, db_key);
         let s = Arc::new(Self {
             channels: DashMap::new(),
@@ -1661,7 +1936,8 @@ impl State {
             ip_last_auth: DashMap::new(),
             session_tokens: DashMap::new(),
             bridges: DashMap::new(),
-            metrics: Metrics::new(),
+            metrics: PerfMetrics::new(),
+            prometheus,
             message_cache: VecCache::new(1000),
             voice_relay: VoiceRelay::new(),
         });
@@ -1755,6 +2031,11 @@ impl State {
     fn connection_opened(&self) {
         self.active_connections.fetch_add(1, Ordering::SeqCst);
         self.metrics.inc_accepted();
+        if let Some(ref m) = self.prometheus {
+            if let Ok(mutex_guard) = m.lock() {
+                mutex_guard.record_connection_accepted();
+            }
+        }
     }
 
     /// Decrements the connection counter. If the counter reaches zero, notifies
@@ -1763,6 +2044,11 @@ impl State {
     fn connection_closed(&self) {
         let prev = self.active_connections.fetch_sub(1, Ordering::SeqCst);
         self.metrics.inc_closed();
+        if let Some(ref m) = self.prometheus {
+            if let Ok(mutex_guard) = m.lock() {
+                mutex_guard.record_connection_closed();
+            }
+        }
         if prev <= 1 {
             self.drained_notify.notify_waiters();
         }
@@ -1909,6 +2195,47 @@ impl State {
             .map(|m| m.is_active())
             .unwrap_or(false)
     }
+
+    // -----------------------------------------------------------------------
+    // Suspicious Activity Detection
+    // -----------------------------------------------------------------------
+
+    const SPAM_MSG_THRESHOLD: usize = 30;
+    const SPAM_WINDOW_SECS: f64 = 60.0;
+    const RAID_JOIN_THRESHOLD: usize = 10;
+    const RAID_WINDOW_SECS: f64 = 60.0;
+
+    fn check_and_alert_spam(&self, username: &str, _channel: &str) {
+        let recent = self.store.get_recent_activity_count(username, "spam", Self::SPAM_WINDOW_SECS);
+        if recent >= Self::SPAM_MSG_THRESHOLD as i64 {
+            self.store.log_suspicious_activity(username, "spam", "medium",
+                Some(&format!("user sent {} messages in {}s window", recent, Self::SPAM_WINDOW_SECS)));
+        }
+    }
+
+    fn check_and_alert_raid(&self, username: &str, _channel: &str) {
+        let recent = self.store.get_recent_activity_count(username, "raid_join", Self::RAID_WINDOW_SECS);
+        if recent >= Self::RAID_JOIN_THRESHOLD as i64 {
+            self.store.log_suspicious_activity(username, "raid_join", "high",
+                Some(&format!("user joined {} channels in {}s window", recent, Self::RAID_WINDOW_SECS)));
+            self.broadcast_alert("raid", username, "high", &format!("Possible raid detected: user {} joining multiple channels rapidly", username));
+        }
+    }
+
+    fn broadcast_alert(&self, alert_type: &str, target: &str, severity: &str, message: &str) {
+        let alert = serde_json::json!({
+            "t": "alert",
+            "alert_type": alert_type,
+            "target": target,
+            "severity": severity,
+            "message": message,
+            "ts": now()
+        }).to_string();
+
+        for channel in self.channels.iter() {
+            let _ = channel.tx.send(alert.clone());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,7 +2291,7 @@ fn send_out_json(out_tx: &mpsc::UnboundedSender<String>, payload: Value) {
 fn send_out_json_with_metrics(
     out_tx: &mpsc::UnboundedSender<String>,
     payload: Value,
-    metrics: &Metrics,
+    metrics: &PerfMetrics,
 ) {
     let serialized = payload.to_string();
     let bytes = serialized.len();
@@ -1973,7 +2300,7 @@ fn send_out_json_with_metrics(
     let _ = out_tx.send(serialized);
 }
 
-fn send_err(out_tx: &mpsc::UnboundedSender<String>, msg: impl std::fmt::Display, metrics: &Metrics) {
+fn send_err(out_tx: &mpsc::UnboundedSender<String>, msg: impl std::fmt::Display, metrics: &PerfMetrics) {
     let payload = serde_json::json!({"t":"err","m":msg.to_string()});
     let serialized = payload.to_string();
     let bytes = serialized.len();
@@ -2158,6 +2485,9 @@ async fn handle_event(
 
             // Update message cache for this channel
             state.message_cache.push_and_trim(&format!("h:{}", ch), entry, 50);
+
+            // Check for spam
+            state.check_and_alert_spam(username, &ch);
         }
         "img" => {
             // Broadcast a base64-encoded image. Not persisted to avoid bloating
@@ -2230,6 +2560,9 @@ async fn handle_event(
             state.store.persist("sys", &ch, username, None, &join_msg, &format!("{} joined", username));
             state.store.persist("join", &ch, username, None, &join_event, &format!("{} joined", username));
             let _ = chan.tx.send(join_msg.to_string());
+
+            // Check for raid patterns
+            state.check_and_alert_raid(username, &ch);
         }
         "history" => {
             // Return persisted events for a channel or DM scope.
@@ -2895,6 +3228,7 @@ async fn handle_event(
                     }
                     match state.store.assign_role(target, &channel, role_name, username) {
                         Ok(_) => {
+                            state.store.log_audit("role_set", username, Some(target), Some(&channel), None, Some(role_name));
                             send_out_json(
                                 out_tx,
                                 serde_json::json!({
@@ -2928,6 +3262,7 @@ async fn handle_event(
                     }
                     match state.store.remove_user_role(target, &channel) {
                         Ok(_) => {
+                            state.store.log_audit("role_remove", username, Some(target), Some(&channel), None, None);
                             send_out_json(
                                 out_tx,
                                 serde_json::json!({
@@ -3001,6 +3336,8 @@ async fn handle_event(
             state.store.persist("sys", &channel, username, None, &serde_json::json!({"t":"sys","m":format!("{} kicked {}", username, target)}), "");
             let _ = state.chan(&channel).tx.send(kick_msg);
 
+            state.store.log_audit("kick", username, Some(target), Some(&channel), Some(reason), None);
+
             send_out_json(
                 out_tx,
                 serde_json::json!({
@@ -3044,6 +3381,10 @@ async fn handle_event(
                             let _ = state.chan(&channel).tx.send(
                                 serde_json::json!({"t":"sys","m":ban_msg,"ts":now()}).to_string()
                             );
+
+                            let metadata = serde_json::json!({"duration": duration_secs}).to_string();
+                            state.store.log_audit("ban", username, Some(target), Some(&channel), reason, Some(&metadata));
+
                             send_out_json(
                                 out_tx,
                                 serde_json::json!({
@@ -3062,6 +3403,7 @@ async fn handle_event(
                 "remove" => {
                     match state.store.unban_user(target, &channel) {
                         Ok(_) => {
+                            state.store.log_audit("unban", username, Some(target), Some(&channel), None, None);
                             let _ = state.chan(&channel).tx.send(
                                 serde_json::json!({"t":"sys","m":format!("{} was unbanned from #{}", target, channel),"ts":now()}).to_string()
                             );
@@ -3138,6 +3480,8 @@ async fn handle_event(
                 "add" | "" => {
                     match state.store.mute_user(target, &channel, username, reason, duration_secs) {
                         Ok(_) => {
+                            let metadata = serde_json::json!({"duration": duration_secs}).to_string();
+                            state.store.log_audit("mute", username, Some(target), Some(&channel), reason, Some(&metadata));
                             send_out_json(
                                 out_tx,
                                 serde_json::json!({
@@ -3156,6 +3500,7 @@ async fn handle_event(
                 "remove" => {
                     match state.store.unmute_user(target, &channel) {
                         Ok(_) => {
+                            state.store.log_audit("unmute", username, Some(target), Some(&channel), None, None);
                             send_out_json(
                                 out_tx,
                                 serde_json::json!({
@@ -3206,17 +3551,9 @@ async fn handle_event(
             }
         }
         "2fa_verify" => {
-            // Post-auth TOTP verification (used for privileged operations that
-            // require step-up authentication). Accepts either a live TOTP code
-            // or a backup code; backup codes are single-use.
             let code = d["code"].as_str().unwrap_or("").to_string();
-            if code.is_empty() {
-                send_err(out_tx, "2fa_verify requires code", &state.metrics);
-                return;
-            }
-
             let mut user_2fa = match state.store.load_user_2fa(username) {
-                Some(v) if v.enabled => v,
+                Some(u) if u.enabled => u,
                 _ => {
                     send_err(out_tx, "2FA is not enabled", &state.metrics);
                     return;
@@ -3231,6 +3568,75 @@ async fn handle_event(
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"2fa_verify","ok":ok,"ts":now()}),
+            );
+        }
+        "unlock" => {
+            let target = d["target"].as_str().unwrap_or("");
+            let channel = safe_ch(d["ch"].as_str().unwrap_or("general"));
+
+            if target.is_empty() {
+                send_err(out_tx, "unlock requires target username", &state.metrics);
+                return;
+            }
+            if !state.can_ban(username, &channel) {
+                send_err(out_tx, "insufficient permissions to unlock accounts", &state.metrics);
+                return;
+            }
+
+            match state.store.unlock_account(target) {
+                Ok(_) => {
+                    state.store.log_audit("unlock", username, Some(target), None, None, None);
+                    send_out_json(
+                        out_tx,
+                        serde_json::json!({
+                            "t":"unlocked",
+                            "target":target,
+                            "by":username,
+                            "ts":now()
+                        }),
+                    );
+                }
+                Err(e) => send_err(out_tx, &e, &state.metrics),
+            }
+        }
+        "audit" => {
+            let _sub = d["sub"].as_str().unwrap_or("query");
+            let filter_type = d["filter"].as_str();
+            let limit = d["limit"].as_i64().unwrap_or(50).min(200);
+            let target = d["target"].as_str().unwrap_or("");
+
+            if !state.can_ban(username, "general") {
+                send_err(out_tx, "insufficient permissions to view audit logs", &state.metrics);
+                return;
+            }
+
+            let filter = match (filter_type, target) {
+                (Some("channel"), _) => Some("channel"),
+                (Some("user"), u) if !u.is_empty() => Some("user"),
+                _ => None,
+            };
+
+            let logs = state.store.get_audit_logs(filter, limit);
+            let log_entries: Vec<Value> = logs.iter().map(|log| {
+                serde_json::json!({
+                    "action": log.action,
+                    "actor": log.actor,
+                    "target": log.target,
+                    "channel": log.channel,
+                    "reason": log.reason,
+                    "metadata": log.metadata,
+                    "ts": log.ts
+                })
+            }).collect();
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t":"audit_logs",
+                    "logs": log_entries,
+                    "count": logs.len(),
+                    "ts":now()
+                }),
             );
         }
         _ => {
@@ -3263,6 +3669,18 @@ fn now() -> f64 { clifford::now()
 /// injection and collisions between logically identical names.
 fn safe_ch(raw: &str) -> String {
     clifford::normalize_channel(raw).unwrap_or_else(|| "general".into())
+}
+
+fn row_to_audit_log(row: &rusqlite::Row) -> rusqlite::Result<AuditLog> {
+    Ok(AuditLog {
+        action: row.get(0)?,
+        actor: row.get(1)?,
+        target: row.get(2)?,
+        channel: row.get(3)?,
+        reason: row.get(4)?,
+        metadata: row.get(5)?,
+        ts: row.get(6)?,
+    })
 }
 
 enum EventQueryScope {
@@ -3311,6 +3729,155 @@ async fn broadcast_system_msg(state: &Arc<State>, msg: &str) {
     for e in state.channels.iter() {
         let _ = e.tx.send(sys_msg.clone());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Health check and metrics HTTP server
+// ---------------------------------------------------------------------------
+
+async fn start_health_server(
+    listener: TcpListener,
+    state: Arc<State>,
+    metrics: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+    metrics_enabled: bool,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, addr)) => {
+                let state = state.clone();
+                let metrics = metrics.clone();
+                let metrics_enabled = metrics_enabled;
+
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    let mut buffer = vec![0u8; 8192];
+
+                    match stream.read(&mut buffer).await {
+                        Ok(n) => {
+                            let request = String::from_utf8_lossy(&buffer[..n]);
+
+                            let (endpoint, method) = parse_http_request(&request);
+
+                            let response = match endpoint {
+                                "/health" | "/health/" => {
+                                    create_health_response(&state)
+                                }
+                                "/metrics" | "/metrics/" if metrics_enabled => {
+                                    create_metrics_response(&metrics)
+                                }
+                                "/ready" | "/ready/" => {
+                                    create_ready_response(&state)
+                                }
+                                _ => {
+                                    create_not_found_response()
+                                }
+                            };
+
+                            let duration = start.elapsed();
+
+                            if let Some(ref m) = metrics {
+                                if let Ok(mutex_guard) = m.lock() {
+                                    mutex_guard.record_http_request(endpoint, method, 200);
+                                    mutex_guard.record_http_duration(endpoint, duration);
+                                }
+                            }
+
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        }
+                        Err(e) => {
+                            warn!("Failed to read from health connection {}: {}", addr, e);
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("Health server accept error: {}", e);
+            }
+        }
+    }
+}
+
+fn parse_http_request(request: &str) -> (&str, &str) {
+    let lines: Vec<&str> = request.lines().collect();
+    if let Some(first_line) = lines.first() {
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            return (parts[1], parts[0]);
+        }
+    }
+    ("/", "GET")
+}
+
+fn create_health_response(state: &Arc<State>) -> String {
+    let channels = state.channels.len();
+    let online = state.online_count();
+    let connections = state.active_connection_count();
+
+    let response = serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": 0,
+        "channels": channels,
+        "online_users": online,
+        "active_connections": connections
+    });
+
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        response.to_string().len(),
+        response
+    )
+}
+
+fn create_ready_response(state: &Arc<State>) -> String {
+    let db_ready = state.store.health_check();
+
+    let response = serde_json::json!({
+        "ready": db_ready,
+        "checks": {
+            "database": if db_ready { "ok" } else { "error" }
+        }
+    });
+
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        response.to_string().len(),
+        response
+    )
+}
+
+fn create_metrics_response(metrics: &Option<Arc<std::sync::Mutex<PrometheusMetrics>>>) -> String {
+    let metrics_text = if let Some(ref m) = metrics {
+        if let Ok(mutex) = m.lock() {
+            let encoder = prometheus::TextEncoder::new();
+            let metric_families = mutex.registry.gather();
+            let mut buffer = Vec::new();
+            if encoder.encode(&metric_families, &mut buffer).is_ok() {
+                String::from_utf8_lossy(&buffer).to_string()
+            } else {
+                "Error encoding metrics".to_string()
+            }
+        } else {
+            "Error acquiring metrics lock".to_string()
+        }
+    } else {
+        "Metrics not enabled".to_string()
+    };
+
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+        metrics_text.len(),
+        metrics_text
+    )
+}
+
+fn create_not_found_response() -> String {
+    let body = "Not Found";
+    format!(
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
 }
 
 /// Constructs the serialised `"ok"` auth response payload.
@@ -3875,20 +4442,63 @@ where
         bridge_routes,
     } = auth;
 
+    // --- Account lockout check ---
+    const MAX_FAILED_ATTEMPTS: i32 = 5;
+    if let Some((_, locked_until)) = state.store.get_lockout_status(&username) {
+        if locked_until > crate::now() {
+            let remaining = (locked_until - crate::now()) as i32;
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({
+                        "t": "err",
+                        "m": format!("account locked, try again in {} seconds", remaining),
+                        "locked": true,
+                        "retry_after": remaining
+                    }).to_string(),
+                ))
+                .await;
+            warn!("auth blocked: account locked for user={}", username);
+            return;
+        }
+    }
+
     // --- Credential verification ---
     // The client sends a PBKDF2 hash of their password. The server stores
     // its own PBKDF2 hash of that value (with a random salt). This two-layer
     // approach means the server never sees the raw password, but also never
     // trusts a client-provided hash blindly.
     match state.store.verify_credential(&username, &pw_hash) {
-        Ok(true) => {} // Hash matches â€” proceed.
+        Ok(true) => {
+            state.store.clear_failed_logins(&username);
+        } // Hash matches â€” proceed.
         Ok(false) => {
-            let _ = sink
-                .send(Message::Text(
-                    serde_json::json!({"t":"err","m":"invalid credentials"}).to_string(),
-                ))
-                .await;
-            warn!("auth failed: invalid password for user={}", username);
+            let (locked, attempts) = state.store.record_failed_login(&username, MAX_FAILED_ATTEMPTS);
+            if locked {
+                state.store.log_suspicious_activity(&username, "brute_force", "high",
+                    Some(&format!("{} failed login attempts", attempts)));
+                let _ = sink
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "t":"err",
+                            "m":"account locked due to too many failed attempts",
+                            "locked": true,
+                            "retry_after": 900
+                        }).to_string(),
+                    ))
+                    .await;
+            } else {
+                let remaining = MAX_FAILED_ATTEMPTS - attempts;
+                let _ = sink
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "t":"err",
+                            "m":"invalid credentials",
+                            "remaining_attempts": remaining
+                        }).to_string(),
+                    ))
+                    .await;
+            }
+            warn!("auth failed: invalid password for user={}, attempts={}", username, attempts);
             return;
         }
         Err("first_login") => {
@@ -4317,8 +4927,131 @@ async fn main() -> ChatifyResult<()> {
         None
     };
 
+    // Initialize Prometheus metrics
+    let metrics: Option<Arc<std::sync::Mutex<PrometheusMetrics>>> = match PrometheusMetrics::new() {
+        Ok(m) => {
+            if args.log {
+                info!("Prometheus metrics initialized");
+            }
+            Some(Arc::new(std::sync::Mutex::new(m)))
+        }
+        Err(e) => {
+            warn!("Failed to initialize metrics: {}; continuing without metrics", e);
+            None
+        }
+    };
+
     let listener = TcpListener::bind(&addr).await?;
-    let state = State::new(args.db.clone(), db_key);
+    let state = State::new(args.db.clone(), db_key, metrics.clone());
+
+    let enc_label = if state.store.is_encrypted() {
+        "ChaCha20-Poly1305"
+    } else {
+        "None (unencrypted)"
+    };
+    let proto = if tls_acceptor.is_some() { "wss" } else { "ws" };
+    println!(" Chatify running on {}://{}", proto, addr);
+    println!(" Encryption: {} |   IP Privacy: On", enc_label);
+    println!(" Event store: {}", args.db);
+
+    // Start health/metrics HTTP server if configured
+    if args.health_port > 0 {
+        let health_metrics = metrics.clone();
+        let health_state = state.clone();
+        let health_enabled = args.metrics_enabled;
+        tokio::spawn(async move {
+            let addr = format!("0.0.0.0:{}", args.health_port);
+            match TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    println!(" Health/Metrics server running on http://{}", addr);
+                    if args.log {
+                        info!("health/metrics server started on {}", addr);
+                    }
+                    start_health_server(listener, health_state, health_metrics, health_enabled).await;
+                }
+                Err(e) => {
+                    warn!("Failed to bind health port {}: {}", args.health_port, e);
+                }
+            }
+        });
+    }
+
+    println!("â¹  Press Ctrl+C to stop\n");
+    if args.log {
+        info!("server started addr={}://{} db={}", proto, addr, args.db);
+    }
+
+    // Periodic nonce cache cleanup: evicts stale entries for users whose
+    // connection dropped without proper cleanup (crash, network partition).
+    {
+        let cleanup_state = state.clone();
+        let log_enabled = args.log;
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(NONCE_CLEANUP_INTERVAL_SECS)).await;
+                let evicted = cleanup_state.evict_stale_nonce_entries(NONCE_MAX_AGE_SECS);
+                if evicted > 0 && log_enabled {
+                    info!("nonce cache: evicted {} stale user entries", evicted);
+                }
+            }
+        });
+    }
+
+    // Accept loop: runs until Ctrl+C is received.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                broadcast_system_msg(&state, "Server is shutting down").await;
+                println!("\nShutdown signal received. Stopping server loop...");
+                info!("shutdown signal received; stopping accept loop");
+                break;
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        // Apply socket optimizations for low latency
+                        configure_socket(&stream);
+                        
+                        let s = state.clone();
+                        if let Some(ref acceptor) = tls_acceptor {
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        handle(
+                                            StreamType::Tls(Box::new(ChatifyTlsStream { inner: tls_stream })),
+                                            addr,
+                                            s,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        warn!("TLS handshake failed from {}: {}", addr, e);
+                                    }
+                                }
+                            });
+                        } else {
+                            tokio::spawn(handle(StreamType::Plain(stream), addr, s));
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+
+    let db_key = resolve_db_key(&args.db, args.db_key.as_deref())?;
+
+    // Set up TLS if enabled.
+    let tls_acceptor = if args.tls {
+        let acceptor = load_tls_config(&args.tls_cert, &args.tls_key)?;
+        Some(acceptor)
+    } else {
+        None
+    };
+
+    let listener = TcpListener::bind(&addr).await?;
+    let state = State::new(args.db.clone(), db_key, metrics.clone());
 
     let enc_label = if state.store.is_encrypted() {
         "ChaCha20-Poly1305"
@@ -4469,7 +5202,7 @@ mod tests {
     /// the drop and the atomic write.
     #[tokio::test]
     async fn connection_counter_tracks_open_and_close() {
-        let state = State::new(":memory:".to_string(), None);
+        let state = State::new(":memory:".to_string(), None, None);
         assert_eq!(state.active_connection_count(), 0);
 
         let addr1: SocketAddr = "127.0.0.1:12345".parse().unwrap();

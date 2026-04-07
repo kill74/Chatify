@@ -2055,19 +2055,20 @@ async fn schema_meta_contains_current_version() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-    assert_eq!(version, "5");
+    assert_eq!(version, "6");
 }
 
-/// Verifies that a server migrates a `v0` database to schema `v5` on startup.
+/// Verifies that a server migrates a `v0` database to schema `v6` on startup.
 ///
 /// Migration correctness is verified by:
 ///
-/// 1. Confirming `schema_meta.schema_version` is updated to `"5"`.
+/// 1. Confirming `schema_meta.schema_version` is updated to `"6"`.
 /// 2. Confirming the `events` table exists (created by `v1` migration).
 /// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
 /// 4. Confirming the `user_credentials` table exists (created by `v3` migration).
 /// 5. Confirming append-only and query indexes from `v4` exist.
 /// 6. Confirming roles/permissions tables from `v5` exist.
+/// 7. Confirming audit_logs and suspicious_activity tables from `v6` exist.
 ///
 /// All assertions are made directly against SQLite rather than through the
 /// server API to keep migration tests independent of server protocol changes.
@@ -2083,8 +2084,8 @@ async fn schema_migrates_from_version_zero_to_current() {
     let conn = Connection::open(&db_path).expect("open migrated db");
     assert_eq!(
         read_schema_version(&db_path),
-        "5",
-        "expected migration to set schema version to 5"
+        "6",
+        "expected migration to set schema version to 6"
     );
 
     let events_exists: i64 = conn
@@ -2181,6 +2182,54 @@ async fn schema_migrates_from_version_zero_to_current() {
     assert!(
         update_result.is_err(),
         "events updates must be rejected by append-only trigger"
+    );
+
+    let audit_logs_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_logs'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for audit_logs");
+    assert_eq!(
+        audit_logs_exists, 1,
+        "audit_logs table should exist after migration"
+    );
+
+    let suspicious_activity_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='suspicious_activity'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for suspicious_activity");
+    assert_eq!(
+        suspicious_activity_exists, 1,
+        "suspicious_activity table should exist after migration"
+    );
+
+    let failed_attempts_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('user_credentials') WHERE name='failed_attempts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query pragma_table_info for failed_attempts");
+    assert_eq!(
+        failed_attempts_column, 1,
+        "failed_attempts column should exist in user_credentials after migration"
+    );
+
+    let locked_until_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('user_credentials') WHERE name='locked_until'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query pragma_table_info for locked_until");
+    assert_eq!(
+        locked_until_column, 1,
+        "locked_until column should exist in user_credentials after migration"
     );
 
     drop(server);

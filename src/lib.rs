@@ -18,6 +18,7 @@ pub mod ui;
 pub mod screen_share;
 pub mod performance;
 pub mod voice;
+pub mod metrics;
 
 use rand::RngCore;
 use std::time::{SystemTime, UNIX_EPOCH};
