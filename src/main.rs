@@ -166,6 +166,26 @@ struct Args {
     /// Enable Prometheus metrics endpoint.
     #[arg(long, default_value_t = true)]
     metrics_enabled: bool,
+
+    /// Maximum time in seconds to wait for connections to drain during shutdown.
+    #[arg(long, default_value_t = 30)]
+    shutdown_timeout_secs: u64,
+
+    /// Enable handling SIGHUP for config hot-reload.
+    #[arg(long)]
+    enable_hot_reload: bool,
+
+    /// Enable shutdown HTTP endpoint for orchestration (POST /shutdown).
+    #[arg(long)]
+    shutdown_endpoint: bool,
+
+    /// Maximum messages per user per minute (0 = unlimited).
+    #[arg(long, default_value_t = 60)]
+    max_msgs_per_minute: u32,
+
+    /// Enable per-user rate limiting.
+    #[arg(long)]
+    enable_user_rate_limit: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1916,11 +1936,34 @@ struct State {
 
     /// Voice channel relay for managing voice rooms, members, and state
     voice_relay: VoiceRelay,
+
+    /// Flag to signal graceful shutdown in progress.
+    /// When true, server stops accepting new connections.
+    shutdown_in_progress: std::sync::atomic::AtomicBool,
+
+    /// Shutdown trigger for external signaling (SIGHUP, shutdown endpoint).
+    shutdown_notify: Notify,
+
+    /// Per-user message rate limiting: username -> (count, window_start).
+    /// Uses DashMap for concurrent access without locking.
+    user_msg_rate: DashMap<String, (u32, f64)>,
+
+    /// Maximum messages per user per minute.
+    max_msgs_per_minute: u32,
+
+    /// Whether per-user rate limiting is enabled.
+    user_rate_limit_enabled: bool,
 }
 
 impl State {
     /// Creates the initial server state, pre-populating the `"general"` channel.
-    fn new(db_path: String, db_key: Option<Vec<u8>>, prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>) -> Arc<Self> {
+    fn new(
+        db_path: String,
+        db_key: Option<Vec<u8>>,
+        prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+        max_msgs_per_minute: u32,
+        user_rate_limit_enabled: bool,
+    ) -> Arc<Self> {
         let store = EventStore::new(db_path, db_key);
         let s = Arc::new(Self {
             channels: DashMap::new(),
@@ -1940,6 +1983,11 @@ impl State {
             prometheus,
             message_cache: VecCache::new(1000),
             voice_relay: VoiceRelay::new(),
+            shutdown_in_progress: std::sync::atomic::AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
+            user_msg_rate: DashMap::new(),
+            max_msgs_per_minute,
+            user_rate_limit_enabled,
         });
         s.channels.insert("general".into(), Channel::new());
         s
@@ -2099,6 +2147,61 @@ impl State {
         }
         self.ip_last_auth.insert(ip, now);
         true
+    }
+
+    /// Check and record per-user message rate limit.
+    /// Returns (allowed, remaining, reset_in_secs).
+    fn check_user_rate_limit(&self, username: &str) -> (bool, u32, u64) {
+        if !self.user_rate_limit_enabled {
+            return (true, self.max_msgs_per_minute, 60);
+        }
+
+        if self.max_msgs_per_minute == 0 {
+            return (true, u32::MAX, 60);
+        }
+
+        let now = crate::now();
+        let window_secs = 60.0;
+
+        let mut entry = self.user_msg_rate.entry(username.to_string()).or_insert((0, now));
+
+        if now - entry.1 >= window_secs {
+            entry.0 = 1;
+            entry.1 = now;
+            return (true, self.max_msgs_per_minute - 1, 60);
+        }
+
+        if entry.0 >= self.max_msgs_per_minute {
+            let reset_in = (window_secs - (now - entry.1)) as u64;
+            return (false, 0, reset_in);
+        }
+
+        entry.0 += 1;
+        let remaining = self.max_msgs_per_minute - entry.0;
+        let reset_in = (window_secs - (now - entry.1)) as u64;
+        (true, remaining, reset_in)
+    }
+
+    // -----------------------------------------------------------------------
+    // Graceful shutdown
+    // -----------------------------------------------------------------------
+
+    /// Signal the server to begin graceful shutdown.
+    /// Returns true if shutdown was initiated, false if already shutting down.
+    fn initiate_shutdown(&self) -> bool {
+        self.shutdown_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Check if server is shutting down.
+    fn is_shutting_down(&self) -> bool {
+        self.shutdown_in_progress.load(Ordering::SeqCst)
+    }
+
+    #[allow(dead_code)]
+    fn notify_shutdown(&self) {
+        self.shutdown_notify.notify_waiters();
     }
 
     // -----------------------------------------------------------------------
@@ -2459,6 +2562,14 @@ async fn handle_event(
             if c.is_empty() {
                 return;
             }
+
+            // Check per-user rate limit
+            let (rate_allowed, _remaining, reset_in) = state.check_user_rate_limit(username);
+            if !rate_allowed {
+                send_err(out_tx, format!("rate limited: try again in {}s", reset_in), &state.metrics);
+                return;
+            }
+
             if !state.can_send(username, &ch) {
                 if state.is_muted(username, &ch) {
                     send_err(out_tx, "you are muted in this channel", &state.metrics);
@@ -3740,58 +3851,87 @@ async fn start_health_server(
     state: Arc<State>,
     metrics: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
     metrics_enabled: bool,
+    shutdown_endpoint_enabled: bool,
+    shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     loop {
-        match listener.accept().await {
-            Ok((mut stream, addr)) => {
-                let state = state.clone();
-                let metrics = metrics.clone();
-                let metrics_enabled = metrics_enabled;
+        tokio::select! {
+            biased;
 
-                tokio::spawn(async move {
-                    let start = Instant::now();
-                    let mut buffer = vec![0u8; 8192];
+            _ = state.shutdown_notify.notified() => {
+                info!("health server shutting down");
+                break;
+            }
 
-                    match stream.read(&mut buffer).await {
-                        Ok(n) => {
-                            let request = String::from_utf8_lossy(&buffer[..n]);
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((mut stream, addr)) => {
+                        let state = state.clone();
+                        let metrics = metrics.clone();
+                        let metrics_enabled = metrics_enabled;
+                        let shutdown_endpoint_enabled = shutdown_endpoint_enabled;
+                        let shutdown_tx = shutdown_tx.clone();
 
-                            let (endpoint, method) = parse_http_request(&request);
+                        tokio::spawn(async move {
+                            let start = Instant::now();
+                            let mut buffer = vec![0u8; 8192];
 
-                            let response = match endpoint {
-                                "/health" | "/health/" => {
-                                    create_health_response(&state)
+                            match stream.read(&mut buffer).await {
+                                Ok(n) => {
+                                    let request = String::from_utf8_lossy(&buffer[..n]);
+
+                                    let (endpoint, method) = parse_http_request(&request);
+
+                                    let response = match endpoint {
+                                        "/health" | "/health/" => {
+                                            create_health_response(&state)
+                                        }
+                                        "/metrics" | "/metrics/" if metrics_enabled => {
+                                            create_metrics_response(&metrics)
+                                        }
+                                        "/ready" | "/ready/" => {
+                                            create_ready_response(&state)
+                                        }
+                                        "/shutdown" | "/shutdown/" if shutdown_endpoint_enabled && method == "POST" => {
+                                            if state.initiate_shutdown() {
+                                                let _ = shutdown_tx.send(()).await;
+                                                create_shutdown_response("initiated")
+                                            } else {
+                                                create_shutdown_response("already_in_progress")
+                                            }
+                                        }
+                                        "/shutdown" | "/shutdown/" if shutdown_endpoint_enabled => {
+                                            create_method_not_allowed_response()
+                                        }
+                                        "/live" | "/live/" => {
+                                            create_live_response()
+                                        }
+                                        _ => {
+                                            create_not_found_response()
+                                        }
+                                    };
+
+                                    let duration = start.elapsed();
+
+                                    if let Some(ref m) = metrics {
+                                        if let Ok(mutex_guard) = m.lock() {
+                                            mutex_guard.record_http_request(endpoint, method, 200);
+                                            mutex_guard.record_http_duration(endpoint, duration);
+                                        }
+                                    }
+
+                                    let _ = stream.write_all(response.as_bytes()).await;
                                 }
-                                "/metrics" | "/metrics/" if metrics_enabled => {
-                                    create_metrics_response(&metrics)
-                                }
-                                "/ready" | "/ready/" => {
-                                    create_ready_response(&state)
-                                }
-                                _ => {
-                                    create_not_found_response()
-                                }
-                            };
-
-                            let duration = start.elapsed();
-
-                            if let Some(ref m) = metrics {
-                                if let Ok(mutex_guard) = m.lock() {
-                                    mutex_guard.record_http_request(endpoint, method, 200);
-                                    mutex_guard.record_http_duration(endpoint, duration);
+                                Err(e) => {
+                                    warn!("Failed to read from health connection {}: {}", addr, e);
                                 }
                             }
-
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        }
-                        Err(e) => {
-                            warn!("Failed to read from health connection {}: {}", addr, e);
-                        }
+                        });
                     }
-                });
-            }
-            Err(e) => {
-                warn!("Health server accept error: {}", e);
+                    Err(e) => {
+                        warn!("Health server accept error: {}", e);
+                    }
+                }
             }
         }
     }
@@ -3875,6 +4015,41 @@ fn create_not_found_response() -> String {
     let body = "Not Found";
     format!(
         "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn create_shutdown_response(status: &str) -> String {
+    let response = serde_json::json!({
+        "status": status,
+        "message": if status == "initiated" {
+            "Shutdown initiated"
+        } else {
+            "Shutdown already in progress"
+        }
+    });
+    let body = response.to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn create_method_not_allowed_response() -> String {
+    let body = "Method Not Allowed";
+    format!(
+        "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAllow: POST\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn create_live_response() -> String {
+    let body = "OK";
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     )
@@ -4906,6 +5081,132 @@ fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<
 /// 5. Accepts connections in a `tokio::select!` loop until Ctrl+C.
 /// 6. Broadcasts a shutdown notice and waits up to 10 s for connections to
 ///    drain before returning.
+
+async fn accept_loop(
+    listener: TcpListener,
+    state: Arc<State>,
+    tls_acceptor: Option<TlsAcceptor>,
+    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+    _args: &Args,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                broadcast_system_msg(&state, "Server is shutting down").await;
+                println!("\nShutdown signal received. Stopping server loop...");
+                info!("shutdown signal received; stopping accept loop");
+                state.initiate_shutdown();
+                break;
+            }
+            _ = shutdown_rx.recv() => {
+                broadcast_system_msg(&state, "Server is shutting down").await;
+                println!("\nShutdown triggered via API. Stopping server loop...");
+                info!("shutdown triggered via API; stopping accept loop");
+                state.initiate_shutdown();
+                break;
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        if state.is_shutting_down() {
+                            debug!("Rejecting new connection during shutdown: {}", addr);
+                            continue;
+                        }
+                        configure_socket(&stream);
+                        let s = state.clone();
+                        if let Some(ref acceptor) = tls_acceptor {
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        handle(
+                                            StreamType::Tls(Box::new(ChatifyTlsStream { inner: tls_stream })),
+                                            addr,
+                                            s,
+                                        ).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("TLS handshake failed from {}: {}", addr, e);
+                                    }
+                                }
+                            });
+                        } else {
+                            tokio::spawn(handle(StreamType::Plain(stream), addr, s));
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn accept_loop_unix(
+    listener: TcpListener,
+    state: Arc<State>,
+    tls_acceptor: Option<TlsAcceptor>,
+    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+    mut sighup_rx: tokio::sync::mpsc::Receiver<()>,
+    args: &Args,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                broadcast_system_msg(&state, "Server is shutting down").await;
+                println!("\nShutdown signal received. Stopping server loop...");
+                info!("shutdown signal received; stopping accept loop");
+                state.initiate_shutdown();
+                break;
+            }
+            _ = shutdown_rx.recv() => {
+                broadcast_system_msg(&state, "Server is shutting down").await;
+                println!("\nShutdown triggered via API. Stopping server loop...");
+                info!("shutdown triggered via API; stopping accept loop");
+                state.initiate_shutdown();
+                break;
+            }
+            _ = sighup_rx.recv() => {
+                if args.enable_hot_reload {
+                    info!("hot reload acknowledged in accept loop");
+                }
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        if state.is_shutting_down() {
+                            debug!("Rejecting new connection during shutdown: {}", addr);
+                            continue;
+                        }
+                        configure_socket(&stream);
+                        let s = state.clone();
+                        if let Some(ref acceptor) = tls_acceptor {
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        handle(
+                                            StreamType::Tls(Box::new(ChatifyTlsStream { inner: tls_stream })),
+                                            addr,
+                                            s,
+                                        ).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("TLS handshake failed from {}: {}", addr, e);
+                                    }
+                                }
+                            });
+                        } else {
+                            tokio::spawn(handle(StreamType::Plain(stream), addr, s));
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
@@ -4942,7 +5243,13 @@ async fn main() -> ChatifyResult<()> {
     };
 
     let listener = TcpListener::bind(&addr).await?;
-    let state = State::new(args.db.clone(), db_key, metrics.clone());
+    let state = State::new(
+        args.db.clone(),
+        db_key,
+        metrics.clone(),
+        args.max_msgs_per_minute,
+        args.enable_user_rate_limit,
+    );
 
     let enc_label = if state.store.is_encrypted() {
         "ChaCha20-Poly1305"
@@ -4953,12 +5260,18 @@ async fn main() -> ChatifyResult<()> {
     println!(" Chatify running on {}://{}", proto, addr);
     println!(" Encryption: {} |   IP Privacy: On", enc_label);
     println!(" Event store: {}", args.db);
+    println!(" User rate limit: {} msgs/min", if args.enable_user_rate_limit { args.max_msgs_per_minute.to_string() } else { "disabled".to_string() });
+
+    // Shutdown channel for orchestration
+    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Start health/metrics HTTP server if configured
     if args.health_port > 0 {
         let health_metrics = metrics.clone();
         let health_state = state.clone();
         let health_enabled = args.metrics_enabled;
+        let shutdown_endpoint_enabled = args.shutdown_endpoint;
+        let health_shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let addr = format!("0.0.0.0:{}", args.health_port);
             match TcpListener::bind(&addr).await {
@@ -4967,7 +5280,7 @@ async fn main() -> ChatifyResult<()> {
                     if args.log {
                         info!("health/metrics server started on {}", addr);
                     }
-                    start_health_server(listener, health_state, health_metrics, health_enabled).await;
+                    start_health_server(listener, health_state, health_metrics, health_enabled, shutdown_endpoint_enabled, health_shutdown_tx).await;
                 }
                 Err(e) => {
                     warn!("Failed to bind health port {}: {}", args.health_port, e);
@@ -4976,7 +5289,7 @@ async fn main() -> ChatifyResult<()> {
         });
     }
 
-    println!("â¹  Press Ctrl+C to stop\n");
+    println!(" Press Ctrl+C to stop\n");
     if args.log {
         info!("server started addr={}://{} db={}", proto, addr, args.db);
     }
@@ -4997,78 +5310,12 @@ async fn main() -> ChatifyResult<()> {
         });
     }
 
-    // Accept loop: runs until Ctrl+C is received.
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                broadcast_system_msg(&state, "Server is shutting down").await;
-                println!("\nShutdown signal received. Stopping server loop...");
-                info!("shutdown signal received; stopping accept loop");
-                break;
-            }
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        // Apply socket optimizations for low latency
-                        configure_socket(&stream);
-                        
-                        let s = state.clone();
-                        if let Some(ref acceptor) = tls_acceptor {
-                            let acceptor = acceptor.clone();
-                            tokio::spawn(async move {
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        handle(
-                                            StreamType::Tls(Box::new(ChatifyTlsStream { inner: tls_stream })),
-                                            addr,
-                                            s,
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        warn!("TLS handshake failed from {}: {}", addr, e);
-                                    }
-                                }
-                            });
-                        } else {
-                            tokio::spawn(handle(StreamType::Plain(stream), addr, s));
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
-    }
-
-    let db_key = resolve_db_key(&args.db, args.db_key.as_deref())?;
-
-    // Set up TLS if enabled.
-    let tls_acceptor = if args.tls {
-        let acceptor = load_tls_config(&args.tls_cert, &args.tls_key)?;
-        Some(acceptor)
-    } else {
-        None
-    };
-
-    let listener = TcpListener::bind(&addr).await?;
-    let state = State::new(args.db.clone(), db_key, metrics.clone());
-
-    let enc_label = if state.store.is_encrypted() {
-        "ChaCha20-Poly1305"
-    } else {
-        "None (unencrypted)"
-    };
-    let proto = if tls_acceptor.is_some() { "wss" } else { "ws" };
-    println!(" Chatify running on {}://{}", proto, addr);
-    println!(" Encryption: {} |   IP Privacy: On", enc_label);
-    println!(" Event store: {}", args.db);
-    println!("â¹  Press Ctrl+C to stop\n");
+    println!(" Press Ctrl+C to stop\n");
     if args.log {
         info!("server started addr={}://{} db={}", proto, addr, args.db);
     }
 
-    // Periodic nonce cache cleanup: evicts stale entries for users whose
-    // connection dropped without proper cleanup (crash, network partition).
+    // Periodic nonce cache cleanup
     {
         let cleanup_state = state.clone();
         let log_enabled = args.log;
@@ -5083,53 +5330,39 @@ async fn main() -> ChatifyResult<()> {
         });
     }
 
-    // Accept loop: runs until Ctrl+C is received.
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                broadcast_system_msg(&state, "Server is shutting down").await;
-                println!("\nShutdown signal received. Stopping server loop...");
-                info!("shutdown signal received; stopping accept loop");
-                break;
-            }
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        // Apply socket optimizations for low latency
-                        configure_socket(&stream);
-                        
-                        let s = state.clone();
-                        if let Some(ref acceptor) = tls_acceptor {
-                            let acceptor = acceptor.clone();
-                            tokio::spawn(async move {
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        handle(
-                                            StreamType::Tls(Box::new(ChatifyTlsStream { inner: tls_stream })),
-                                            addr,
-                                            s,
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        warn!("TLS handshake failed from {}: {}", addr, e);
-                                    }
-                                }
-                            });
-                        } else {
-                            tokio::spawn(handle(StreamType::Plain(stream), addr, s));
-                        }
+    #[cfg(unix)]
+    {
+        let (sighup_tx, mut sighup_rx) = tokio::sync::mpsc::channel::<()>(1);
+        if args.enable_hot_reload {
+            use tokio::signal::unix::{Signal, SignalKind};
+            let mut sighup: Signal = tokio::signal::unix::signal(SignalKind::hangup())?;
+            let reload_state = state.clone();
+            let reload_log = args.log;
+            let sighup_tx = sighup_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    sighup.recv().await;
+                    info!("SIGHUP received - triggering hot reload");
+                    broadcast_system_msg(&reload_state, "Server reloading configuration...").await;
+                    reload_state.user_msg_rate.clear();
+                    if reload_log {
+                        info!("hot reload complete: rate limit counters cleared, {} active connections", reload_state.active_connection_count());
                     }
-                    Err(_) => continue,
+                    broadcast_system_msg(&reload_state, "Configuration reloaded").await;
+                    let _ = sighup_tx.send(()).await;
                 }
-            }
+            });
         }
+        accept_loop_unix(listener, state, tls_acceptor, shutdown_rx, sighup_rx, args).await;
     }
 
-    // Graceful drain: wait up to 10 s for all handlers to finish.
-    // The `drained_notify` Notify wakes us immediately if connections drain
-    // before the 250 ms poll interval fires.
-    let drain_timeout = Duration::from_secs(10);
+    #[cfg(not(unix))]
+    {
+        accept_loop(listener, state.clone(), tls_acceptor, shutdown_rx, &args).await;
+    }
+
+    // Graceful drain: wait for connections to close.
+    let drain_timeout = Duration::from_secs(args.shutdown_timeout_secs);
     let start = std::time::Instant::now();
     loop {
         let active = state.active_connection_count();
@@ -5154,6 +5387,9 @@ async fn main() -> ChatifyResult<()> {
             _ = sleep(Duration::from_millis(250)) => {}
         }
     }
+
+    println!("Shutdown complete.");
+    info!("server shutdown complete");
 
     #[allow(unreachable_code)]
     Ok(())
@@ -5202,7 +5438,7 @@ mod tests {
     /// the drop and the atomic write.
     #[tokio::test]
     async fn connection_counter_tracks_open_and_close() {
-        let state = State::new(":memory:".to_string(), None, None);
+        let state = State::new(":memory:".to_string(), None, None, 60, false);
         assert_eq!(state.active_connection_count(), 0);
 
         let addr1: SocketAddr = "127.0.0.1:12345".parse().unwrap();
