@@ -1,6 +1,6 @@
-//! # `clicord-server` Integration Test Suite
+//! # `clifford-server` Integration Test Suite
 //!
-//! End-to-end contract tests for the `clicord-server` WebSocket binary.
+//! End-to-end contract tests for the `clifford-server` WebSocket binary.
 //!
 //! ## Architecture
 //!
@@ -19,7 +19,7 @@
 //! cargo test --test integration
 //! ```
 //!
-//! The binary path is resolved at compile time via the `CARGO_BIN_EXE_clicord-server`
+//! The binary path is resolved at compile time via the `CARGO_BIN_EXE_clifford-server`
 //! env var injected by Cargo, so no manual `PATH` setup is needed.
 //!
 //! ## Coverage Areas
@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use clicord_server::crypto::{new_keypair, pub_b64};
+use clifford::crypto::{new_keypair, pub_b64};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -267,8 +267,8 @@ async fn start_server_with_db(db_path: PathBuf) -> TestServer {
 
     // Cargo injects the compiled binary path as an env var so we don't need
     // to hard-code build-directory paths or shell out to `cargo build`.
-    let server_bin = std::env::var("CARGO_BIN_EXE_clicord-server")
-        .expect("CARGO_BIN_EXE_clicord-server must be set by cargo test");
+    let server_bin = std::env::var("CARGO_BIN_EXE_clifford-server")
+        .expect("CARGO_BIN_EXE_clifford-server must be set by cargo test");
 
     let child = Command::new(server_bin)
         .arg("--host")

@@ -368,6 +368,12 @@ impl Metrics {
             connections_closed: self
                 .connections_closed
                 .load(std::sync::atomic::Ordering::Relaxed),
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_hit_rate: 0.0,
+            pool_active: 0,
+            pool_idle: 0,
+            pool_total: 0,
         }
     }
 }
@@ -383,6 +389,8 @@ impl Default for Metrics {
 pub struct MessageCache<V> {
     cache: RwLock<LruCache<String, Arc<V>>>,
     _max_entries: usize,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
 }
 
 impl<V> MessageCache<V> {
@@ -392,11 +400,20 @@ impl<V> MessageCache<V> {
                 std::num::NonZeroUsize::new(max_entries).unwrap(),
             )),
             _max_entries: max_entries,
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<Arc<V>> {
-        self.cache.write().get(key).cloned()
+        let result = self.cache.write().get(key).cloned();
+        if result.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     pub fn insert(&self, key: String, value: V) {
@@ -411,6 +428,100 @@ impl<V> MessageCache<V> {
     pub fn clear(&self) {
         self.cache.write().clear();
     }
+
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self.misses.load(std::sync::atomic::Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    pub fn stats(&self) -> (u64, u64, f64) {
+        let hits = self.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self.misses.load(std::sync::atomic::Ordering::Relaxed);
+        (hits, misses, self.hit_rate())
+    }
+}
+
+/// Specialized LRU cache for vectors that avoids JSON serialization round-trips.
+/// Stores Vec<T> directly instead of wrapping in serde_json::Value.
+pub struct VecCache<T> {
+    cache: RwLock<LruCache<String, Arc<Vec<T>>>>,
+    _max_entries: usize,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+impl<T: Clone> VecCache<T> {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            cache: RwLock::new(LruCache::new(
+                std::num::NonZeroUsize::new(max_entries).unwrap(),
+            )),
+            _max_entries: max_entries,
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<Arc<Vec<T>>> {
+        let result = self.cache.write().get(key).cloned();
+        if result.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub fn insert(&self, key: String, value: Vec<T>) {
+        let arc_value = Arc::new(value);
+        self.cache.write().push(key, arc_value);
+    }
+
+    pub fn invalidate(&self, key: &str) {
+        self.cache.write().pop(key);
+    }
+
+    pub fn clear(&self) {
+        self.cache.write().clear();
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self.misses.load(std::sync::atomic::Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    pub fn stats(&self) -> (u64, u64, f64) {
+        let hits = self.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self.misses.load(std::sync::atomic::Ordering::Relaxed);
+        (hits, misses, self.hit_rate())
+    }
+
+    pub fn push_and_trim(&self, key: &str, item: T, max_len: usize) {
+        let mut cache = self.cache.write();
+        if let Some(existing) = cache.get_mut(key) {
+            let vec = Arc::make_mut(existing);
+            vec.push(item);
+            if vec.len() > max_len {
+                let drain_start = vec.len() - max_len;
+                vec.drain(0..drain_start);
+            }
+        } else {
+            cache.push(key.to_string(), Arc::new(vec![item]));
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -422,4 +533,10 @@ pub struct MetricsSnapshot {
     pub errors: u64,
     pub connections_accepted: u64,
     pub connections_closed: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_hit_rate: f64,
+    pub pool_active: usize,
+    pub pool_idle: usize,
+    pub pool_total: usize,
 }

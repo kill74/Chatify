@@ -180,6 +180,48 @@ pub struct OwnedTheme {
     pub success: String,
 }
 
+/// Parses an ANSI color escape sequence into a `ratatui::style::Color`.
+///
+/// Supports `\x1b[38;5;Nm` (256-color) and `\x1b[38;2;R;G;Bm` (true-color).
+/// Falls back to `Color::Reset` for unrecognized sequences.
+pub fn ansi_to_ratatui_color(ansi: &str) -> ratatui::style::Color {
+    use ratatui::style::Color;
+
+    let trimmed = ansi.trim();
+
+    // Try 256-color: \x1b[38;5;Nm
+    if let Some(rest) = trimmed.strip_prefix("\x1b[38;5;") {
+        if let Some(code_str) = rest.strip_suffix('m') {
+            if let Ok(code) = code_str.parse::<u8>() {
+                return Color::Indexed(code);
+            }
+        }
+    }
+
+    // Try true-color: \x1b[38;2;R;G;Bm
+    if let Some(rest) = trimmed.strip_prefix("\x1b[38;2;") {
+        if let Some(code_str) = rest.strip_suffix('m') {
+            let parts: Vec<&str> = code_str.split(';').collect();
+            if parts.len() == 3 {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    parts[0].parse::<u8>(),
+                    parts[1].parse::<u8>(),
+                    parts[2].parse::<u8>(),
+                ) {
+                    return Color::Rgb(r, g, b);
+                }
+            }
+        }
+    }
+
+    // Try plain number (0-255) as 256-color index
+    if let Ok(code) = trimmed.parse::<u8>() {
+        return Color::Indexed(code);
+    }
+
+    Color::Reset
+}
+
 impl OwnedTheme {
     /// Creates an OwnedTheme from a built-in Theme by cloning the static strings.
     pub fn from_builtin(t: &Theme) -> Self {
@@ -231,6 +273,38 @@ impl OwnedTheme {
             Some(t) => Self::from_builtin(t),
             None => Self::from_builtin(default_theme()),
         }
+    }
+
+    // --- ratatui color accessors ---
+    pub fn header_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.header)
+    }
+    pub fn subtitle_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.subtitle)
+    }
+    pub fn feed_text_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.feed_text)
+    }
+    pub fn sidebar_text_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.sidebar_text)
+    }
+    pub fn hint_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.hint)
+    }
+    pub fn dim_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.dim)
+    }
+    pub fn accent_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.accent)
+    }
+    pub fn border_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.border)
+    }
+    pub fn error_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.error)
+    }
+    pub fn success_color(&self) -> ratatui::style::Color {
+        ansi_to_ratatui_color(&self.success)
     }
 }
 

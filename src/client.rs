@@ -31,12 +31,19 @@ use base64::{self, engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use crossterm::cursor::MoveTo;
+use crossterm::event::{self as crossterm_event, Event, KeyCode, KeyEventKind, KeyModifiers, EnableMouseCapture, DisableMouseCapture};
 use crossterm::execute;
-use crossterm::terminal::{size as term_size, Clear, ClearType};
+use crossterm::terminal::{size as term_size, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Terminal;
 use rand::RngCore;
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
-use tokio::io::{AsyncBufReadExt, BufReader};
+// BufReader and AsyncBufReadExt no longer needed - stdin handled via crossterm events
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -54,16 +61,24 @@ const INVALID_UTF8_PLACEHOLDER: &str = "[Invalid UTF-8]";
 const HELP_TEXT: &str = "Available commands: /commands [filter], /help [command], /join, /switch, /dm, /typing [on|off] [#channel|dm:user], /status [presence|text], /theme [name|list], /emoji [on|off|list [query]], /image <path>, /video <path>, /me, /users, /channels, /voice [room], /history [channel] [window], /search <query>, /replay <timestamp>, /rewind <Ns|Nm|Nh|Nd> [limit], /fingerprint [user], /trust <user> <fingerprint>, /clear, /edit [#N] <new text>, /quit";
 const RETRO_MIN_WIDTH: usize = 72;
 const RETRO_MIN_HEIGHT: usize = 18;
+#[allow(dead_code)]
 const DASHBOARD_HEADER_ROWS: usize = 2;
+#[allow(dead_code)]
 const DASHBOARD_FOOTER_ROWS: usize = 1;
+#[allow(dead_code)]
 const DASHBOARD_GUTTER_WIDTH: usize = 3;
+#[allow(dead_code)]
 const SIDEBAR_RATIO_PERCENT: usize = 34;
+#[allow(dead_code)]
 const SIDEBAR_MIN_WIDTH: usize = 28;
+#[allow(dead_code)]
 const SIDEBAR_MAX_WIDTH: usize = 46;
+#[allow(dead_code)]
 const MAIN_MIN_WIDTH: usize = 24;
 const FEED_LOOKBACK_MESSAGES: usize = 48;
 const PROFILE_PANEL_ROWS: usize = 8;
 const COMMANDS_PANEL_ROWS: usize = 6;
+#[allow(dead_code)]
 const MIN_CHANNEL_PANEL_ROWS: usize = 3;
 const TRUST_STORE_FILENAME: &str = "trust-store-v1.json";
 const TRUST_STORE_DIR_WINDOWS: &str = "Chatify";
@@ -73,6 +88,7 @@ const CLIENT_ID_HEX_LEN: usize = 12;
 const CLIENT_ID_GROUP_SIZE: usize = 4;
 const DEFAULT_GUEST_PREFIX: &str = "guest";
 const DEFAULT_GUEST_SUFFIX_BYTES: usize = 3;
+#[allow(dead_code)]
 const COMPACT_MODE_HINT: &str = "compact mode: expand terminal for side panels";
 const DM_UNREAD_SCOPE_PREFIX: &str = "dm:";
 const ACTIVITY_PULSE_WINDOW_SECS: u64 = 12;
@@ -457,6 +473,548 @@ fn footer_hint_line(state: &ClientState, width: usize) -> String {
             .to_string()
     };
     fit_to_width(&raw, width)
+}
+
+// ---------------------------------------------------------------------------
+// ratatui UI rendering
+// ---------------------------------------------------------------------------
+
+/// Main UI rendering function called by `terminal.draw()`.
+fn ui(frame: &mut ratatui::Frame, state: &ClientState) {
+    let size = frame.size();
+
+    // Main layout: header(2) / body(rest) / footer(2)
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // header
+            Constraint::Min(6),   // body
+            Constraint::Length(2), // footer (hint + input)
+        ])
+        .split(size);
+
+    render_header_widget(frame, state, vertical[0]);
+
+    // Body: two-column if terminal is wide enough, else single column
+    if size.width as usize >= RETRO_MIN_WIDTH && size.height as usize >= RETRO_MIN_HEIGHT {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(66),
+                Constraint::Min(SIDEBAR_MIN_WIDTH as u16),
+            ])
+            .split(vertical[1]);
+
+        render_feed_widget(frame, state, body[0]);
+        render_sidebar_widget(frame, state, body[1]);
+    } else {
+        render_feed_widget(frame, state, vertical[1]);
+    }
+
+    render_footer_widget(frame, state, vertical[2]);
+}
+
+/// Renders the 2-line header with styled status chips.
+fn render_header_widget(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let now_str = chrono::Local::now().format("%H:%M").to_string();
+    let header_text = format!(
+        "// CHATIFY // {} {} {} {} {} {}",
+        status_chip("ONLINE", state.users.len()),
+        status_chip("CHANNELS", state.chs.len()),
+        status_chip("EVENTS", state.message_history.len()),
+        status_chip("UNREAD", state.unread_total()),
+        status_chip("TYPING", state.typing_count()),
+        status_chip("THEME", &state.theme.name),
+    );
+    let subtitle_text = format!(
+        "{} {} {} {} {} {}",
+        status_chip("ROOM", format!("#{}", state.ch)),
+        status_chip("VOICE", if state.voice_active { "ON" } else { "OFF" }),
+        status_chip("STATUS", format!("{} ({})", state.status.text, state.status.presence.as_str())),
+        status_chip("LIVE", state.live_activity_label()),
+        status_chip("CLIENT", &state.client_id),
+        status_chip("TIME", &now_str),
+    );
+
+    let header_line = Line::from(vec![
+        Span::styled(header_text, Style::default().fg(state.theme.header_color()).add_modifier(Modifier::BOLD)),
+    ]);
+    let subtitle_line = Line::from(vec![
+        Span::styled(subtitle_text, Style::default().fg(state.theme.dim_color())),
+    ]);
+
+    let header_widget = Paragraph::new(vec![header_line, subtitle_line]);
+    frame.render_widget(header_widget, area);
+}
+
+/// Renders the main message feed panel.
+fn render_feed_widget(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let inner_width = (area.width as usize).saturating_sub(2); // borders
+    let lines = collect_feed_line_spans(state, inner_width);
+
+    let total_lines = lines.len();
+    let viewable = (area.height as usize).saturating_sub(2); // borders
+    let max_scroll = total_lines.saturating_sub(viewable);
+    let scroll = state.scroll_offset.min(max_scroll);
+
+    let feed = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("GLOBAL_FEED")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(state.theme.border_color())),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
+
+    frame.render_widget(feed, area);
+}
+
+/// Renders the right sidebar with stacked panels.
+fn render_sidebar_widget(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.width < 4 || area.height < 6 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((PROFILE_PANEL_ROWS + 2) as u16),
+            Constraint::Length((COMMANDS_PANEL_ROWS + 2) as u16),
+            Constraint::Min(5),
+            Constraint::Min(5),
+        ])
+        .split(area);
+
+    render_profile_panel(frame, state, chunks[0]);
+    render_commands_panel(frame, state, chunks[1]);
+    render_roster_panel(frame, state, chunks[2]);
+    render_channel_panel(frame, state, chunks[3]);
+}
+
+/// Renders the profile sidebar panel.
+fn render_profile_panel(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+
+    let mut known_users: Vec<String> = state.users.keys().cloned().collect();
+    known_users.sort_unstable();
+    let (unknown, trusted, changed) = state.trust_counts_for_users(&known_users);
+    let typing_summary = state.typing_summary(2);
+
+    let lines = vec![
+        Line::from(format!("{} {} [{}]", state.status.avatar, state.me, state.client_id)),
+        Line::from(format!("status: {} ({})", state.status.text, state.status.presence.as_str())),
+        Line::from(format!("bio: {}", if state.status.bio.trim().is_empty() { "(none)" } else { state.status.bio.as_str() })),
+        Line::from(format!("channel: #{}", state.ch)),
+        Line::from(format!("voice: {}", if state.voice_active { "ON" } else { "OFF" })),
+        Line::from(format!("trust T:{} U:{} C:{}", trusted, unknown, changed)),
+        Line::from(format!("unread:{} (dm:{})", state.unread_total(), state.unread_dm_total())),
+        Line::from(format!("typing: {}", typing_summary)),
+    ];
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("PROFILE")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(state.theme.border_color())),
+        );
+    frame.render_widget(panel, area);
+}
+
+/// Renders the quick commands sidebar panel.
+fn render_commands_panel(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+
+    let lines = vec![
+        Line::from("/commands [filter]"),
+        Line::from("/help [command]"),
+        Line::from("/join <channel> /switch"),
+        Line::from("/dm <user> <msg>"),
+        Line::from("/status [presence] [text]"),
+        Line::from("/theme [name|list]"),
+    ];
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("QUICK ACTIONS")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(state.theme.border_color())),
+        );
+    frame.render_widget(panel, area);
+}
+
+/// Renders the online roster sidebar panel.
+fn render_roster_panel(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+
+    let mut online_users: Vec<String> = state.users.keys().cloned().collect();
+    online_users.sort_unstable();
+    let typing_users = state.active_typing_users();
+
+    let lines: Vec<Line> = if online_users.is_empty() {
+        vec![
+            Line::from("No peers online yet."),
+            Line::from("Use /users to refresh."),
+        ]
+    } else {
+        online_users
+            .into_iter()
+            .map(|u| {
+                if typing_users.contains(&u) {
+                    Line::from(vec![
+                        Span::raw(format!("• {} ", u)),
+                        Span::styled("(typing)", Style::default().fg(state.theme.accent_color()).add_modifier(Modifier::ITALIC)),
+                    ])
+                } else {
+                    Line::from(format!("• {}", u))
+                }
+            })
+            .collect()
+    };
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("LIVE ROSTER")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(state.theme.border_color())),
+        );
+    frame.render_widget(panel, area);
+}
+
+/// Renders the channel list sidebar panel.
+fn render_channel_panel(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+
+    let mut channels: Vec<String> = state.chs.keys().cloned().collect();
+    channels.sort_unstable();
+
+    let lines: Vec<Line> = if channels.is_empty() {
+        vec![
+            Line::from("No channels tracked yet."),
+            Line::from("Join: /join general"),
+        ]
+    } else {
+        channels
+            .into_iter()
+            .map(|ch| {
+                let unread = state.unread_for_channel(&ch);
+                let is_active = ch == state.ch;
+                if is_active {
+                    let mut spans = vec![
+                        Span::styled("* ", Style::default().fg(state.theme.accent_color()).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("#{}", ch), Style::default().fg(state.theme.accent_color()).add_modifier(Modifier::BOLD)),
+                    ];
+                    if unread > 0 {
+                        spans.push(Span::styled(
+                            format!(" [{}]", unread),
+                            Style::default().fg(state.theme.error_color()).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    Line::from(spans)
+                } else if unread > 0 {
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::raw(format!("#{}", ch)),
+                        Span::styled(
+                            format!(" [{}]", unread),
+                            Style::default().fg(state.theme.error_color()).add_modifier(Modifier::BOLD),
+                        ),
+                    ])
+                } else {
+                    Line::from(format!("  #{}", ch))
+                }
+            })
+            .collect()
+    };
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("CHANNEL DOCK")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(state.theme.border_color())),
+        );
+    frame.render_widget(panel, area);
+}
+
+/// Renders the footer with hint line and input buffer + cursor.
+fn render_footer_widget(frame: &mut ratatui::Frame, state: &ClientState, area: Rect) {
+    if area.height == 0 || area.width < 3 {
+        return;
+    }
+
+    let hint_text = footer_hint_line(state, area.width as usize);
+
+    // Split footer area into hint line and input line
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Hint line
+    let hint = Paragraph::new(Line::from(vec![
+        Span::styled(hint_text, Style::default().fg(state.theme.dim_color())),
+    ]));
+    frame.render_widget(hint, chunks[0]);
+
+    // Input line
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("> ", Style::default().fg(state.theme.hint_color())),
+        Span::styled(&state.input_buffer, Style::default().fg(state.theme.hint_color())),
+    ]));
+    frame.render_widget(footer, chunks[1]);
+
+    // Position the cursor after the input text
+    let cursor_x = chunks[1].x + 2 + (state.input_cursor.min(state.input_buffer.len())) as u16;
+    if cursor_x < chunks[1].x + chunks[1].width {
+        frame.set_cursor(cursor_x.min(chunks[1].x + chunks[1].width - 1), chunks[1].y);
+    }
+}
+
+/// Converts message history into styled `Line` spans for the feed widget.
+fn collect_feed_line_spans(state: &ClientState, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let lookback = state.message_history.len().saturating_sub(FEED_LOOKBACK_MESSAGES);
+    let messages: Vec<&DisplayedMessage> = state.message_history.iter().skip(lookback).collect();
+
+    if messages.is_empty() {
+        return vec![
+            Line::from(Span::styled(
+                "No messages yet in this room.",
+                Style::default().fg(state.theme.dim_color()),
+            )),
+            Line::from(Span::styled(
+                "Start with a hello or switch rooms using /join <channel>.",
+                Style::default().fg(state.theme.dim_color()),
+            )),
+            Line::from(Span::styled(
+                "Tip: use /commands to discover power actions quickly.",
+                Style::default().fg(state.theme.dim_color()),
+            )),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    let mut current_group: Option<(String, String)> = None;
+    let enable_md = state.config.ui.enable_markdown;
+    let enable_syntax = state.config.ui.enable_syntax_highlighting;
+    let dim_style = Style::default().fg(state.theme.dim_color());
+    let feed_style = Style::default().fg(state.theme.feed_text_color());
+
+    for msg in &messages {
+        match msg.msg_type {
+            MessageType::Msg | MessageType::Dm => {
+                let user = msg.user.as_deref().unwrap_or("?");
+                let channel = msg.channel.as_deref().unwrap_or("general");
+                let key = (user.to_string(), channel.to_string());
+                let group_started = current_group.as_ref() != Some(&key);
+
+                if group_started {
+                    let header = format!("[{}] {}  #{}", msg.time, user, channel);
+                    lines.push(Line::from(vec![
+                        Span::styled(header, dim_style),
+                    ]));
+                }
+
+                let suffix = if msg.edited { " (edited)" } else { "" };
+                let display_text = format!("{}{}", msg.text, suffix);
+                let styled_text = render_markdown(&display_text, enable_md, enable_syntax);
+
+                let prefix = if group_started { "  > " } else { "    " };
+                let prefix_width = prefix.len();
+                let content_width = width.saturating_sub(prefix_width).max(1);
+                let wrapped = wrap_words(&styled_text, content_width, 200);
+
+                for (i, wline) in wrapped.iter().enumerate() {
+                    let p = if i == 0 { prefix } else { "    " };
+                    lines.push(Line::from(vec![
+                        Span::styled(p.to_string(), dim_style),
+                        Span::styled(wline.clone(), feed_style),
+                    ]));
+                }
+
+                current_group = Some(key);
+            }
+            MessageType::Img | MessageType::Audio => {
+                let user = msg.user.as_deref().unwrap_or("?");
+                let label = if msg.msg_type == MessageType::Img { "IMG" } else { "AUDIO" };
+                let header = format!("[{}] {} {} ", msg.time, label, user);
+                let header_len = header.len();
+
+                for (i, raw_line) in msg.text.lines().enumerate() {
+                    let marker = if i == 0 { header.as_str() } else { &" ".repeat(header_len) };
+                    let content_width = width.saturating_sub(marker.len()).max(1);
+                    let clipped = truncate_with_ellipsis(raw_line, content_width);
+                    lines.push(Line::from(vec![
+                        Span::styled(marker.to_string(), dim_style),
+                        Span::styled(clipped, feed_style),
+                    ]));
+                }
+                current_group = None;
+            }
+            _ => {
+                let entry = format_feed_entry(msg);
+                let wrapped = wrap_words(&entry, width, 200);
+                for wline in wrapped {
+                    lines.push(Line::from(Span::styled(wline, feed_style)));
+                }
+                current_group = None;
+            }
+        }
+    }
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard and mouse event handlers
+// ---------------------------------------------------------------------------
+
+/// Handles keyboard events for the TUI.
+fn handle_key_event(state: &mut ClientState, key: crossterm::event::KeyEvent) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.running = false;
+        }
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.needs_redraw = true;
+        }
+        KeyCode::Enter => {
+            let line = state.input_buffer.trim().to_string();
+            state.command_history.push(line.clone());
+            state.history_index = None;
+            state.input_buffer.clear();
+            state.input_cursor = 0;
+            state.scroll_offset = 0;
+
+            if !line.is_empty() {
+                if line.starts_with('/') {
+                    // Store for processing: keep in input_buffer as sentinel
+                    state.input_buffer = line;
+                } else {
+                    let channel = state.ch.clone();
+                    queue_channel_message(state, &channel, &line);
+                    state.input_buffer.clear();
+                }
+            }
+            state.needs_redraw = true;
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input_buffer.insert(state.input_cursor, c);
+            state.input_cursor += 1;
+            state.needs_redraw = true;
+        }
+        KeyCode::Backspace => {
+            if state.input_cursor > 0 {
+                state.input_buffer.remove(state.input_cursor - 1);
+                state.input_cursor -= 1;
+                state.needs_redraw = true;
+            }
+        }
+        KeyCode::Delete => {
+            if state.input_cursor < state.input_buffer.len() {
+                state.input_buffer.remove(state.input_cursor);
+                state.needs_redraw = true;
+            }
+        }
+        KeyCode::Left => {
+            if state.input_cursor > 0 {
+                state.input_cursor -= 1;
+                state.needs_redraw = true;
+            }
+        }
+        KeyCode::Right => {
+            if state.input_cursor < state.input_buffer.len() {
+                state.input_cursor += 1;
+                state.needs_redraw = true;
+            }
+        }
+        KeyCode::Up => {
+            if !state.command_history.is_empty() {
+                let idx = state.history_index.unwrap_or(state.command_history.len());
+                if idx > 0 {
+                    state.history_index = Some(idx - 1);
+                    state.input_buffer = state.command_history[idx - 1].clone();
+                    state.input_cursor = state.input_buffer.len();
+                    state.needs_redraw = true;
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let Some(idx) = state.history_index {
+                if idx + 1 < state.command_history.len() {
+                    state.history_index = Some(idx + 1);
+                    state.input_buffer = state.command_history[idx + 1].clone();
+                } else {
+                    state.history_index = None;
+                    state.input_buffer.clear();
+                }
+                state.input_cursor = state.input_buffer.len();
+                state.needs_redraw = true;
+            }
+        }
+        KeyCode::PageUp => {
+            state.scroll_offset = state.scroll_offset.saturating_add(10);
+            state.needs_redraw = true;
+        }
+        KeyCode::PageDown => {
+            state.scroll_offset = state.scroll_offset.saturating_sub(10);
+            state.needs_redraw = true;
+        }
+        KeyCode::Home => {
+            state.input_cursor = 0;
+            state.needs_redraw = true;
+        }
+        KeyCode::End => {
+            state.input_cursor = state.input_buffer.len();
+            state.needs_redraw = true;
+        }
+        _ => {}
+    }
+}
+
+/// Handles mouse events for the TUI (scroll wheel).
+fn handle_mouse_event(state: &mut ClientState, mouse: crossterm::event::MouseEvent) {
+    match mouse.kind {
+        crossterm::event::MouseEventKind::ScrollUp => {
+            state.scroll_offset = state.scroll_offset.saturating_add(3);
+            state.needs_redraw = true;
+        }
+        crossterm::event::MouseEventKind::ScrollDown => {
+            state.scroll_offset = state.scroll_offset.saturating_sub(3);
+            state.needs_redraw = true;
+        }
+        _ => {}
+    }
 }
 
 type SharedState = Arc<tokio::sync::Mutex<ClientState>>;
@@ -1072,6 +1630,22 @@ struct ClientState {
     voice_speaking: bool,
     /// Whether rich media rendering is enabled
     media_enabled: bool,
+    /// Current input buffer for the command line
+    input_buffer: String,
+    /// Cursor position within the input buffer
+    input_cursor: usize,
+    /// Command history for up/down arrow navigation
+    command_history: Vec<String>,
+    /// Current index into command history (None = at live input)
+    history_index: Option<usize>,
+    /// Scroll offset for the message feed (0 = bottom/latest)
+    scroll_offset: usize,
+    /// Cached header line (avoids recomputing per frame)
+    cached_header: String,
+    /// Cached subtitle line
+    cached_subtitle: String,
+    /// Dirty flag: set true when state changes, cleared after draw
+    needs_redraw: bool,
 }
 
 impl ClientState {
@@ -1350,7 +1924,8 @@ impl ClientState {
     }
 
     fn refresh_dashboard(&self) {
-        let _ = render_terminal_dashboard(self);
+        // Rendering is now handled by the ratatui main loop.
+        // This is intentionally a no-op to avoid interfering with terminal state.
     }
 
     fn add_message(&mut self, msg: DisplayedMessage) {
@@ -1766,7 +2341,7 @@ fn queue_media_upload(
 
 /// Normalize channel name to match server rules.
 fn normalize_channel(raw: &str) -> Option<String> {
-    clicord_server::normalize_channel(raw)
+    clifford::normalize_channel(raw)
 }
 
 fn is_valid_username_token(name: &str) -> bool {
@@ -1990,7 +2565,7 @@ fn ts_value(v: &serde_json::Value) -> u64 {
 }
 
 fn now_secs() -> u64 {
-    clicord_server::now_secs()
+    clifford::now_secs()
 }
 
 fn truncate_with_ellipsis(input: &str, width: usize) -> String {
@@ -2030,6 +2605,7 @@ fn truncate_with_ellipsis(input: &str, width: usize) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn fit_to_width(input: &str, width: usize) -> String {
     let clipped = truncate_with_ellipsis(input, width);
     let clipped_len = visible_width(&clipped);
@@ -2092,6 +2668,7 @@ fn wrap_words(input: &str, width: usize, max_lines: usize) -> Vec<String> {
     }
 }
 
+#[allow(dead_code)]
 fn build_panel(title: &str, lines: &[String], width: usize, height: usize) -> Vec<String> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -2144,6 +2721,7 @@ fn format_feed_entry(msg: &DisplayedMessage) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn feed_empty_state_lines() -> Vec<String> {
     vec![
         "No messages yet in this room.".to_string(),
@@ -2152,6 +2730,7 @@ fn feed_empty_state_lines() -> Vec<String> {
     ]
 }
 
+#[allow(dead_code)]
 fn prefixed_wrapped_lines(prefix: &str, text: &str, width: usize, max_lines: usize) -> Vec<String> {
     if width == 0 || max_lines == 0 {
         return Vec::new();
@@ -2165,6 +2744,7 @@ fn prefixed_wrapped_lines(prefix: &str, text: &str, width: usize, max_lines: usi
         .collect()
 }
 
+#[allow(dead_code)]
 fn prefixed_preformatted_lines(
     prefix: &str,
     text: &str,
@@ -2197,6 +2777,7 @@ fn prefixed_preformatted_lines(
     output
 }
 
+#[allow(dead_code)]
 fn render_grouped_feed_lines<'a, I>(
     messages: I,
     width: usize,
@@ -2272,6 +2853,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 fn collect_recent_feed_lines(state: &ClientState, width: usize, max_lines: usize) -> Vec<String> {
     if width == 0 || max_lines == 0 {
         return Vec::new();
@@ -2300,6 +2882,7 @@ fn collect_recent_feed_lines(state: &ClientState, width: usize, max_lines: usize
     }
 }
 
+#[allow(dead_code)]
 fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<String> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -2455,6 +3038,7 @@ fn build_right_column(state: &ClientState, width: usize, height: usize) -> Vec<S
     out
 }
 
+#[allow(dead_code)]
 fn render_compact_dashboard(
     out: &mut io::Stdout,
     state: &ClientState,
@@ -2492,6 +3076,7 @@ fn render_compact_dashboard(
     )
 }
 
+#[allow(dead_code)]
 fn render_full_dashboard(
     out: &mut io::Stdout,
     state: &ClientState,
@@ -2549,6 +3134,7 @@ fn render_full_dashboard(
     )
 }
 
+#[allow(dead_code)]
 fn render_terminal_dashboard(state: &ClientState) -> io::Result<()> {
     let (w, h) = term_size().unwrap_or((120, 36));
     let width = usize::from(w);
@@ -2570,6 +3156,7 @@ fn status_chip(label: &str, value: impl std::fmt::Display) -> String {
     format!("[{}:{}]", label, value)
 }
 
+#[allow(dead_code)]
 fn dashboard_header_lines(state: &ClientState) -> (String, String) {
     let mut known_users: Vec<String> = state.users.keys().cloned().collect();
     known_users.sort_unstable();
@@ -2607,7 +3194,7 @@ fn dashboard_header_lines(state: &ClientState) -> (String, String) {
 }
 
 fn fresh_nonce_hex() -> String {
-    clicord_server::fresh_nonce_hex()
+    clifford::fresh_nonce_hex()
 }
 
 fn generate_guest_username() -> String {
@@ -5023,6 +5610,14 @@ async fn main() -> ChatifyResult<()> {
             voice_deafened: false,
             voice_speaking: false,
             media_enabled,
+            input_buffer: String::new(),
+            input_cursor: 0,
+            command_history: Vec::new(),
+            history_index: None,
+            scroll_offset: 0,
+            cached_header: String::new(),
+            cached_subtitle: String::new(),
+            needs_redraw: true,
         }));
         {
             let mut state_lock = state.lock().await;
@@ -5057,27 +5652,46 @@ async fn main() -> ChatifyResult<()> {
             }
         }
 
-        // Spawn tasks for reading from WebSocket and from stdin
-        // and coordinate shutdown so either side can terminate the other.
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Initialize terminal for TUI
+        enable_raw_mode().map_err(|e| ChatifyError::Validation(format!("raw mode: {}", e)))?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+            .map_err(|e| ChatifyError::Validation(format!("terminal setup: {}", e)))?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)
+            .map_err(|e| ChatifyError::Validation(format!("terminal create: {}", e)))?;
+        terminal.clear()?;
+
+        // Spawn WebSocket receiver task
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let state_clone = state.clone();
         let shutdown_tx_rx = shutdown_tx.clone();
-        let mut rx_task = tokio::spawn(async move {
+        let rx_task = tokio::spawn(async move {
             loop {
-                let msg = match ws_rx.next().await {
-                    Some(Ok(msg)) => msg,
-                    Some(Err(e)) => {
-                        let mut state = state_clone.lock().await;
-                        state.log("WARN", &format!("WebSocket receive error: {}", e));
-                        state.add_notice(format!("WebSocket receive error: {}", e));
-                        break;
+                let msg = tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_ok() && *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
                     }
-                    None => {
-                        let mut state = state_clone.lock().await;
-                        state.log("INFO", "Disconnected: server closed connection");
-                        state.add_notice("Disconnected: server closed connection");
-                        break;
+                    msg_result = ws_rx.next() => {
+                        match msg_result {
+                            Some(Ok(msg)) => msg,
+                            Some(Err(e)) => {
+                                let mut state = state_clone.lock().await;
+                                state.log("WARN", &format!("WebSocket receive error: {}", e));
+                                state.add_notice(format!("WebSocket receive error: {}", e));
+                                break;
+                            }
+                            None => {
+                                let mut state = state_clone.lock().await;
+                                state.log("INFO", "Disconnected: server closed connection");
+                                state.add_notice("Disconnected: server closed connection");
+                                break;
+                            }
+                        }
                     }
                 };
 
@@ -5094,72 +5708,71 @@ async fn main() -> ChatifyResult<()> {
             let _ = shutdown_tx_rx.send(true);
         });
 
-        let state_clone2 = state.clone();
-        let shutdown_tx_stdin = shutdown_tx.clone();
-        let mut shutdown_rx_stdin = shutdown_rx.clone();
-        let mut stdin_task = tokio::spawn(async move {
-            let stdin = BufReader::new(tokio::io::stdin());
-            let mut lines = stdin.lines();
-            loop {
-                let line = tokio::select! {
-                    changed = shutdown_rx_stdin.changed() => {
-                        if changed.is_ok() && *shutdown_rx_stdin.borrow() {
-                            break;
-                        }
-                        continue;
-                    }
-                    line_result = lines.next_line() => {
-                        match line_result {
-                            Ok(Some(line)) => line,
-                            Ok(None) => break,
-                            Err(e) => {
-                                let mut state = state_clone2.lock().await;
-                                state.log("WARN", &format!("stdin read error: {}", e));
-                                state.add_notice(format!("stdin read error: {}", e));
+        // TUI event loop: poll for crossterm events and draw
+        let shutdown_tx_event = shutdown_tx.clone();
+        loop {
+            // Draw the UI
+            {
+                let s = state.lock().await;
+                if !s.running {
+                    break;
+                }
+                terminal.draw(|frame| ui(frame, &s))?;
+            }
+
+            // Poll for terminal events (50ms tick for clock/updates)
+            if crossterm_event::poll(Duration::from_millis(50))? {
+                match crossterm_event::read()? {
+                    Event::Key(key) => {
+                        let mut s = state.lock().await;
+                        handle_key_event(&mut s, key);
+
+                        // Process pending slash commands from handle_key_event
+                        if s.input_buffer.starts_with('/') {
+                            let cmd_line = s.input_buffer.clone();
+                            s.input_buffer.clear();
+                            s.input_cursor = 0;
+
+                            let mut parts = cmd_line.trim().splitn(2, ' ');
+                            let cmd = parts.next().unwrap_or("");
+                            let args = parts.next().unwrap_or("");
+                            if matches!(
+                                handle_slash_command(&mut s, cmd, args, &shutdown_tx_event),
+                                CommandFlow::Exit
+                            ) {
                                 break;
                             }
                         }
                     }
-                };
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if line.starts_with('/') {
-                    // Handle commands
-                    let mut parts = line.splitn(2, ' ');
-                    let cmd = parts.next().unwrap_or("");
-                    let args = parts.next().unwrap_or("");
-
-                    let mut state = state_clone2.lock().await;
-                    if matches!(
-                        handle_slash_command(&mut state, cmd, args, &shutdown_tx_stdin),
-                        CommandFlow::Exit
-                    ) {
-                        break;
+                    Event::Mouse(mouse) => {
+                        let mut s = state.lock().await;
+                        handle_mouse_event(&mut s, mouse);
                     }
-                } else {
-                    // Send as a regular message
-                    let mut state = state_clone2.lock().await;
-                    let channel = state.ch.clone();
-                    queue_channel_message(&mut state, &channel, line);
+                    Event::Resize(_, _) => {
+                        // ratatui handles resize on next draw
+                    }
+                    _ => {}
                 }
             }
-        });
 
-        tokio::select! {
-            _ = &mut rx_task => {
-                let _ = shutdown_tx.send(true);
-                stdin_task.abort();
-            }
-            _ = &mut stdin_task => {
-                let _ = shutdown_tx.send(true);
-                rx_task.abort();
+            // Check if WebSocket task finished
+            if rx_task.is_finished() {
+                break;
             }
         }
 
-        let _ = rx_task.await;
-        let _ = stdin_task.await;
+        // Cancel rx task if still running
+        rx_task.abort();
+        let _ = shutdown_tx.send(true);
+
+        // Restore terminal
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
 
         let (ws_tx_cleanup, voice_to_stop) = {
             let mut state = state.lock().await;
@@ -5242,6 +5855,14 @@ mod tests {
             voice_deafened: false,
             voice_speaking: false,
             media_enabled: true,
+            input_buffer: String::new(),
+            input_cursor: 0,
+            command_history: Vec::new(),
+            history_index: None,
+            scroll_offset: 0,
+            cached_header: String::new(),
+            cached_subtitle: String::new(),
+            needs_redraw: true,
         };
         (tx, state)
     }

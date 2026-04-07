@@ -1,51 +1,51 @@
-//! # `clicord-server` — WebSocket Chat Server
+﻿//! # `clicord-server` â€” WebSocket Chat Server
 //!
 //! A single-binary, async WebSocket server built on [Tokio] and
 //! [tokio-tungstenite]. It provides:
 //!
-//! * **Authentication** — first-frame auth with username/password-hash and an
+//! * **Authentication** â€” first-frame auth with username/password-hash and an
 //!   Ed25519 public key for E2E-encrypted DMs.
-//! * **2-Factor Authentication** — TOTP (RFC 6238) and single-use backup codes,
+//! * **2-Factor Authentication** â€” TOTP (RFC 6238) and single-use backup codes,
 //!   stored in SQLite.
-//! * **Channel messaging** — broadcast channels with a bounded in-memory ring
+//! * **Channel messaging** â€” broadcast channels with a bounded in-memory ring
 //!   buffer and a durable SQLite event store.
-//! * **Direct messages** — per-user DM channels keyed `__dm__<username>`.
-//! * **Voice rooms** — low-latency audio relay via per-room broadcast channels.
-//! * **Search & history** — full-text LIKE search and time-window ("rewind")
+//! * **Direct messages** â€” per-user DM channels keyed `__dm__<username>`.
+//! * **Voice rooms** â€” low-latency audio relay via per-room broadcast channels.
+//! * **Search & history** â€” full-text LIKE search and time-window ("rewind")
 //!   queries backed by SQLite.
-//! * **Protocol safety** — payload size gates, timestamp-skew validation, and
+//! * **Protocol safety** â€” payload size gates, timestamp-skew validation, and
 //!   nonce-based replay protection on mutating events.
-//! * **Graceful shutdown** — Ctrl+C drains active connections before exiting,
+//! * **Graceful shutdown** â€” Ctrl+C drains active connections before exiting,
 //!   with a bounded timeout.
 //!
 //! ## Architecture Overview
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────┐
-//! │                   Tokio Runtime                      │
-//! │                                                      │
-//! │  TcpListener::accept()                               │
-//! │       │                                              │
-//! │       └─► tokio::spawn( handle(stream, addr, state) )│
-//! │                 │                                    │
-//! │        ┌────────▼─────────┐                          │
-//! │        │  WebSocket auth  │  ← validates first frame  │
-//! │        └────────┬─────────┘                          │
-//! │                 │                                    │
-//! │       ┌─────────▼──────────┐                         │
-//! │       │  Message recv loop  │                        │
-//! │       │  handle_event(...)  │                        │
-//! │       └─────────┬──────────┘                         │
-//! │                 │                                    │
-//! │   mpsc::unbounded ──► sink writer task               │
-//! └─────────────────────────────────────────────────────┘
+//! â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+//! â”‚                   Tokio Runtime                      â”‚
+//! â”‚                                                      â”‚
+//! â”‚  TcpListener::accept()                               â”‚
+//! â”‚       â”‚                                              â”‚
+//! â”‚       â””â”€â–º tokio::spawn( handle(stream, addr, state) )â”‚
+//! â”‚                 â”‚                                    â”‚
+//! â”‚        â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”                          â”‚
+//! â”‚        â”‚  WebSocket auth  â”‚  â† validates first frame  â”‚
+//! â”‚        â””â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                          â”‚
+//! â”‚                 â”‚                                    â”‚
+//! â”‚       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”                         â”‚
+//! â”‚       â”‚  Message recv loop  â”‚                        â”‚
+//! â”‚       â”‚  handle_event(...)  â”‚                        â”‚
+//! â”‚       â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                         â”‚
+//! â”‚                 â”‚                                    â”‚
+//! â”‚   mpsc::unbounded â”€â”€â–º sink writer task               â”‚
+//! â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 //!
 //! Shared State (Arc<State>)
-//!   ├── channels   : DashMap<String, Channel>
-//!   ├── voice      : DashMap<String, broadcast::Sender>
-//!   ├── user_statuses / user_pubkeys  : DashMap
-//!   ├── recent_nonces : DashMap<String, VecDeque<String>>
-//!   └── store      : EventStore  ──► SQLite file
+//!   â”œâ”€â”€ channels   : DashMap<String, Channel>
+//!   â”œâ”€â”€ voice      : DashMap<String, broadcast::Sender>
+//!   â”œâ”€â”€ user_statuses / user_pubkeys  : DashMap
+//!   â”œâ”€â”€ recent_nonces : DashMap<String, VecDeque<String>>
+//!   â””â”€â”€ store      : EventStore  â”€â”€â–º SQLite file
 //! ```
 //!
 //! ## Configuration
@@ -77,8 +77,8 @@ use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
 use clifford::crypto;
 use clifford::error::{ChatifyError, ChatifyResult};
-use clifford::performance::{Metrics, MessageCache};
-use clifford::voice::VoiceRelay;
+use clifford::performance::{Metrics, VecCache};
+use clifford::voice::{VoiceRelay, relay::VoiceBroadcast};
 use clifford::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
@@ -202,6 +202,20 @@ const DEFAULT_REWIND_SECONDS: u64 = 3600;
 /// Default number of events returned by a `rewind` request.
 const DEFAULT_REWIND_LIMIT: usize = 100;
 
+/// DM channel name prefix - avoids repeated format!() calls.
+const DM_CHANNEL_PREFIX: &str = "__dm__";
+
+/// Maximum events to batch before flushing to DB (batch-writes feature).
+const BATCH_SIZE: usize = 100;
+
+/// Maximum time to wait before flushing a partial batch (ms, batch-writes feature).
+const BATCH_FLUSH_MS: u64 = 10;
+
+/// Creates a DM channel name for a given user.
+fn dm_channel_name(user: &str) -> String {
+    format!("{}{}", DM_CHANNEL_PREFIX, user)
+}
+
 /// WebSocket sub-protocol version advertised in the `"ok"` auth response.
 /// Clients can use this to detect incompatible server versions.
 const PROTOCOL_VERSION: u64 = 1;
@@ -218,7 +232,7 @@ const MAX_PASSWORD_FIELD_LEN: usize = 256;
 const MAX_PUBLIC_KEY_FIELD_LEN: usize = 256;
 
 /// Allowed clock skew in seconds between the client-supplied `"ts"` timestamp
-/// and the server's wall clock. A window of ±300 s accommodates clients with
+/// and the server's wall clock. A window of Â±300 s accommodates clients with
 /// moderately drifted clocks while still preventing stale-message replay.
 const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
 
@@ -234,13 +248,13 @@ const MAX_NONCE_LEN: usize = 64;
 const NONCE_CACHE_CAP: usize = 256;
 
 /// How often the nonce cleanup task runs (seconds).
-/// The sweep is cheap — it only iterates `nonce_last_seen`, which has at most
+/// The sweep is cheap â€” it only iterates `nonce_last_seen`, which has at most
 /// one entry per connected user.
 const NONCE_CLEANUP_INTERVAL_SECS: u64 = 60;
 
 /// Age threshold for nonce eviction (seconds).
 /// Users whose nonce cache has not been updated within this window are removed.
-/// Set to 2× the clock-skew window: any frame older than `MAX_CLOCK_SKEW_SECS`
+/// Set to 2Ã— the clock-skew window: any frame older than `MAX_CLOCK_SKEW_SECS`
 /// is already rejected by `validate_timestamp_skew`, so the extra margin is
 /// pure safety against clock jitter.
 const NONCE_MAX_AGE_SECS: f64 = MAX_CLOCK_SKEW_SECS * 2.0;
@@ -251,7 +265,7 @@ const MAX_CONNECTIONS_PER_IP: usize = 5;
 
 /// Minimum interval in seconds between auth attempts from the same IP.
 /// Attempts within this window are rejected to slow brute-force attacks.
-/// Set to 0.5s — enough to throttle automated tools while allowing
+/// Set to 0.5s â€” enough to throttle automated tools while allowing
 /// rapid legitimate connections (e.g. from integration tests).
 const AUTH_RATE_LIMIT_SECS: f64 = 0.5;
 
@@ -280,14 +294,14 @@ const MAX_STATUS_EMOJI_LEN: usize = 16;
 /// Validated, strongly-typed representation of a successful auth frame parse.
 ///
 /// Created by [`validate_auth_payload`] after all field-level validation
-/// passes. Using a typed struct here — rather than passing `&Value` through
-/// downstream functions — makes it impossible to accidentally skip validation
+/// passes. Using a typed struct here â€” rather than passing `&Value` through
+/// downstream functions â€” makes it impossible to accidentally skip validation
 /// or misread a field name.
 struct AuthInfo {
-    /// Validated username (ASCII alphanumeric / `-` / `_`, ≤ 32 chars).
+    /// Validated username (ASCII alphanumeric / `-` / `_`, â‰¤ 32 chars).
     username: String,
 
-    /// Password hash submitted by the client (non-empty, ≤ 256 chars).
+    /// Password hash submitted by the client (non-empty, â‰¤ 256 chars).
     /// Used for credential verification against the stored hash.
     pw_hash: String,
 
@@ -317,77 +331,218 @@ struct AuthInfo {
 }
 
 // ---------------------------------------------------------------------------
-// EventStore — SQLite persistence layer
+// Write Queue — Batched DB writes for high-throughput scenarios
+// Only used when `batch-writes` feature is enabled
 // ---------------------------------------------------------------------------
 
-/// Thin wrapper around a SQLite file that handles schema migration, event
-/// persistence, and read queries.
-///
-/// All methods open a *new* connection for each call (`open_conn`). This
-/// avoids holding a connection across `await` points, which is unsound with
-/// the single-threaded `rusqlite` connection type. The trade-off is connection
-/// overhead; for a chat server at this scale the overhead is negligible.
-///
-/// When `encryption_key` is `Some`, the `payload` and `search_text` columns
-/// are encrypted with ChaCha20-Poly1305 before writing and decrypted on read.
-/// This protects data at rest — an attacker who obtains the `.db` file cannot
-/// read the chat history without the key. The key is 32 bytes (256 bits) and
-/// is never stored in the database itself.
-///
-/// Cloning an `EventStore` is cheap — it only duplicates the path and key.
+#[cfg(feature = "batch-writes")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "batch-writes")]
+use std::sync::Arc as StdArc;
+
+#[cfg(feature = "batch-writes")]
+struct EventRow {
+    event_type: String,
+    channel: String,
+    sender: String,
+    target: Option<String>,
+    payload: String,
+    search_text: String,
+    ts: f64,
+}
+
+#[cfg(feature = "batch-writes")]
+struct WriteQueue {
+    pool: DbPool,
+    rows: parking_lot::Mutex<Vec<EventRow>>,
+    shutdown: AtomicBool,
+    flush_count: AtomicUsize,
+}
+
+#[cfg(feature = "batch-writes")]
+impl WriteQueue {
+    fn new(pool: DbPool) -> Self {
+        Self {
+            pool,
+            rows: parking_lot::Mutex::new(Vec::with_capacity(BATCH_SIZE)),
+            shutdown: AtomicBool::new(false),
+            flush_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, row: EventRow) {
+        let should_flush = {
+            let mut rows = self.rows.lock();
+            rows.push(row);
+            rows.len() >= BATCH_SIZE
+        };
+        if should_flush {
+            self.flush();
+        }
+    }
+
+    fn flush(&self) {
+        let rows: Vec<EventRow> = {
+            let mut rows_guard = self.rows.lock();
+            if rows_guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *rows_guard)
+        };
+        self.flush_rows(rows);
+    }
+
+    fn flush_rows(&self, rows: Vec<EventRow>) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(conn) = self.pool.pool.get().ok() {
+            if conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
+                for row in &rows {
+                    let _ = conn.execute(
+                        "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![row.ts, row.event_type, row.channel, row.sender, row.target, row.payload, row.search_text],
+                    );
+                }
+                let _ = conn.execute_batch("COMMIT");
+                self.flush_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn run(&self) {
+        let interval = std::time::Duration::from_millis(BATCH_FLUSH_MS);
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                self.flush();
+                break;
+            }
+            std::thread::sleep(interval);
+            self.flush();
+        }
+    }
+}
+
+#[cfg(feature = "batch-writes")]
+impl Drop for WriteQueue {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EventStore — SQLite persistence layer with connection pooling
+// ---------------------------------------------------------------------------
+
+const DB_POOL_SIZE: u32 = 8;
+const DB_POOL_MIN_IDLE: u32 = 2;
+const DB_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
+const DB_PRAGMAS: &str = "
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA cache_size = -2000;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA foreign_keys = ON;
+    PRAGMA mmap_size = 268435456;
+    PRAGMA page_size = 4096;
+";
+
 #[derive(Clone)]
-struct EventStore {
-    /// Absolute or relative path to the SQLite file (or `":memory:"`).
+struct PooledConnection {
+    #[allow(dead_code)]
     path: String,
-    /// Optional 32-byte encryption key for ChaCha20-Poly1305. `None` means
-    /// unencrypted (e.g. `:memory:` databases used in tests).
+    #[allow(dead_code)]
     encryption_key: Option<Vec<u8>>,
 }
 
-impl EventStore {
-    /// Creates a new `EventStore` pointing at `path` with an optional
-    /// encryption key and immediately runs [`init`](Self::init) to ensure
-    /// the schema is current.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the database cannot be opened or initialised. A server
-    /// running with a broken event store is worse than one that crashes
-    /// at startup — it silently loses data.
+impl PooledConnection {
     fn new(path: String, encryption_key: Option<Vec<u8>>) -> Self {
-        let store = Self {
+        Self {
             path,
             encryption_key,
-        };
+        }
+    }
+}
+
+impl r2d2::ManageConnection for PooledConnection {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let conn = Connection::open(&self.path)?;
+        if self.path != ":memory:" {
+            conn.execute_batch(DB_PRAGMAS)?;
+        } else {
+            conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        }
+        conn.set_prepared_statement_cache_capacity(100);
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        conn.execute_batch("SELECT 1")
+    }
+
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        !conn.is_autocommit()
+    }
+}
+
+#[derive(Clone)]
+struct DbPool {
+    #[allow(dead_code)]
+    path: String,
+    #[allow(dead_code)]
+    encryption_key: Option<Vec<u8>>,
+    pool: r2d2::Pool<PooledConnection>,
+}
+
+impl DbPool {
+    fn new(path: String, encryption_key: Option<Vec<u8>>) -> Result<Self, r2d2::Error> {
+        let manager = PooledConnection::new(path.clone(), encryption_key.clone());
+        let pool = r2d2::Pool::builder()
+            .max_size(DB_POOL_SIZE)
+            .min_idle(Some(DB_POOL_MIN_IDLE))
+            .idle_timeout(Some(std::time::Duration::from_secs(
+                DB_POOL_IDLE_TIMEOUT_SECS,
+            )))
+            .connection_timeout(std::time::Duration::from_secs(10))
+            .test_on_check_out(true)
+            .build(manager)?;
+        Ok(Self {
+            pool,
+            path,
+            encryption_key,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct EventStore {
+    pool: DbPool,
+    #[cfg(feature = "batch-writes")]
+    write_queue: Option<StdArc<WriteQueue>>,
+}
+
+impl EventStore {
+    fn new(path: String, encryption_key: Option<Vec<u8>>) -> Self {
+        let pool = DbPool::new(path.clone(), encryption_key.clone())
+            .expect("failed to create database pool");
+        #[cfg(feature = "batch-writes")]
+        let write_queue = Some(StdArc::new(WriteQueue::new(pool.clone())));
+        let store = Self { pool, #[cfg(feature = "batch-writes")] write_queue };
         store.init().expect("failed to initialise event store — check database path, permissions, and encryption key");
         store
     }
 
-    /// Returns `true` if this store uses SQLCipher encryption.
     fn is_encrypted(&self) -> bool {
-        self.encryption_key.is_some()
+        self.pool.encryption_key.is_some()
     }
 
-    /// Opens a connection, creates `schema_meta` if it does not exist, reads
-    /// the current schema version, and drives migrations to
-    /// [`CURRENT_SCHEMA_VERSION`].
     fn init(&self) -> rusqlite::Result<()> {
-        let conn = Connection::open(&self.path)?;
-
-        // Set PRAGMAs once here. For file-based databases these persist in the
-        // file and need not be repeated on every subsequent connection.
-        if self.path != ":memory:" {
-            conn.execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = NORMAL;
-                 PRAGMA cache_size = -2000;
-                 PRAGMA temp_store = MEMORY;
-                 PRAGMA foreign_keys = ON;"
-            )?;
-        }
-
-        // Enable prepared statement caching for better performance
-        conn.set_prepared_statement_cache_capacity(100);
+        let conn = self.get_connection()
+            .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
         conn.execute_batch(
             "
@@ -397,16 +552,28 @@ impl EventStore {
             );
             ",
         )?;
-
         let version = Self::schema_version(&conn)?;
         self.migrate(&conn, version)?;
         Ok(())
     }
 
-    /// Reads `schema_meta.schema_version` as an `i64`.
-    ///
-    /// Returns `0` if the row does not exist (fresh database), or propagates
-    /// any other SQLite error to the caller.
+    fn get_connection(&self) -> Option<r2d2::PooledConnection<PooledConnection>> {
+        self.pool.pool.get().ok()
+    }
+
+    fn get_pool_stats(&self) -> clifford::performance::PoolStats {
+        use clifford::performance::PoolStats;
+        let state = self.pool.pool.state();
+        PoolStats {
+            active_connections: (state.connections - state.idle_connections) as usize,
+            idle_connections: state.idle_connections as usize,
+            total_connections: state.connections as usize,
+            wait_count: 0,
+            acquisition_count: 0,
+            release_count: 0,
+        }
+    }
+
     fn schema_version(conn: &Connection) -> rusqlite::Result<i64> {
         let value: rusqlite::Result<String> = conn.query_row(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'",
@@ -420,7 +587,6 @@ impl EventStore {
         }
     }
 
-    /// Upserts `schema_meta.schema_version` to `version`.
     fn set_schema_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT INTO schema_meta(key, value)
@@ -431,23 +597,6 @@ impl EventStore {
         Ok(())
     }
 
-    /// Applies all pending migrations in sequential order starting from
-    /// `from_version`.
-    ///
-    /// Each migration step:
-    /// 1. Is guarded by `IF NOT EXISTS` DDL so re-running it is idempotent.
-    /// 2. Updates `schema_version` immediately after its DDL, before the next
-    ///    step runs, so a crash mid-migration leaves a consistent partial state
-    ///    that can be resumed on restart.
-    ///
-    /// # Migration history
-    ///
-    /// | Version | Tables / Indexes Added                                    |
-    /// |---------|-----------------------------------------------------------|
-    /// | 0 → 1   | `events`, `idx_events_channel_ts`, `idx_events_search`   |
-    /// | 1 → 2   | `user_2fa`                                                |
-    /// | 2 → 3   | `user_credentials`                                        |
-    /// | 3 → 4   | append-only triggers + `idx_events_dm_route_ts`          |
     fn migrate(&self, conn: &Connection, from_version: i64) -> rusqlite::Result<()> {
         let mut version = from_version;
 
@@ -547,9 +696,6 @@ impl EventStore {
             Self::set_schema_version(conn, version)?;
         }
 
-        // A version higher than CURRENT_SCHEMA_VERSION means this binary was
-        // deployed against a database written by a newer server. Log a warning
-        // but leave the schema intact — we must never silently downgrade.
         if version > CURRENT_SCHEMA_VERSION {
             warn!(
                 "Database schema version {} is newer than supported version {}",
@@ -560,38 +706,8 @@ impl EventStore {
         Ok(())
     }
 
-    /// Opens a connection to the database, returning `None` and logging a
-    /// warning on failure.
-    ///
-    /// Callers use the `?` operator or early-return pattern on `None` so that
-    /// a transient I/O error degrades gracefully (the operation is skipped)
-    /// rather than crashing the connection handler.
-    fn open_conn(&self) -> Option<Connection> {
-        match Connection::open(&self.path) {
-            Ok(c) => {
-                // For in-memory databases each connection is independent, so
-                // PRAGMAs must be re-applied. For file-based databases they
-                // were already set once in `init()` and persist in the file.
-                if self.path == ":memory:" {
-                    let _ = c.pragma_update(None, "journal_mode", "wal");
-                    let _ = c.execute_batch("PRAGMA foreign_keys = ON");
-                }
-                Some(c)
-            }
-            Err(e) => {
-                warn!("event store open failed: {}", e);
-                None
-            }
-        }
-    }
-
-    /// Encrypts a plaintext string for storage.
-    ///
-    /// Returns a JSON string `{"nonce":"<hex>","ct":"<hex>"}` that can be
-    /// stored in the database. If no encryption key is configured, returns
-    /// the plaintext unchanged.
     fn encrypt_field(&self, plaintext: &str) -> String {
-        if let Some(ref key) = self.encryption_key {
+        if let Some(ref key) = self.pool.encryption_key {
             match crypto::enc_bytes(key, plaintext.as_bytes()) {
                 Ok(ct) => serde_json::json!({"ct": hex::encode(ct)}).to_string(),
                 Err(e) => {
@@ -604,13 +720,8 @@ impl EventStore {
         }
     }
 
-    /// Decrypts a stored field back to plaintext.
-    ///
-    /// If the field is a JSON object with `"ct"`, attempts decryption.
-    /// If no encryption key is configured or the field is not encrypted
-    /// JSON, returns it as-is.
     fn decrypt_field(&self, stored: &str) -> String {
-        if let Some(ref key) = self.encryption_key {
+        if let Some(ref key) = self.pool.encryption_key {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(stored) {
                 if let Some(ct_hex) = val.get("ct").and_then(|v| v.as_str()) {
                     if let Ok(ct_bytes) = hex::decode(ct_hex) {
@@ -628,23 +739,17 @@ impl EventStore {
         stored.to_string()
     }
 
-    /// Deserialises a list of raw JSON strings into [`Value`]s, silently
-    /// dropping any entries that fail to parse.
     fn decode_rows(rows: Vec<String>) -> Vec<Value> {
         rows.into_iter()
             .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
             .collect()
     }
 
-    /// Generic helper that prepares `sql`, executes it with `params`, and
-    /// returns the results in **chronological** order (the query uses
-    /// `ORDER BY ts DESC` for efficient index use; this method reverses the
-    /// results before returning).
     fn query_events<P>(&self, sql: &str, params: P) -> Vec<Value>
     where
         P: rusqlite::Params,
     {
-        let Some(conn) = self.open_conn() else {
+        let Some(conn) = self.get_connection() else {
             return Vec::new();
         };
         let mut stmt = match conn.prepare(sql) {
@@ -663,30 +768,14 @@ impl EventStore {
             }
         };
 
-        // Decrypt each row, then parse as JSON.
         let decrypted: Vec<String> = rows
             .filter_map(|r| r.ok())
             .map(|raw| self.decrypt_field(&raw))
             .collect();
 
-        // Reverse: SQLite returns newest-first for index efficiency; callers
-        // expect oldest-first (chronological) order.
-        let mut out = Self::decode_rows(decrypted);
-        out.reverse();
-        out
+        Self::decode_rows(decrypted)
     }
 
-    /// Inserts a new event row into `events`.
-    ///
-    /// # Parameters
-    ///
-    /// * `event_type`  — `"msg"`, `"dm"`, `"sys"`, etc.
-    /// * `channel`     — Target channel name (or `__dm__<user>` for DMs).
-    /// * `sender`      — Username of the originating client.
-    /// * `target`      — Recipient username, used only for DMs.
-    /// * `payload`     — The full JSON event value to store and replay.
-    /// * `search_text` — Plaintext index field (stored lowercased for
-    ///   case-insensitive LIKE queries).
     fn persist(
         &self,
         event_type: &str,
@@ -696,30 +785,47 @@ impl EventStore {
         payload: &Value,
         search_text: &str,
     ) {
-        let Some(conn) = self.open_conn() else {
+        #[cfg(feature = "batch-writes")]
+        if let Some(ref queue) = self.write_queue {
+            let payload_json = payload.to_string();
+            queue.push(EventRow {
+                event_type: event_type.to_string(),
+                channel: channel.to_string(),
+                sender: sender.to_string(),
+                target: target.map(String::from),
+                payload: self.encrypt_field(&payload_json),
+                search_text: self.encrypt_field(&search_text.to_lowercase()),
+                ts: now(),
+            });
             return;
-        };
-        let payload_json = payload.to_string();
-        let enc_payload = self.encrypt_field(&payload_json);
-        let enc_search = self.encrypt_field(&search_text.to_lowercase());
-        if let Err(e) = conn.execute(
-            "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                now(),
-                event_type,
-                channel,
-                sender,
-                target,
-                enc_payload,
-                enc_search,
-            ],
-        ) {
-            warn!("event persist failed: {}", e);
+        }
+        
+        #[cfg(not(feature = "batch-writes"))]
+        {
+            let Some(conn) = self.get_connection() else {
+                return;
+            };
+            let payload_json = payload.to_string();
+            let enc_payload = self.encrypt_field(&payload_json);
+            let enc_search = self.encrypt_field(&search_text.to_lowercase());
+            if let Err(e) = conn.execute(
+                "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    now(),
+                    event_type,
+                    channel,
+                    sender,
+                    target,
+                    enc_payload,
+                    enc_search,
+                ],
+            ) {
+                warn!("event persist failed: {}", e);
+            }
         }
     }
 
-    /// Returns up to `limit` most-recent events for `channel`, oldest first.
     fn history(&self, channel: &str, limit: usize) -> Vec<Value> {
         self.query_events(
             "SELECT payload FROM events
@@ -730,8 +836,6 @@ impl EventStore {
         )
     }
 
-    /// Returns up to `limit` events for `channel` from `from_ts` onward,
-    /// oldest first.
     fn history_since(&self, channel: &str, from_ts: f64, limit: usize) -> Vec<Value> {
         self.query_events(
             "SELECT payload FROM events
@@ -742,43 +846,27 @@ impl EventStore {
         )
     }
 
-    /// Returns up to `limit` DM events exchanged between `username` and
-    /// `peer`, oldest first.
     fn dm_history(&self, username: &str, peer: &str, limit: usize) -> Vec<Value> {
         self.query_events(
-            "SELECT payload FROM (
-                 SELECT ts, payload FROM events
-                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2
-                 UNION ALL
-                 SELECT ts, payload FROM events
-                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1
-             )
+            "SELECT payload FROM events
+             WHERE event_type = 'dm' AND ((sender = ?1 AND target = ?2) OR (sender = ?2 AND target = ?1))
              ORDER BY ts DESC
              LIMIT ?3",
             params![username, peer, limit as i64],
         )
     }
 
-    /// Returns up to `limit` DM events exchanged between `username` and `peer`
-    /// within the last `seconds`, oldest first.
     fn dm_rewind(&self, username: &str, peer: &str, seconds: u64, limit: usize) -> Vec<Value> {
         let cutoff = (now() - seconds as f64).max(0.0);
         self.query_events(
-            "SELECT payload FROM (
-                 SELECT ts, payload FROM events
-                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2 AND ts >= ?3
-                 UNION ALL
-                 SELECT ts, payload FROM events
-                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1 AND ts >= ?3
-             )
+            "SELECT payload FROM events
+             WHERE event_type = 'dm' AND ts >= ?3 AND ((sender = ?1 AND target = ?2) OR (sender = ?2 AND target = ?1))
              ORDER BY ts DESC
              LIMIT ?4",
             params![username, peer, cutoff, limit as i64],
         )
     }
 
-    /// Returns up to `limit` DM events exchanged between `username` and `peer`
-    /// from `from_ts` onward, oldest first.
     fn dm_history_since(
         &self,
         username: &str,
@@ -787,22 +875,14 @@ impl EventStore {
         limit: usize,
     ) -> Vec<Value> {
         self.query_events(
-            "SELECT payload FROM (
-                 SELECT ts, payload FROM events
-                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2 AND ts >= ?3
-                 UNION ALL
-                 SELECT ts, payload FROM events
-                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1 AND ts >= ?3
-             )
+            "SELECT payload FROM events
+             WHERE event_type = 'dm' AND ts >= ?3 AND ((sender = ?1 AND target = ?2) OR (sender = ?2 AND target = ?1))
              ORDER BY ts DESC
              LIMIT ?4",
             params![username, peer, from_ts, limit as i64],
         )
     }
 
-    /// Executes an encrypted-mode search: fetches rows matching `sql`/`params`,
-    /// decrypts each row's `search_text`, filters by `query_lower`, and returns
-    /// up to `limit` decrypted JSON values.
     fn search_encrypted<P>(
         &self,
         sql: &str,
@@ -814,7 +894,7 @@ impl EventStore {
     where
         P: rusqlite::Params,
     {
-        let Some(conn) = self.open_conn() else {
+        let Some(conn) = self.get_connection() else {
             return Vec::new();
         };
         let mut stmt = match conn.prepare(sql) {
@@ -847,7 +927,6 @@ impl EventStore {
         results
     }
 
-    /// Escapes a query string for SQL LIKE and wraps it in `%...%`.
     fn like_pattern(query: &str) -> String {
         let escaped = query
             .replace('\\', "\\\\")
@@ -856,12 +935,10 @@ impl EventStore {
         format!("%{}%", escaped.to_lowercase())
     }
 
-    /// Returns up to `limit` events for `channel` whose `search_text` column
-    /// contains `query` (case-insensitive LIKE match), oldest first.
     fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
         let query_lower = query.to_lowercase();
 
-        if self.encryption_key.is_some() {
+        if self.pool.encryption_key.is_some() {
             self.search_encrypted(
                 "SELECT payload, search_text FROM events
                  WHERE channel = ?1
@@ -883,12 +960,10 @@ impl EventStore {
         }
     }
 
-    /// Returns up to `limit` DM events between `username` and `peer` whose
-    /// searchable text contains `query`, oldest first.
     fn dm_search(&self, username: &str, peer: &str, query: &str, limit: usize) -> Vec<Value> {
         let query_lower = query.to_lowercase();
 
-        if self.encryption_key.is_some() {
+        if self.pool.encryption_key.is_some() {
             self.search_encrypted(
                 "SELECT payload, search_text FROM (
                      SELECT ts, payload, search_text FROM events
@@ -924,11 +999,6 @@ impl EventStore {
         }
     }
 
-    /// Returns up to `limit` events for `channel` that occurred within the
-    /// last `seconds` seconds, oldest first.
-    ///
-    /// The `cutoff` is clamped to `0.0` so that an absurdly large `seconds`
-    /// value does not produce a negative timestamp.
     fn rewind(&self, channel: &str, seconds: u64, limit: usize) -> Vec<Value> {
         let cutoff = (now() - seconds as f64).max(0.0);
         self.query_events(
@@ -940,10 +1010,8 @@ impl EventStore {
         )
     }
 
-    /// Loads the [`User2FA`] record for `username` from `user_2fa`, or returns
-    /// `None` if no record exists (2-FA never configured for this user).
     fn load_user_2fa(&self, username: &str) -> Option<User2FA> {
-        let conn = self.open_conn()?;
+        let conn = self.get_connection()?;
         let row = conn
             .query_row(
                 "SELECT enabled, secret, backup_codes, enabled_at, last_verified
@@ -988,11 +1056,8 @@ impl EventStore {
         })
     }
 
-    /// Upserts a [`User2FA`] record using SQLite's `ON CONFLICT … DO UPDATE`
-    /// semantics so the same call can both insert new records and update
-    /// existing ones without callers needing to distinguish the two cases.
     fn upsert_user_2fa(&self, user: &User2FA) {
-        let Some(conn) = self.open_conn() else {
+        let Some(conn) = self.get_connection() else {
             return;
         };
 
@@ -1022,18 +1087,8 @@ impl EventStore {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // User credential management (password verification)
-    // -----------------------------------------------------------------------
-
-    /// Loads the stored password hash for `username`.
-    ///
-    /// Returns:
-    /// - `Ok(Some(hash))` when a credential exists.
-    /// - `Ok(None)` when no credential exists yet.
-    /// - `Err(..)` when the storage layer is unavailable or query execution fails.
     fn load_pw_hash(&self, username: &str) -> Result<Option<String>, &'static str> {
-        let Some(conn) = self.open_conn() else {
+        let Some(conn) = self.get_connection() else {
             return Err("store_unavailable");
         };
         conn.query_row(
@@ -1057,12 +1112,8 @@ impl EventStore {
         })
     }
 
-    /// Creates or updates the credential record for `username`.
-    ///
-    /// On first login the hash is stored. On subsequent logins the stored
-    /// hash is compared against the submitted hash; a mismatch is rejected.
     fn upsert_credentials(&self, username: &str, pw_hash: &str) {
-        let Some(conn) = self.open_conn() else {
+        let Some(conn) = self.get_connection() else {
             return;
         };
         let ts = now();
@@ -1079,13 +1130,6 @@ impl EventStore {
         }
     }
 
-    /// Checks whether `submitted_hash` matches the stored hash for `username`.
-    ///
-    /// Returns:
-    /// - `Ok(true)` if the hash matches.
-    /// - `Ok(false)` if the hash does not match.
-    /// - `Err("first_login")` if no credential exists yet (first-time user).
-    /// - `Err("store_unavailable" | "store_query_failed")` on storage failures.
     fn verify_credential(
         &self,
         username: &str,
@@ -1103,6 +1147,8 @@ impl EventStore {
 // ---------------------------------------------------------------------------
 // Channel — in-memory broadcast + history ring buffer
 // ---------------------------------------------------------------------------
+// Channel â€” in-memory broadcast + history ring buffer
+// ---------------------------------------------------------------------------
 
 /// A named chat channel consisting of a bounded in-memory history ring buffer
 /// and a [tokio broadcast] channel for real-time fan-out to all subscribers.
@@ -1113,7 +1159,7 @@ impl EventStore {
 #[derive(Clone)]
 struct Channel {
     /// In-memory ring buffer of the last [`HISTORY_CAP`] messages.
-    /// Wrapped in `Arc<RwLock<…>>` so multiple tasks can read concurrently
+    /// Wrapped in `Arc<RwLock<â€¦>>` so multiple tasks can read concurrently
     /// while writes are exclusive.
     history: Arc<RwLock<VecDeque<Value>>>,
 
@@ -1152,7 +1198,7 @@ impl Channel {
 // Bridge tracking
 // ---------------------------------------------------------------------------
 
-/// Metadata for a connected bridge (e.g. Discord ↔ Chatify).
+/// Metadata for a connected bridge (e.g. Discord â†” Chatify).
 /// Stored in `State::bridges` for the lifetime of the connection.
 #[derive(Clone)]
 struct BridgeInfo {
@@ -1169,7 +1215,7 @@ struct BridgeInfo {
 }
 
 // ---------------------------------------------------------------------------
-// State — shared, thread-safe server state
+// State â€” shared, thread-safe server state
 // ---------------------------------------------------------------------------
 
 /// Central server state shared by all connection handler tasks via `Arc`.
@@ -1188,7 +1234,7 @@ struct State {
     voice: DashMap<String, broadcast::Sender<String>>,
 
     /// Current status value for each online user
-    /// (e.g. `{"text":"Online","emoji":"🟢"}`).
+    /// (e.g. `{"text":"Online","emoji":"ðŸŸ¢"}`).
     /// Presence in this map is the authoritative signal that a user is online.
     user_statuses: DashMap<String, Value>,
 
@@ -1227,7 +1273,7 @@ struct State {
     /// Used to enforce a minimum interval between auth attempts.
     ip_last_auth: DashMap<std::net::IpAddr, f64>,
 
-    /// Session tokens keyed by token string → username.
+    /// Session tokens keyed by token string â†’ username.
     /// Generated at auth time and validated on every post-auth frame.
     session_tokens: DashMap<String, String>,
 
@@ -1238,7 +1284,7 @@ struct State {
     /// Server metrics for monitoring and performance tracking.
     metrics: Metrics,
 
-    message_cache: MessageCache<Value>,
+    message_cache: VecCache<Value>,
 
     /// Voice channel relay for managing voice rooms, members, and state
     voice_relay: VoiceRelay,
@@ -1247,6 +1293,7 @@ struct State {
 impl State {
     /// Creates the initial server state, pre-populating the `"general"` channel.
     fn new(db_path: String, db_key: Option<Vec<u8>>) -> Arc<Self> {
+        let store = EventStore::new(db_path, db_key);
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
@@ -1256,17 +1303,15 @@ impl State {
             nonce_last_seen: DashMap::new(),
             active_connections: AtomicUsize::new(0),
             drained_notify: Notify::new(),
-            store: EventStore::new(db_path, db_key),
+            store,
             ip_connections: DashMap::new(),
             ip_last_auth: DashMap::new(),
             session_tokens: DashMap::new(),
             bridges: DashMap::new(),
             metrics: Metrics::new(),
-            message_cache: MessageCache::new(1000),
+            message_cache: VecCache::new(1000),
             voice_relay: VoiceRelay::new(),
         });
-        // `"general"` is guaranteed to exist so that new connections always
-        // have a channel to subscribe to before any `"join"` event is sent.
         s.channels.insert("general".into(), Channel::new());
         s
     }
@@ -1280,7 +1325,7 @@ impl State {
     /// `MAX_CLOCK_SKEW_SECS`, so entries beyond that window are unreachable
     /// and safe to evict.
     fn evict_stale_nonce_entries(&self, max_age_secs: f64) -> usize {
-        let cutoff = clicord_server::now() - max_age_secs;
+        let cutoff = crate::now() - max_age_secs;
         let stale_keys: Vec<String> = self
             .nonce_last_seen
             .iter()
@@ -1311,7 +1356,7 @@ impl State {
 
     /// Returns the voice broadcast sender for `room`, creating it lazily on
     /// first access. The `_` receiver returned by `broadcast::channel` is
-    /// immediately dropped — active subscribers obtain their own receivers
+    /// immediately dropped â€” active subscribers obtain their own receivers
     /// via `vtx.subscribe()` when they call `"vjoin"`.
     fn voice_tx(&self, room: &str) -> broadcast::Sender<String> {
         self.voice
@@ -1518,7 +1563,7 @@ fn send_err(out_tx: &mpsc::UnboundedSender<String>, msg: impl std::fmt::Display,
 /// - `rx` reports `RecvError::Closed` (channel dropped).
 /// - `out_tx.send()` fails (the sink task has exited).
 ///
-/// Lagged messages (`RecvError::Lagged`) are silently skipped — the client
+/// Lagged messages (`RecvError::Lagged`) are silently skipped â€” the client
 /// will see a gap in the message stream, which is preferable to crashing the
 /// connection.
 fn spawn_broadcast_forwarder(
@@ -1541,7 +1586,7 @@ fn spawn_broadcast_forwarder(
 }
 
 fn spawn_voice_relay_forwarder(
-    mut rx: broadcast::Receiver<clicord_server::voice::relay::VoiceBroadcast>,
+    mut rx: broadcast::Receiver<VoiceBroadcast>,
     out_tx: mpsc::UnboundedSender<String>,
 ) {
     tokio::spawn(async move {
@@ -1589,12 +1634,12 @@ fn spawn_voice_relay_forwarder(
 /// | `search`      | Full-text search over a channel's plaintext index   |
 /// | `rewind`      | Fetch events within a relative time window          |
 /// | `replay`      | Fetch events from an absolute timestamp onward       |
-/// | `users`       | Get the current online user → public key directory  |
+/// | `users`       | Get the current online user â†’ public key directory  |
 /// | `info`        | Get server info (channels list, online count)       |
 /// | `vjoin`       | Join a voice room                                   |
 /// | `vleave`      | Leave the current voice room                        |
 /// | `vdata`       | Forward audio data to all members of a voice room   |
-/// | `ping`        | Heartbeat — server replies with `pong`              |
+/// | `ping`        | Heartbeat â€” server replies with `pong`              |
 /// | `edit`        | Edit a previously sent message (in-memory only)     |
 /// | `file_meta`   | Announce a file transfer to a channel               |
 /// | `file_chunk`  | Stream a chunk of a file transfer                   |
@@ -1655,8 +1700,8 @@ async fn handle_event(
             // `"c"` is the ciphertext blob; `"p"` is optional plaintext for
             // the search index only — it is never echoed back to clients.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let c = d["c"].as_str().unwrap_or("").to_string();
-            let p = d["p"].as_str().unwrap_or("").to_string();
+            let c = d["c"].as_str().unwrap_or("");
+            let p = d["p"].as_str().unwrap_or("");
             if c.is_empty() {
                 return;
             }
@@ -1667,27 +1712,15 @@ async fn handle_event(
             if let Some(relay) = d.get("relay").filter(|v| v.is_object()) {
                 entry["relay"] = relay.clone();
             }
+            let serialized = entry.to_string();
             let chan = state.chan(&ch);
             chan.push(entry.clone()).await;
-            // Fall back to ciphertext as the search index when no plaintext is provided.
-            let searchable = if p.is_empty() { c.clone() } else { p };
-            state
-                .store
-                .persist("msg", &ch, username, None, &entry, &searchable);
-            let _ = chan.tx.send(entry.to_string());
+            let searchable = if p.is_empty() { c } else { p };
+            state.store.persist("msg", &ch, username, None, &entry, searchable);
+            let _ = chan.tx.send(serialized);
 
             // Update message cache for this channel
-            let cache_key = format!("h:{}", ch);
-            if let Some(cached) = state.message_cache.get(&cache_key) {
-                let mut cached_vec: Vec<Value> = serde_json::from_value(cached.as_ref().clone()).unwrap_or_default();
-                cached_vec.push(entry.clone());
-                if cached_vec.len() > 50 {
-                    cached_vec = cached_vec.into_iter().rev().take(50).rev().collect();
-                }
-                state.message_cache.insert(cache_key, serde_json::Value::Array(cached_vec));
-            } else {
-                state.message_cache.insert(cache_key, serde_json::Value::Array(vec![entry]));
-            }
+            state.message_cache.push_and_trim(&format!("h:{}", ch), entry, 50);
         }
         "img" => {
             // Broadcast a base64-encoded image. Not persisted to avoid bloating
@@ -1723,32 +1756,13 @@ async fn handle_event(
             let p = event.to_string();
             // Persist to both the recipient's and the sender's DM channel so
             // history is available from either party's perspective.
-            state.store.persist(
-                "dm",
-                &format!("__dm__{}", target),
-                username,
-                Some(&target),
-                &event,
-                &ptxt,
-            );
-            let _ = state.chan(&format!("__dm__{}", target)).tx.send(p.clone());
-            let _ = state.chan(&format!("__dm__{}", username)).tx.send(p.clone());
+            state.store.persist("dm", &dm_channel_name(&target), username, Some(&target), &event, &ptxt);
+            let _ = state.chan(&dm_channel_name(&target)).tx.send(p.clone());
+            let _ = state.chan(&dm_channel_name(&username)).tx.send(p.clone());
 
             // Update DM cache for both parties
-            let sender_cache_key = format!("dm:{}:{}", username, target);
-            let recipient_cache_key = format!("dm:{}:{}", target, username);
-            if let Some(cached) = state.message_cache.get(&sender_cache_key) {
-                let mut cached_vec: Vec<Value> = serde_json::from_value(cached.as_ref().clone()).unwrap_or_default();
-                cached_vec.push(event.clone());
-                if cached_vec.len() > 50 {
-                    cached_vec = cached_vec.into_iter().rev().take(50).rev().collect();
-                }
-                state.message_cache.insert(sender_cache_key, serde_json::Value::Array(cached_vec.clone()));
-                state.message_cache.insert(recipient_cache_key, serde_json::Value::Array(cached_vec));
-            } else {
-                state.message_cache.insert(sender_cache_key, serde_json::Value::Array(vec![event.clone()]));
-                state.message_cache.insert(recipient_cache_key, serde_json::Value::Array(vec![event]));
-            }
+            state.message_cache.push_and_trim(&format!("dm:{}:{}", username, target), event.clone(), 50);
+            state.message_cache.push_and_trim(&format!("dm:{}:{}", target, username), event, 50);
         }
         "join" => {
             // Subscribe to a channel and immediately receive its history.
@@ -1767,7 +1781,7 @@ async fn handle_event(
             );
             let join_msg = serde_json::json!({
                 "t":"sys",
-                "m":format!("→ {} joined #{}", username, ch),
+                "m":format!("â†’ {} joined #{}", username, ch),
                 "ts":now()
             });
             let join_event = serde_json::json!({
@@ -1776,22 +1790,8 @@ async fn handle_event(
                 "u":username,
                 "ts":now()
             });
-            state.store.persist(
-                "sys",
-                &ch,
-                username,
-                None,
-                &join_msg,
-                &format!("{} joined", username),
-            );
-            state.store.persist(
-                "join",
-                &ch,
-                username,
-                None,
-                &join_event,
-                &format!("{} joined", username),
-            );
+            state.store.persist("sys", &ch, username, None, &join_msg, &format!("{} joined", username));
+            state.store.persist("join", &ch, username, None, &join_event, &format!("{} joined", username));
             let _ = chan.tx.send(join_msg.to_string());
         }
         "history" => {
@@ -1816,13 +1816,11 @@ async fn handle_event(
             let response_ch = scope.response_channel();
             let events = match scope {
                 EventQueryScope::Channel(ch) => {
-                    // Only use cache when no time window filter is applied
                     let cache_key = format!("h:{}", ch);
                     if limit <= 50 && seconds.is_none() {
                         if let Some(cached) = state.message_cache.get(&cache_key) {
-                            let cached_vec: Vec<Value> = serde_json::from_value(cached.as_ref().clone()).unwrap_or_default();
-                            if !cached_vec.is_empty() {
-                                let result: Vec<Value> = cached_vec.into_iter().take(limit).collect();
+                            if !cached.is_empty() {
+                                let result: Vec<Value> = cached.iter().take(limit).cloned().collect();
                                 send_out_json(
                                     out_tx,
                                     serde_json::json!({"t":"history","ch":response_ch,"events":result,"ts":now()}),
@@ -1841,9 +1839,8 @@ async fn handle_event(
                     let cache_key = format!("dm:{}:{}", username, peer);
                     if limit <= 50 && seconds.is_none() {
                         if let Some(cached) = state.message_cache.get(&cache_key) {
-                            let cached_vec: Vec<Value> = serde_json::from_value(cached.as_ref().clone()).unwrap_or_default();
-                            if !cached_vec.is_empty() {
-                                let result: Vec<Value> = cached_vec.into_iter().take(limit).collect();
+                            if !cached.is_empty() {
+                                let result: Vec<Value> = cached.iter().take(limit).cloned().collect();
                                 send_out_json(
                                     out_tx,
                                     serde_json::json!({"t":"history","ch":response_ch,"events":result,"ts":now()}),
@@ -1974,7 +1971,7 @@ async fn handle_event(
             );
         }
         "users" => {
-            // Return the current user → public key directory.
+            // Return the current user â†’ public key directory.
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"users","users":state.users_with_keys_json()}),
@@ -2006,7 +2003,7 @@ async fn handle_event(
                         "instance_id": info.instance_id,
                         "connected_at": info.connected_at,
                         "route_count": info.route_count,
-                        "uptime_secs": (clicord_server::now() - info.connected_at) as u64,
+                        "uptime_secs": (crate::now() - info.connected_at) as u64,
                     })
                 })
                 .collect();
@@ -2016,7 +2013,7 @@ async fn handle_event(
                     "t": "bridge_status",
                     "bridges": bridges,
                     "count": bridges.len(),
-                    "ts": clicord_server::now(),
+                    "ts": crate::now(),
                 }),
             );
             info!(
@@ -2027,6 +2024,8 @@ async fn handle_event(
         }
         "metrics" => {
             let snapshot = state.metrics.snapshot();
+            let cache_stats = state.message_cache.stats();
+            let pool_stats = state.store.get_pool_stats();
             send_out_json(
                 out_tx,
                 serde_json::json!({
@@ -2039,6 +2038,13 @@ async fn handle_event(
                     "connections_accepted": snapshot.connections_accepted,
                     "connections_closed": snapshot.connections_closed,
                     "active_connections": state.active_connection_count(),
+                    "cache_hits": cache_stats.0,
+                    "cache_misses": cache_stats.1,
+                    "cache_hit_rate": cache_stats.2,
+                    "db_pool_active": pool_stats.active_connections,
+                    "db_pool_idle": pool_stats.idle_connections,
+                    "db_pool_total": pool_stats.total_connections,
+                    "db_pool_waiters": pool_stats.wait_count,
                     "ts": now(),
                 }),
             );
@@ -2053,7 +2059,7 @@ async fn handle_event(
             let members = state.voice_relay.join_room(&room, username);
             
             // Broadcast voice member update
-            state.voice_relay.broadcast(clicord_server::voice::relay::VoiceBroadcast::Users {
+            state.voice_relay.broadcast(VoiceBroadcast::Users {
                 room: room.clone(),
                 members: members.clone(),
             });
@@ -2076,17 +2082,10 @@ async fn handle_event(
             *voice_room = Some(room.clone());
             let join_voice = serde_json::json!({
                 "t":"sys",
-                "m":format!("🎙 {} joined voice #{}", username, room),
+                "m":format!("ðŸŽ™ {} joined voice #{}", username, room),
                 "ts":now()
             });
-            state.store.persist(
-                "sys",
-                &room,
-                username,
-                None,
-                &join_voice,
-                &format!("{} voice joined", username),
-            );
+            state.store.persist("sys", &room, username, None, &join_voice, &format!("{} voice joined", username));
             let _ = state.chan(&room).tx.send(join_voice.to_string());
         }
         "vleave" => {
@@ -2097,17 +2096,10 @@ async fn handle_event(
                 
                 let leave_voice = serde_json::json!({
                     "t":"sys",
-                    "m":format!("🎙 {} left voice #{}", username, room),
+                    "m":format!("ðŸŽ™ {} left voice #{}", username, room),
                     "ts":now()
                 });
-                state.store.persist(
-                    "sys",
-                    room,
-                    username,
-                    None,
-                    &leave_voice,
-                    &format!("{} voice left", username),
-                );
+                state.store.persist("sys", room, username, None, &leave_voice, &format!("{} voice left", username));
                 let _ = state.chan(room).tx.send(leave_voice.to_string());
             }
         }
@@ -2172,14 +2164,14 @@ async fn handle_event(
             }
         }
         "ping" => {
-            // Heartbeat — keep-alive for clients behind proxies with idle
+            // Heartbeat â€” keep-alive for clients behind proxies with idle
             // connection timeouts.
             let _ = out_tx.send(r#"{"t":"pong"}"#.into());
         }
         "edit" => {
             // In-memory edit of the most recent matching message.
             // The edit is persisted for history but not applied retroactively
-            // to the SQLite event store — the original row is left intact.
+            // to the SQLite event store â€” the original row is left intact.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let old_text = d["old_text"].as_str().unwrap_or("").to_string();
             let new_text = d["new_text"].as_str().unwrap_or("").to_string();
@@ -2202,9 +2194,7 @@ async fn handle_event(
                 "t":"edit","ch":ch,"u":username,
                 "old_text":old_text,"new_text":new_text,"ts":now()
             });
-            state
-                .store
-                .persist("edit", &ch, username, None, &edit_msg, &new_text);
+            state.store.persist("edit", &ch, username, None, &edit_msg, &new_text);
             let _ = chan.tx.send(edit_msg.to_string());
         }
         "file_meta" => {
@@ -2271,19 +2261,12 @@ async fn handle_event(
             if let Some(mime_value) = mime {
                 file_announce["mime"] = Value::String(mime_value);
             }
-            state.store.persist(
-                "file_meta",
-                &ch,
-                username,
-                None,
-                &file_announce,
-                &format!("{} {}", media_kind, filename),
-            );
+            state.store.persist("file_meta", &ch, username, None, &file_announce, &format!("{} {}", media_kind, filename));
             let _ = state.chan(&ch).tx.send(file_announce.to_string());
         }
         "file_chunk" => {
             // Relay a single chunk of a file transfer to the channel.
-            // Chunks are not persisted — they are ephemeral relay frames.
+            // Chunks are not persisted â€” they are ephemeral relay frames.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let file_id = d["file_id"].as_str().unwrap_or("").trim().to_string();
             let chunk_data = d["data"].as_str().unwrap_or("").to_string();
@@ -2330,10 +2313,10 @@ async fn handle_event(
                 .to_string();
 
                 let _ = state
-                    .chan(&format!("__dm__{}", target_channel))
+                    .chan(&dm_channel_name(&target_channel))
                     .tx
                     .send(event.clone());
-                let _ = state.chan(&format!("__dm__{}", username)).tx.send(event);
+                let _ = state.chan(&dm_channel_name(&username)).tx.send(event);
             } else {
                 let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
                 let event = serde_json::json!({
@@ -2355,33 +2338,33 @@ async fn handle_event(
                 state
                     .user_statuses
                     .insert(username.to_string(), status_val.clone());
-                let status_update = serde_json::json!({
-                    "t":"status_update","user":username,"status":status_val
-                })
-                .to_string();
+                let status_update = Arc::new(
+                    serde_json::json!({
+                        "t":"status_update","user":username,"status":status_val
+                    })
+                    .to_string()
+                );
                 for chan_entry in state.channels.iter() {
-                    let _ = chan_entry.tx.send(status_update.clone());
+                    let _ = chan_entry.tx.send(status_update.as_ref().clone());
                 }
             }
         }
         "reaction" => {
             // Broadcast an emoji reaction to a specific message in a channel.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let emoji = d["emoji"].as_str().unwrap_or("👍").to_string();
+            let emoji = d["emoji"].as_str().unwrap_or("ðŸ‘Ž").to_string();
             let msg_id = d["msg_id"].as_str().unwrap_or("unknown").to_string();
             let reaction_msg = serde_json::json!({
                 "t":"reaction","user":username,"emoji":emoji,
                 "msg_id":msg_id,"ch":ch,"ts":now()
             });
-            state
-                .store
-                .persist("reaction", &ch, username, None, &reaction_msg, &emoji);
+            state.store.persist("reaction", &ch, username, None, &reaction_msg, &emoji);
             let _ = state.chan(&ch).tx.send(reaction_msg.to_string());
         }
         "2fa_setup" => {
             // Begin the TOTP enrollment flow: generate a fresh secret and
             // return a QR-code URL that the user can scan with an authenticator
-            // app. The secret is NOT persisted here — it is only saved when
+            // app. The secret is NOT persisted here â€” it is only saved when
             // the user confirms enrollment via `2fa_enable`.
             let secret = generate_secret();
             let issuer = d["issuer"].as_str().unwrap_or("Chatify");
@@ -2482,7 +2465,7 @@ async fn handle_event(
             );
         }
         _ => {
-            // Unknown event type — silently ignore. This is intentional:
+            // Unknown event type â€” silently ignore. This is intentional:
             // newer clients may send events that older servers do not
             // understand, and a hard error would break forward compatibility.
         }
@@ -2494,8 +2477,7 @@ async fn handle_event(
 // ---------------------------------------------------------------------------
 
 /// Returns the current Unix timestamp as a floating-point number of seconds.
-fn now() -> f64 {
-    clicord_server::now()
+fn now() -> f64 { clifford::now()
 }
 
 /// Normalises a raw channel name to a safe, consistent format.
@@ -2511,7 +2493,7 @@ fn now() -> f64 {
 /// is used as a `DashMap` key or SQLite parameter, preventing channel-name
 /// injection and collisions between logically identical names.
 fn safe_ch(raw: &str) -> String {
-    clicord_server::normalize_channel(raw).unwrap_or_else(|| "general".into())
+    clifford::normalize_channel(raw).unwrap_or_else(|| "general".into())
 }
 
 enum EventQueryScope {
@@ -2601,7 +2583,7 @@ fn is_valid_username(name: &str) -> bool {
 
 /// Returns `true` if `pk` is a base64-encoded 32-byte public key.
 ///
-/// The length check on the raw string (≤ [`MAX_PUBLIC_KEY_FIELD_LEN`])
+/// The length check on the raw string (â‰¤ [`MAX_PUBLIC_KEY_FIELD_LEN`])
 /// prevents base64 decoding arbitrarily large inputs. After decoding, the
 /// decoded length must be exactly 32 bytes to match the Ed25519 key size.
 fn is_valid_pubkey_b64(pk: &str) -> bool {
@@ -2622,9 +2604,9 @@ fn is_valid_pubkey_b64(pk: &str) -> bool {
 ///
 /// 1. Frame must be a JSON object with `"t": "auth"`.
 /// 2. `"u"` must pass [`is_valid_username`].
-/// 3. `"pw"` must be non-empty and ≤ [`MAX_PASSWORD_FIELD_LEN`].
+/// 3. `"pw"` must be non-empty and â‰¤ [`MAX_PASSWORD_FIELD_LEN`].
 /// 4. `"pk"` must pass [`is_valid_pubkey_b64`].
-/// 5. `"otp"` (optional) must be ≤ [`MAX_NONCE_LEN`] characters if present.
+/// 5. `"otp"` (optional) must be â‰¤ [`MAX_NONCE_LEN`] characters if present.
 fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
     if !d.is_object() {
         return Err(ChatifyError::Validation("invalid auth frame".to_string()));
@@ -2762,8 +2744,8 @@ fn validate_status_field(status: Option<&Value>) -> ChatifyResult<Value> {
 /// Verifies a TOTP or backup code for `user_2fa`, mutating state on success.
 ///
 /// The verification order is:
-/// 1. TOTP code (live window) — if valid, updates `last_verified`.
-/// 2. Backup code — if valid, the code is consumed (removed from the list) by
+/// 1. TOTP code (live window) â€” if valid, updates `last_verified`.
+/// 2. Backup code â€” if valid, the code is consumed (removed from the list) by
 ///    `verify_backup_code`. This enforces single-use semantics at the model
 ///    layer before the caller persists the updated record.
 fn verify_user_2fa_code(user_2fa: &mut User2FA, code: &str) -> bool {
@@ -2836,7 +2818,7 @@ fn requires_fresh_protection(event_type: &str) -> bool {
 }
 
 /// Validates that the client-supplied `"ts"` field is within
-/// ±[`MAX_CLOCK_SKEW_SECS`] of the server's wall clock.
+/// Â±[`MAX_CLOCK_SKEW_SECS`] of the server's wall clock.
 ///
 /// Nonce-based replay protection is only enforced when the client includes a
 /// `"n"` field. Frames without `"n"` are accepted unconditionally for
@@ -2846,7 +2828,7 @@ fn requires_fresh_protection(event_type: &str) -> bool {
 /// rejected to guard against clients that send uninitialised fields.
 fn validate_timestamp_skew(d: &Value) -> ChatifyResult<()> {
     if d.get("n").and_then(|v| v.as_str()).is_none() {
-        // No nonce present — backward-compatible path: skip skew check.
+        // No nonce present â€” backward-compatible path: skip skew check.
         return Ok(());
     }
 
@@ -2889,7 +2871,7 @@ fn validate_timestamp_skew(d: &Value) -> ChatifyResult<()> {
 /// nonces that could arrive within that window.
 fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> ChatifyResult<()> {
     let Some(nonce) = d.get("n").and_then(|v| v.as_str()) else {
-        // No nonce present — backward-compatible path.
+        // No nonce present â€” backward-compatible path.
         return Ok(());
     };
 
@@ -2915,7 +2897,7 @@ fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> Chat
 
     state
         .nonce_last_seen
-        .insert(username.to_string(), clicord_server::now());
+        .insert(username.to_string(), crate::now());
 
     Ok(())
 }
@@ -2990,10 +2972,10 @@ impl Callback for HandshakeValidator {
 /// # Lifecycle
 ///
 /// ```text
-/// accept_async → read auth frame → validate auth → enforce 2FA
-///     → register user → send "ok" → spawn sink writer task
-///     → main recv loop ( handle_event )
-///     → deregister user → broadcast leave
+/// accept_async â†’ read auth frame â†’ validate auth â†’ enforce 2FA
+///     â†’ register user â†’ send "ok" â†’ spawn sink writer task
+///     â†’ main recv loop ( handle_event )
+///     â†’ deregister user â†’ broadcast leave
 /// ```
 ///
 /// A [`ConnectionGuard`] is created immediately after accept and dropped at
@@ -3130,7 +3112,7 @@ where
     // approach means the server never sees the raw password, but also never
     // trusts a client-provided hash blindly.
     match state.store.verify_credential(&username, &pw_hash) {
-        Ok(true) => {} // Hash matches — proceed.
+        Ok(true) => {} // Hash matches â€” proceed.
         Ok(false) => {
             let _ = sink
                 .send(Message::Text(
@@ -3141,7 +3123,7 @@ where
             return;
         }
         Err("first_login") => {
-            // First time this username connects — store their credential.
+            // First time this username connects â€” store their credential.
             // The submitted hash is itself a PBKDF2 output, so we wrap it
             // in another salted PBKDF2 layer server-side.
             let server_hash = crypto::pw_hash(&pw_hash);
@@ -3194,7 +3176,7 @@ where
             username: username.clone(),
             bridge_type: bridge_type.clone(),
             instance_id: bridge_instance_id.clone(),
-            connected_at: clicord_server::now(),
+            connected_at: crate::now(),
             route_count: bridge_routes,
         };
         state.bridges.insert(username.clone(), info);
@@ -3218,7 +3200,7 @@ where
         return;
     }
 
-    broadcast_system_msg(&state, &format!("→ {} joined", username)).await;
+    broadcast_system_msg(&state, &format!("â†’ {} joined", username)).await;
     info!("+ {}", username);
 
     // ---- Phase 3: set up bidirectional message routing ----------------------
@@ -3311,7 +3293,7 @@ where
     if state.bridges.remove(&username).is_some() {
         info!("event=bridge_disconnected user={}", username);
     }
-    broadcast_system_msg(&state, &format!("✖ {} left", username)).await;
+    broadcast_system_msg(&state, &format!("âœ– {} left", username)).await;
     info!("- {}", username);
     // _conn_guard drops here, decrementing active_connections and IP counter.
 }
@@ -3578,7 +3560,7 @@ async fn main() -> ChatifyResult<()> {
     println!(" Chatify running on {}://{}", proto, addr);
     println!(" Encryption: {} |   IP Privacy: On", enc_label);
     println!(" Event store: {}", args.db);
-    println!("⏹  Press Ctrl+C to stop\n");
+    println!("â¹  Press Ctrl+C to stop\n");
     if args.log {
         info!("server started addr={}://{} db={}", proto, addr, args.db);
     }
@@ -3741,3 +3723,6 @@ mod tests {
         assert_eq!(state.active_connection_count(), 0);
     }
 }
+
+
+

@@ -8,6 +8,7 @@ license = "MIT"
 default = []
 discord-bridge = ["dep:serenity"]
 bridge-client = []
+batch-writes = []
 
 [[bin]]
 name = "clifford-server"
