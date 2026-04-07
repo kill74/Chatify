@@ -50,6 +50,8 @@ pub struct UiConfig {
     pub compact_mode: bool,
     #[serde(default)]
     pub custom_themes: Vec<CustomThemeConfig>,
+    #[serde(default)]
+    pub disable_animations: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +186,7 @@ impl Default for UiConfig {
             enable_media: true,
             compact_mode: false,
             custom_themes: Vec::new(),
+            disable_animations: false,
         }
     }
 }
@@ -324,6 +327,9 @@ impl Config {
             "ui.theme" => {
                 self.ui.theme = value.to_string();
             }
+            "ui.disable_animations" => {
+                self.ui.disable_animations = parse_bool(value)?;
+            }
             "ui.enable_markdown" => {
                 self.ui.enable_markdown = parse_bool(value)?;
             }
@@ -405,6 +411,7 @@ impl Config {
   enable_syntax_highlighting = {}
   enable_emoji = {}
   compact_mode = {}
+  disable_animations = {}
   custom_themes = [{}]
 
 [notifications]
@@ -434,6 +441,7 @@ Config file: {}"#,
             self.ui.enable_syntax_highlighting,
             self.ui.enable_emoji,
             self.ui.compact_mode,
+            self.ui.disable_animations,
             custom_theme_names.join(", "),
             self.notifications.enabled,
             self.notifications.on_dm,

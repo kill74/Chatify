@@ -10,6 +10,7 @@ use clifford::crypto::{
 use clifford::error::{ChatifyError, ChatifyResult};
 use clifford::notifications::NotificationService;
 use clifford::ui::ansi::{strip_ansi, visible_width};
+use clifford::ui::animations::{self as anim_mod, AnimationConfig};
 use clifford::ui::emoji;
 use clifford::ui::markdown::render_markdown;
 use clifford::ui::theme::{self as theme_mod, OwnedTheme, RESET as THEME_RESET};
@@ -5445,6 +5446,12 @@ async fn main() -> ChatifyResult<()> {
                 .action(clap::ArgAction::SetTrue)
                 .help("Disable rich media rendering (images, audio)"),
         )
+        .arg(
+            clap::Arg::new("no-animation")
+                .long("no-animation")
+                .action(clap::ArgAction::SetTrue)
+                .help("Disable startup and exit animations"),
+        )
         .get_matches();
 
     // Merge config with CLI args (CLI takes precedence)
@@ -5460,6 +5467,7 @@ async fn main() -> ChatifyResult<()> {
     let log_enabled = matches.get_flag("log");
     let markdown_enabled = !matches.get_flag("no-markdown") && config.ui.enable_markdown;
     let media_enabled = !matches.get_flag("no-media") && config.ui.enable_media;
+    let animations_enabled = !matches.get_flag("no-animation") && !config.ui.disable_animations;
 
     let scheme = if tls { "wss" } else { "ws" };
     let uri = format!("{}://{}:{}", scheme, host, port);
@@ -5652,6 +5660,12 @@ async fn main() -> ChatifyResult<()> {
             }
         }
 
+        // Play startup animation if enabled
+        if animations_enabled {
+            let anim_config = AnimationConfig::default();
+            anim_mod::play_startup_animation(&anim_config);
+        }
+
         // Initialize terminal for TUI
         enable_raw_mode().map_err(|e| ChatifyError::Validation(format!("raw mode: {}", e)))?;
         let mut stdout = io::stdout();
@@ -5764,6 +5778,12 @@ async fn main() -> ChatifyResult<()> {
         // Cancel rx task if still running
         rx_task.abort();
         let _ = shutdown_tx.send(true);
+
+        // Play exit animation if enabled
+        if animations_enabled {
+            let anim_config = AnimationConfig::default();
+            anim_mod::play_exit_animation(&anim_config);
+        }
 
         // Restore terminal
         disable_raw_mode()?;
