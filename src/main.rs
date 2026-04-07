@@ -188,7 +188,7 @@ const MAX_HANDSHAKE_HEADERS: usize = 64;
 /// The migration path in [`EventStore::migrate`] upgrades from any lower
 /// version to this one. If the stored version is *higher*, the server logs a
 /// warning and continues without modifying the schema (no downgrade).
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// Default number of events returned by a `history` request.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -204,12 +204,6 @@ const DEFAULT_REWIND_LIMIT: usize = 100;
 
 /// DM channel name prefix - avoids repeated format!() calls.
 const DM_CHANNEL_PREFIX: &str = "__dm__";
-
-/// Maximum events to batch before flushing to DB (batch-writes feature).
-const BATCH_SIZE: usize = 100;
-
-/// Maximum time to wait before flushing a partial batch (ms, batch-writes feature).
-const BATCH_FLUSH_MS: u64 = 10;
 
 /// Creates a DM channel name for a given user.
 fn dm_channel_name(user: &str) -> String {
@@ -428,6 +422,107 @@ impl WriteQueue {
 impl Drop for WriteQueue {
     fn drop(&mut self) {
         self.flush();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Roles & Permissions System
+// ---------------------------------------------------------------------------
+
+bitflags::bitflags! {
+    #[derive(Clone, Debug, Default)]
+    pub struct RolePermissions: u32 {
+        const NONE      = 0;
+        const VIEW       = 1 << 0;
+        const SEND       = 1 << 1;
+        const KICK       = 1 << 2;
+        const BAN        = 1 << 3;
+        const MUTE       = 1 << 4;
+        const MANAGE     = 1 << 5;
+        const PIN        = 1 << 6;
+    }
+}
+
+impl RolePermissions {
+    pub fn from_db_row(can_kick: bool, can_ban: bool, can_mute: bool, can_manage: bool, can_pin: bool) -> Self {
+        let mut perms = Self::NONE;
+        perms |= Self::VIEW | Self::SEND;
+        if can_kick { perms |= Self::KICK; }
+        if can_ban { perms |= Self::BAN; }
+        if can_mute { perms |= Self::MUTE; }
+        if can_manage { perms |= Self::MANAGE; }
+        if can_pin { perms |= Self::PIN; }
+        perms
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Role {
+    pub id: i64,
+    pub name: String,
+    pub level: i32,
+    pub permissions: RolePermissions,
+}
+
+impl Role {
+    pub fn is_admin(&self) -> bool {
+        self.level >= 100
+    }
+
+    pub fn can_kick(&self) -> bool {
+        self.permissions.contains(RolePermissions::KICK)
+    }
+
+    pub fn can_ban(&self) -> bool {
+        self.permissions.contains(RolePermissions::BAN)
+    }
+
+    pub fn can_mute(&self) -> bool {
+        self.permissions.contains(RolePermissions::MUTE)
+    }
+
+    pub fn can_manage(&self) -> bool {
+        self.permissions.contains(RolePermissions::MANAGE)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Ban {
+    pub username: String,
+    pub channel: String,
+    pub banned_by: String,
+    pub reason: Option<String>,
+    pub banned_at: f64,
+    pub expires_at: Option<f64>,
+}
+
+impl Ban {
+    pub fn is_active(&self) -> bool {
+        if let Some(expires) = self.expires_at {
+            crate::now() < expires
+        } else {
+            true
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Mute {
+    pub username: String,
+    pub channel: String,
+    pub muted_by: String,
+    pub reason: Option<String>,
+    pub muted_at: f64,
+    pub expires_at: Option<f64>,
+}
+
+impl Mute {
+    pub fn is_active(&self) -> bool {
+        if let Some(expires) = self.expires_at {
+            crate::now() < expires
+        } else {
+            true
+        }
     }
 }
 
@@ -693,6 +788,75 @@ impl EventStore {
                 ",
             )?;
             version = 4;
+            Self::set_schema_version(conn, version)?;
+        }
+
+        if version < 5 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS roles (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL UNIQUE,
+                    level       INTEGER NOT NULL DEFAULT 0,
+                    can_kick    BOOLEAN NOT NULL DEFAULT FALSE,
+                    can_ban    BOOLEAN NOT NULL DEFAULT FALSE,
+                    can_mute    BOOLEAN NOT NULL DEFAULT FALSE,
+                    can_manage  BOOLEAN NOT NULL DEFAULT FALSE,
+                    can_pin     BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at  REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS user_roles (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username    TEXT NOT NULL,
+                    channel     TEXT NOT NULL,
+                    role_id     INTEGER NOT NULL,
+                    assigned_by TEXT NOT NULL,
+                    assigned_at  REAL NOT NULL,
+                    UNIQUE(username, channel),
+                    FOREIGN KEY (role_id) REFERENCES roles(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS bans (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username    TEXT NOT NULL,
+                    channel     TEXT NOT NULL,
+                    banned_by   TEXT NOT NULL,
+                    reason      TEXT,
+                    banned_at   REAL NOT NULL,
+                    expires_at  REAL,
+                    UNIQUE(username, channel)
+                );
+
+                CREATE TABLE IF NOT EXISTS mutes (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username    TEXT NOT NULL,
+                    channel     TEXT NOT NULL,
+                    muted_by    TEXT NOT NULL,
+                    reason      TEXT,
+                    muted_at    REAL NOT NULL,
+                    expires_at  REAL,
+                    UNIQUE(username, channel)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_roles_lookup
+                    ON user_roles(username, channel);
+                CREATE INDEX IF NOT EXISTS idx_bans_lookup
+                    ON bans(username, channel);
+                CREATE INDEX IF NOT EXISTS idx_mutes_lookup
+                    ON mutes(username, channel);
+
+                INSERT OR IGNORE INTO roles (name, level, can_kick, can_ban, can_mute, can_manage, can_pin, created_at)
+                VALUES ('admin', 100, TRUE, TRUE, TRUE, TRUE, TRUE, ?1);
+                INSERT OR IGNORE INTO roles (name, level, can_kick, can_ban, can_mute, can_manage, can_pin, created_at)
+                VALUES ('moderator', 50, TRUE, TRUE, TRUE, FALSE, TRUE, ?1);
+                INSERT OR IGNORE INTO roles (name, level, can_kick, can_ban, can_mute, can_manage, can_pin, created_at)
+                VALUES ('member', 10, FALSE, FALSE, FALSE, FALSE, FALSE, ?1);
+                INSERT OR IGNORE INTO roles (name, level, can_kick, can_ban, can_mute, can_manage, can_pin, created_at)
+                VALUES ('guest', 1, FALSE, FALSE, FALSE, FALSE, FALSE, ?1);
+                ",
+            )?;
+            version = 5;
             Self::set_schema_version(conn, version)?;
         }
 
@@ -1142,6 +1306,195 @@ impl EventStore {
             Err(e) => Err(e),
         }
     }
+
+    fn get_user_role(&self, username: &str, channel: &str) -> Option<Role> {
+        let conn = self.get_connection()?;
+        let result: rusqlite::Result<(i64, String, i32, bool, bool, bool, bool, bool)>
+            = conn.query_row(
+            "SELECT r.id, r.name, r.level, r.can_kick, r.can_ban, r.can_mute, r.can_manage, r.can_pin
+             FROM roles r
+             JOIN user_roles ur ON r.id = ur.role_id
+             WHERE ur.username = ?1 AND ur.channel = ?2",
+            params![username, channel],
+            |row| Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?,
+                row.get::<_, i32>(3)? != 0,
+                row.get::<_, i32>(4)? != 0,
+                row.get::<_, i32>(5)? != 0,
+                row.get::<_, i32>(6)? != 0,
+                row.get::<_, i32>(7)? != 0,
+            )),
+        );
+        
+        match result {
+            Ok((id, name, level, can_kick, can_ban, can_mute, can_manage, can_pin)) => {
+                Some(Role {
+                    id,
+                    name,
+                    level,
+                    permissions: RolePermissions::from_db_row(can_kick, can_ban, can_mute, can_manage, can_pin),
+                })
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn get_default_role(&self) -> Option<Role> {
+        let conn = self.get_connection()?;
+        let result: rusqlite::Result<(i64, String, i32, bool, bool, bool, bool, bool)>
+            = conn.query_row(
+            "SELECT id, name, level, can_kick, can_ban, can_mute, can_manage, can_pin FROM roles WHERE name = 'member'",
+            [],
+            |row| Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?,
+                row.get::<_, i32>(3)? != 0,
+                row.get::<_, i32>(4)? != 0,
+                row.get::<_, i32>(5)? != 0,
+                row.get::<_, i32>(6)? != 0,
+                row.get::<_, i32>(7)? != 0,
+            )),
+        );
+        
+        match result {
+            Ok((id, name, level, can_kick, can_ban, can_mute, can_manage, can_pin)) => {
+                Some(Role {
+                    id,
+                    name,
+                    level,
+                    permissions: RolePermissions::from_db_row(can_kick, can_ban, can_mute, can_manage, can_pin),
+                })
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn assign_role(&self, username: &str, channel: &str, role_name: &str, assigned_by: &str) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+        
+        let role_id = conn.query_row(
+            "SELECT id FROM roles WHERE name = ?1",
+            params![role_name],
+            |row| row.get::<_, i64>(0),
+        ).map_err(|_| format!("role '{}' not found", role_name))?;
+        
+        conn.execute(
+            "INSERT INTO user_roles (username, channel, role_id, assigned_by, assigned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(username, channel) DO UPDATE SET role_id = ?3, assigned_by = ?4, assigned_at = ?5",
+            params![username, channel, role_id, assigned_by, crate::now()],
+        ).map_err(|e| format!("failed to assign role: {}", e))?;
+        
+        Ok(())
+    }
+
+    fn remove_user_role(&self, username: &str, channel: &str) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+        
+        conn.execute(
+            "DELETE FROM user_roles WHERE username = ?1 AND channel = ?2",
+            params![username, channel],
+        ).map_err(|e| format!("failed to remove role: {}", e))?;
+        
+        Ok(())
+    }
+
+    fn ban_user(&self, username: &str, channel: &str, banned_by: &str, reason: Option<&str>, duration_secs: Option<i64>) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+        
+        let expires_at = duration_secs.map(|secs| crate::now() + secs as f64);
+        
+        conn.execute(
+            "INSERT INTO bans (username, channel, banned_by, reason, banned_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(username, channel) DO UPDATE SET
+                banned_by = ?3, reason = ?4, banned_at = ?5, expires_at = ?6",
+            params![username, channel, banned_by, reason, crate::now(), expires_at],
+        ).map_err(|e| format!("failed to ban user: {}", e))?;
+        
+        Ok(())
+    }
+
+    fn unban_user(&self, username: &str, channel: &str) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+        
+        conn.execute(
+            "DELETE FROM bans WHERE username = ?1 AND channel = ?2",
+            params![username, channel],
+        ).map_err(|e| format!("failed to unban user: {}", e))?;
+        
+        Ok(())
+    }
+
+    fn is_banned(&self, username: &str, channel: &str) -> Option<Ban> {
+        let conn = self.get_connection()?;
+        
+        let result: rusqlite::Result<(String, String, String, Option<String>, f64, Option<f64>)>
+            = conn.query_row(
+            "SELECT username, channel, banned_by, reason, banned_at, expires_at
+             FROM bans WHERE username = ?1 AND channel = ?2",
+            params![username, channel],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        );
+        
+        match result {
+            Ok((username, channel, banned_by, reason, banned_at, expires_at)) => {
+                Some(Ban { username, channel, banned_by, reason, banned_at, expires_at })
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn mute_user(&self, username: &str, channel: &str, muted_by: &str, reason: Option<&str>, duration_secs: Option<i64>) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+        
+        let expires_at = duration_secs.map(|secs| crate::now() + secs as f64);
+        
+        conn.execute(
+            "INSERT INTO mutes (username, channel, muted_by, reason, muted_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(username, channel) DO UPDATE SET
+                muted_by = ?3, reason = ?4, muted_at = ?5, expires_at = ?6",
+            params![username, channel, muted_by, reason, crate::now(), expires_at],
+        ).map_err(|e| format!("failed to mute user: {}", e))?;
+        
+        Ok(())
+    }
+
+    fn unmute_user(&self, username: &str, channel: &str) -> Result<(), String> {
+        let conn = self.get_connection()
+            .ok_or("database connection unavailable")?;
+        
+        conn.execute(
+            "DELETE FROM mutes WHERE username = ?1 AND channel = ?2",
+            params![username, channel],
+        ).map_err(|e| format!("failed to unmute user: {}", e))?;
+        
+        Ok(())
+    }
+
+    fn is_muted(&self, username: &str, channel: &str) -> Option<Mute> {
+        let conn = self.get_connection()?;
+        
+        let result: rusqlite::Result<(String, String, String, Option<String>, f64, Option<f64>)>
+            = conn.query_row(
+            "SELECT username, channel, muted_by, reason, muted_at, expires_at
+             FROM mutes WHERE username = ?1 AND channel = ?2",
+            params![username, channel],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        );
+        
+        match result {
+            Ok((username, channel, muted_by, reason, muted_at, expires_at)) => {
+                Some(Mute { username, channel, muted_by, reason, muted_at, expires_at })
+            }
+            Err(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,6 +1835,80 @@ impl State {
     fn remove_session(&self, username: &str) {
         self.session_tokens.retain(|_, v| v != username);
     }
+
+    /// Check if user can send messages in a channel (checks bans, mutes, and permissions)
+    fn can_send(&self, username: &str, channel: &str) -> bool {
+        if let Some(ban) = self.store.is_banned(username, channel) {
+            if ban.is_active() {
+                return false;
+            }
+        }
+        if let Some(mute) = self.store.is_muted(username, channel) {
+            if mute.is_active() {
+                return false;
+            }
+        }
+        // By default, users can send messages unless they have no role AND permissions are restricted
+        let role = self.store.get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        match role {
+            Some(r) => r.permissions.contains(RolePermissions::SEND),
+            None => true, // Default allow for backwards compatibility
+        }
+    }
+
+    /// Check if user can kick others in a channel
+    fn can_kick(&self, username: &str, channel: &str) -> bool {
+        let role = self.store.get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        
+        match role {
+            Some(r) => r.can_kick(),
+            None => false,
+        }
+    }
+
+    /// Check if user can ban others in a channel
+    fn can_ban(&self, username: &str, channel: &str) -> bool {
+        let role = self.store.get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        
+        match role {
+            Some(r) => r.can_ban(),
+            None => false,
+        }
+    }
+
+    /// Check if user can mute others in a channel
+    fn can_mute(&self, username: &str, channel: &str) -> bool {
+        let role = self.store.get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        
+        match role {
+            Some(r) => r.can_mute(),
+            None => false,
+        }
+    }
+
+    /// Get user's role in a channel
+    fn get_user_role(&self, username: &str, channel: &str) -> Option<String> {
+        self.store.get_user_role(username, channel)
+            .map(|r| r.name)
+    }
+
+    /// Check if user is banned in a channel
+    fn is_banned(&self, username: &str, channel: &str) -> bool {
+        self.store.is_banned(username, channel)
+            .map(|b| b.is_active())
+            .unwrap_or(false)
+    }
+
+    /// Check if user is muted in a channel
+    fn is_muted(&self, username: &str, channel: &str) -> bool {
+        self.store.is_muted(username, channel)
+            .map(|m| m.is_active())
+            .unwrap_or(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1703,6 +2130,16 @@ async fn handle_event(
             let c = d["c"].as_str().unwrap_or("");
             let p = d["p"].as_str().unwrap_or("");
             if c.is_empty() {
+                return;
+            }
+            if !state.can_send(username, &ch) {
+                if state.is_muted(username, &ch) {
+                    send_err(out_tx, "you are muted in this channel", &state.metrics);
+                } else if state.is_banned(username, &ch) {
+                    send_err(out_tx, "you are banned from this channel", &state.metrics);
+                } else {
+                    send_err(out_tx, "you do not have permission to send messages", &state.metrics);
+                }
                 return;
             }
             let mut entry = serde_json::json!({"t":"msg","ch":ch,"u":username,"c":c,"ts":now()});
@@ -2352,6 +2789,10 @@ async fn handle_event(
         "reaction" => {
             // Broadcast an emoji reaction to a specific message in a channel.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            if !state.can_send(username, &ch) {
+                send_err(out_tx, "you cannot react in this channel", &state.metrics);
+                return;
+            }
             let emoji = d["emoji"].as_str().unwrap_or("ðŸ‘Ž").to_string();
             let msg_id = d["msg_id"].as_str().unwrap_or("unknown").to_string();
             let reaction_msg = serde_json::json!({
@@ -2435,6 +2876,334 @@ async fn handle_event(
                 out_tx,
                 serde_json::json!({"t":"2fa_disabled","enabled":false,"ts":now()}),
             );
+        }
+        "role" => {
+            let sub = d["sub"].as_str().unwrap_or("");
+            let target = d["target"].as_str().unwrap_or("");
+            let channel = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let role_name = d["role"].as_str().unwrap_or("member");
+
+            match sub {
+                "set" => {
+                    if target.is_empty() {
+                        send_err(out_tx, "role set requires target username", &state.metrics);
+                        return;
+                    }
+                    if !state.can_kick(username, &channel) {
+                        send_err(out_tx, "insufficient permissions to assign roles", &state.metrics);
+                        return;
+                    }
+                    match state.store.assign_role(target, &channel, role_name, username) {
+                        Ok(_) => {
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"role_set",
+                                    "target":target,
+                                    "role":role_name,
+                                    "channel":channel,
+                                    "by":username,
+                                    "ts":now()
+                                }),
+                            );
+                            let _ = state.chan(&channel).tx.send(
+                                serde_json::json!({
+                                    "t":"sys",
+                                    "m":format!("{} set {}'s role to {} in #{}", username, target, role_name, channel),
+                                    "ts":now()
+                                }).to_string()
+                            );
+                        }
+                        Err(e) => send_err(out_tx, &e, &state.metrics),
+                    }
+                }
+                "remove" => {
+                    if target.is_empty() {
+                        send_err(out_tx, "role remove requires target username", &state.metrics);
+                        return;
+                    }
+                    if !state.can_kick(username, &channel) {
+                        send_err(out_tx, "insufficient permissions to remove roles", &state.metrics);
+                        return;
+                    }
+                    match state.store.remove_user_role(target, &channel) {
+                        Ok(_) => {
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"role_removed",
+                                    "target":target,
+                                    "channel":channel,
+                                    "by":username,
+                                    "ts":now()
+                                }),
+                            );
+                        }
+                        Err(e) => send_err(out_tx, &e, &state.metrics),
+                    }
+                }
+                "get" => {
+                    if target.is_empty() {
+                        let role = state.get_user_role(username, &channel).unwrap_or_else(|| "none".to_string());
+                        send_out_json(
+                            out_tx,
+                            serde_json::json!({
+                                "t":"role_info",
+                                "user":username,
+                                "channel":channel,
+                                "role":role,
+                                "ts":now()
+                            }),
+                        );
+                    } else {
+                        let role = state.get_user_role(target, &channel).unwrap_or_else(|| "none".to_string());
+                        send_out_json(
+                            out_tx,
+                            serde_json::json!({
+                                "t":"role_info",
+                                "user":target,
+                                "channel":channel,
+                                "role":role,
+                                "ts":now()
+                            }),
+                        );
+                    }
+                }
+                _ => {
+                    send_err(out_tx, "unknown role subcommand (set|remove|get)", &state.metrics);
+                }
+            }
+        }
+        "kick" => {
+            let target = d["target"].as_str().unwrap_or("");
+            let channel = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let reason = d["reason"].as_str().unwrap_or("kicked by moderator");
+
+            if target.is_empty() {
+                send_err(out_tx, "kick requires target username", &state.metrics);
+                return;
+            }
+            if target == username {
+                send_err(out_tx, "cannot kick yourself", &state.metrics);
+                return;
+            }
+            if !state.can_kick(username, &channel) {
+                send_err(out_tx, "insufficient permissions to kick", &state.metrics);
+                return;
+            }
+
+            let kick_msg = serde_json::json!({
+                "t":"sys",
+                "m":format!("{} was kicked from #{}: {}", target, channel, reason),
+                "ts":now()
+            }).to_string();
+
+            state.store.persist("sys", &channel, username, None, &serde_json::json!({"t":"sys","m":format!("{} kicked {}", username, target)}), "");
+            let _ = state.chan(&channel).tx.send(kick_msg);
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t":"kicked",
+                    "target":target,
+                    "channel":channel,
+                    "by":username,
+                    "ts":now()
+                }),
+            );
+        }
+        "ban" => {
+            let sub = d["sub"].as_str().unwrap_or("add");
+            let target = d["target"].as_str().unwrap_or("");
+            let channel = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let reason = d["reason"].as_str();
+            let duration_secs = d["duration"].as_i64();
+
+            if target.is_empty() {
+                send_err(out_tx, "ban requires target username", &state.metrics);
+                return;
+            }
+            if target == username {
+                send_err(out_tx, "cannot ban yourself", &state.metrics);
+                return;
+            }
+            if !state.can_ban(username, &channel) {
+                send_err(out_tx, "insufficient permissions to ban", &state.metrics);
+                return;
+            }
+
+            match sub {
+                "add" | "" => {
+                    match state.store.ban_user(target, &channel, username, reason, duration_secs) {
+                        Ok(_) => {
+                            let ban_msg = if let Some(dur) = duration_secs {
+                                format!("{} was banned from #{} for {} seconds by {}: {}", target, channel, dur, username, reason.unwrap_or("banned"))
+                            } else {
+                                format!("{} was permanently banned from #{} by {}: {}", target, channel, username, reason.unwrap_or("banned"))
+                            };
+                            let _ = state.chan(&channel).tx.send(
+                                serde_json::json!({"t":"sys","m":ban_msg,"ts":now()}).to_string()
+                            );
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"banned",
+                                    "target":target,
+                                    "channel":channel,
+                                    "by":username,
+                                    "duration":duration_secs,
+                                    "ts":now()
+                                }),
+                            );
+                        }
+                        Err(e) => send_err(out_tx, &e, &state.metrics),
+                    }
+                }
+                "remove" => {
+                    match state.store.unban_user(target, &channel) {
+                        Ok(_) => {
+                            let _ = state.chan(&channel).tx.send(
+                                serde_json::json!({"t":"sys","m":format!("{} was unbanned from #{}", target, channel),"ts":now()}).to_string()
+                            );
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"unbanned",
+                                    "target":target,
+                                    "channel":channel,
+                                    "by":username,
+                                    "ts":now()
+                                }),
+                            );
+                        }
+                        Err(e) => send_err(out_tx, &e, &state.metrics),
+                    }
+                }
+                "check" => {
+                    let is_banned = state.is_banned(target, &channel);
+                    if let Some(ban) = state.store.is_banned(target, &channel) {
+                        send_out_json(
+                            out_tx,
+                            serde_json::json!({
+                                "t":"ban_info",
+                                "target":target,
+                                "channel":channel,
+                                "banned":is_banned,
+                                "active":ban.is_active(),
+                                "banned_by":ban.banned_by,
+                                "reason":ban.reason,
+                                "expires_at":ban.expires_at,
+                                "ts":now()
+                            }),
+                        );
+                    } else {
+                        send_out_json(
+                            out_tx,
+                            serde_json::json!({
+                                "t":"ban_info",
+                                "target":target,
+                                "channel":channel,
+                                "banned":false,
+                                "ts":now()
+                            }),
+                        );
+                    }
+                }
+                _ => {
+                    send_err(out_tx, "unknown ban subcommand (add|remove|check)", &state.metrics);
+                }
+            }
+        }
+        "mute" => {
+            let sub = d["sub"].as_str().unwrap_or("add");
+            let target = d["target"].as_str().unwrap_or("");
+            let channel = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let reason = d["reason"].as_str();
+            let duration_secs = d["duration"].as_i64();
+
+            if target.is_empty() {
+                send_err(out_tx, "mute requires target username", &state.metrics);
+                return;
+            }
+            if target == username {
+                send_err(out_tx, "cannot mute yourself", &state.metrics);
+                return;
+            }
+            if !state.can_mute(username, &channel) {
+                send_err(out_tx, "insufficient permissions to mute", &state.metrics);
+                return;
+            }
+
+            match sub {
+                "add" | "" => {
+                    match state.store.mute_user(target, &channel, username, reason, duration_secs) {
+                        Ok(_) => {
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"muted",
+                                    "target":target,
+                                    "channel":channel,
+                                    "by":username,
+                                    "duration":duration_secs,
+                                    "ts":now()
+                                }),
+                            );
+                        }
+                        Err(e) => send_err(out_tx, &e, &state.metrics),
+                    }
+                }
+                "remove" => {
+                    match state.store.unmute_user(target, &channel) {
+                        Ok(_) => {
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"unmuted",
+                                    "target":target,
+                                    "channel":channel,
+                                    "by":username,
+                                    "ts":now()
+                                }),
+                            );
+                        }
+                        Err(e) => send_err(out_tx, &e, &state.metrics),
+                    }
+                }
+                "check" => {
+                    let is_muted = state.is_muted(target, &channel);
+                    if let Some(mute) = state.store.is_muted(target, &channel) {
+                        send_out_json(
+                            out_tx,
+                            serde_json::json!({
+                                "t":"mute_info",
+                                "target":target,
+                                "channel":channel,
+                                "muted":is_muted,
+                                "active":mute.is_active(),
+                                "muted_by":mute.muted_by,
+                                "reason":mute.reason,
+                                "expires_at":mute.expires_at,
+                                "ts":now()
+                            }),
+                        );
+                    } else {
+                        send_out_json(
+                            out_tx,
+                            serde_json::json!({
+                                "t":"mute_info",
+                                "target":target,
+                                "channel":channel,
+                                "muted":false,
+                                "ts":now()
+                            }),
+                        );
+                    }
+                }
+                _ => {
+                    send_err(out_tx, "unknown mute subcommand (add|remove|check)", &state.metrics);
+                }
+            }
         }
         "2fa_verify" => {
             // Post-auth TOTP verification (used for privileged operations that

@@ -2055,18 +2055,19 @@ async fn schema_meta_contains_current_version() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-    assert_eq!(version, "4");
+    assert_eq!(version, "5");
 }
 
-/// Verifies that a server migrates a `v0` database to schema `v4` on startup.
+/// Verifies that a server migrates a `v0` database to schema `v5` on startup.
 ///
 /// Migration correctness is verified by:
 ///
-/// 1. Confirming `schema_meta.schema_version` is updated to `"4"`.
+/// 1. Confirming `schema_meta.schema_version` is updated to `"5"`.
 /// 2. Confirming the `events` table exists (created by `v1` migration).
 /// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
 /// 4. Confirming the `user_credentials` table exists (created by `v3` migration).
 /// 5. Confirming append-only and query indexes from `v4` exist.
+/// 6. Confirming roles/permissions tables from `v5` exist.
 ///
 /// All assertions are made directly against SQLite rather than through the
 /// server API to keep migration tests independent of server protocol changes.
@@ -2082,8 +2083,8 @@ async fn schema_migrates_from_version_zero_to_current() {
     let conn = Connection::open(&db_path).expect("open migrated db");
     assert_eq!(
         read_schema_version(&db_path),
-        "4",
-        "expected migration to set schema version to 4"
+        "5",
+        "expected migration to set schema version to 5"
     );
 
     let events_exists: i64 = conn
