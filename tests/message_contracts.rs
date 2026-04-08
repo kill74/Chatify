@@ -773,7 +773,7 @@ async fn auth_contract_rejects_invalid_username() {
         json!({
             "t": "auth", "u": "invalid user",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
     ))
