@@ -14,14 +14,6 @@ bridge-client = []
 batch-writes = []
 
 [[bin]]
-name = "clifford-server"
-path = "src/main.rs"
-
-[[bin]]
-name = "clifford-client"
-path = "src/client.rs"
-
-[[bin]]
 name = "discord_bot"
 path = "src/discord_bot.rs"
 required-features = ["discord-bridge"]
