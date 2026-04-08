@@ -1,14 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 pub mod capture;
+pub mod display;
 pub mod encode;
 pub mod webrtc;
-pub mod display;
 
 pub use capture::{CaptureManager, SourceInfo};
+pub use display::TerminalDisplay;
 pub use encode::{Encoder, EncoderConfig, QualityPreset};
 pub use webrtc::WebRTCManager;
-pub use display::TerminalDisplay;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenShareOptions {
@@ -96,7 +96,10 @@ impl ScreenShareManager {
     }
 
     pub fn state(&self) -> ScreenShareState {
-        self.session.as_ref().map(|s| s.state).unwrap_or(ScreenShareState::Idle)
+        self.session
+            .as_ref()
+            .map(|s| s.state)
+            .unwrap_or(ScreenShareState::Idle)
     }
 
     pub fn session(&self) -> Option<&ScreenShareSession> {
@@ -119,7 +122,8 @@ impl ScreenShareManager {
         let mut capture_manager = capture::CaptureManager::new()
             .map_err(|e| format!("Failed to initialize capture: {}", e))?;
 
-        let sources = capture_manager.list_sources()
+        let sources = capture_manager
+            .list_sources()
             .map_err(|e| format!("Failed to list sources: {}", e))?;
 
         if sources.is_empty() {
@@ -130,9 +134,11 @@ impl ScreenShareManager {
             sources.iter().find(|s| s.id == *source_id).cloned()
         } else {
             sources.into_iter().next()
-        }.ok_or_else(|| "Selected source not found".to_string())?;
+        }
+        .ok_or_else(|| "Selected source not found".to_string())?;
 
-        capture_manager.start(&source.id)
+        capture_manager
+            .start(&source.id)
             .map_err(|e| format!("Failed to start capture: {}", e))?;
 
         let encoder_config = EncoderConfig {
@@ -152,7 +158,7 @@ impl ScreenShareManager {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
-                .unwrap_or(0)
+                .unwrap_or(0),
         );
 
         self.session = Some(session);
@@ -178,21 +184,33 @@ impl ScreenShareManager {
     }
 
     pub async fn handle_viewer_offer(&mut self, offer: String) -> Result<String, String> {
-        self.webrtc_manager.as_mut()
+        self.webrtc_manager
+            .as_mut()
             .ok_or_else(|| "No active screen share session".to_string())?
             .handle_offer(offer)
             .await
     }
 
-    pub async fn add_viewer_ice(&mut self, candidate: String, sdp_mid: Option<String>) -> Result<(), String> {
-        self.webrtc_manager.as_mut()
+    pub async fn add_viewer_ice(
+        &mut self,
+        candidate: String,
+        sdp_mid: Option<String>,
+    ) -> Result<(), String> {
+        self.webrtc_manager
+            .as_mut()
             .ok_or_else(|| "No active screen share session".to_string())?
             .add_remote_ice(candidate, sdp_mid)
             .await
     }
 
-    pub fn encode_frame(&mut self, rgba_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-        self.encoder.as_mut()
+    pub fn encode_frame(
+        &mut self,
+        rgba_data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
+        self.encoder
+            .as_mut()
             .ok_or_else(|| "Encoder not initialized".to_string())?
             .encode_frame(rgba_data, width, height)
     }

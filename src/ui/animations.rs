@@ -187,14 +187,13 @@ pub fn play_startup_animation(config: &AnimationConfig) -> bool {
 
     let _ = stdout.flush();
 
-    if config.show_skip_prompt {
-        if crossterm::event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            let _ = execute!(stdout, cursor::Show);
-            let _ = execute!(stdout, terminal::LeaveAlternateScreen);
-            let _ = execute!(stdout, terminal::Clear(ClearType::All));
-            let _ = stdout.flush();
-            return true;
-        }
+    if config.show_skip_prompt && crossterm::event::poll(Duration::from_millis(50)).unwrap_or(false)
+    {
+        let _ = execute!(stdout, cursor::Show);
+        let _ = execute!(stdout, terminal::LeaveAlternateScreen);
+        let _ = execute!(stdout, terminal::Clear(ClearType::All));
+        let _ = stdout.flush();
+        return true;
     }
 
     false
@@ -238,7 +237,7 @@ pub fn play_exit_animation(config: &AnimationConfig) {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let lines = vec![
+    let lines = [
         ("".to_string(), config.colors.primary),
         ("              Goodbye!".to_string(), config.colors.accent),
         ("".to_string(), config.colors.primary),
@@ -313,14 +312,14 @@ pub fn play_exit_animation(config: &AnimationConfig) {
 
     std::thread::sleep(Duration::from_millis(500));
 
-    if config.show_skip_prompt {
-        if crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {
-            let _ = execute!(stdout, cursor::Show);
-            let _ = execute!(stdout, terminal::LeaveAlternateScreen);
-            let _ = execute!(stdout, terminal::Clear(ClearType::All));
-            let _ = stdout.flush();
-            return;
-        }
+    if config.show_skip_prompt
+        && crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false)
+    {
+        let _ = execute!(stdout, cursor::Show);
+        let _ = execute!(stdout, terminal::LeaveAlternateScreen);
+        let _ = execute!(stdout, terminal::Clear(ClearType::All));
+        let _ = stdout.flush();
+        return;
     }
 
     std::thread::sleep(Duration::from_millis(2000));

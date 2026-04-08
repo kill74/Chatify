@@ -46,7 +46,8 @@ impl WebRTCManager {
         if let Ok(mut guard) = self.local_offer.lock() {
             *guard = Some(offer);
         }
-        self.create_answer().ok_or_else(|| "Failed to create answer".to_string())
+        self.create_answer()
+            .ok_or_else(|| "Failed to create answer".to_string())
     }
 
     pub async fn handle_answer(&mut self, answer: String) -> Result<(), String> {
@@ -56,7 +57,11 @@ impl WebRTCManager {
         Ok(())
     }
 
-    pub async fn add_remote_ice(&mut self, candidate: String, _sdp_mid: Option<String>) -> Result<(), String> {
+    pub async fn add_remote_ice(
+        &mut self,
+        candidate: String,
+        _sdp_mid: Option<String>,
+    ) -> Result<(), String> {
         log::debug!("ICE: {}", &candidate[..candidate.len().min(50)]);
         Ok(())
     }
@@ -68,10 +73,14 @@ pub struct IceServer {
 
 impl IceServer {
     pub fn google() -> Self {
-        Self { urls: vec!["stun:stun.l.google.com:19302".into()] }
+        Self {
+            urls: vec!["stun:stun.l.google.com:19302".into()],
+        }
     }
     pub fn google_alt() -> Self {
-        Self { urls: vec!["stun:stun1.l.google.com:19302".into()] }
+        Self {
+            urls: vec!["stun:stun1.l.google.com:19302".into()],
+        }
     }
 }
 
