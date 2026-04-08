@@ -1,51 +1,51 @@
-//! # `clicord-server` Ã¢â‚¬â€ WebSocket Chat Server
+//! # `clicord-server` ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â WebSocket Chat Server
 //!
 //! A single-binary, async WebSocket server built on [Tokio] and
 //! [tokio-tungstenite]. It provides:
 //!
-//! * **Authentication** Ã¢â‚¬â€ first-frame auth with username/password-hash and an
+//! * **Authentication** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â first-frame auth with username/password-hash and an
 //!   Ed25519 public key for E2E-encrypted DMs.
-//! * **2-Factor Authentication** Ã¢â‚¬â€ TOTP (RFC 6238) and single-use backup codes,
+//! * **2-Factor Authentication** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â TOTP (RFC 6238) and single-use backup codes,
 //!   stored in SQLite.
-//! * **Channel messaging** Ã¢â‚¬â€ broadcast channels with a bounded in-memory ring
+//! * **Channel messaging** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â broadcast channels with a bounded in-memory ring
 //!   buffer and a durable SQLite event store.
-//! * **Direct messages** Ã¢â‚¬â€ per-user DM channels keyed `__dm__<username>`.
-//! * **Voice rooms** Ã¢â‚¬â€ low-latency audio relay via per-room broadcast channels.
-//! * **Search & history** Ã¢â‚¬â€ full-text LIKE search and time-window ("rewind")
+//! * **Direct messages** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â per-user DM channels keyed `__dm__<username>`.
+//! * **Voice rooms** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â low-latency audio relay via per-room broadcast channels.
+//! * **Search & history** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â full-text LIKE search and time-window ("rewind")
 //!   queries backed by SQLite.
-//! * **Protocol safety** Ã¢â‚¬â€ payload size gates, timestamp-skew validation, and
+//! * **Protocol safety** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â payload size gates, timestamp-skew validation, and
 //!   nonce-based replay protection on mutating events.
-//! * **Graceful shutdown** Ã¢â‚¬â€ Ctrl+C drains active connections before exiting,
+//! * **Graceful shutdown** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Ctrl+C drains active connections before exiting,
 //!   with a bounded timeout.
 //!
 //! ## Architecture Overview
 //!
 //! ```text
-//! Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â
-//! Ã¢â€â€š                   Tokio Runtime                      Ã¢â€â€š
-//! Ã¢â€â€š                                                      Ã¢â€â€š
-//! Ã¢â€â€š  TcpListener::accept()                               Ã¢â€â€š
-//! Ã¢â€â€š       Ã¢â€â€š                                              Ã¢â€â€š
-//! Ã¢â€â€š       Ã¢â€â€Ã¢â€â‚¬Ã¢â€“Âº tokio::spawn( handle(stream, addr, state) )Ã¢â€â€š
-//! Ã¢â€â€š                 Ã¢â€â€š                                    Ã¢â€â€š
-//! Ã¢â€â€š        Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Â¼Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â                          Ã¢â€â€š
-//! Ã¢â€â€š        Ã¢â€â€š  WebSocket auth  Ã¢â€â€š  Ã¢â€ Â validates first frame  Ã¢â€â€š
-//! Ã¢â€â€š        Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Ëœ                          Ã¢â€â€š
-//! Ã¢â€â€š                 Ã¢â€â€š                                    Ã¢â€â€š
-//! Ã¢â€â€š       Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Â¼Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â                         Ã¢â€â€š
-//! Ã¢â€â€š       Ã¢â€â€š  Message recv loop  Ã¢â€â€š                        Ã¢â€â€š
-//! Ã¢â€â€š       Ã¢â€â€š  handle_event(...)  Ã¢â€â€š                        Ã¢â€â€š
-//! Ã¢â€â€š       Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Ëœ                         Ã¢â€â€š
-//! Ã¢â€â€š                 Ã¢â€â€š                                    Ã¢â€â€š
-//! Ã¢â€â€š   mpsc::unbounded Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº sink writer task               Ã¢â€â€š
-//! Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Ëœ
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ…â€™ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‚Â
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                   Tokio Runtime                      ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                                                      ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡  TcpListener::accept()                               ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                                              ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬â€œÃ‚Âº tokio::spawn( handle(stream, addr, state) )ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                 ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                                    ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡        ÃƒÂ¢Ã¢â‚¬ÂÃ…â€™ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬â€œÃ‚Â¼ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‚Â                          ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡        ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡  WebSocket auth  ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡  ÃƒÂ¢Ã¢â‚¬Â Ã‚Â validates first frame  ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡        ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‚Â¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‹Å“                          ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                 ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                                    ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ…â€™ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬â€œÃ‚Â¼ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‚Â                         ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡  Message recv loop  ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                        ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡  handle_event(...)  ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                        ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡       ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‚Â¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‹Å“                         ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                 ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡                                    ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡   mpsc::unbounded ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬â€œÃ‚Âº sink writer task               ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬Å¡
+//! ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ‹Å“
 //!
 //! Shared State (Arc<State>)
-//!   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ channels   : DashMap<String, Channel>
-//!   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ voice      : DashMap<String, broadcast::Sender>
-//!   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ user_statuses / user_pubkeys  : DashMap
-//!   Ã¢â€Å“Ã¢â€â‚¬Ã¢â€â‚¬ recent_nonces : DashMap<String, VecDeque<String>>
-//!   Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬ store      : EventStore  Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº SQLite file
+//!   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ channels   : DashMap<String, Channel>
+//!   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ voice      : DashMap<String, broadcast::Sender>
+//!   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ user_statuses / user_pubkeys  : DashMap
+//!   ÃƒÂ¢Ã¢â‚¬ÂÃ…â€œÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ recent_nonces : DashMap<String, VecDeque<String>>
+//!   ÃƒÂ¢Ã¢â‚¬ÂÃ¢â‚¬ÂÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ store      : EventStore  ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬â€œÃ‚Âº SQLite file
 //! ```
 //!
 //! ## Configuration
@@ -259,7 +259,7 @@ const MAX_PASSWORD_FIELD_LEN: usize = 256;
 const MAX_PUBLIC_KEY_FIELD_LEN: usize = 256;
 
 /// Allowed clock skew in seconds between the client-supplied `"ts"` timestamp
-/// and the server's wall clock. A window of Ã‚Â±300 s accommodates clients with
+/// and the server's wall clock. A window of Ãƒâ€šÃ‚Â±300 s accommodates clients with
 /// moderately drifted clocks while still preventing stale-message replay.
 const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
 
@@ -275,13 +275,13 @@ const MAX_NONCE_LEN: usize = 64;
 const NONCE_CACHE_CAP: usize = 256;
 
 /// How often the nonce cleanup task runs (seconds).
-/// The sweep is cheap Ã¢â‚¬â€ it only iterates `nonce_last_seen`, which has at most
+/// The sweep is cheap ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â it only iterates `nonce_last_seen`, which has at most
 /// one entry per connected user.
 const NONCE_CLEANUP_INTERVAL_SECS: u64 = 60;
 
 /// Age threshold for nonce eviction (seconds).
 /// Users whose nonce cache has not been updated within this window are removed.
-/// Set to 2Ãƒâ€” the clock-skew window: any frame older than `MAX_CLOCK_SKEW_SECS`
+/// Set to 2ÃƒÆ’Ã¢â‚¬â€ the clock-skew window: any frame older than `MAX_CLOCK_SKEW_SECS`
 /// is already rejected by `validate_timestamp_skew`, so the extra margin is
 /// pure safety against clock jitter.
 const NONCE_MAX_AGE_SECS: f64 = MAX_CLOCK_SKEW_SECS * 2.0;
@@ -292,7 +292,7 @@ const MAX_CONNECTIONS_PER_IP: usize = 5;
 
 /// Minimum interval in seconds between auth attempts from the same IP.
 /// Attempts within this window are rejected to slow brute-force attacks.
-/// Set to 0.5s Ã¢â‚¬â€ enough to throttle automated tools while allowing
+/// Set to 0.5s ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â enough to throttle automated tools while allowing
 /// rapid legitimate connections (e.g. from integration tests).
 const AUTH_RATE_LIMIT_SECS: f64 = 0.5;
 
@@ -327,14 +327,14 @@ const MAX_REACTION_EMOJI_LEN: usize = 32;
 /// Validated, strongly-typed representation of a successful auth frame parse.
 ///
 /// Created by [`validate_auth_payload`] after all field-level validation
-/// passes. Using a typed struct here Ã¢â‚¬â€ rather than passing `&Value` through
-/// downstream functions Ã¢â‚¬â€ makes it impossible to accidentally skip validation
+/// passes. Using a typed struct here ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â rather than passing `&Value` through
+/// downstream functions ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â makes it impossible to accidentally skip validation
 /// or misread a field name.
 struct AuthInfo {
-    /// Validated username (ASCII alphanumeric / `-` / `_`, Ã¢â€°Â¤ 32 chars).
+    /// Validated username (ASCII alphanumeric / `-` / `_`, ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 32 chars).
     username: String,
 
-    /// Password hash submitted by the client (non-empty, Ã¢â€°Â¤ 256 chars).
+    /// Password hash submitted by the client (non-empty, ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 256 chars).
     /// Used for credential verification against the stored hash.
     pw_hash: String,
 
@@ -364,7 +364,7 @@ struct AuthInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Write Queue â€” Batched DB writes for high-throughput scenarios
+// Write Queue Ã¢â‚¬â€ Batched DB writes for high-throughput scenarios
 // Only used when `batch-writes` feature is enabled
 // ---------------------------------------------------------------------------
 
@@ -640,7 +640,7 @@ impl Mute {
 }
 
 // ---------------------------------------------------------------------------
-// EventStore â€” SQLite persistence layer with connection pooling
+// EventStore Ã¢â‚¬â€ SQLite persistence layer with connection pooling
 // ---------------------------------------------------------------------------
 
 const DB_POOL_SIZE: u32 = 8;
@@ -751,7 +751,7 @@ impl EventStore {
             #[cfg(feature = "batch-writes")]
             write_queue,
         };
-        store.init().expect("failed to initialise event store â€” check database path, permissions, and encryption key");
+        store.init().expect("failed to initialise event store Ã¢â‚¬â€ check database path, permissions, and encryption key");
         store
     }
 
@@ -2034,9 +2034,9 @@ pub struct AuditLog {
 }
 
 // ---------------------------------------------------------------------------
-// Channel â€” in-memory broadcast + history ring buffer
-// ---------------------------------------------------------------------------
 // Channel Ã¢â‚¬â€ in-memory broadcast + history ring buffer
+// ---------------------------------------------------------------------------
+// Channel ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â in-memory broadcast + history ring buffer
 // ---------------------------------------------------------------------------
 
 /// A named chat channel consisting of a bounded in-memory history ring buffer
@@ -2048,7 +2048,7 @@ pub struct AuditLog {
 #[derive(Clone)]
 struct Channel {
     /// In-memory ring buffer of the last [`HISTORY_CAP`] messages.
-    /// Wrapped in `Arc<RwLock<Ã¢â‚¬Â¦>>` so multiple tasks can read concurrently
+    /// Wrapped in `Arc<RwLock<ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦>>` so multiple tasks can read concurrently
     /// while writes are exclusive.
     history: Arc<RwLock<VecDeque<Value>>>,
 
@@ -2087,7 +2087,7 @@ impl Channel {
 // Bridge tracking
 // ---------------------------------------------------------------------------
 
-/// Metadata for a connected bridge (e.g. Discord Ã¢â€ â€ Chatify).
+/// Metadata for a connected bridge (e.g. Discord ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬Â Chatify).
 /// Stored in `State::bridges` for the lifetime of the connection.
 #[derive(Clone)]
 struct BridgeInfo {
@@ -2104,7 +2104,7 @@ struct BridgeInfo {
 }
 
 // ---------------------------------------------------------------------------
-// State Ã¢â‚¬â€ shared, thread-safe server state
+// State ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â shared, thread-safe server state
 // ---------------------------------------------------------------------------
 
 /// Central server state shared by all connection handler tasks via `Arc`.
@@ -2123,7 +2123,7 @@ struct State {
     voice: DashMap<String, broadcast::Sender<String>>,
 
     /// Current status value for each online user
-    /// (e.g. `{"text":"Online","emoji":"Ã°Å¸Å¸Â¢"}`).
+    /// (e.g. `{"text":"Online","emoji":"ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢"}`).
     /// Presence in this map is the authoritative signal that a user is online.
     user_statuses: DashMap<String, Value>,
 
@@ -2162,7 +2162,7 @@ struct State {
     /// Used to enforce a minimum interval between auth attempts.
     ip_last_auth: DashMap<std::net::IpAddr, f64>,
 
-    /// Session tokens keyed by token string Ã¢â€ â€™ username.
+    /// Session tokens keyed by token string ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ username.
     /// Generated at auth time and validated on every post-auth frame.
     session_tokens: DashMap<String, String>,
 
@@ -2277,7 +2277,7 @@ impl State {
 
     /// Returns the voice broadcast sender for `room`, creating it lazily on
     /// first access. The `_` receiver returned by `broadcast::channel` is
-    /// immediately dropped Ã¢â‚¬â€ active subscribers obtain their own receivers
+    /// immediately dropped ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â active subscribers obtain their own receivers
     /// via `vtx.subscribe()` when they call `"vjoin"`.
     fn voice_tx(&self, room: &str) -> broadcast::Sender<String> {
         self.voice
@@ -2783,7 +2783,7 @@ fn send_err(
 /// - `rx` reports `RecvError::Closed` (channel dropped).
 /// - `out_tx.send()` fails (the sink task has exited).
 ///
-/// Lagged messages (`RecvError::Lagged`) are silently skipped Ã¢â‚¬â€ the client
+/// Lagged messages (`RecvError::Lagged`) are silently skipped ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the client
 /// will see a gap in the message stream, which is preferable to crashing the
 /// connection.
 fn spawn_broadcast_forwarder(
@@ -2855,12 +2855,12 @@ fn spawn_voice_relay_forwarder(
 /// | `search`      | Full-text search over a channel's plaintext index   |
 /// | `rewind`      | Fetch events within a relative time window          |
 /// | `replay`      | Fetch events from an absolute timestamp onward       |
-/// | `users`       | Get the current online user Ã¢â€ â€™ public key directory  |
+/// | `users`       | Get the current online user ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ public key directory  |
 /// | `info`        | Get server info (channels list, online count)       |
 /// | `vjoin`       | Join a voice room                                   |
 /// | `vleave`      | Leave the current voice room                        |
 /// | `vdata`       | Forward audio data to all members of a voice room   |
-/// | `ping`        | Heartbeat Ã¢â‚¬â€ server replies with `pong`              |
+/// | `ping`        | Heartbeat ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â server replies with `pong`              |
 /// | `edit`        | Edit a previously sent message (in-memory only)     |
 /// | `file_meta`   | Announce a file transfer to a channel               |
 /// | `file_chunk`  | Stream a chunk of a file transfer                   |
@@ -2927,7 +2927,7 @@ async fn handle_event(
         "msg" => {
             // Broadcast an encrypted message to a channel.
             // `"c"` is the ciphertext blob; `"p"` is optional plaintext for
-            // the search index only â€” it is never echoed back to clients.
+            // the search index only Ã¢â‚¬â€ it is never echoed back to clients.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let c = d["c"].as_str().unwrap_or("");
             let p = d["p"].as_str().unwrap_or("");
@@ -3064,7 +3064,7 @@ async fn handle_event(
             );
             let join_msg = serde_json::json!({
                 "t":"sys",
-                "m":format!("Ã¢â€ â€™ {} joined #{}", username, ch),
+                "m":format!("ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {} joined #{}", username, ch),
                 "ts":now()
             });
             let join_event = serde_json::json!({
@@ -3290,7 +3290,7 @@ async fn handle_event(
             );
         }
         "users" => {
-            // Return the current user Ã¢â€ â€™ public key directory.
+            // Return the current user ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ public key directory.
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"users","users":state.users_with_keys_json()}),
@@ -3401,7 +3401,7 @@ async fn handle_event(
             *voice_room = Some(room.clone());
             let join_voice = serde_json::json!({
                 "t":"sys",
-                "m":format!("Ã°Å¸Å½â„¢ {} joined voice #{}", username, room),
+                "m":format!("ÃƒÂ°Ã…Â¸Ã…Â½Ã¢â€žÂ¢ {} joined voice #{}", username, room),
                 "ts":now()
             });
             state.store.persist(
@@ -3422,7 +3422,7 @@ async fn handle_event(
 
                 let leave_voice = serde_json::json!({
                     "t":"sys",
-                    "m":format!("Ã°Å¸Å½â„¢ {} left voice #{}", username, room),
+                    "m":format!("ÃƒÂ°Ã…Â¸Ã…Â½Ã¢â€žÂ¢ {} left voice #{}", username, room),
                     "ts":now()
                 });
                 state.store.persist(
@@ -3501,14 +3501,14 @@ async fn handle_event(
             }
         }
         "ping" => {
-            // Heartbeat Ã¢â‚¬â€ keep-alive for clients behind proxies with idle
+            // Heartbeat ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â keep-alive for clients behind proxies with idle
             // connection timeouts.
             let _ = out_tx.send(r#"{"t":"pong"}"#.into());
         }
         "edit" => {
             // In-memory edit of the most recent matching message.
             // The edit is persisted for history but not applied retroactively
-            // to the SQLite event store Ã¢â‚¬â€ the original row is left intact.
+            // to the SQLite event store ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the original row is left intact.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let old_text = d["old_text"].as_str().unwrap_or("").to_string();
             let new_text = d["new_text"].as_str().unwrap_or("").to_string();
@@ -3612,7 +3612,7 @@ async fn handle_event(
         }
         "file_chunk" => {
             // Relay a single chunk of a file transfer to the channel.
-            // Chunks are not persisted Ã¢â‚¬â€ they are ephemeral relay frames.
+            // Chunks are not persisted ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â they are ephemeral relay frames.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let file_id = d["file_id"].as_str().unwrap_or("").trim().to_string();
             let chunk_data = d["data"].as_str().unwrap_or("").to_string();
@@ -3726,7 +3726,7 @@ async fn handle_event(
         "2fa_setup" => {
             // Begin the TOTP enrollment flow: generate a fresh secret and
             // return a QR-code URL that the user can scan with an authenticator
-            // app. The secret is NOT persisted here Ã¢â‚¬â€ it is only saved when
+            // app. The secret is NOT persisted here ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â it is only saved when
             // the user confirms enrollment via `2fa_enable`.
             let secret = generate_secret();
             let issuer = d["issuer"].as_str().unwrap_or("Chatify");
@@ -4358,7 +4358,7 @@ async fn handle_event(
             );
         }
         _ => {
-            // Unknown event type Ã¢â‚¬â€ silently ignore. This is intentional:
+            // Unknown event type ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â silently ignore. This is intentional:
             // newer clients may send events that older servers do not
             // understand, and a hard error would break forward compatibility.
         }
@@ -4716,7 +4716,7 @@ fn is_valid_reaction_emoji(emoji: &str) -> bool {
 
 /// Returns `true` if `pk` is a base64-encoded 32-byte public key.
 ///
-/// The length check on the raw string (Ã¢â€°Â¤ [`MAX_PUBLIC_KEY_FIELD_LEN`])
+/// The length check on the raw string (ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ [`MAX_PUBLIC_KEY_FIELD_LEN`])
 /// prevents base64 decoding arbitrarily large inputs. After decoding, the
 /// decoded length must be exactly 32 bytes to match the Ed25519 key size.
 fn is_valid_pubkey_b64(pk: &str) -> bool {
@@ -4737,9 +4737,9 @@ fn is_valid_pubkey_b64(pk: &str) -> bool {
 ///
 /// 1. Frame must be a JSON object with `"t": "auth"`.
 /// 2. `"u"` must pass [`is_valid_username`].
-/// 3. `"pw"` must be non-empty and Ã¢â€°Â¤ [`MAX_PASSWORD_FIELD_LEN`].
+/// 3. `"pw"` must be non-empty and ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ [`MAX_PASSWORD_FIELD_LEN`].
 /// 4. `"pk"` must pass [`is_valid_pubkey_b64`].
-/// 5. `"otp"` (optional) must be Ã¢â€°Â¤ [`MAX_NONCE_LEN`] characters if present.
+/// 5. `"otp"` (optional) must be ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ [`MAX_NONCE_LEN`] characters if present.
 fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
     if !d.is_object() {
         return Err(ChatifyError::Validation("invalid auth frame".to_string()));
@@ -4877,8 +4877,8 @@ fn validate_status_field(status: Option<&Value>) -> ChatifyResult<Value> {
 /// Verifies a TOTP or backup code for `user_2fa`, mutating state on success.
 ///
 /// The verification order is:
-/// 1. TOTP code (live window) Ã¢â‚¬â€ if valid, updates `last_verified`.
-/// 2. Backup code Ã¢â‚¬â€ if valid, the code is consumed (removed from the list) by
+/// 1. TOTP code (live window) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â if valid, updates `last_verified`.
+/// 2. Backup code ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â if valid, the code is consumed (removed from the list) by
 ///    `verify_backup_code`. This enforces single-use semantics at the model
 ///    layer before the caller persists the updated record.
 fn verify_user_2fa_code(user_2fa: &mut User2FA, code: &str) -> bool {
@@ -4951,7 +4951,7 @@ fn requires_fresh_protection(event_type: &str) -> bool {
 }
 
 /// Validates that the client-supplied `"ts"` field is within
-/// Ã‚Â±[`MAX_CLOCK_SKEW_SECS`] of the server's wall clock.
+/// Ãƒâ€šÃ‚Â±[`MAX_CLOCK_SKEW_SECS`] of the server's wall clock.
 ///
 /// Timestamp skew validation is enforced when nonce (`"n"`) is present.
 ///
@@ -5103,10 +5103,10 @@ impl Callback for HandshakeValidator {
 /// # Lifecycle
 ///
 /// ```text
-/// accept_async Ã¢â€ â€™ read auth frame Ã¢â€ â€™ validate auth Ã¢â€ â€™ enforce 2FA
-///     Ã¢â€ â€™ register user Ã¢â€ â€™ send "ok" Ã¢â€ â€™ spawn sink writer task
-///     Ã¢â€ â€™ main recv loop ( handle_event )
-///     Ã¢â€ â€™ deregister user Ã¢â€ â€™ broadcast leave
+/// accept_async ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ read auth frame ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ validate auth ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ enforce 2FA
+///     ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ register user ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ send "ok" ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ spawn sink writer task
+///     ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ main recv loop ( handle_event )
+///     ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ deregister user ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ broadcast leave
 /// ```
 ///
 /// A [`ConnectionGuard`] is created immediately after accept and dropped at
@@ -5266,7 +5266,7 @@ where
     match state.store.verify_credential(&username, &pw_hash) {
         Ok(true) => {
             state.store.clear_failed_logins(&username);
-        } // Hash matches Ã¢â‚¬â€ proceed.
+        } // Hash matches ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â proceed.
         Ok(false) => {
             let (locked, attempts) = state
                 .store
@@ -5309,7 +5309,7 @@ where
             return;
         }
         Err("first_login") => {
-            // First time this username connects Ã¢â‚¬â€ store their credential.
+            // First time this username connects ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â store their credential.
             // The submitted hash is itself a PBKDF2 output, so we wrap it
             // in another salted PBKDF2 layer server-side.
             let server_hash = crypto::pw_hash(&pw_hash);
@@ -5386,7 +5386,7 @@ where
         return;
     }
 
-    broadcast_system_msg(&state, &format!("Ã¢â€ â€™ {} joined", username)).await;
+    broadcast_system_msg(&state, &format!("ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {} joined", username)).await;
     info!("+ {}", username);
 
     // ---- Phase 3: set up bidirectional message routing ----------------------
@@ -5479,7 +5479,7 @@ where
     if state.bridges.remove(&username).is_some() {
         info!("event=bridge_disconnected user={}", username);
     }
-    broadcast_system_msg(&state, &format!("Ã¢Å“â€“ {} left", username)).await;
+    broadcast_system_msg(&state, &format!("ÃƒÂ¢Ã…â€œÃ¢â‚¬â€œ {} left", username)).await;
     info!("- {}", username);
     // _conn_guard drops here, decrementing active_connections and IP counter.
 }
@@ -5959,8 +5959,6 @@ async fn main() -> ChatifyResult<()> {
         });
     }
 
-
-
     #[cfg(unix)]
     {
         let (sighup_tx, mut sighup_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -6092,4 +6090,3 @@ mod tests {
         assert_eq!(state.active_connection_count(), 0);
     }
 }
-
