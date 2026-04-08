@@ -70,11 +70,11 @@ Most self-hosted chat systems are web-first and treat the protocol as a second-c
                                  Discord API (serenity)
 ```
 
-| Binary | Purpose |
-|---|---|
+| Binary           | Purpose                                                  |
+| ---------------- | -------------------------------------------------------- |
 | `clicord-server` | WebSocket server, event persistence, auth, rate limiting |
-| `clicord-client` | Terminal dashboard: channels, DMs, media, search, trust |
-| `discord_bot` | Discord ↔ Chatify relay bridge (feature-gated) |
+| `clicord-client` | Terminal dashboard: channels, DMs, media, search, trust  |
+| `discord_bot`    | Discord ↔ Chatify relay bridge (feature-gated)           |
 
 **Terminal dashboard layout:**
 
@@ -151,18 +151,19 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ### Server — `clicord-server`
 
-| Flag | Default | Notes |
-|---|---|---|
-| `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8765` | Bind port |
-| `--db` | `chatify.db` | SQLite database path |
-| `--db-key` | *(auto)* | 32-byte encryption key, hex-encoded (64 chars). See resolution order below. |
-| `--tls` | `false` | Enable TLS (`wss://`). Requires `--tls-cert` and `--tls-key`. |
-| `--tls-cert` | `cert.pem` | PEM certificate path |
-| `--tls-key` | `key.pem` | PEM private key path |
-| `--log` | `false` | Structured logging to stderr |
+| Flag         | Default      | Notes                                                                       |
+| ------------ | ------------ | --------------------------------------------------------------------------- |
+| `--host`     | `0.0.0.0`    | Bind address                                                                |
+| `--port`     | `8765`       | Bind port                                                                   |
+| `--db`       | `chatify.db` | SQLite database path                                                        |
+| `--db-key`   | _(auto)_     | 32-byte encryption key, hex-encoded (64 chars). See resolution order below. |
+| `--tls`      | `false`      | Enable TLS (`wss://`). Requires `--tls-cert` and `--tls-key`.               |
+| `--tls-cert` | `cert.pem`   | PEM certificate path                                                        |
+| `--tls-key`  | `key.pem`    | PEM private key path                                                        |
+| `--log`      | `false`      | Structured logging to stderr                                                |
 
 **DB key resolution order:**
+
 1. `--db-key` CLI flag
 2. `<db>.key` file — auto-generated on first run if absent
 3. No encryption when `--db :memory:`
@@ -171,43 +172,43 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ### Client — `clicord-client`
 
-| Flag | Default | Notes |
-|---|---|---|
-| `--host` | `127.0.0.1` | Server host |
-| `--port` | `8765` | Server port |
-| `--tls` | `false` | Connect via `wss://` |
-| `--log` | `false` | Debug logging to stderr |
+| Flag     | Default     | Notes                   |
+| -------- | ----------- | ----------------------- |
+| `--host` | `127.0.0.1` | Server host             |
+| `--port` | `8765`      | Server port             |
+| `--tls`  | `false`     | Connect via `wss://`    |
+| `--log`  | `false`     | Debug logging to stderr |
 
 ---
 
 ## Client Command Reference
 
-| Command | Description |
-|---|---|
-| `/commands [filter]` | List all commands, optionally filtered by prefix |
-| `/help [command]` | General help, or detailed usage for a specific command |
-| `/join <channel>` | Join or create a channel |
-| `/switch <channel>` | Alias for `/join` |
-| `/dm <user> <message>` | Send an encrypted direct message |
-| `/typing [on\|off] [scope]` | Broadcast typing indicator to `#channel` or `dm:<user>` |
-| `/image <path>` | Transfer an image to the current channel (chunked, ≤100 MB) |
-| `/video <path>` | Transfer a video to the current channel (chunked, ≤100 MB) |
-| `/me [action]` | Display your profile or send an action-style message |
-| `/users` | List currently online users |
-| `/channels` | List available channels |
-| `/voice [room]` | Toggle voice presence in a room |
-| `/history [channel] [window]` | Load persisted event history for a channel or DM scope |
-| `/search <query>` | Search persisted events in the current channel |
-| `/replay <timestamp>` | Reconstruct channel state from an absolute timestamp |
-| `/rewind <time> [n]` | Replay the last N events within a relative window (`15m`, `2h`) |
-| `/recent [n]` | Show recent message IDs for quick reaction targeting |
-| `/react <msg_id\|#index> <emoji>` | React to a message using a stable `msg_id` or recent index |
-| `/sync` | Request reaction snapshot sync for the active channel |
-| `/fingerprint [user]` | Inspect trust state and key fingerprint for a peer |
-| `/trust <user> <fingerprint>` | Record a peer fingerprint as trusted after out-of-band verification |
-| `/edit [#N] <new text>` | Edit your most recent (or Nth) message. Renders `(edited)` suffix in feed. |
-| `/clear` | Clear terminal output |
-| `/quit` `/exit` `/q` | Disconnect and exit |
+| Command                           | Description                                                                |
+| --------------------------------- | -------------------------------------------------------------------------- |
+| `/commands [filter]`              | List all commands, optionally filtered by prefix                           |
+| `/help [command]`                 | General help, or detailed usage for a specific command                     |
+| `/join <channel>`                 | Join or create a channel                                                   |
+| `/switch <channel>`               | Alias for `/join`                                                          |
+| `/dm <user> <message>`            | Send an encrypted direct message                                           |
+| `/typing [on\|off] [scope]`       | Broadcast typing indicator to `#channel` or `dm:<user>`                    |
+| `/image <path>`                   | Transfer an image to the current channel (chunked, ≤100 MB)                |
+| `/video <path>`                   | Transfer a video to the current channel (chunked, ≤100 MB)                 |
+| `/me [action]`                    | Display your profile or send an action-style message                       |
+| `/users`                          | List currently online users                                                |
+| `/channels`                       | List available channels                                                    |
+| `/voice [room]`                   | Toggle voice presence in a room                                            |
+| `/history [channel] [window]`     | Load persisted event history for a channel or DM scope                     |
+| `/search <query>`                 | Search persisted events in the current channel                             |
+| `/replay <timestamp>`             | Reconstruct channel state from an absolute timestamp                       |
+| `/rewind <time> [n]`              | Replay the last N events within a relative window (`15m`, `2h`)            |
+| `/recent [n]`                     | Show recent message IDs for quick reaction targeting                       |
+| `/react <msg_id\|#index> <emoji>` | React to a message using a stable `msg_id` or recent index                 |
+| `/sync`                           | Request reaction snapshot sync for the active channel                      |
+| `/fingerprint [user]`             | Inspect trust state and key fingerprint for a peer                         |
+| `/trust <user> <fingerprint>`     | Record a peer fingerprint as trusted after out-of-band verification        |
+| `/edit [#N] <new text>`           | Edit your most recent (or Nth) message. Renders `(edited)` suffix in feed. |
+| `/clear`                          | Clear terminal output                                                      |
+| `/quit` `/exit` `/q`              | Disconnect and exit                                                        |
 
 ### Reactions and Message IDs
 
@@ -226,6 +227,7 @@ Transfer uses `file_meta` + `file_chunk` framing over the existing WebSocket con
 ```
 
 Received files are written to:
+
 - **Windows:** `%APPDATA%\Chatify\media\`
 - **Linux/macOS:** `$HOME/.chatify/media/`
 
@@ -240,12 +242,14 @@ The event store is **append-only**. Events are inserted once; they are never upd
 **Schema management:** versioned via a `schema_meta` table. Migrations run sequentially on server startup. A no-downgrade policy is enforced: a server will refuse to start against a database created by a newer schema version.
 
 **Indexes:**
+
 - Channel history: `(channel, ts DESC)`
 - DM history: `(event_type, sender, target, ts DESC)`
 
 **Encryption at rest:** `payload` and `search_text` columns are encrypted with the key resolved at startup. The `/search` command decrypts rows in a linear scan — O(n) in stored event count. This is acceptable for single-tenant use; it is not suitable for large corpora without an external index or a separate plaintext search field with access controls.
 
 **CI-verified guarantees:**
+
 - Event history survives server restart (store durability)
 - `/history` and `/search` complete within acceptable timeout on a 100k-event local dataset
 
@@ -256,16 +260,17 @@ The event store is **append-only**. Events are inserted once; they are never upd
 Chatify uses **explicit fingerprint verification** rather than TOFU.
 
 **Verification flow:**
+
 1. Run `/fingerprint <user>` to retrieve the peer's current key fingerprint.
 2. Verify the fingerprint out-of-band (voice call, secure side-channel, etc.).
 3. Run `/trust <user> <fingerprint>` to record it in the local trust store.
 
 **Trust states:**
 
-| State | Meaning | DM encryption |
-|---|---|---|
-| `unknown` | No fingerprint on record | Blocked |
-| `trusted` | Fingerprint verified and stored locally | Allowed |
+| State     | Meaning                                  | DM encryption             |
+| --------- | ---------------------------------------- | ------------------------- |
+| `unknown` | No fingerprint on record                 | Blocked                   |
+| `trusted` | Fingerprint verified and stored locally  | Allowed                   |
 | `changed` | Peer key rotated since last verification | Blocked until re-verified |
 
 Key changes are never silent. A rotation transitions the peer to `changed` and immediately blocks encrypted DM traffic in both directions. The operator must re-run the full verification flow. This prevents MITM via silent key rotation but adds friction to any legitimate rotation — a deliberate tradeoff.
@@ -276,17 +281,17 @@ Key changes are never silent. A rotation transitions the peer to `changed` and i
 
 **Implemented controls:**
 
-| Control | Implementation |
-|---|---|
-| Transport encryption | TLS via `rustls` |
-| Credential storage | PBKDF2, salted, per-user |
-| Two-factor authentication | TOTP + backup codes |
-| Session management | Token lifecycle with expiry; tokens do not survive server restart |
-| Replay protection | Nonce + timestamp window; periodic nonce cache eviction for ghost connections |
-| Rate limiting | Per-IP limits on connection establishment and auth attempts |
-| Input validation | Payload size limits enforced; parameterized queries throughout |
-| Encryption at rest | `payload` and `search_text` columns encrypted with the server DB key |
-| Schema integrity | No-downgrade policy enforced at startup |
+| Control                   | Implementation                                                                |
+| ------------------------- | ----------------------------------------------------------------------------- |
+| Transport encryption      | TLS via `rustls`                                                              |
+| Credential storage        | PBKDF2, salted, per-user                                                      |
+| Two-factor authentication | TOTP + backup codes                                                           |
+| Session management        | Token lifecycle with expiry; tokens do not survive server restart             |
+| Replay protection         | Nonce + timestamp window; periodic nonce cache eviction for ghost connections |
+| Rate limiting             | Per-IP limits on connection establishment and auth attempts                   |
+| Input validation          | Payload size limits enforced; parameterized queries throughout                |
+| Encryption at rest        | `payload` and `search_text` columns encrypted with the server DB key          |
+| Schema integrity          | No-downgrade policy enforced at startup                                       |
 
 **Known gaps — do not deploy in adversarial environments without addressing these:**
 
@@ -318,24 +323,24 @@ CHATIFY_PASSWORD=<server-password>
 
 **Full configuration:**
 
-| Variable | Default | Description |
-|---|---|---|
-| `CHATIFY_HOST` | `127.0.0.1` | Chatify server host |
-| `CHATIFY_PORT` | `8765` | Chatify server port |
-| `CHATIFY_CHANNEL` | `general` | Default relay channel |
-| `CHATIFY_BOT_USERNAME` | `DiscordBot` | Bridge identity on Chatify |
-| `CHATIFY_WS_SCHEME` | `ws` | `ws` or `wss` |
-| `CHATIFY_AUTH_TIMEOUT_SECS` | `15` | Auth handshake timeout |
-| `CHATIFY_RECONNECT_BASE_SECS` | `1` | Exponential backoff base (seconds) |
-| `CHATIFY_RECONNECT_MAX_SECS` | `30` | Exponential backoff ceiling (seconds) |
-| `CHATIFY_RECONNECT_JITTER_PCT` | `20` | Jitter applied to reconnect interval |
-| `CHATIFY_RECONNECT_WARN_THRESHOLD` | `5` | Consecutive reconnects before log warning |
-| `CHATIFY_PING_SECS` | `20` | Keepalive interval (`0` to disable) |
-| `CHATIFY_HEALTH_LOG_SECS` | `30` | Health telemetry log interval |
-| `CHATIFY_BRIDGE_INSTANCE_ID` | — | Optional stable source identifier for multi-instance deployments |
-| `CHATIFY_DISCORD_CHANNEL_MAP` | — | Inline route map: `discordId:chatifyChannel,...` |
-| `CHATIFY_DISCORD_CHANNEL_MAP_FILE` | `bridge-channel-map.json` | Path to route map file |
-| `CHATIFY_LOG` | — | Set to `1` to enable bridge logging |
+| Variable                           | Default                   | Description                                                      |
+| ---------------------------------- | ------------------------- | ---------------------------------------------------------------- |
+| `CHATIFY_HOST`                     | `127.0.0.1`               | Chatify server host                                              |
+| `CHATIFY_PORT`                     | `8765`                    | Chatify server port                                              |
+| `CHATIFY_CHANNEL`                  | `general`                 | Default relay channel                                            |
+| `CHATIFY_BOT_USERNAME`             | `DiscordBot`              | Bridge identity on Chatify                                       |
+| `CHATIFY_WS_SCHEME`                | `ws`                      | `ws` or `wss`                                                    |
+| `CHATIFY_AUTH_TIMEOUT_SECS`        | `15`                      | Auth handshake timeout                                           |
+| `CHATIFY_RECONNECT_BASE_SECS`      | `1`                       | Exponential backoff base (seconds)                               |
+| `CHATIFY_RECONNECT_MAX_SECS`       | `30`                      | Exponential backoff ceiling (seconds)                            |
+| `CHATIFY_RECONNECT_JITTER_PCT`     | `20`                      | Jitter applied to reconnect interval                             |
+| `CHATIFY_RECONNECT_WARN_THRESHOLD` | `5`                       | Consecutive reconnects before log warning                        |
+| `CHATIFY_PING_SECS`                | `20`                      | Keepalive interval (`0` to disable)                              |
+| `CHATIFY_HEALTH_LOG_SECS`          | `30`                      | Health telemetry log interval                                    |
+| `CHATIFY_BRIDGE_INSTANCE_ID`       | —                         | Optional stable source identifier for multi-instance deployments |
+| `CHATIFY_DISCORD_CHANNEL_MAP`      | —                         | Inline route map: `discordId:chatifyChannel,...`                 |
+| `CHATIFY_DISCORD_CHANNEL_MAP_FILE` | `bridge-channel-map.json` | Path to route map file                                           |
+| `CHATIFY_LOG`                      | —                         | Set to `1` to enable bridge logging                              |
 
 **Route map — inline:**
 
@@ -348,7 +353,10 @@ CHATIFY_DISCORD_CHANNEL_MAP=123456789012345678:general,987654321098765432:ops
 ```json
 {
   "routes": [
-    { "discord_channel_id": "123456789012345678", "chatify_channel": "general" },
+    {
+      "discord_channel_id": "123456789012345678",
+      "chatify_channel": "general"
+    },
     { "discord_channel_id": "987654321098765432", "chatify_channel": "ops" }
   ]
 }
@@ -357,6 +365,7 @@ CHATIFY_DISCORD_CHANNEL_MAP=123456789012345678:general,987654321098765432:ops
 Merge precedence: file routes load first; `CHATIFY_DISCORD_CHANNEL_MAP` entries override matching Discord channel IDs.
 
 **Operational notes:**
+
 - **Loop prevention:** relay frames carry `src` and `relay.markers`. A frame is not re-relayed to Discord if the destination marker already appears in `relay.markers`. This handles the common loop on normal operation; it is not a guarantee against all loop topologies in complex multi-bridge configurations.
 - **Mention safety:** Discord outbound relay sets `allowed_mentions` to suppress `@everyone`, `@here`, role, and user pings.
 - **Attachment and reply preservation:** Discord → Chatify relay includes attachment URL metadata and reply context. Chatify → Discord relay reconstructs and emits that context on the Discord side.
@@ -382,13 +391,13 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer tar
 
 **Output artifacts:**
 
-| Artifact | Description |
-|---|---|
-| `dist/chatify-windows-x64.zip` | Portable binary package |
-| `dist/chatify-windows-x64.zip.sha256` | SHA256 checksum |
-| `dist/chatify-setup-<version>.exe` | Installer (when Inno Setup is available) |
-| `dist/chatify-setup-<version>.exe.sha256` | Installer checksum |
-| `dist/chatify-windows-x64/chatify-launcher.cmd` | Interactive launch helper |
+| Artifact                                        | Description                              |
+| ----------------------------------------------- | ---------------------------------------- |
+| `dist/chatify-windows-x64.zip`                  | Portable binary package                  |
+| `dist/chatify-windows-x64.zip.sha256`           | SHA256 checksum                          |
+| `dist/chatify-setup-<version>.exe`              | Installer (when Inno Setup is available) |
+| `dist/chatify-setup-<version>.exe.sha256`       | Installer checksum                       |
+| `dist/chatify-windows-x64/chatify-launcher.cmd` | Interactive launch helper                |
 
 **Checksum verification (PowerShell):**
 
