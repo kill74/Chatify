@@ -15,6 +15,7 @@ pub mod error;
 pub mod metrics;
 pub mod notifications;
 pub mod performance;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub mod screen_share;
 pub mod totp;
 pub mod ui;

@@ -70,7 +70,6 @@ regex = "1.10"
 bytes = "1"
 bitflags = "2"
 lru = "0.8"
-crabgrab = "0.4"
 webrtc = "0.17"
 flate2 = "1.0"
 parking_lot = "0.12"
@@ -78,9 +77,11 @@ prometheus = "0.13"
 lazy_static = "1.4"
 
 [target.'cfg(windows)'.dependencies]
+crabgrab = "0.4"
 windows-capture = "1.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+crabgrab = "0.4"
 screencapturekit = "1.5"
 
 [profile.release]
