@@ -6,6 +6,24 @@ This format is based on Keep a Changelog and the project follows Semantic Versio
 
 ## [Unreleased]
 
+### Added
+
+- Message reactions with server-side aggregation and client-side rendering in the modular terminal client.
+- New message identifier field `msg_id` in `msg` events to support reaction targeting and replay-safe correlation.
+- New `reaction_sync` protocol event for reconnect/bootstrap reaction hydration.
+- New modular client commands: `/react`, `/recent`, and `/sync` for reaction workflows.
+
+### Changed
+
+- Hardened reaction payload validation on the server for `msg_id` and `emoji` fields.
+- Optimized reaction synchronization to query only reaction events instead of full channel history.
+- Improved client-side dedup logic for message IDs and reaction events to avoid double counting.
+
+### Tests
+
+- Added contract coverage for reaction broadcast/sync aggregation flow.
+- Added contract coverage for invalid reaction payload rejection (`reaction requires valid msg_id`).
+
 ### Planned
 
 - Add reproducible benchmark runs and publish measured results for each tagged release.

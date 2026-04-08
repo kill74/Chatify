@@ -1,4 +1,4 @@
-//! # `clifford-server` Integration Test Suite
+﻿//! # `clifford-server` Integration Test Suite
 //!
 //! End-to-end contract tests for the `clifford-server` WebSocket binary.
 //!
@@ -29,12 +29,13 @@
 //! | Auth contract    | Field validation, key format, oversized frames, JSON    |
 //! | 2-FA             | Missing code, backup-code happy path, code consumption  |
 //! | Protocol safety  | Timestamp skew, nonce replay, payload size, fuzz corpus |
-//! | Schema migration | v0→v4 upgrade, future-version no-downgrade              |
+//! | Schema migration | v0ÔåÆv4 upgrade, future-version no-downgrade              |
 //! | Feature contracts| Messages, history, search, replay, rewind, voice (vdata) |
 
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -59,7 +60,7 @@ struct TestServer {
     /// for the full lifetime of [`TestServer`] without an "unused" warning.
     _child: Child,
 
-    /// `ws://127.0.0.1:<port>` – the root WebSocket endpoint.
+    /// `ws://127.0.0.1:<port>` ÔÇô the root WebSocket endpoint.
     url: String,
 
     /// Absolute path to the SQLite file used by this server instance.
@@ -104,6 +105,7 @@ type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Protocol version this test suite expects to remain backward-compatible.
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
+static BUILD_SERVER_BINARY_ONCE: Once = Once::new();
 
 // ---------------------------------------------------------------------------
 // Server / database helpers
@@ -181,10 +183,10 @@ fn hash_backup_code(code: &str) -> String {
 ///
 /// # Parameters
 ///
-/// * `db_path`      – Absolute path to the target SQLite file.
-/// * `username`     – The username to seed (must satisfy the server's username
+/// * `db_path`      ÔÇô Absolute path to the target SQLite file.
+/// * `username`     ÔÇô The username to seed (must satisfy the server's username
 ///   validation rules).
-/// * `backup_codes` – Raw backup code strings. These are hashed before storage
+/// * `backup_codes` ÔÇô Raw backup code strings. These are hashed before storage
 ///   to match the server's security model.
 fn seed_enabled_2fa_user(db_path: &PathBuf, username: &str, backup_codes: &[&str]) {
     let conn = Connection::open(db_path).expect("create sqlite db for 2fa seed");
@@ -254,6 +256,89 @@ fn read_schema_version(db_path: &PathBuf) -> String {
     .expect("schema_version row exists")
 }
 
+/// Resolves the server binary used by integration tests.
+///
+/// Preferred order:
+/// 1) Cargo-provided env vars (`CARGO_BIN_EXE_*`)
+/// 2) Sibling binary next to the compiled test in `target/debug`
+/// 3) One-time `cargo build -p clifford-server --bin chatify-server`
+fn resolve_server_binary() -> PathBuf {
+    for var in [
+        "CARGO_BIN_EXE_chatify-server",
+        "CARGO_BIN_EXE_clifford-server",
+        "CARGO_BIN_EXE_clicord-server",
+    ] {
+        if let Ok(path) = std::env::var(var) {
+            let candidate = PathBuf::from(path);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
+    let mut candidates = Vec::<PathBuf>::new();
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(debug_dir) = current_exe.parent().and_then(|p| p.parent()) {
+            candidates.push(debug_dir.join(format!("chatify-server{}", exe_suffix)));
+            candidates.push(debug_dir.join(format!("clifford-server{}", exe_suffix)));
+            candidates.push(debug_dir.join(format!("clicord-server{}", exe_suffix)));
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("target"));
+
+    candidates.push(
+        target_dir
+            .join("debug")
+            .join(format!("chatify-server{}", exe_suffix)),
+    );
+    candidates.push(
+        target_dir
+            .join("debug")
+            .join(format!("clifford-server{}", exe_suffix)),
+    );
+    candidates.push(
+        target_dir
+            .join("debug")
+            .join(format!("clicord-server{}", exe_suffix)),
+    );
+
+    // When Cargo does not inject CARGO_BIN_EXE_*, force a one-time build so
+    // fallback binaries are guaranteed to match current sources.
+    BUILD_SERVER_BINARY_ONCE.call_once(|| {
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("-p")
+            .arg("clifford-server")
+            .arg("--bin")
+            .arg("chatify-server")
+            .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+            .status()
+            .expect("spawn cargo build for chatify-server");
+
+        assert!(
+            status.success(),
+            "cargo build -p clifford-server --bin chatify-server failed"
+        );
+    });
+
+    let built = target_dir
+        .join("debug")
+        .join(format!("chatify-server{}", exe_suffix));
+    if built.is_file() {
+        return built;
+    }
+
+    panic!(
+        "could not locate chatify server binary; checked: {:?}",
+        candidates
+    );
+}
 /// Spawns the server binary against `db_path` on a newly allocated port and
 /// polls the WebSocket endpoint until it is accepting connections (up to 5 s).
 ///
@@ -264,11 +349,8 @@ fn read_schema_version(db_path: &PathBuf) -> String {
 async fn start_server_with_db(db_path: PathBuf) -> TestServer {
     let port = allocate_port();
     let url = format!("ws://127.0.0.1:{}", port);
-
-    // Cargo injects the compiled binary path as an env var so we don't need
-    // to hard-code build-directory paths or shell out to `cargo build`.
-    let server_bin = std::env::var("CARGO_BIN_EXE_clifford-server")
-        .expect("CARGO_BIN_EXE_clifford-server must be set by cargo test");
+    // Resolve binary via env var, target/debug lookup, or one-time cargo build.
+    let server_bin = resolve_server_binary();
 
     let child = Command::new(server_bin)
         .arg("--host")
@@ -333,7 +415,7 @@ async fn connect_and_auth(url: &str, username: &str) -> Ws {
 /// ```json
 /// // Request
 /// { "t": "auth", "u": "<username>", "pw": "<hash>", "pk": "<base64>",
-///   "status": { "text": "Online", "emoji": "🟢" }, "otp": "<code>" }
+///   "status": { "text": "Online", "emoji": "­ƒƒó" }, "otp": "<code>" }
 ///
 /// // Expected response
 /// { "t": "ok", "u": "<username>", "channels": [...], "hist": [...],
@@ -350,14 +432,14 @@ async fn connect_and_auth_with_otp(url: &str, username: &str, otp: Option<&str>)
             "t": "auth", "u": username,
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"},
+            "status": {"text":"Online","emoji":"­ƒƒó"},
             "otp": code
         }),
         None => json!({
             "t": "auth", "u": username,
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"}
+            "status": {"text":"Online","emoji":"­ƒƒó"}
         }),
     };
 
@@ -429,7 +511,7 @@ async fn auth_contract_rejects_when_2fa_enabled_without_code() {
             "t": "auth", "u": "alice",
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"}
+            "status": {"text":"Online","emoji":"­ƒƒó"}
         })
         .to_string(),
     ))
@@ -464,13 +546,13 @@ async fn auth_contract_accepts_backup_code_and_consumes_it() {
 
     let server = start_server_with_db(db_path).await;
 
-    // First use of the backup code — must succeed.
+    // First use of the backup code ÔÇö must succeed.
     let mut ws = connect_and_auth_with_otp(&server.url, "alice", Some(backup_code)).await;
     ws.close(None)
         .await
         .expect("close first authenticated socket");
 
-    // Second use of the same backup code — must be rejected.
+    // Second use of the same backup code ÔÇö must be rejected.
     let (mut ws2, _) = connect_async(&server.url)
         .await
         .expect("connect websocket for consumed backup code test");
@@ -478,7 +560,7 @@ async fn auth_contract_accepts_backup_code_and_consumes_it() {
         "t": "auth", "u": "alice",
         "pw": "test-password-hash",
         "pk": pub_b64(&new_keypair()).unwrap(),
-        "status": {"text":"Online","emoji":"🟢"},
+        "status": {"text":"Online","emoji":"­ƒƒó"},
         "otp": backup_code
     });
     ws2.send(Message::Text(auth.to_string()))
@@ -529,7 +611,7 @@ async fn auth_contract_returns_expected_fields() {
         json!({
             "t": "auth", "u": "auth-contract-check",
             "pw": "test", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"}
+            "status": {"text":"Online","emoji":"­ƒƒó"}
         })
         .to_string(),
     ))
@@ -651,7 +733,7 @@ async fn protocol_contract_advertises_backward_compatible_version() {
             "t": "auth", "u": "proto-check",
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"}
+            "status": {"text":"Online","emoji":"­ƒƒó"}
         })
         .to_string(),
     ))
@@ -691,7 +773,7 @@ async fn auth_contract_rejects_invalid_username() {
         json!({
             "t": "auth", "u": "invalid user",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"}
+            "status": {"text":"Online","emoji":"­ƒƒó"}
         })
         .to_string(),
     ))
@@ -746,7 +828,7 @@ async fn auth_contract_rejects_invalid_public_key() {
         json!({
             "t": "auth", "u": "alice",
             "pw": "test-password-hash", "pk": "not-base64",
-            "status": {"text":"Online","emoji":"🟢"}
+            "status": {"text":"Online","emoji":"­ƒƒó"}
         })
         .to_string(),
     ))
@@ -808,7 +890,7 @@ async fn auth_contract_rejects_malformed_json() {
 }
 
 /// Verifies that SQL-injection-style strings in the `"u"` field are rejected
-/// by the input validation layer — **before** they can reach any SQL statement.
+/// by the input validation layer ÔÇö **before** they can reach any SQL statement.
 ///
 /// This is a belt-and-suspenders test: parameterised queries should already
 /// prevent injection, but enforcing strict username formatting ensures the
@@ -825,7 +907,7 @@ async fn auth_contract_rejects_sql_injection_like_username() {
         json!({
             "t": "auth", "u": "alice' OR '1'='1",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"}
+            "status": {"text":"Online","emoji":"­ƒƒó"}
         })
         .to_string(),
     ))
@@ -861,7 +943,7 @@ async fn auth_contract_rejects_oversized_otp_input() {
         json!({
             "t": "auth", "u": "alice",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢"},
+            "status": {"text":"Online","emoji":"­ƒƒó"},
             "otp": oversized_otp
         })
         .to_string(),
@@ -921,7 +1003,7 @@ async fn auth_contract_rejects_unexpected_status_object_field() {
         json!({
             "t": "auth", "u": "alice",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"🟢","mood":"focused"}
+            "status": {"text":"Online","emoji":"­ƒƒó","mood":"focused"}
         })
         .to_string(),
     ))
@@ -940,7 +1022,7 @@ async fn auth_contract_rejects_unexpected_status_object_field() {
 ///
 /// This test deliberately **does not** assert rate-limiting behaviour (that
 /// would be a separate security test). Its goal is to confirm that the auth
-/// state remains consistent after a sequence of failures — i.e. the valid
+/// state remains consistent after a sequence of failures ÔÇö i.e. the valid
 /// backup code still works after all wrong attempts, and there is no
 /// accidental state corruption in the `user_2fa` row.
 #[tokio::test]
@@ -962,7 +1044,7 @@ async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
             json!({
                 "t": "auth", "u": "alice",
                 "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-                "status": {"text":"Online","emoji":"🟢"},
+                "status": {"text":"Online","emoji":"­ƒƒó"},
                 "otp": wrong_otp
             })
             .to_string(),
@@ -1065,7 +1147,7 @@ async fn status_contract_broadcasts_status_update_to_other_clients() {
         .send(Message::Text(
             json!({
                 "t":"status",
-                "status": {"text":"In focus","emoji":"✅"}
+                "status": {"text":"In focus","emoji":"Ô£à"}
             })
             .to_string(),
         ))
@@ -1086,7 +1168,7 @@ async fn status_contract_broadcasts_status_update_to_other_clients() {
             .get("status")
             .and_then(|v| v.get("emoji"))
             .and_then(|v| v.as_str()),
-        Some("✅")
+        Some("Ô£à")
     );
 }
 
@@ -1183,9 +1265,9 @@ async fn typing_contract_routes_dm_scope_updates() {
 /// back to the sender (and to all other channel members). The echoed frame
 /// must preserve:
 ///
-/// * `"ch"` – the target channel name.
-/// * `"u"`  – the sending username (added by the server).
-/// * `"c"`  – the ciphertext blob (unchanged).
+/// * `"ch"` ÔÇô the target channel name.
+/// * `"u"`  ÔÇô the sending username (added by the server).
+/// * `"c"`  ÔÇô the ciphertext blob (unchanged).
 ///
 /// Because messages are end-to-end encrypted the server MUST NOT inspect or
 /// modify the `"c"` field; any corruption would silently break decryption on
@@ -1212,6 +1294,12 @@ async fn msg_contract_roundtrips_channel_payload() {
     assert_eq!(
         msg.get("c").and_then(|v| v.as_str()),
         Some("ciphertext-blob")
+    );
+    assert!(
+        msg.get("msg_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| !id.is_empty()),
+        "msg contract should include non-empty msg_id"
     );
 }
 
@@ -1292,6 +1380,124 @@ async fn msg_contract_preserves_bridge_source_and_relay_markers() {
             .and_then(|reply| reply.get("discord_message_id"))
             .and_then(|v| v.as_str()),
         Some("555")
+    );
+}
+
+/// Verifies that reaction events are broadcast and can be re-synced as
+/// aggregated counters for reconnect/bootstrap flows.
+#[tokio::test]
+async fn reaction_contract_broadcasts_and_syncs_aggregated_counts() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"join","ch":"reaction-room"}).to_string(),
+        ))
+        .await
+        .expect("alice joins reaction-room");
+    let _ = recv_by_type(&mut alice, "joined").await;
+
+    bob.send(Message::Text(
+        json!({"t":"join","ch":"reaction-room"}).to_string(),
+    ))
+    .await
+    .expect("bob joins reaction-room");
+    let _ = recv_by_type(&mut bob, "joined").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"msg","ch":"reaction-room","c":"reaction-seed"}).to_string(),
+        ))
+        .await
+        .expect("alice sends message in reaction-room");
+
+    let msg = recv_by_type(&mut alice, "msg").await;
+    let msg_id = msg
+        .get("msg_id")
+        .and_then(|v| v.as_str())
+        .expect("message should include msg_id")
+        .to_string();
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"reaction",
+                "ch":"reaction-room",
+                "msg_id":msg_id,
+                "emoji":"+1",
+                "ts": clifford::now(),
+                "n": clifford::fresh_nonce_hex()
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("alice sends reaction");
+
+    let reaction = recv_by_type(&mut bob, "reaction").await;
+    assert_eq!(
+        reaction.get("ch").and_then(|v| v.as_str()),
+        Some("reaction-room")
+    );
+    assert_eq!(reaction.get("user").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(reaction.get("emoji").and_then(|v| v.as_str()), Some("+1"));
+    let reacted_msg_id = reaction
+        .get("msg_id")
+        .and_then(|v| v.as_str())
+        .expect("reaction should carry msg_id")
+        .to_string();
+
+    bob.send(Message::Text(
+        json!({"t":"reaction_sync","ch":"reaction-room","limit":200}).to_string(),
+    ))
+    .await
+    .expect("request reaction sync");
+
+    let sync = recv_by_type(&mut bob, "reaction_sync").await;
+    assert_eq!(
+        sync.get("ch").and_then(|v| v.as_str()),
+        Some("reaction-room")
+    );
+
+    let reactions = sync
+        .get("reactions")
+        .and_then(|v| v.as_array())
+        .expect("reaction_sync should include reactions array");
+
+    let found = reactions.iter().any(|entry| {
+        entry.get("msg_id").and_then(|v| v.as_str()) == Some(reacted_msg_id.as_str())
+            && entry.get("emoji").and_then(|v| v.as_str()) == Some("+1")
+            && entry.get("count").and_then(|v| v.as_u64()) == Some(1)
+    });
+    assert!(found, "reaction_sync should contain aggregated +1 reaction");
+}
+
+/// Verifies that malformed reaction payloads are rejected with a clear error.
+#[tokio::test]
+async fn reaction_contract_rejects_invalid_msg_id() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"reaction",
+                "ch":"general",
+                "msg_id":"bad id with spaces",
+                "emoji":"+1",
+                "ts": clifford::now(),
+                "n": clifford::fresh_nonce_hex()
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send invalid reaction payload");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("reaction requires valid msg_id")
     );
 }
 
@@ -2281,7 +2487,7 @@ async fn schema_newer_version_is_not_downgraded_and_server_auth_still_works() {
 ///
 /// Accepting arbitrarily old timestamps would allow replay attacks where an
 /// attacker captures a legitimate frame and resubmits it later. The server
-/// must enforce a tight clock-skew window (typically ±30–60 s) and reject
+/// must enforce a tight clock-skew window (typically ┬▒30ÔÇô60 s) and reject
 /// anything outside it with a descriptive error.
 #[tokio::test]
 async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
@@ -2360,14 +2566,14 @@ async fn protocol_contract_rejects_replayed_nonce() {
         "n": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     });
 
-    // First send — must succeed.
+    // First send ÔÇö must succeed.
     alice
         .send(Message::Text(payload.to_string()))
         .await
         .expect("send first message with nonce");
     let _ = recv_by_type(&mut alice, "msg").await;
 
-    // Identical replay — must be rejected.
+    // Identical replay ÔÇö must be rejected.
     alice
         .send(Message::Text(payload.to_string()))
         .await

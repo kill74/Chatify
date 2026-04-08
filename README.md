@@ -200,11 +200,21 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 | `/search <query>` | Search persisted events in the current channel |
 | `/replay <timestamp>` | Reconstruct channel state from an absolute timestamp |
 | `/rewind <time> [n]` | Replay the last N events within a relative window (`15m`, `2h`) |
+| `/recent [n]` | Show recent message IDs for quick reaction targeting |
+| `/react <msg_id\|#index> <emoji>` | React to a message using a stable `msg_id` or recent index |
+| `/sync` | Request reaction snapshot sync for the active channel |
 | `/fingerprint [user]` | Inspect trust state and key fingerprint for a peer |
 | `/trust <user> <fingerprint>` | Record a peer fingerprint as trusted after out-of-band verification |
 | `/edit [#N] <new text>` | Edit your most recent (or Nth) message. Renders `(edited)` suffix in feed. |
 | `/clear` | Clear terminal output |
 | `/quit` `/exit` `/q` | Disconnect and exit |
+
+### Reactions and Message IDs
+
+- Every channel message now includes a stable `msg_id` in the protocol payload.
+- Reactions are sent as `reaction` events and aggregated per `(msg_id, emoji)`.
+- Clients can bootstrap reaction state with `reaction_sync` after join/reconnect.
+- For terminal UX, `/react #1 +1` targets the most recent visible message ID.
 
 ### Media Transfer
 

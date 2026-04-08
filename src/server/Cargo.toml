@@ -3,6 +3,10 @@ name = "clifford-server"
 version = "0.2.0"
 edition = "2021"
 
+[features]
+default = []
+batch-writes = []
+
 [lib]
 name = "clifford_server"
 path = "src/lib.rs"
