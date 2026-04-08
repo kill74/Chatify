@@ -6,10 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::Message,
-};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::args::{HISTORY_CAP, MAX_AUTH_BYTES};
 use crate::state::{BridgeInfo, State};
@@ -20,7 +17,10 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if !state.ip_connect(&addr) {
-        warn!("connection rejected: too many connections from {}", addr.ip());
+        warn!(
+            "connection rejected: too many connections from {}",
+            addr.ip()
+        );
         if let Ok(ws) = accept_async(stream).await {
             let (mut sink, _) = ws.split();
             let _ = sink
@@ -251,7 +251,10 @@ pub async fn handle_event(
         }
         "history" => {
             let ch = crate::http::safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let limit = d.get("limit").and_then(|v| v.as_u64()).unwrap_or(HISTORY_CAP as u64) as usize;
+            let limit = d
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(HISTORY_CAP as u64) as usize;
             let hist = if let Some(ch_data) = state.channels.get(&ch) {
                 ch_data.hist(limit.min(1000))
             } else {
@@ -302,15 +305,24 @@ struct ConnectionGuard {
 
 impl ConnectionGuard {
     fn new(state: Arc<State>, _addr: std::net::SocketAddr) -> Self {
-        state.active_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state
+            .active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self { state }
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.state.active_connections.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if self.state.active_connections.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        self.state
+            .active_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .state
+            .active_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
             self.state.drained_notify.notify_waiters();
         }
     }

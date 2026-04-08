@@ -149,7 +149,9 @@ pub fn create_ready_response(state: &Arc<State>) -> String {
     )
 }
 
-pub fn create_metrics_response(metrics: &Option<Arc<std::sync::Mutex<PrometheusMetrics>>>) -> String {
+pub fn create_metrics_response(
+    metrics: &Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+) -> String {
     let metrics_text = if let Some(ref m) = metrics {
         if let Ok(mutex) = m.lock() {
             let encoder = prometheus::TextEncoder::new();
@@ -226,7 +228,11 @@ pub fn safe_ch(raw: &str) -> String {
         .collect()
 }
 
-pub fn create_ok_response(username: &str, state: &crate::state::State, hist: Vec<serde_json::Value>) -> String {
+pub fn create_ok_response(
+    username: &str,
+    state: &crate::state::State,
+    hist: Vec<serde_json::Value>,
+) -> String {
     let users: Vec<_> = state
         .user_pubkeys
         .iter()
@@ -239,5 +245,6 @@ pub fn create_ok_response(username: &str, state: &crate::state::State, hist: Vec
         "channels": state.channels_json(),
         "users": users,
         "history": hist
-    }).to_string()
+    })
+    .to_string()
 }
