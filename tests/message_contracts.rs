@@ -432,14 +432,14 @@ async fn connect_and_auth_with_otp(url: &str, username: &str, otp: Option<&str>)
             "t": "auth", "u": username,
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"},
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
             "otp": code
         }),
         None => json!({
             "t": "auth", "u": username,
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         }),
     };
 
@@ -511,7 +511,7 @@ async fn auth_contract_rejects_when_2fa_enabled_without_code() {
             "t": "auth", "u": "alice",
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
     ))
@@ -560,7 +560,7 @@ async fn auth_contract_accepts_backup_code_and_consumes_it() {
         "t": "auth", "u": "alice",
         "pw": "test-password-hash",
         "pk": pub_b64(&new_keypair()).unwrap(),
-        "status": {"text":"Online","emoji":"­ƒƒó"},
+        "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
         "otp": backup_code
     });
     ws2.send(Message::Text(auth.to_string()))
@@ -611,7 +611,7 @@ async fn auth_contract_returns_expected_fields() {
         json!({
             "t": "auth", "u": "auth-contract-check",
             "pw": "test", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
     ))
@@ -733,7 +733,7 @@ async fn protocol_contract_advertises_backward_compatible_version() {
             "t": "auth", "u": "proto-check",
             "pw": "test-password-hash",
             "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
     ))
@@ -828,7 +828,7 @@ async fn auth_contract_rejects_invalid_public_key() {
         json!({
             "t": "auth", "u": "alice",
             "pw": "test-password-hash", "pk": "not-base64",
-            "status": {"text":"Online","emoji":"­ƒƒó"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
     ))
@@ -907,7 +907,7 @@ async fn auth_contract_rejects_sql_injection_like_username() {
         json!({
             "t": "auth", "u": "alice' OR '1'='1",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
     ))
@@ -943,7 +943,7 @@ async fn auth_contract_rejects_oversized_otp_input() {
         json!({
             "t": "auth", "u": "alice",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó"},
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
             "otp": oversized_otp
         })
         .to_string(),
@@ -1003,7 +1003,7 @@ async fn auth_contract_rejects_unexpected_status_object_field() {
         json!({
             "t": "auth", "u": "alice",
             "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-            "status": {"text":"Online","emoji":"­ƒƒó","mood":"focused"}
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó","mood":"focused"}
         })
         .to_string(),
     ))
@@ -1044,7 +1044,7 @@ async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
             json!({
                 "t": "auth", "u": "alice",
                 "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
-                "status": {"text":"Online","emoji":"­ƒƒó"},
+                "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
                 "otp": wrong_otp
             })
             .to_string(),

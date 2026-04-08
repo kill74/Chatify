@@ -24,10 +24,8 @@
 //! - `CHATIFY_DISCORD_CHANNEL_MAP`: Optional map `discordChannelId:chatifyChannel,...`
 //! - `CHATIFY_LOG`: Set to "1" to enable logging
 
-use clicord_server::crypto::dh_key;
-use clicord_server::crypto::{
-    channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash_client,
-};
+use clifford::crypto::dh_key;
+use clifford::crypto::{channel_key, dec_bytes, enc_bytes, new_keypair, pub_b64, pw_hash_client};
 
 use std::collections::HashMap;
 use std::env;
@@ -73,7 +71,7 @@ const RELAY_ORIGIN_DISCORD: &str = "discord";
 const RELAY_MARKER_PREFIX_DISCORD: &str = "discord:";
 
 fn normalize_chatify_channel(raw: &str) -> Option<String> {
-    clicord_server::normalize_channel(raw)
+    clifford::normalize_channel(raw)
 }
 
 fn parse_channel_map(raw: &str) -> HashMap<String, String> {
@@ -899,7 +897,7 @@ fn jittered_backoff_secs(base_secs: u64, jitter_pct: u64) -> u64 {
 
 /// Get current Unix timestamp
 fn now_secs() -> u64 {
-    clicord_server::now_secs()
+    clifford::now() as u64
 }
 
 fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
@@ -907,7 +905,7 @@ fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
 }
 
 fn fresh_nonce_hex() -> String {
-    clicord_server::fresh_nonce_hex()
+    clifford::fresh_nonce_hex()
 }
 
 fn load_users(users_value: &serde_json::Value, users_map: &DashMap<String, String>) {
