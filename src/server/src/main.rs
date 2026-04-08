@@ -6002,7 +6002,7 @@ async fn main() -> ChatifyResult<()> {
                 }
             });
         }
-        accept_loop_unix(listener, state, tls_acceptor, shutdown_rx, sighup_rx, args).await;
+        accept_loop_unix(listener, state, tls_acceptor, shutdown_rx, sighup_rx, &args).await;
     }
 
     #[cfg(not(unix))]
