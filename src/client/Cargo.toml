@@ -1,0 +1,44 @@
+[package]
+name = "clifford-client"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "clifford_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chatify-client"
+path = "src/main.rs"
+
+[dependencies]
+clifford = { path = "../../" }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+tungstenite = "0.21"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+dashmap = "5"
+clap = { version = "=4.4.18", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+log = "0.4"
+env_logger = "0.11"
+prometheus = "0.13"
+tokio-rustls = "0.25"
+rustls = "0.22"
+rustls-pemfile = "2"
+base64 = "0.21"
+rand = "0.8"
+bitflags = "2"
+parking_lot = "0.12"
+crossterm = "0.27"
+ratatui = "0.26"
+chrono = "0.4"
+zeroize = "1.7"
+cpal = "0.14"
+rodio = "0.18"
+image = "0.24"

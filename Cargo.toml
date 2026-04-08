@@ -4,6 +4,9 @@ version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
+[workspace]
+members = ["src/server", "src/client"]
+
 [features]
 default = []
 discord-bridge = ["dep:serenity"]

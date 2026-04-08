@@ -12,13 +12,13 @@
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod metrics;
 pub mod notifications;
+pub mod performance;
+pub mod screen_share;
 pub mod totp;
 pub mod ui;
-pub mod screen_share;
-pub mod performance;
 pub mod voice;
-pub mod metrics;
 
 use rand::RngCore;
 use std::time::{SystemTime, UNIX_EPOCH};
