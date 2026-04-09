@@ -240,3 +240,9 @@ impl Channel {
             .collect()
     }
 }
+
+impl Default for Channel {
+    fn default() -> Self {
+        Self::new()
+    }
+}

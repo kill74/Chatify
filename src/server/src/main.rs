@@ -68,6 +68,8 @@
 //! See [`validate_auth_payload`] for the full auth contract and
 //! [`handle_event`] for the complete set of post-auth event types.
 
+mod plugin_runtime;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -85,6 +87,9 @@ use clifford::voice::{relay::VoiceBroadcast, VoiceRelay};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
+use plugin_runtime::{
+    MessageHookResult, PluginMessage, PluginMessageTarget, PluginRuntime, PLUGIN_API_VERSION,
+};
 use prometheus::Encoder;
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
@@ -186,6 +191,18 @@ struct Args {
     /// Enable per-user rate limiting.
     #[arg(long)]
     enable_user_rate_limit: bool,
+
+    /// Internal mode: run a built-in plugin worker process.
+    #[arg(long, hide = true)]
+    chatify_plugin_worker: Option<String>,
+
+    /// Internal mode: plugin operation (`manifest`, `slash`, `message_hook`).
+    #[arg(long, hide = true, default_value = "manifest")]
+    chatify_plugin_op: String,
+
+    /// Internal mode: slash command identifier for plugin slash dispatch.
+    #[arg(long, hide = true)]
+    chatify_plugin_command: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2197,6 +2214,9 @@ struct State {
 
     /// Whether per-user rate limiting is enabled.
     user_rate_limit_enabled: bool,
+
+    /// Plugin runtime manager (API v1).
+    plugin_runtime: PluginRuntime,
 }
 
 impl State {
@@ -2205,6 +2225,7 @@ impl State {
         db_path: String,
         db_key: Option<Vec<u8>>,
         prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+        plugin_runtime: PluginRuntime,
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
     ) -> Arc<Self> {
@@ -2232,6 +2253,7 @@ impl State {
             user_msg_rate: DashMap::new(),
             max_msgs_per_minute,
             user_rate_limit_enabled,
+            plugin_runtime,
         });
         s.channels.insert("general".into(), Channel::new());
         s
@@ -2775,6 +2797,88 @@ fn send_err(
     let _ = out_tx.send(serialized);
 }
 
+fn parse_slash_invocation(input: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = input.split_whitespace();
+    let first = parts.next()?;
+    if !first.starts_with('/') {
+        return None;
+    }
+
+    let command = first.trim_start_matches('/').trim().to_ascii_lowercase();
+    if command.is_empty() {
+        return None;
+    }
+
+    let args = parts.map(|part| part.to_string()).collect::<Vec<String>>();
+    Some((command, args))
+}
+
+fn emit_plugin_messages(
+    state: &Arc<State>,
+    out_tx: &mpsc::UnboundedSender<String>,
+    channel: &str,
+    messages: &[PluginMessage],
+) {
+    for message in messages {
+        let payload = serde_json::json!({
+            "t": "sys",
+            "m": format!("[plugin:{}] {}", message.plugin, message.text),
+            "ts": now()
+        })
+        .to_string();
+
+        match message.target {
+            PluginMessageTarget::Channel => {
+                let _ = state.chan(channel).tx.send(payload);
+            }
+            PluginMessageTarget::Sender => {
+                let _ = out_tx.send(payload);
+            }
+        }
+    }
+}
+
+async fn execute_plugin_slash(
+    state: &Arc<State>,
+    username: &str,
+    channel: &str,
+    raw_input: &str,
+) -> Result<plugin_runtime::SlashExecutionResult, String> {
+    let (command, args) = parse_slash_invocation(raw_input)
+        .ok_or_else(|| "invalid slash command format".to_string())?;
+
+    let state = state.clone();
+    let username = username.to_string();
+    let channel = channel.to_string();
+    tokio::task::spawn_blocking(move || {
+        state
+            .plugin_runtime
+            .execute_slash(&channel, &username, &command, &args)
+    })
+    .await
+    .map_err(|_| "plugin runtime task failed".to_string())?
+}
+
+async fn run_plugin_message_hooks(
+    state: &Arc<State>,
+    username: &str,
+    channel: &str,
+    content: &str,
+) -> Result<MessageHookResult, String> {
+    let state = state.clone();
+    let username = username.to_string();
+    let channel = channel.to_string();
+    let content = content.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        state
+            .plugin_runtime
+            .apply_message_hooks(&channel, &username, &content)
+    })
+    .await
+    .map_err(|_| "plugin hook runtime task failed".to_string())?
+}
+
 /// Spawns a background task that forwards messages from a broadcast `rx` to
 /// an mpsc `out_tx`, bridging the fan-out broadcast model to the single-writer
 /// sink task.
@@ -2924,13 +3028,165 @@ async fn handle_event(
 
     // --- Event dispatch switch ---------------------------------------------
     match t {
+        "slash" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let raw = d["cmd"].as_str().unwrap_or("").trim();
+            if raw.is_empty() {
+                send_err(out_tx, "slash command is required", &state.metrics);
+                return;
+            }
+
+            match execute_plugin_slash(state, username, &ch, raw).await {
+                Ok(result) => {
+                    emit_plugin_messages(state, out_tx, &ch, &result.messages);
+                    send_out_json(
+                        out_tx,
+                        serde_json::json!({
+                            "t":"slash_ok",
+                            "api_version": PLUGIN_API_VERSION,
+                            "cmd": raw,
+                            "messages": result.messages.len(),
+                            "ts": now()
+                        }),
+                    );
+                }
+                Err(err) => {
+                    send_err(out_tx, err, &state.metrics);
+                }
+            }
+        }
+        "plugin" => {
+            if !state.can_ban(username, "general") {
+                send_err(
+                    out_tx,
+                    "insufficient permissions to manage plugins",
+                    &state.metrics,
+                );
+                return;
+            }
+
+            let sub = d["sub"].as_str().unwrap_or("list");
+            match sub {
+                "install" => {
+                    let spec = d
+                        .get("plugin")
+                        .or_else(|| d.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+
+                    if spec.is_empty() {
+                        send_err(
+                            out_tx,
+                            "plugin install requires 'plugin' (name or executable path)",
+                            &state.metrics,
+                        );
+                        return;
+                    }
+
+                    let state_for_task = state.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        state_for_task.plugin_runtime.install_plugin(&spec)
+                    })
+                    .await
+                    {
+                        Ok(Ok(manifest)) => {
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"plugin_installed",
+                                    "api_version": PLUGIN_API_VERSION,
+                                    "plugin": manifest.name,
+                                    "commands": manifest.commands,
+                                    "message_hook": manifest.message_hook,
+                                    "ts": now()
+                                }),
+                            );
+                        }
+                        Ok(Err(err)) => send_err(out_tx, err, &state.metrics),
+                        Err(_) => send_err(out_tx, "plugin install task failed", &state.metrics),
+                    }
+                }
+                "disable" => {
+                    let plugin_id = d
+                        .get("plugin")
+                        .or_else(|| d.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+
+                    if plugin_id.is_empty() {
+                        send_err(out_tx, "plugin disable requires 'plugin'", &state.metrics);
+                        return;
+                    }
+
+                    let state_for_task = state.clone();
+                    let plugin_id_for_task = plugin_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        state_for_task
+                            .plugin_runtime
+                            .disable_plugin(&plugin_id_for_task)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            send_out_json(
+                                out_tx,
+                                serde_json::json!({
+                                    "t":"plugin_disabled",
+                                    "plugin": plugin_id,
+                                    "ts": now()
+                                }),
+                            );
+                        }
+                        Ok(Err(err)) => send_err(out_tx, err, &state.metrics),
+                        Err(_) => send_err(out_tx, "plugin disable task failed", &state.metrics),
+                    }
+                }
+                "list" | "" => {
+                    send_out_json(
+                        out_tx,
+                        serde_json::json!({
+                            "t":"plugins",
+                            "api_version": PLUGIN_API_VERSION,
+                            "plugins": state.plugin_runtime.list_plugins_json(),
+                            "ts": now()
+                        }),
+                    );
+                }
+                _ => send_err(
+                    out_tx,
+                    "unknown plugin subcommand (install|disable|list)",
+                    &state.metrics,
+                ),
+            }
+        }
         "msg" => {
             // Broadcast an encrypted message to a channel.
             // `"c"` is the ciphertext blob; `"p"` is optional plaintext for
             // the search index only Ã¢â‚¬â€ it is never echoed back to clients.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let c = d["c"].as_str().unwrap_or("");
-            let p = d["p"].as_str().unwrap_or("");
+            let mut c = d["c"].as_str().unwrap_or("").to_string();
+            let mut p = d["p"].as_str().unwrap_or("").to_string();
+
+            let slash_input = if p.trim_start().starts_with('/') {
+                Some(p.clone())
+            } else if c.trim_start().starts_with('/') {
+                Some(c.clone())
+            } else {
+                None
+            };
+
+            if let Some(raw_slash) = slash_input {
+                match execute_plugin_slash(state, username, &ch, &raw_slash).await {
+                    Ok(result) => emit_plugin_messages(state, out_tx, &ch, &result.messages),
+                    Err(err) => send_err(out_tx, err, &state.metrics),
+                }
+                return;
+            }
+
             if c.is_empty() {
                 return;
             }
@@ -2960,6 +3216,32 @@ async fn handle_event(
                 }
                 return;
             }
+
+            let hook_content = if !p.is_empty() { p.clone() } else { c.clone() };
+
+            match run_plugin_message_hooks(state, username, &ch, &hook_content).await {
+                Ok(hook_result) => {
+                    if let Some(replacement) = hook_result.replacement {
+                        if !p.is_empty() {
+                            p = replacement;
+                        } else {
+                            c = replacement;
+                        }
+                    }
+
+                    if hook_result.blocked {
+                        emit_plugin_messages(state, out_tx, &ch, &hook_result.messages);
+                        send_err(out_tx, "message blocked by plugin policy", &state.metrics);
+                        return;
+                    }
+
+                    emit_plugin_messages(state, out_tx, &ch, &hook_result.messages);
+                }
+                Err(err) => {
+                    warn!("plugin message hook failed: {}", err);
+                }
+            }
+
             let msg_id = clifford::fresh_nonce_hex();
             let mut entry = serde_json::json!({
                 "t":"msg",
@@ -2978,7 +3260,7 @@ async fn handle_event(
             let serialized = entry.to_string();
             let chan = state.chan(&ch);
             chan.push(entry.clone()).await;
-            let searchable = if p.is_empty() { c } else { p };
+            let searchable = if p.is_empty() { c.as_str() } else { p.as_str() };
             state
                 .store
                 .persist("msg", &ch, username, None, &entry, searchable);
@@ -5841,6 +6123,17 @@ async fn accept_loop_unix(
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
+
+    if let Some(plugin_name) = args.chatify_plugin_worker.as_deref() {
+        plugin_runtime::run_builtin_plugin_worker(
+            plugin_name,
+            &args.chatify_plugin_op,
+            args.chatify_plugin_command.as_deref(),
+        )
+        .map_err(ChatifyError::Message)?;
+        return Ok(());
+    }
+
     let addr = format!("{}:{}", args.host, args.port);
 
     if args.log {
@@ -5876,14 +6169,26 @@ async fn main() -> ChatifyResult<()> {
         }
     };
 
+    let plugin_runtime = PluginRuntime::new(std::env::current_exe()?);
+
     let listener = TcpListener::bind(&addr).await?;
     let state = State::new(
         args.db.clone(),
         db_key,
         metrics.clone(),
+        plugin_runtime,
         args.max_msgs_per_minute,
         args.enable_user_rate_limit,
     );
+
+    for plugin_name in plugin_runtime::DEFAULT_BUILTIN_PLUGINS {
+        if let Err(err) = state.plugin_runtime.install_plugin(plugin_name) {
+            warn!(
+                "failed to install built-in plugin '{}' at startup: {}",
+                plugin_name, err
+            );
+        }
+    }
 
     let enc_label = if state.store.is_encrypted() {
         "ChaCha20-Poly1305"
@@ -6067,7 +6372,16 @@ mod tests {
     /// the drop and the atomic write.
     #[tokio::test]
     async fn connection_counter_tracks_open_and_close() {
-        let state = State::new(":memory:".to_string(), None, None, 60, false);
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            ":memory:".to_string(),
+            None,
+            None,
+            plugin_runtime,
+            60,
+            false,
+        );
         assert_eq!(state.active_connection_count(), 0);
 
         let addr1: SocketAddr = "127.0.0.1:12345".parse().unwrap();
