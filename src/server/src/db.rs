@@ -65,4 +65,8 @@ impl EventStore {
     pub fn history(&self, _channel: &str, _limit: usize) -> Vec<serde_json::Value> {
         Vec::new()
     }
+
+    pub fn is_user_muted(&self, _username: &str, _channel: &str) -> Result<bool, &'static str> {
+        Ok(false)
+    }
 }

@@ -89,3 +89,6 @@ pub const MAX_FILE_ID_LEN: usize = 128;
 pub const MAX_MEDIA_MIME_LEN: usize = 128;
 pub const MAX_STATUS_TEXT_LEN: usize = 128;
 pub const MAX_STATUS_EMOJI_LEN: usize = 16;
+pub const CHANNEL_BUFFER_SIZE: usize = 1000;
+pub const CHANNEL_HISTORY_LIMIT: usize = 1000;
+pub const MAX_MSG_ID_LEN: usize = 64;

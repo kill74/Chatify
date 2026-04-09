@@ -89,8 +89,23 @@ use dashmap::{DashMap, DashSet};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use plugin_runtime::{
-    MessageHookResult, PluginMessage, PluginMessageTarget, PluginRuntime, PLUGIN_API_VERSION,
+    PluginRuntime, DEFAULT_BUILTIN_PLUGINS, PLUGIN_API_VERSION,
 };
+use prometheus::Encoder;
+use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
+use serde_json::Value;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc, Notify, RwLock};
+use tokio::time::{sleep, Duration};
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::{
+    accept_hdr_async, connect_async, tungstenite::Message, Connector,
+};
+
+use crate::validation::AuthInfo;
 use prometheus::Encoder;
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
@@ -247,6 +262,10 @@ struct Args {
     #[arg(long)]
     shutdown_endpoint: bool,
 
+    /// Secret token required for shutdown endpoint.
+    #[arg(long, default_value = "")]
+    shutdown_token: String,
+
     /// Maximum messages per user per minute (0 = unlimited).
     #[arg(long, default_value_t = 60)]
     max_msgs_per_minute: u32,
@@ -254,6 +273,10 @@ struct Args {
     /// Enable per-user rate limiting.
     #[arg(long)]
     enable_user_rate_limit: bool,
+
+    /// Database connection pool size.
+    #[arg(long, default_value_t = 8)]
+    db_pool_size: u32,
 
     /// Internal mode: run a built-in plugin worker process.
     #[arg(long, hide = true)]
@@ -407,10 +430,10 @@ const MAX_REACTION_EMOJI_LEN: usize = 32;
 /// Validated, strongly-typed representation of a successful auth frame parse.
 ///
 /// Created by [`validate_auth_payload`] after all field-level validation
-/// passes. Using a typed struct here ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â rather than passing `&Value` through
-/// downstream functions ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â makes it impossible to accidentally skip validation
+/// passes. Using a typed struct here — rather than passing `&Value` through
+/// downstream functions — makes it impossible to accidentally skip validation
 /// or misread a field name.
-struct AuthInfo {
+/// The struct is defined in `validation.rs` and re-exported here via `use crate::validation::AuthInfo`.
     /// Validated username (ASCII alphanumeric / `-` / `_`, ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 32 chars).
     username: String,
 
@@ -789,10 +812,11 @@ impl DbPool {
         path: String,
         encryption_key: Option<Vec<u8>>,
         durability_mode: DbDurabilityMode,
+        pool_size: u32,
     ) -> Result<Self, r2d2::Error> {
         let manager = PooledConnection::new(path.clone(), encryption_key.clone(), durability_mode);
         let pool = r2d2::Pool::builder()
-            .max_size(DB_POOL_SIZE)
+            .max_size(pool_size)
             .min_idle(Some(DB_POOL_MIN_IDLE))
             .idle_timeout(Some(std::time::Duration::from_secs(
                 DB_POOL_IDLE_TIMEOUT_SECS,
@@ -826,8 +850,9 @@ impl EventStore {
         encryption_key: Option<Vec<u8>>,
         durability_mode: DbDurabilityMode,
         prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+        pool_size: u32,
     ) -> Self {
-        let pool = DbPool::new(path.clone(), encryption_key.clone(), durability_mode)
+        let pool = DbPool::new(path.clone(), encryption_key.clone(), durability_mode, pool_size)
             .expect("failed to create database pool");
         #[cfg(feature = "batch-writes")]
         let write_queue = {
@@ -1015,20 +1040,6 @@ impl EventStore {
         if version < 4 {
             conn.execute_batch(
                 "
-                CREATE TABLE IF NOT EXISTS events (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts          REAL    NOT NULL,
-                    event_type  TEXT    NOT NULL,
-                    channel     TEXT    NOT NULL,
-                    sender      TEXT,
-                    target      TEXT,
-                    payload     TEXT    NOT NULL,
-                    search_text TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_events_channel_ts
-                    ON events(channel, ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_search
-                    ON events(search_text);
                 CREATE INDEX IF NOT EXISTS idx_events_dm_route_ts
                     ON events(event_type, sender, target, ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_channel_search_ts
@@ -1164,12 +1175,23 @@ impl EventStore {
             conn.execute(
                 "ALTER TABLE user_credentials ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
                 [],
-            ).ok();
+            ).map_err(|e| {
+                if !e.to_string().contains("duplicate column name") {
+                    return e;
+                }
+                rusqlite::Error::QueryReturnedNoRows
+            }).ok();
 
             conn.execute(
                 "ALTER TABLE user_credentials ADD COLUMN locked_until REAL NOT NULL DEFAULT 0",
                 [],
             )
+            .map_err(|e| {
+                if !e.to_string().contains("duplicate column name") {
+                    return e;
+                }
+                rusqlite::Error::QueryReturnedNoRows
+            })
             .ok();
 
             version = 6;
@@ -2749,8 +2771,9 @@ impl State {
         plugin_runtime: PluginRuntime,
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
+        db_pool_size: u32,
     ) -> Arc<Self> {
-        let store = EventStore::new(db_path, db_key, db_durability, prometheus.clone());
+        let store = EventStore::new(db_path, db_key, db_durability, prometheus.clone(), db_pool_size);
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
@@ -5460,6 +5483,7 @@ async fn start_health_server(
     metrics: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
     metrics_enabled: bool,
     shutdown_endpoint_enabled: bool,
+    shutdown_token: String,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     loop {
@@ -5486,7 +5510,7 @@ async fn start_health_server(
                                 Ok(n) => {
                                     let request = String::from_utf8_lossy(&buffer[..n]);
 
-                                    let (endpoint, method) = parse_http_request(&request);
+                                    let (endpoint, method, auth) = parse_http_request(&request);
 
                                     let response = match endpoint {
                                         "/health" | "/health/" => {
@@ -5499,7 +5523,16 @@ async fn start_health_server(
                                             create_ready_response(&state)
                                         }
                                         "/shutdown" | "/shutdown/" if shutdown_endpoint_enabled && method == "POST" => {
-                                            if state.initiate_shutdown() {
+                                            if !shutdown_token.is_empty() {
+                                                if auth != Some(shutdown_token.as_str()) {
+                                                    create_unauthorized_response()
+                                                } else if state.initiate_shutdown() {
+                                                    let _ = shutdown_tx.send(()).await;
+                                                    create_shutdown_response("initiated")
+                                                } else {
+                                                    create_shutdown_response("already_in_progress")
+                                                }
+                                            } else if state.initiate_shutdown() {
                                                 let _ = shutdown_tx.send(()).await;
                                                 create_shutdown_response("initiated")
                                             } else {
@@ -5543,15 +5576,20 @@ async fn start_health_server(
     }
 }
 
-fn parse_http_request(request: &str) -> (&str, &str) {
+fn parse_http_request(request: &str) -> (&str, &str, Option<&str>) {
     let lines: Vec<&str> = request.lines().collect();
     if let Some(first_line) = lines.first() {
         let parts: Vec<&str> = first_line.split_whitespace().collect();
         if parts.len() >= 2 {
-            return (parts[1], parts[0]);
+            let path = parts[1];
+            let method = parts[0];
+            let auth = lines.iter()
+                .find(|l| l.to_lowercase().starts_with("authorization:"))
+                .map(|l| l.split(':').skip(1).collect::<Vec<_>>().join(":").trim());
+            return (path, method, auth);
         }
     }
-    ("/", "GET")
+    ("/", "GET", None)
 }
 
 fn create_health_response(state: &Arc<State>) -> String {
@@ -5652,6 +5690,15 @@ fn create_method_not_allowed_response() -> String {
     )
 }
 
+fn create_unauthorized_response() -> String {
+    let body = "Unauthorized: invalid or missing token";
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
 fn create_live_response() -> String {
     let body = "OK";
     format!(
@@ -5665,10 +5712,11 @@ fn create_live_response() -> String {
 ///
 /// Inline construction here (rather than in the caller) keeps all protocol
 /// field names in one place, making it easier to evolve the auth contract.
-fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>) -> String {
+fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>, session_token: &str) -> String {
     serde_json::json!({
         "t": "ok",
         "u": username,
+        "session_token": session_token,
         "users": state.users_with_keys_json(),
         "channels": state.channels_json(),
         "hist": hist,
@@ -6355,7 +6403,7 @@ where
     }
 
     // Generate a session token for this connection.
-    let _session_token = state.create_session(&username);
+    let session_token = state.create_session(&username);
 
     // ---- Phase 2: register user and send welcome response -------------------
 
@@ -6404,7 +6452,7 @@ where
         hist = general.hist().await;
     }
 
-    let ok = create_ok_response(&username, &state, hist);
+    let ok = create_ok_response(&username, &state, hist, &session_token);
     if sink.send(Message::Text(ok)).await.is_err() {
         return;
     }
@@ -6959,6 +7007,7 @@ async fn main() -> ChatifyResult<()> {
         plugin_runtime,
         args.max_msgs_per_minute,
         args.enable_user_rate_limit,
+        args.db_pool_size,
     );
 
     for plugin_name in plugin_runtime::DEFAULT_BUILTIN_PLUGINS {
@@ -6998,6 +7047,7 @@ async fn main() -> ChatifyResult<()> {
         let health_state = state.clone();
         let health_enabled = args.metrics_enabled;
         let shutdown_endpoint_enabled = args.shutdown_endpoint;
+        let shutdown_token = args.shutdown_token.clone();
         let health_shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let addr = format!("0.0.0.0:{}", args.health_port);
@@ -7013,6 +7063,7 @@ async fn main() -> ChatifyResult<()> {
                         health_metrics,
                         health_enabled,
                         shutdown_endpoint_enabled,
+                        shutdown_token,
                         health_shutdown_tx,
                     )
                     .await;

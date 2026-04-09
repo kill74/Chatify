@@ -8,6 +8,8 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, Notify};
 
+use crate::args::{CHANNEL_BUFFER_SIZE, CHANNEL_HISTORY_LIMIT};
+
 pub struct State {
     pub channels: DashMap<String, Channel>,
     pub voice: DashMap<String, broadcast::Sender<String>>,
@@ -20,6 +22,7 @@ pub struct State {
     pub ip_connections: DashMap<std::net::IpAddr, usize>,
     pub ip_last_auth: DashMap<std::net::IpAddr, f64>,
     pub session_tokens: DashMap<String, String>,
+    pub username_to_token: DashMap<String, String>,
     pub bridges: DashMap<String, BridgeInfo>,
     pub prometheus: Option<Arc<std::sync::Mutex<clifford::metrics::PrometheusMetrics>>>,
     pub shutdown_in_progress: AtomicBool,
@@ -65,6 +68,7 @@ impl State {
             ip_connections: DashMap::new(),
             ip_last_auth: DashMap::new(),
             session_tokens: DashMap::new(),
+            username_to_token: DashMap::new(),
             bridges: DashMap::new(),
             prometheus,
             shutdown_in_progress: AtomicBool::new(false),
@@ -142,11 +146,19 @@ impl State {
         )
     }
 
-    pub fn can_send(&self, _username: &str, _channel: &str) -> bool {
+    pub fn can_send(&self, username: &str, channel: &str) -> bool {
+        if let Ok(muted) = self.store.is_user_muted(username, channel) {
+            if muted {
+                return false;
+            }
+        }
         true
     }
 
-    pub fn is_muted(&self, _username: &str, _channel: &str) -> bool {
+    pub fn is_muted(&self, username: &str, channel: &str) -> bool {
+        if let Ok(muted) = self.store.is_user_muted(username, channel) {
+            return muted;
+        }
         false
     }
 
@@ -154,17 +166,23 @@ impl State {
         let token = clifford::fresh_nonce_hex();
         self.session_tokens
             .insert(token.clone(), username.to_string());
+        self.username_to_token
+            .insert(username.to_string(), token.clone());
         token
     }
 
     pub fn end_session(&self, username: &str) {
-        let to_remove: Option<String> = self
+        if let Some((_key, _value)) = self.username_to_token.remove(username) {
+            // Clean up the username -> token mapping already done by remove
+        }
+        // Also remove from session_tokens - need to find the token by username first
+        let token_to_remove: Option<String> = self
             .session_tokens
             .iter()
             .find(|v| v.value() == username)
             .map(|v| v.key().clone());
-        if let Some(token) = to_remove {
-            self.session_tokens.remove(&token);
+        if let Some(token) = token_to_remove {
+            self.session_tokens.remove(token.as_str());
         }
     }
 
@@ -210,7 +228,7 @@ impl State {
 
 impl Channel {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(1000);
+        let (tx, _) = broadcast::channel(CHANNEL_BUFFER_SIZE);
         Self {
             name: String::new(),
             tx,
@@ -221,7 +239,7 @@ impl Channel {
     pub fn add_message(&self, msg: String, ts: f64) {
         let mut hist = self.history.lock();
         hist.push_back((msg, ts));
-        if hist.len() > 1000 {
+        if hist.len() > CHANNEL_HISTORY_LIMIT {
             hist.pop_front();
         }
     }

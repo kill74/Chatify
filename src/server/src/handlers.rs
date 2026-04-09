@@ -289,6 +289,75 @@ pub async fn handle_event(
         "ping" => {
             let _ = out_tx.send(serde_json::json!({"t": "pong"}).to_string());
         }
+        "dm" => {
+            let target = d["target"].as_str().unwrap_or("");
+            if target.is_empty() {
+                send_err(out_tx, "dm target required".to_string());
+                return;
+            }
+            let content = d["c"].as_str().unwrap_or("");
+            if content.is_empty() {
+                return;
+            }
+            let dm_ch = format!("__dm__{}", target);
+            let payload = serde_json::json!({
+                "t": "dm",
+                "ch": dm_ch,
+                "from": username,
+                "c": content,
+                "ts": clifford::now()
+            });
+            if let Some(ch_data) = state.channels.get(&dm_ch) {
+                let _ = ch_data.tx.send(payload.to_string());
+            }
+        }
+        "join" => {
+            let ch = crate::http::safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let chan = state.chan(&ch);
+            let hist = chan.hist(100);
+            let _ = out_tx.send(serde_json::json!({
+                "t": "joined",
+                "ch": ch,
+                "hist": hist
+            }).to_string());
+        }
+        "leave" => {
+            let ch = crate::http::safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let _ = out_tx.send(serde_json::json!({
+                "t": "left",
+                "ch": ch
+            }).to_string());
+        }
+        "reaction" => {
+            let msg_id = d["msg_id"].as_str().unwrap_or("");
+            let emoji = d["emoji"].as_str().unwrap_or("");
+            if msg_id.is_empty() || emoji.is_empty() {
+                return;
+            }
+            let ch = crate::http::safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let payload = serde_json::json!({
+                "t": "reaction",
+                "msg_id": msg_id,
+                "emoji": emoji,
+                "user": username,
+                "ch": ch,
+                "ts": clifford::now()
+            });
+            if let Some(ch_data) = state.channels.get(&ch) {
+                let _ = ch_data.tx.send(payload.to_string());
+            }
+        }
+        "typing" => {
+            let ch = crate::http::safe_ch(d["ch"].as_str().unwrap_or("general"));
+            let payload = serde_json::json!({
+                "t": "typing",
+                "user": username,
+                "ch": ch
+            });
+            if let Some(ch_data) = state.channels.get(&ch) {
+                let _ = ch_data.tx.send(payload.to_string());
+            }
+        }
         _ => {
             debug!("unhandled event type: {}", t);
         }
