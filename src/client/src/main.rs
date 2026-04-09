@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use clifford::crypto::{new_keypair, pub_b64, pw_hash_client};
+use clifford::notifications::NotificationService;
 use futures_util::{SinkExt, StreamExt};
 use log::info;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -31,6 +33,143 @@ const MAX_RECENT_LIMIT: usize = 50;
 const DEFAULT_REACTION_SYNC_LIMIT: usize = 500;
 const DEFAULT_TRUST_AUDIT_LIMIT: usize = 20;
 const MAX_TRUST_AUDIT_LIMIT: usize = 200;
+
+#[derive(Clone, Copy)]
+struct CommandHelp {
+    name: &'static str,
+    usage: &'static str,
+    summary: &'static str,
+    aliases: &'static [&'static str],
+}
+
+const COMMANDS: &[CommandHelp] = &[
+    CommandHelp {
+        name: "/commands",
+        usage: "/commands [filter]",
+        summary: "List commands, optionally filtered by keyword",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/help",
+        usage: "/help [command]",
+        summary: "Show general help or detailed help for one command",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/join",
+        usage: "/join <channel>",
+        summary: "Join or switch to a channel",
+        aliases: &["/switch"],
+    },
+    CommandHelp {
+        name: "/leave",
+        usage: "/leave [channel]",
+        summary: "Leave a channel (default: current channel)",
+        aliases: &["/part"],
+    },
+    CommandHelp {
+        name: "/history",
+        usage: "/history [ch|dm:user] [limit]",
+        summary: "Load channel or DM history",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/search",
+        usage: "/search [#ch|dm:user] <query> [limit=N]",
+        summary: "Search timeline events",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/replay",
+        usage: "/replay <from_ts> [#ch|dm:user] [limit=N]",
+        summary: "Replay events from a timestamp",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/users",
+        usage: "/users",
+        summary: "Refresh online users and key directory",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/metrics",
+        usage: "/metrics",
+        summary: "Show runtime and database metrics",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/db-profile",
+        usage: "/db-profile",
+        summary: "Show focused database latency profile",
+        aliases: &["/dbprofile"],
+    },
+    CommandHelp {
+        name: "/typing",
+        usage: "/typing [on|off] [#ch|dm:user]",
+        summary: "Broadcast ephemeral typing state",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/notify",
+        usage: "/notify [target] [on|off] | reset | export [--redact] [path|stdout] | doctor [--json] | test [sound] [level] [message]",
+        summary: "Show or update desktop notification preferences",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/dm",
+        usage: "/dm <user> <message>",
+        summary: "Send direct message (trust-verified)",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/fingerprint",
+        usage: "/fingerprint [user]",
+        summary: "Show key fingerprint(s) and trust state",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/trust",
+        usage: "/trust <user> <fingerprint>",
+        summary: "Mark peer fingerprint as trusted",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/trust-audit",
+        usage: "/trust-audit [n]",
+        summary: "Show recent trust audit entries",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/trust-export",
+        usage: "/trust-export [path]",
+        summary: "Export deterministic trust audit JSON",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/recent",
+        usage: "/recent [n]",
+        summary: "Show recent message IDs",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/react",
+        usage: "/react <msg_id|#index> <emoji>",
+        summary: "React to a message",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/sync",
+        usage: "/sync",
+        summary: "Request reaction sync for active channel",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/quit",
+        usage: "/quit",
+        summary: "Exit client",
+        aliases: &["/exit", "/q"],
+    },
+];
 
 fn is_valid_reaction_emoji(emoji: &str) -> bool {
     let trimmed = emoji.trim();
@@ -147,6 +286,274 @@ fn parse_replay_timestamp(raw: &str) -> Option<f64> {
     }
 }
 
+fn parse_toggle_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" | "y" => Some(true),
+        "off" | "false" | "0" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+fn notification_key_for_token(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "enabled" => Some("notifications.enabled"),
+        "dm" | "on_dm" => Some("notifications.on_dm"),
+        "mention" | "on_mention" => Some("notifications.on_mention"),
+        "all" | "all_messages" | "on_all_messages" => Some("notifications.on_all_messages"),
+        "sound" | "sound_enabled" => Some("notifications.sound_enabled"),
+        _ => None,
+    }
+}
+
+fn notification_value_for_key(
+    cfg: &clifford::config::NotificationConfig,
+    key: &str,
+) -> Option<bool> {
+    match key {
+        "notifications.enabled" => Some(cfg.enabled),
+        "notifications.on_dm" => Some(cfg.on_dm),
+        "notifications.on_mention" => Some(cfg.on_mention),
+        "notifications.on_all_messages" => Some(cfg.on_all_messages),
+        "notifications.sound_enabled" => Some(cfg.sound_enabled),
+        _ => None,
+    }
+}
+
+fn parse_notify_probe_level(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "info" => Some("INFO"),
+        "warning" | "warn" => Some("WARNING"),
+        "critical" | "crit" | "error" => Some("CRITICAL"),
+        _ => None,
+    }
+}
+
+fn parse_notify_test_args(tokens: &[&str]) -> (bool, &'static str, usize) {
+    let mut sound_probe = false;
+    let mut level = "INFO";
+    let mut message_start = 1usize;
+
+    if let Some(raw) = tokens.get(message_start) {
+        if raw.eq_ignore_ascii_case("sound") {
+            sound_probe = true;
+            message_start += 1;
+        }
+    }
+
+    if let Some(raw) = tokens.get(message_start) {
+        if let Some(parsed_level) = parse_notify_probe_level(raw) {
+            level = parsed_level;
+            message_start += 1;
+        }
+    }
+
+    (sound_probe, level, message_start)
+}
+
+fn build_notification_export(
+    cfg: &clifford::config::NotificationConfig,
+    profile_user: &str,
+    host: &str,
+    port: u16,
+    tls: bool,
+) -> serde_json::Value {
+    let normalized_user = if profile_user.trim().is_empty() {
+        "anonymous".to_string()
+    } else {
+        profile_user.trim().to_string()
+    };
+
+    let normalized_host = if host.trim().is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host.trim().to_string()
+    };
+
+    serde_json::json!({
+        "schema_version": 1,
+        "profile": {
+            "user": normalized_user,
+            "host": normalized_host,
+            "port": port,
+            "tls": tls,
+        },
+        "notifications": {
+            "enabled": cfg.enabled,
+            "on_dm": cfg.on_dm,
+            "on_mention": cfg.on_mention,
+            "on_all_messages": cfg.on_all_messages,
+            "sound_enabled": cfg.sound_enabled,
+        }
+    })
+}
+
+fn redact_notification_export(payload: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = payload.clone();
+    if let Some(profile) = redacted.get_mut("profile").and_then(|v| v.as_object_mut()) {
+        profile.insert(
+            "user".to_string(),
+            serde_json::Value::String("redacted".to_string()),
+        );
+        profile.insert(
+            "host".to_string(),
+            serde_json::Value::String("redacted".to_string()),
+        );
+    }
+    redacted
+}
+
+fn sanitize_notify_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+
+    if out.is_empty() {
+        "default".to_string()
+    } else {
+        out
+    }
+}
+
+fn notify_export_default_path(profile_user: &str, host: &str, port: u16, tls: bool) -> PathBuf {
+    let user_component = sanitize_notify_component(profile_user.trim());
+    let host_component = sanitize_notify_component(host.trim());
+    let mode = if tls { "tls" } else { "plain" };
+    let file_name = format!(
+        "notify-export-{}-{}-{}-{}.json",
+        user_component, host_component, port, mode
+    );
+
+    let base = Config::config_dir().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".chatify")
+    });
+    base.join("exports").join(file_name)
+}
+
+fn notify_recommendations(cfg: &clifford::config::NotificationConfig) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    if !cfg.enabled {
+        recommendations.push(
+            "enable notifications with '/notify enabled on' to receive desktop alerts".to_string(),
+        );
+    }
+
+    if cfg.enabled && !cfg.on_dm && !cfg.on_mention && !cfg.on_all_messages {
+        recommendations
+            .push("all delivery flags are off; enable one of dm/mention/all".to_string());
+    }
+
+    if !cfg.sound_enabled {
+        recommendations.push(
+            "enable sound with '/notify sound on' before using '/notify test sound'".to_string(),
+        );
+    }
+
+    recommendations
+}
+
+fn build_notify_diagnostics_json(
+    cfg: &clifford::config::NotificationConfig,
+    profile_user: &str,
+    host: &str,
+    port: u16,
+    tls: bool,
+) -> serde_json::Value {
+    let user = if profile_user.trim().is_empty() {
+        "anonymous".to_string()
+    } else {
+        profile_user.trim().to_string()
+    };
+
+    let normalized_host = if host.trim().is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host.trim().to_string()
+    };
+
+    let config_path = Config::config_path();
+    let config_path_text = config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(unavailable)".to_string());
+    let config_dir_state = config_path
+        .as_ref()
+        .and_then(|path| path.parent().map(|p| p.exists()))
+        .map(|exists| if exists { "exists" } else { "missing" }.to_string())
+        .unwrap_or_else(|| "(no parent)".to_string());
+
+    let default_export_path = notify_export_default_path(&user, &normalized_host, port, tls)
+        .display()
+        .to_string();
+
+    serde_json::json!({
+        "schema_version": 1,
+        "profile": {
+            "user": user,
+            "host": normalized_host,
+            "port": port,
+            "tls": tls,
+        },
+        "notifications": {
+            "enabled": cfg.enabled,
+            "on_dm": cfg.on_dm,
+            "on_mention": cfg.on_mention,
+            "on_all_messages": cfg.on_all_messages,
+            "sound_enabled": cfg.sound_enabled,
+        },
+        "config_path": config_path_text,
+        "config_dir_state": config_dir_state,
+        "default_export_path": default_export_path,
+        "recommendations": notify_recommendations(cfg),
+    })
+}
+
+fn print_notification_settings(cfg: &clifford::config::NotificationConfig) {
+    println!(
+        "Notifications: enabled={} dm={} mention={} all={} sound={}",
+        cfg.enabled, cfg.on_dm, cfg.on_mention, cfg.on_all_messages, cfg.sound_enabled
+    );
+}
+
+fn print_notify_usage() {
+    println!("Usage: /notify");
+    println!("       /notify [enabled|dm|mention|all|sound]");
+    println!("       /notify [enabled|dm|mention|all|sound] [on|off]");
+    println!("       /notify reset");
+    println!("       /notify doctor [--json]");
+    println!("       /notify export [--redact] [path|stdout]");
+    println!("       /notify test [sound] [info|warning|critical] [message]");
+}
+
+fn send_notification_test(
+    cfg: &clifford::config::NotificationConfig,
+    level: &str,
+    message: &str,
+    sound_probe: bool,
+) {
+    let mut probe_cfg = cfg.clone();
+    // One-time probe should still work when notifications.enabled is currently off.
+    probe_cfg.enabled = true;
+    let title = format!("Chatify notification test [{}]", level);
+    NotificationService::send(&probe_cfg, &title, message, true);
+
+    if sound_probe {
+        if cfg.sound_enabled {
+            // Terminal bell fallback as a low-cost probe for sound-enabled setups.
+            print!("\x07");
+            let _ = io::stdout().flush();
+        } else {
+            eprintln!("notifications.sound_enabled is off; skipped local sound probe.");
+        }
+    }
+}
+
 fn format_scope_for_help(scope: &str) -> String {
     if scope.starts_with("dm:") {
         scope.to_string()
@@ -155,27 +562,78 @@ fn format_scope_for_help(scope: &str) -> String {
     }
 }
 
+fn find_command_help(raw: &str) -> Option<CommandHelp> {
+    let needle = raw.trim().trim_start_matches('/').to_ascii_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+
+    COMMANDS.iter().copied().find(|entry| {
+        entry
+            .name
+            .trim_start_matches('/')
+            .eq_ignore_ascii_case(&needle)
+            || entry
+                .aliases
+                .iter()
+                .any(|alias| alias.trim_start_matches('/').eq_ignore_ascii_case(&needle))
+    })
+}
+
+fn print_command_help(entry: CommandHelp) {
+    println!("Command: {}", entry.name);
+    println!("Usage: {}", entry.usage);
+    println!("Description: {}", entry.summary);
+    if !entry.aliases.is_empty() {
+        println!("Aliases: {}", entry.aliases.join(", "));
+    }
+}
+
+fn print_commands(filter: Option<&str>) {
+    let filter = filter.map(|value| value.trim().trim_start_matches('/').to_ascii_lowercase());
+    let mut matching: Vec<CommandHelp> = COMMANDS
+        .iter()
+        .copied()
+        .filter(|entry| {
+            if let Some(filter) = &filter {
+                if filter.is_empty() {
+                    return true;
+                }
+
+                entry.name.to_ascii_lowercase().contains(filter)
+                    || entry.usage.to_ascii_lowercase().contains(filter)
+                    || entry.summary.to_ascii_lowercase().contains(filter)
+                    || entry
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.to_ascii_lowercase().contains(filter))
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    matching.sort_by(|a, b| a.name.cmp(b.name));
+
+    if matching.is_empty() {
+        if let Some(filter) = &filter {
+            println!("No commands matched '{}'.", filter);
+        } else {
+            println!("No commands available.");
+        }
+        return;
+    }
+
+    println!("Available commands:");
+    for entry in matching {
+        println!("  {:<38} {}", entry.usage, entry.summary);
+    }
+}
+
 fn print_help() {
-    println!("Commands:");
-    println!("  /help                          Show this help");
-    println!("  /join <channel>                Join or switch to a channel");
-    println!("  /leave [channel]               Leave a channel (default: current)");
-    println!("  /history [ch|dm:user] [limit]  Load channel or DM history");
-    println!("  /search [#ch|dm:user] <query> [limit=N]   Search timeline events");
-    println!("  /replay <from_ts> [#ch|dm:user] [limit=N] Replay events from timestamp");
-    println!("  /users                         Refresh online users and key directory");
-    println!("  /metrics                       Show runtime and database metrics");
-    println!("  /db-profile                    Show detailed database latency profile");
-    println!("  /dm <user> <message>           Send direct message (trust-verified)");
-    println!("  /fingerprint [user]            Show current key fingerprint(s)");
-    println!("  /trust <user> <fingerprint>    Trust a peer fingerprint");
-    println!("  /trust-audit [n]               Show recent trust audit entries");
-    println!("  /trust-export [path]           Export deterministic trust audit JSON");
-    println!("  /recent [n]                    Show recent message IDs");
-    println!("  /react <msg_id|#index> <emoji> React to a message");
-    println!("  /sync                          Request reaction sync for active channel");
-    println!("  /quit                          Exit client");
-    println!("  <text>                         Send a message to active channel");
+    print_commands(None);
+    println!("  {:<38} Send a message to active channel", "<text>");
+    println!("Use /help <command> for details.");
 }
 
 fn print_prompt() {
@@ -185,6 +643,7 @@ fn print_prompt() {
 
 async fn print_recent_messages(state: &SharedState, limit: usize) {
     let state_lock = state.lock().await;
+    let current_user = state_lock.me.clone();
     let mut shown = 0usize;
     for msg in state_lock.message_history.iter().rev() {
         if msg.id.is_empty() {
@@ -192,13 +651,15 @@ async fn print_recent_messages(state: &SharedState, limit: usize) {
         }
 
         let reaction_summary = state_lock.reaction_summary(&msg.id);
+        let (display_content, _) =
+            handlers::format_content_for_mentions(&msg.content, &current_user);
         let short_id: String = msg.id.chars().take(8).collect();
         if reaction_summary.is_empty() {
-            println!("#{} {}: {}", short_id, msg.sender, msg.content);
+            println!("#{} {}: {}", short_id, msg.sender, display_content);
         } else {
             println!(
                 "#{} {}: {} {}",
-                short_id, msg.sender, msg.content, reaction_summary
+                short_id, msg.sender, display_content, reaction_summary
             );
         }
 
@@ -233,7 +694,33 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
 
     match cmd {
         "/help" => {
-            print_help();
+            let maybe_command = parts.next();
+            if parts.next().is_some() {
+                println!("Usage: /help [command]");
+                return true;
+            }
+
+            if let Some(command_name) = maybe_command {
+                if let Some(entry) = find_command_help(command_name) {
+                    print_command_help(entry);
+                } else {
+                    println!(
+                        "Unknown command '{}'. Run /commands {} to search.",
+                        command_name,
+                        command_name.trim_start_matches('/')
+                    );
+                }
+            } else {
+                print_help();
+            }
+        }
+        "/commands" => {
+            let filter = parts.next();
+            if parts.next().is_some() {
+                println!("Usage: /commands [filter]");
+                return true;
+            }
+            print_commands(filter);
         }
         "/quit" | "/exit" | "/q" => {
             return false;
@@ -424,6 +911,361 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
             if let Err(err) = state_lock.send_db_profile() {
                 eprintln!("failed to request db profile: {}", err);
             }
+        }
+        "/typing" => {
+            let current_scope = state.lock().await.ch.clone();
+            let mut tokens: Vec<&str> = parts.collect();
+            let mut typing = true;
+
+            if let Some(first) = tokens.first().copied() {
+                match first.to_ascii_lowercase().as_str() {
+                    "on" | "true" => {
+                        typing = true;
+                        let _ = tokens.remove(0);
+                    }
+                    "off" | "false" => {
+                        typing = false;
+                        let _ = tokens.remove(0);
+                    }
+                    _ => {}
+                }
+            }
+
+            let scope = if let Some(first) = tokens.first().copied() {
+                let parsed = normalize_scope_token(first, &current_scope, true);
+                let _ = tokens.remove(0);
+                parsed
+            } else {
+                current_scope.clone()
+            };
+
+            if !tokens.is_empty() {
+                println!("Usage: /typing [on|off] [#ch|dm:user]");
+                return true;
+            }
+
+            let state_lock = state.lock().await;
+            if let Err(err) = state_lock.send_typing(&scope, typing) {
+                eprintln!("failed to send typing state: {}", err);
+            } else {
+                let status = if typing { "on" } else { "off" };
+                println!("typing={} for {}", status, format_scope_for_help(&scope));
+            }
+        }
+        "/notify" => {
+            let tokens: Vec<&str> = parts.collect();
+
+            if tokens.is_empty() {
+                let state_lock = state.lock().await;
+                print_notification_settings(&state_lock.config.notifications);
+                return true;
+            }
+
+            let target = tokens[0];
+
+            if target.eq_ignore_ascii_case("reset") {
+                if tokens.len() != 1 {
+                    print_notify_usage();
+                    return true;
+                }
+
+                let (old_config, new_config) = {
+                    let mut state_lock = state.lock().await;
+                    let old_config = state_lock.config.clone();
+                    state_lock.config.notifications =
+                        clifford::config::NotificationConfig::default();
+                    let new_config = state_lock.config.clone();
+                    (old_config, new_config)
+                };
+
+                if let Err(err) = new_config.save() {
+                    eprintln!("failed to persist notification config: {}", err);
+                    let mut state_lock = state.lock().await;
+                    state_lock.config = old_config;
+                    return true;
+                }
+
+                println!("Notification settings reset to defaults.");
+                print_notification_settings(&new_config.notifications);
+                return true;
+            }
+
+            if target.eq_ignore_ascii_case("export") {
+                let mut redact = false;
+                let mut destination: Option<&str> = None;
+                for token in tokens.iter().skip(1) {
+                    if token.eq_ignore_ascii_case("--redact") {
+                        if redact {
+                            print_notify_usage();
+                            return true;
+                        }
+                        redact = true;
+                        continue;
+                    }
+
+                    if destination.is_none() {
+                        destination = Some(*token);
+                    } else {
+                        print_notify_usage();
+                        return true;
+                    }
+                }
+
+                let maybe_path = destination;
+
+                let (payload, me, host, port, tls) = {
+                    let state_lock = state.lock().await;
+                    (
+                        build_notification_export(
+                            &state_lock.config.notifications,
+                            &state_lock.me,
+                            &state_lock.client_config.host,
+                            state_lock.client_config.port,
+                            state_lock.client_config.tls,
+                        ),
+                        state_lock.me.clone(),
+                        state_lock.client_config.host.clone(),
+                        state_lock.client_config.port,
+                        state_lock.client_config.tls,
+                    )
+                };
+
+                let export_payload = if redact {
+                    redact_notification_export(&payload)
+                } else {
+                    payload
+                };
+
+                let serialized = match serde_json::to_string_pretty(&export_payload) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!("failed to serialize notification export: {}", err);
+                        return true;
+                    }
+                };
+
+                if maybe_path
+                    .map(|v| v.eq_ignore_ascii_case("stdout") || v == "-")
+                    .unwrap_or(false)
+                {
+                    println!("{}", serialized);
+                    return true;
+                }
+
+                let target_path = maybe_path
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| notify_export_default_path(&me, &host, port, tls));
+                if let Some(parent) = target_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(err) = fs::create_dir_all(parent) {
+                            eprintln!("failed to create export directory: {}", err);
+                            return true;
+                        }
+                    }
+                }
+
+                if let Err(err) = fs::write(&target_path, serialized) {
+                    eprintln!("failed to write notification export: {}", err);
+                    return true;
+                }
+
+                println!(
+                    "Exported notification settings to {}",
+                    target_path.display()
+                );
+                if redact {
+                    println!("Export mode: redacted profile fields.");
+                }
+
+                return true;
+            }
+
+            if target.eq_ignore_ascii_case("doctor") {
+                let json_output = if tokens.len() == 1 {
+                    false
+                } else if tokens.len() == 2 && tokens[1].eq_ignore_ascii_case("--json") {
+                    true
+                } else {
+                    print_notify_usage();
+                    return true;
+                };
+
+                let (notifications, me, host, port, tls) = {
+                    let state_lock = state.lock().await;
+                    (
+                        state_lock.config.notifications.clone(),
+                        state_lock.me.clone(),
+                        state_lock.client_config.host.clone(),
+                        state_lock.client_config.port,
+                        state_lock.client_config.tls,
+                    )
+                };
+
+                let diagnostics =
+                    build_notify_diagnostics_json(&notifications, &me, &host, port, tls);
+
+                if json_output {
+                    match serde_json::to_string_pretty(&diagnostics) {
+                        Ok(rendered) => println!("{}", rendered),
+                        Err(err) => {
+                            eprintln!("failed to serialize notify diagnostics: {}", err);
+                        }
+                    }
+                    return true;
+                }
+
+                println!("Notify doctor:");
+                println!(
+                    "  profile: user={} server={}:{} tls={}",
+                    diagnostics
+                        .get("profile")
+                        .and_then(|v| v.get("user"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("anonymous"),
+                    diagnostics
+                        .get("profile")
+                        .and_then(|v| v.get("host"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("127.0.0.1"),
+                    port,
+                    tls
+                );
+                print_notification_settings(&notifications);
+                println!(
+                    "  config_path: {}",
+                    diagnostics
+                        .get("config_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unavailable)")
+                );
+                println!(
+                    "  config_dir_state: {}",
+                    diagnostics
+                        .get("config_dir_state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)")
+                );
+                println!(
+                    "  default_export_path: {}",
+                    diagnostics
+                        .get("default_export_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)")
+                );
+
+                if let Some(recommendations) = diagnostics
+                    .get("recommendations")
+                    .and_then(|v| v.as_array())
+                {
+                    for recommendation in recommendations {
+                        if let Some(text) = recommendation.as_str() {
+                            println!("  recommendation: {}", text);
+                        }
+                    }
+                }
+
+                return true;
+            }
+
+            if target.eq_ignore_ascii_case("test") {
+                let (sound_probe, level, message_start) = parse_notify_test_args(&tokens);
+                let (notifications, me) = {
+                    let state_lock = state.lock().await;
+                    (
+                        state_lock.config.notifications.clone(),
+                        state_lock.me.clone(),
+                    )
+                };
+
+                let body = if tokens.len() > message_start {
+                    tokens[message_start..].join(" ").trim().to_string()
+                } else if me.is_empty() {
+                    format!(
+                        "This is a {} test notification from Chatify.",
+                        level.to_ascii_lowercase()
+                    )
+                } else {
+                    format!(
+                        "This is a {} test notification for {}.",
+                        level.to_ascii_lowercase(),
+                        me
+                    )
+                };
+
+                if body.is_empty() {
+                    print_notify_usage();
+                    return true;
+                }
+
+                if !notifications.enabled {
+                    println!("notifications.enabled is off; sending one-time test anyway.");
+                }
+
+                send_notification_test(&notifications, level, &body, sound_probe);
+                println!(
+                    "Sent desktop notification probe (level={}, sound_probe={}).",
+                    level,
+                    if sound_probe { "on" } else { "off" }
+                );
+                return true;
+            }
+
+            let Some(config_key) = notification_key_for_token(target) else {
+                println!(
+                    "Unknown notify setting '{}'. Use: enabled, dm, mention, all, sound.",
+                    target
+                );
+                return true;
+            };
+
+            if tokens.len() == 1 {
+                let state_lock = state.lock().await;
+                let value =
+                    notification_value_for_key(&state_lock.config.notifications, config_key)
+                        .unwrap_or(false);
+                println!("{} = {}", config_key, if value { "on" } else { "off" });
+                return true;
+            }
+
+            if tokens.len() != 2 {
+                print_notify_usage();
+                return true;
+            }
+
+            let value_raw = tokens[1];
+
+            let Some(enabled) = parse_toggle_bool(value_raw) else {
+                println!("Invalid notify value '{}'. Use on/off.", value_raw);
+                return true;
+            };
+
+            let (old_config, new_config) = {
+                let mut state_lock = state.lock().await;
+                let old_config = state_lock.config.clone();
+                if let Err(err) = state_lock
+                    .config
+                    .set_value(config_key, if enabled { "true" } else { "false" })
+                {
+                    println!("{}", err);
+                    return true;
+                }
+                let new_config = state_lock.config.clone();
+                (old_config, new_config)
+            };
+
+            if let Err(err) = new_config.save() {
+                eprintln!("failed to persist notification config: {}", err);
+                let mut state_lock = state.lock().await;
+                state_lock.config = old_config;
+                return true;
+            }
+
+            println!(
+                "Updated {} = {}.",
+                config_key,
+                if enabled { "on" } else { "off" }
+            );
+            print_notification_settings(&new_config.notifications);
         }
         "/dm" => {
             let Some(raw_user) = parts.next() else {
@@ -753,7 +1595,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
             }
         }
         _ => {
-            println!("Unknown command. Type /help.");
+            println!("Unknown command. Type /help or /commands.");
         }
     }
 
@@ -782,6 +1624,7 @@ async fn run_input_loop(state: SharedState) {
 async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
     let config = Config::load();
+    NotificationService::init();
     let client_config = args.merge_with_config(&config);
 
     if client_config.log_enabled {
@@ -898,4 +1741,222 @@ async fn main() -> ChatifyResult<()> {
 
     println!("Disconnected");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_notification_export, build_notify_diagnostics_json, notification_key_for_token,
+        notification_value_for_key, notify_export_default_path, parse_notify_probe_level,
+        parse_notify_test_args, parse_toggle_bool, redact_notification_export,
+        sanitize_notify_component,
+    };
+
+    #[test]
+    fn parse_toggle_bool_accepts_truthy_and_falsey_values() {
+        for value in ["on", "true", "1", "yes", "y", "ON"] {
+            assert_eq!(parse_toggle_bool(value), Some(true));
+        }
+
+        for value in ["off", "false", "0", "no", "n", "OFF"] {
+            assert_eq!(parse_toggle_bool(value), Some(false));
+        }
+    }
+
+    #[test]
+    fn parse_toggle_bool_rejects_unknown_values() {
+        assert_eq!(parse_toggle_bool("maybe"), None);
+        assert_eq!(parse_toggle_bool(""), None);
+    }
+
+    #[test]
+    fn notification_key_for_token_supports_aliases() {
+        assert_eq!(
+            notification_key_for_token("enabled"),
+            Some("notifications.enabled")
+        );
+        assert_eq!(
+            notification_key_for_token("dm"),
+            Some("notifications.on_dm")
+        );
+        assert_eq!(
+            notification_key_for_token("on_dm"),
+            Some("notifications.on_dm")
+        );
+        assert_eq!(
+            notification_key_for_token("mention"),
+            Some("notifications.on_mention")
+        );
+        assert_eq!(
+            notification_key_for_token("on_mention"),
+            Some("notifications.on_mention")
+        );
+        assert_eq!(
+            notification_key_for_token("all"),
+            Some("notifications.on_all_messages")
+        );
+        assert_eq!(
+            notification_key_for_token("sound"),
+            Some("notifications.sound_enabled")
+        );
+        assert_eq!(notification_key_for_token("unknown"), None);
+    }
+
+    #[test]
+    fn parse_notify_probe_level_supports_aliases() {
+        assert_eq!(parse_notify_probe_level("info"), Some("INFO"));
+        assert_eq!(parse_notify_probe_level("warning"), Some("WARNING"));
+        assert_eq!(parse_notify_probe_level("warn"), Some("WARNING"));
+        assert_eq!(parse_notify_probe_level("critical"), Some("CRITICAL"));
+        assert_eq!(parse_notify_probe_level("crit"), Some("CRITICAL"));
+        assert_eq!(parse_notify_probe_level("error"), Some("CRITICAL"));
+        assert_eq!(parse_notify_probe_level("other"), None);
+    }
+
+    #[test]
+    fn parse_notify_test_args_supports_sound_and_level() {
+        let (sound, level, start) = parse_notify_test_args(&["test", "sound", "warning", "disk"]);
+        assert!(sound);
+        assert_eq!(level, "WARNING");
+        assert_eq!(start, 3);
+
+        let (sound, level, start) = parse_notify_test_args(&["test", "critical", "disk"]);
+        assert!(!sound);
+        assert_eq!(level, "CRITICAL");
+        assert_eq!(start, 2);
+
+        let (sound, level, start) = parse_notify_test_args(&["test", "sound"]);
+        assert!(sound);
+        assert_eq!(level, "INFO");
+        assert_eq!(start, 2);
+    }
+
+    #[test]
+    fn build_notification_export_contains_expected_fields() {
+        let cfg = clifford::config::NotificationConfig {
+            enabled: true,
+            on_dm: false,
+            on_mention: true,
+            on_all_messages: false,
+            sound_enabled: true,
+        };
+
+        let export = build_notification_export(&cfg, "alice", "chatify.local", 8765, true);
+        assert_eq!(
+            export.get("schema_version").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            export
+                .get("profile")
+                .and_then(|v| v.get("user"))
+                .and_then(|v| v.as_str()),
+            Some("alice")
+        );
+        assert_eq!(
+            export
+                .get("profile")
+                .and_then(|v| v.get("host"))
+                .and_then(|v| v.as_str()),
+            Some("chatify.local")
+        );
+        assert_eq!(
+            export
+                .get("notifications")
+                .and_then(|v| v.get("sound_enabled"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn redact_notification_export_masks_profile_identifiers() {
+        let cfg = clifford::config::NotificationConfig::default();
+        let export = build_notification_export(&cfg, "alice", "chatify.local", 8765, false);
+        let redacted = redact_notification_export(&export);
+
+        assert_eq!(
+            redacted
+                .get("profile")
+                .and_then(|v| v.get("user"))
+                .and_then(|v| v.as_str()),
+            Some("redacted")
+        );
+        assert_eq!(
+            redacted
+                .get("profile")
+                .and_then(|v| v.get("host"))
+                .and_then(|v| v.as_str()),
+            Some("redacted")
+        );
+    }
+
+    #[test]
+    fn sanitize_notify_component_replaces_unsafe_chars() {
+        assert_eq!(sanitize_notify_component("Alice Admin"), "Alice_Admin");
+        assert_eq!(sanitize_notify_component("chatify.local"), "chatify.local");
+        assert_eq!(sanitize_notify_component(""), "default");
+    }
+
+    #[test]
+    fn notify_export_default_path_contains_expected_suffix() {
+        let path = notify_export_default_path("alice", "chatify.local", 8765, true);
+        let as_text = path.to_string_lossy();
+        assert!(as_text.contains("notify-export-alice-chatify.local-8765-tls.json"));
+    }
+
+    #[test]
+    fn build_notify_diagnostics_json_contains_recommendations() {
+        let cfg = clifford::config::NotificationConfig {
+            enabled: false,
+            on_dm: false,
+            on_mention: false,
+            on_all_messages: false,
+            sound_enabled: false,
+        };
+
+        let diagnostics = build_notify_diagnostics_json(&cfg, "", "", 8765, false);
+
+        let recommendations = diagnostics
+            .get("recommendations")
+            .and_then(|v| v.as_array())
+            .expect("recommendations should be array");
+        assert!(recommendations.len() >= 2);
+    }
+
+    #[test]
+    fn notification_value_for_key_reads_expected_flags() {
+        let cfg = clifford::config::NotificationConfig {
+            enabled: true,
+            on_dm: false,
+            on_mention: true,
+            on_all_messages: false,
+            sound_enabled: true,
+        };
+
+        assert_eq!(
+            notification_value_for_key(&cfg, "notifications.enabled"),
+            Some(true)
+        );
+        assert_eq!(
+            notification_value_for_key(&cfg, "notifications.on_dm"),
+            Some(false)
+        );
+        assert_eq!(
+            notification_value_for_key(&cfg, "notifications.on_mention"),
+            Some(true)
+        );
+        assert_eq!(
+            notification_value_for_key(&cfg, "notifications.on_all_messages"),
+            Some(false)
+        );
+        assert_eq!(
+            notification_value_for_key(&cfg, "notifications.sound_enabled"),
+            Some(true)
+        );
+        assert_eq!(
+            notification_value_for_key(&cfg, "notifications.unknown"),
+            None
+        );
+    }
 }

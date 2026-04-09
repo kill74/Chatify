@@ -1,7 +1,10 @@
 //! Client event handlers.
 
-use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState};
+use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState, TypingPresence};
 use crate::voice::{decode_voice_frame, VoiceEvent};
+use clifford::notifications::NotificationService;
+
+const TYPING_TTL_SECS: u64 = 30;
 
 fn extract_msg_id(data: &serde_json::Value) -> String {
     data.get("msg_id")
@@ -60,6 +63,91 @@ fn print_live_message(message: &DisplayedMessage, reaction_summary: &str) {
             id, scope, message.sender, message.content, reaction_summary
         );
     }
+}
+
+fn is_mention_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn mention_target(username: &str) -> String {
+    username.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+pub fn format_content_for_mentions(content: &str, username: &str) -> (String, bool) {
+    let target = mention_target(username);
+    if target.is_empty() {
+        return (content.to_string(), false);
+    }
+
+    let mut out = String::with_capacity(content.len() + 8);
+    let mut cursor = 0usize;
+    let mut mentioned = false;
+
+    while cursor < content.len() {
+        let Some(ch) = content[cursor..].chars().next() else {
+            break;
+        };
+
+        if ch != '@' {
+            out.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        let previous = content[..cursor].chars().next_back();
+        if previous.map(is_mention_char).unwrap_or(false) {
+            out.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        let mut end = cursor + ch.len_utf8();
+        let mut token_len = 0usize;
+        let mut token_lower = String::new();
+        for next in content[end..].chars() {
+            if !is_mention_char(next) {
+                break;
+            }
+
+            end += next.len_utf8();
+            token_len += 1;
+            if token_len <= 32 {
+                token_lower.push(next.to_ascii_lowercase());
+            }
+        }
+
+        if token_len == 0 {
+            out.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        let mention_text = &content[cursor..end];
+        if token_len <= 32 && token_lower == target {
+            out.push('[');
+            out.push_str(mention_text);
+            out.push(']');
+            mentioned = true;
+        } else {
+            out.push_str(mention_text);
+        }
+        cursor = end;
+    }
+
+    (out, mentioned)
+}
+
+fn notify_message(
+    notifications: &clifford::config::NotificationConfig,
+    title: &str,
+    message: &str,
+) {
+    let body = message.trim();
+    if body.is_empty() {
+        return;
+    }
+
+    NotificationService::send(notifications, title, body, false);
 }
 
 fn value_as_u64(value: Option<&serde_json::Value>) -> u64 {
@@ -238,6 +326,8 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
 
     let mut state_lock = state.lock().await;
     let trust_audit_len_before = state_lock.trust_store.audit_log.len();
+    let current_user = state_lock.me.clone();
+    let notification_config = state_lock.config.notifications.clone();
     let message = DisplayedMessage {
         id: msg_id.clone(),
         ts: event_ts,
@@ -268,7 +358,29 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
     let reaction_summary = state_lock.reaction_summary(&msg_id);
     drop(state_lock);
 
-    print_live_message(&message, &reaction_summary);
+    let (rendered_content, mentioned_me) =
+        format_content_for_mentions(&message.content, &current_user);
+    let mut rendered_message = message.clone();
+    rendered_message.content = rendered_content;
+    print_live_message(&rendered_message, &reaction_summary);
+
+    let from_self = !current_user.is_empty() && message.sender.eq_ignore_ascii_case(&current_user);
+    if !from_self {
+        if mentioned_me && notification_config.on_mention {
+            notify_message(
+                &notification_config,
+                &format!("Mention from {}", message.sender),
+                &message.content,
+            );
+        } else if notification_config.on_all_messages {
+            notify_message(
+                &notification_config,
+                &format!("Message from {}", message.sender),
+                &message.content,
+            );
+        }
+    }
+
     if let Some(warning) = trust_warning {
         eprintln!("[trust-warning] {}", trust_warning_summary(&warning));
     }
@@ -284,6 +396,7 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
 
     let mut state_lock = state.lock().await;
     let trust_audit_len_before = state_lock.trust_store.audit_log.len();
+    let notification_config = state_lock.config.notifications.clone();
 
     let my_user = state_lock.me.clone();
     let from_is_me = !my_user.is_empty() && from.eq_ignore_ascii_case(&my_user);
@@ -328,7 +441,33 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
     let reaction_summary = state_lock.reaction_summary(&msg_id);
     drop(state_lock);
 
-    print_live_message(&message, &reaction_summary);
+    let (rendered_content, mentioned_me) = format_content_for_mentions(&message.content, &my_user);
+    let mut rendered_message = message.clone();
+    rendered_message.content = rendered_content;
+    print_live_message(&rendered_message, &reaction_summary);
+
+    if !from_is_me {
+        if notification_config.on_dm {
+            notify_message(
+                &notification_config,
+                &format!("DM from {}", from),
+                &message.content,
+            );
+        } else if mentioned_me && notification_config.on_mention {
+            notify_message(
+                &notification_config,
+                &format!("Mention from {}", from),
+                &message.content,
+            );
+        } else if notification_config.on_all_messages {
+            notify_message(
+                &notification_config,
+                &format!("Message from {}", from),
+                &message.content,
+            );
+        }
+    }
+
     if let Some(warning) = trust_warning {
         eprintln!("[trust-warning] {}", trust_warning_summary(&warning));
     }
@@ -383,6 +522,7 @@ async fn ingest_timeline_events(
 ) -> (usize, Vec<String>) {
     let mut state_lock = state.lock().await;
     let mut reaction_events = 0usize;
+    let current_user = state_lock.me.clone();
 
     for event in events.iter().rev() {
         let t = event.get("t").and_then(|v| v.as_str()).unwrap_or("msg");
@@ -467,15 +607,21 @@ async fn ingest_timeline_events(
         .filter(|msg| msg.channel == scope && !msg.id.is_empty())
         .take(5)
         .map(|msg| {
+            let (display_content, _) = format_content_for_mentions(&msg.content, &current_user);
             let summary = state_lock.reaction_summary(&msg.id);
             if summary.is_empty() {
-                format!("  [{}] {}: {}", short_id(&msg.id), msg.sender, msg.content)
+                format!(
+                    "  [{}] {}: {}",
+                    short_id(&msg.id),
+                    msg.sender,
+                    display_content
+                )
             } else {
                 format!(
                     "  [{}] {}: {} {}",
                     short_id(&msg.id),
                     msg.sender,
-                    msg.content,
+                    display_content,
                     summary
                 )
             }
@@ -710,6 +856,107 @@ pub async fn handle_status_update_event(state: &SharedState, data: &serde_json::
     println!("[status] {} -> {}", user, summary);
 }
 
+pub async fn handle_typing_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let user = data
+        .get("u")
+        .or_else(|| data.get("from"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if user.is_empty() {
+        return;
+    }
+
+    let typing = data.get("typing").and_then(|v| v.as_bool()).unwrap_or(true);
+    let now_ts = clifford::now() as u64;
+    let event_ts = extract_ts(data, now_ts) as u64;
+
+    let mut state_lock = state.lock().await;
+    if !state_lock.me.is_empty() && user.eq_ignore_ascii_case(&state_lock.me) {
+        return;
+    }
+
+    let fallback_scope = state_lock.ch.clone();
+    let raw_scope = data
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .or_else(|| {
+            data.get("ch")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+        })
+        .or_else(|| {
+            data.get("to")
+                .and_then(|v| v.as_str())
+                .map(|peer| format!("dm:{}", peer.to_ascii_lowercase()))
+        })
+        .unwrap_or_else(|| fallback_scope.clone());
+
+    let scope = if raw_scope.starts_with("dm:") {
+        let peer = raw_scope
+            .trim_start_matches("dm:")
+            .trim()
+            .to_ascii_lowercase();
+        if peer.is_empty() {
+            fallback_scope
+        } else {
+            format!("dm:{}", peer)
+        }
+    } else {
+        clifford::normalize_channel(raw_scope.trim_start_matches('#')).unwrap_or(fallback_scope)
+    };
+
+    let key = format!("{}|{}", scope, user.to_ascii_lowercase());
+    if typing {
+        state_lock.typing_presence.insert(
+            key,
+            TypingPresence {
+                user: user.to_string(),
+                timestamp: event_ts,
+            },
+        );
+    } else {
+        state_lock.typing_presence.remove(&key);
+    }
+
+    let cutoff = now_ts.saturating_sub(TYPING_TTL_SECS);
+    state_lock
+        .typing_presence
+        .retain(|_, presence| presence.timestamp >= cutoff);
+
+    let scope_prefix = format!("{}|", scope);
+    let mut active_users: Vec<String> = state_lock
+        .typing_presence
+        .iter()
+        .filter_map(|(k, presence)| {
+            if k.starts_with(&scope_prefix) && presence.timestamp >= cutoff {
+                Some(presence.user.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    active_users.sort_by_key(|name| name.to_ascii_lowercase());
+    active_users.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    drop(state_lock);
+
+    if !typing || active_users.is_empty() {
+        return;
+    }
+
+    let scope_label = format_scope_label(&scope);
+    if active_users.len() == 1 {
+        println!("[typing] {} is typing in {}", active_users[0], scope_label);
+    } else {
+        println!(
+            "[typing] {} are typing in {}",
+            active_users.join(", "),
+            scope_label
+        );
+    }
+}
+
 pub async fn handle_reaction_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
     let msg_id = data.get("msg_id").and_then(|v| v.as_str()).unwrap_or("");
     let emoji = data.get("emoji").and_then(|v| v.as_str()).unwrap_or("");
@@ -930,6 +1177,9 @@ pub async fn dispatch_event(
         "status_update" => {
             handle_status_update_event(state, &serde_json::Value::Object(data.clone())).await;
         }
+        "typing" => {
+            handle_typing_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
         "metrics" => {
             handle_metrics_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
@@ -965,4 +1215,24 @@ pub async fn dispatch_event(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_content_for_mentions;
+
+    #[test]
+    fn mention_highlights_current_user() {
+        let (rendered, mentioned) = format_content_for_mentions("hey @Alice and @bob", "alice");
+        assert!(mentioned);
+        assert_eq!(rendered, "hey [@Alice] and @bob");
+    }
+
+    #[test]
+    fn mention_ignores_embedded_at_signs() {
+        let (rendered, mentioned) =
+            format_content_for_mentions("mail alice@example.com then @carol", "alice");
+        assert!(!mentioned);
+        assert_eq!(rendered, "mail alice@example.com then @carol");
+    }
 }

@@ -843,6 +843,32 @@ impl ClientState {
         }))
     }
 
+    pub fn send_typing(&self, scope: &str, typing: bool) -> Result<(), String> {
+        let scope = scope.trim();
+        if let Some(target) = scope.strip_prefix("dm:") {
+            let to = target.trim().to_ascii_lowercase();
+            if to.is_empty() {
+                return Err("typing dm target cannot be empty".to_string());
+            }
+
+            return self.send_json(serde_json::json!({
+                "t": "typing",
+                "to": to,
+                "typing": typing,
+            }));
+        }
+
+        if scope.is_empty() {
+            return Err("typing channel cannot be empty".to_string());
+        }
+
+        self.send_json(serde_json::json!({
+            "t": "typing",
+            "ch": scope,
+            "typing": typing,
+        }))
+    }
+
     pub fn send_metrics(&self) -> Result<(), String> {
         self.send_json(serde_json::json!({
             "t": "metrics",
@@ -1064,6 +1090,38 @@ mod tests {
             .and_then(|v| v.as_f64())
             .expect("from_ts should be f64");
         assert!((from_ts - 1_711_234_567.125).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn send_typing_channel_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_typing("general", true)
+            .expect("send_typing should serialize channel scope");
+
+        let frame = rx.try_recv().expect("typing frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("typing"));
+        assert_eq!(parsed.get("ch").and_then(|v| v.as_str()), Some("general"));
+        assert_eq!(parsed.get("typing").and_then(|v| v.as_bool()), Some(true));
+        assert!(parsed.get("to").is_none());
+    }
+
+    #[test]
+    fn send_typing_dm_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_typing("dm:Alice", false)
+            .expect("send_typing should serialize dm scope");
+
+        let frame = rx.try_recv().expect("typing frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("typing"));
+        assert_eq!(parsed.get("to").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(parsed.get("typing").and_then(|v| v.as_bool()), Some(false));
+        assert!(parsed.get("ch").is_none());
     }
 
     #[test]

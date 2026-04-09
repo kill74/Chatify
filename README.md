@@ -182,7 +182,8 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 | Command                                      | Description                                                       |
 | -------------------------------------------- | ----------------------------------------------------------------- |
-| `/help`                                      | Show command help                                                 |
+| `/commands [filter]`                         | List commands, optionally filtered by keyword                     |
+| `/help [command]`                            | Show command help (general or per-command detail)                 |
 | `/join <channel>`                            | Join or switch to a channel                                       |
 | `/switch <channel>`                          | Alias for `/join`                                                 |
 | `/leave [channel]`                           | Leave a channel (defaults to current channel)                     |
@@ -193,6 +194,8 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 | `/users`                                     | Refresh online users and key directory                            |
 | `/metrics`                                   | Show runtime counters plus DB pool and DB latency summaries       |
 | `/db-profile` or `/dbprofile`                | Show focused DB latency profile and alerts                        |
+| `/typing [on\|off] [#ch\|dm:user]`           | Broadcast ephemeral typing state                                  |
+| `/notify [target] [on\|off]`                 | Show, update, reset, or test desktop notification preferences     |
 | `/dm <user> <message>`                       | Send encrypted direct message (trust-verified)                    |
 | `/fingerprint [user]`                        | Show peer key fingerprint(s) and trust status                     |
 | `/trust <user> <fingerprint>`                | Mark a peer fingerprint as trusted after out-of-band verification |
@@ -204,6 +207,22 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 | `/quit` `/exit` `/q`                         | Disconnect and exit                                               |
 
 Any non-command text is sent as a channel message to the active scope.
+
+### Mentions and Notifications
+
+- Mention a user with `@username` inside message text.
+- The client highlights mentions addressed to the current user.
+- Desktop notifications are controlled by `notifications.*` config flags:
+  - `notifications.on_mention` for mention alerts.
+  - `notifications.on_dm` for incoming DM alerts.
+  - `notifications.on_all_messages` for broad message alerts.
+- `/notify` lets you inspect and toggle these settings from the client runtime.
+- Valid `/notify` targets: `enabled`, `dm`, `mention`, `all`, `sound`.
+- Use `/notify <target>` to inspect a single notification setting.
+- Use `/notify reset` to restore notification settings to defaults.
+- Use `/notify export [--redact] [path|stdout]` to write a settings snapshot, optionally masking profile identifiers.
+- Use `/notify doctor [--json]` to print a quick diagnostics report in text or JSON format.
+- Use `/notify test [sound] [info|warning|critical] [message]` to trigger a one-time desktop notification probe.
 
 ### Reactions and Message IDs
 
