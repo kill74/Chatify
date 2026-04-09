@@ -1,6 +1,12 @@
 //! Server CLI arguments and protocol constants.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DbDurabilityMode {
+    Balanced,
+    MaxSafety,
+}
 
 #[derive(Parser)]
 #[command(name = "clifford-server")]
@@ -16,6 +22,9 @@ pub struct Args {
 
     #[arg(long, default_value = "chatify.db")]
     pub db: String,
+
+    #[arg(long, value_enum, default_value_t = DbDurabilityMode::MaxSafety)]
+    pub db_durability: DbDurabilityMode,
 
     #[arg(long)]
     pub db_key: Option<String>,

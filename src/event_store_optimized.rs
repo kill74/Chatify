@@ -253,37 +253,49 @@ impl EventStore {
         Ok(())
     }
 
-    fn encrypt_field(&self, plaintext: &str) -> String {
+    fn encrypt_field(&self, plaintext: &str) -> Option<String> {
         if let Some(ref key) = self.pool.encryption_key {
             match crypto::enc_bytes(key, plaintext.as_bytes()) {
-                Ok(ct) => serde_json::json!({"ct": hex::encode(ct)}).to_string(),
+                Ok(ct) => Some(serde_json::json!({"ct": hex::encode(ct)}).to_string()),
                 Err(e) => {
-                    warn!("encryption failed, storing plaintext: {}", e);
-                    plaintext.to_string()
+                    warn!("encryption failed; dropping persistence write: {}", e);
+                    None
                 }
             }
         } else {
-            plaintext.to_string()
+            Some(plaintext.to_string())
         }
     }
 
-    fn decrypt_field(&self, stored: &str) -> String {
+    fn decrypt_field(&self, stored: &str) -> Option<String> {
         if let Some(ref key) = self.pool.encryption_key {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(stored) {
-                if let Some(ct_hex) = val.get("ct").and_then(|v| v.as_str()) {
-                    if let Ok(ct_bytes) = hex::decode(ct_hex) {
-                        match crypto::dec_bytes(key, &ct_bytes) {
-                            Ok(pt) => return String::from_utf8_lossy(&pt).to_string(),
-                            Err(e) => {
-                                warn!("decryption failed: {}", e);
-                                return stored.to_string();
-                            }
-                        }
-                    }
+            let val = match serde_json::from_str::<serde_json::Value>(stored) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Backward-compatible read path for legacy plaintext rows.
+                    // New writes remain fail-closed in encrypt_field.
+                    warn!("legacy plaintext row encountered while encryption is enabled");
+                    return Some(stored.to_string());
+                }
+            };
+            let Some(ct_hex) = val.get("ct").and_then(|v| v.as_str()) else {
+                warn!("legacy plaintext row encountered while encryption is enabled");
+                return Some(stored.to_string());
+            };
+            let Ok(ct_bytes) = hex::decode(ct_hex) else {
+                warn!("encrypted payload has invalid ciphertext encoding; dropping row");
+                return None;
+            };
+            match crypto::dec_bytes(key, &ct_bytes) {
+                Ok(pt) => Some(String::from_utf8_lossy(&pt).to_string()),
+                Err(e) => {
+                    warn!("decryption failed; dropping row: {}", e);
+                    None
                 }
             }
+        } else {
+            Some(stored.to_string())
         }
-        stored.to_string()
     }
 
     fn decode_rows(rows: Vec<String>) -> Vec<Value> {
@@ -317,7 +329,7 @@ impl EventStore {
 
         let decrypted: Vec<String> = rows
             .filter_map(|r| r.ok())
-            .map(|raw| self.decrypt_field(&raw))
+            .filter_map(|raw| self.decrypt_field(&raw))
             .collect();
 
         let mut out = Self::decode_rows(decrypted);
@@ -338,8 +350,20 @@ impl EventStore {
             return;
         };
         let payload_json = payload.to_string();
-        let enc_payload = self.encrypt_field(&payload_json);
-        let enc_search = self.encrypt_field(&search_text.to_lowercase());
+        let Some(enc_payload) = self.encrypt_field(&payload_json) else {
+            warn!(
+                "event persist dropped: type={} channel={} sender={} reason=payload_encrypt_failed",
+                event_type, channel, sender
+            );
+            return;
+        };
+        let Some(enc_search) = self.encrypt_field(&search_text.to_lowercase()) else {
+            warn!(
+                "event persist dropped: type={} channel={} sender={} reason=search_encrypt_failed",
+                event_type, channel, sender
+            );
+            return;
+        };
         if let Err(e) = conn.execute(
             "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -459,9 +483,13 @@ impl EventStore {
 
         let mut results = Vec::new();
         for (enc_payload, enc_search) in rows {
-            let search_text = self.decrypt_field(&enc_search);
+            let Some(search_text) = self.decrypt_field(&enc_search) else {
+                continue;
+            };
             if search_text.contains(query_lower) {
-                let decrypted = self.decrypt_field(&enc_payload);
+                let Some(decrypted) = self.decrypt_field(&enc_payload) else {
+                    continue;
+                };
                 if let Ok(val) = serde_json::from_str::<Value>(&decrypted) {
                     results.push(val);
                 }

@@ -2,7 +2,29 @@ use prometheus::{
     CounterVec, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
     IntGauge, Opts, Registry,
 };
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DbOperationSummary {
+    pub operation: String,
+    pub samples: u64,
+    pub errors: u64,
+    pub error_rate: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub avg_ms: f64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DbLatencyAlert {
+    pub operation: String,
+    pub severity: String,
+    pub p95_ms: f64,
+    pub threshold_ms: f64,
+    pub samples: u64,
+}
 
 pub struct PrometheusMetrics {
     pub registry: Registry,
@@ -399,6 +421,188 @@ impl PrometheusMetrics {
         }
         hits as f64 / total as f64
     }
+
+    pub fn top_db_operations_by_p95(&self, top_n: usize) -> Vec<DbOperationSummary> {
+        if top_n == 0 {
+            return Vec::new();
+        }
+
+        let mut duration_map: HashMap<String, (u64, f64, f64, f64, f64)> = HashMap::new();
+        let mut error_map: HashMap<String, u64> = HashMap::new();
+
+        for family in self.registry.gather() {
+            match family.get_name() {
+                "chatify_db_query_duration_seconds" => {
+                    for metric in family.get_metric() {
+                        let operation = metric
+                            .get_label()
+                            .iter()
+                            .find(|label| label.get_name() == "operation")
+                            .map(|label| label.get_value().to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        let histogram = metric.get_histogram();
+                        let samples = histogram.get_sample_count();
+                        if samples == 0 {
+                            continue;
+                        }
+
+                        let sum_seconds = histogram.get_sample_sum();
+                        let p50_ms = estimate_histogram_percentile_ms(histogram, 0.50)
+                            .unwrap_or_else(|| (sum_seconds / samples as f64) * 1000.0);
+                        let p95_ms = estimate_histogram_percentile_ms(histogram, 0.95)
+                            .unwrap_or_else(|| (sum_seconds / samples as f64) * 1000.0);
+                        let p99_ms = estimate_histogram_percentile_ms(histogram, 0.99)
+                            .unwrap_or_else(|| (sum_seconds / samples as f64) * 1000.0);
+
+                        duration_map
+                            .insert(operation, (samples, sum_seconds, p50_ms, p95_ms, p99_ms));
+                    }
+                }
+                "chatify_db_query_errors_total" => {
+                    for metric in family.get_metric() {
+                        let operation = metric
+                            .get_label()
+                            .iter()
+                            .find(|label| label.get_name() == "operation")
+                            .map(|label| label.get_value().to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        let errors = metric.get_counter().get_value() as u64;
+                        error_map.insert(operation, errors);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut summaries: Vec<DbOperationSummary> = duration_map
+            .into_iter()
+            .map(
+                |(operation, (samples, sum_seconds, p50_ms, p95_ms, p99_ms))| {
+                    let errors = *error_map.get(&operation).unwrap_or(&0);
+                    let error_rate = if samples == 0 {
+                        0.0
+                    } else {
+                        errors as f64 / samples as f64
+                    };
+                    DbOperationSummary {
+                        operation,
+                        samples,
+                        errors,
+                        error_rate,
+                        p50_ms,
+                        p95_ms,
+                        p99_ms,
+                        avg_ms: (sum_seconds / samples as f64) * 1000.0,
+                    }
+                },
+            )
+            .collect();
+
+        summaries.sort_by(|a, b| {
+            b.p95_ms
+                .partial_cmp(&a.p95_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.samples.cmp(&a.samples))
+                .then_with(|| a.operation.cmp(&b.operation))
+        });
+
+        summaries.truncate(top_n);
+        summaries
+    }
+
+    pub fn db_latency_alerts(
+        &self,
+        top_n: usize,
+        warning_p95_ms: f64,
+        critical_p95_ms: f64,
+        min_samples: u64,
+    ) -> Vec<DbLatencyAlert> {
+        if top_n == 0 {
+            return Vec::new();
+        }
+
+        let mut alerts: Vec<DbLatencyAlert> = self
+            .top_db_operations_by_p95(top_n.saturating_mul(4).max(top_n))
+            .into_iter()
+            .filter_map(|summary| {
+                if summary.samples < min_samples {
+                    return None;
+                }
+
+                if summary.p95_ms >= critical_p95_ms {
+                    return Some(DbLatencyAlert {
+                        operation: summary.operation,
+                        severity: "critical".to_string(),
+                        p95_ms: summary.p95_ms,
+                        threshold_ms: critical_p95_ms,
+                        samples: summary.samples,
+                    });
+                }
+
+                if summary.p95_ms >= warning_p95_ms {
+                    return Some(DbLatencyAlert {
+                        operation: summary.operation,
+                        severity: "warning".to_string(),
+                        p95_ms: summary.p95_ms,
+                        threshold_ms: warning_p95_ms,
+                        samples: summary.samples,
+                    });
+                }
+
+                None
+            })
+            .collect();
+
+        alerts.sort_by(|a, b| {
+            severity_rank(&b.severity)
+                .cmp(&severity_rank(&a.severity))
+                .then_with(|| {
+                    b.p95_ms
+                        .partial_cmp(&a.p95_ms)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.samples.cmp(&a.samples))
+                .then_with(|| a.operation.cmp(&b.operation))
+        });
+
+        alerts.truncate(top_n);
+        alerts
+    }
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "critical" => 2,
+        "warning" => 1,
+        _ => 0,
+    }
+}
+
+fn estimate_histogram_percentile_ms(
+    histogram: &prometheus::proto::Histogram,
+    percentile: f64,
+) -> Option<f64> {
+    let samples = histogram.get_sample_count();
+    if samples == 0 {
+        return None;
+    }
+
+    let target = ((samples as f64) * percentile).ceil() as u64;
+    let average_ms = (histogram.get_sample_sum() / samples as f64) * 1000.0;
+
+    for bucket in histogram.get_bucket() {
+        if bucket.get_cumulative_count() >= target {
+            let upper = bucket.get_upper_bound();
+            if upper.is_finite() {
+                return Some(upper * 1000.0);
+            }
+            return Some(average_ms);
+        }
+    }
+
+    Some(average_ms)
 }
 
 pub struct Timer {
@@ -496,5 +700,55 @@ mod tests {
         assert_eq!(metrics.bytes_sent.get(), 1024);
         assert_eq!(metrics.bytes_received.get(), 2048);
         assert_eq!(metrics.errors.get(), 1);
+    }
+
+    #[test]
+    fn test_top_db_operations_profile_includes_percentiles() {
+        let metrics = PrometheusMetrics::new().unwrap();
+
+        metrics.record_db_query("history", Duration::from_millis(8));
+        metrics.record_db_query("history", Duration::from_millis(12));
+        metrics.record_db_query("history", Duration::from_millis(20));
+        metrics.record_db_query("search_encrypted_dm", Duration::from_millis(120));
+        metrics.record_db_query("search_encrypted_dm", Duration::from_millis(180));
+        metrics.record_db_error("search_encrypted_dm");
+
+        let top = metrics.top_db_operations_by_p95(10);
+        assert!(!top.is_empty());
+
+        let history = top
+            .iter()
+            .find(|summary| summary.operation == "history")
+            .expect("history operation should be present");
+        assert!(history.samples >= 3);
+        assert!(history.p50_ms > 0.0);
+        assert!(history.p95_ms > 0.0);
+        assert!(history.p99_ms > 0.0);
+        assert!(history.avg_ms > 0.0);
+    }
+
+    #[test]
+    fn test_db_latency_alerts_respect_thresholds() {
+        let metrics = PrometheusMetrics::new().unwrap();
+
+        for _ in 0..8 {
+            metrics.record_db_query("persist_insert", Duration::from_millis(220));
+        }
+        for _ in 0..8 {
+            metrics.record_db_query("history", Duration::from_millis(60));
+        }
+
+        let alerts = metrics.db_latency_alerts(10, 50.0, 200.0, 5);
+        assert!(!alerts.is_empty());
+
+        let has_critical = alerts
+            .iter()
+            .any(|alert| alert.operation == "persist_insert" && alert.severity == "critical");
+        let has_warning = alerts
+            .iter()
+            .any(|alert| alert.operation == "history" && alert.severity == "warning");
+
+        assert!(has_critical);
+        assert!(has_warning);
     }
 }

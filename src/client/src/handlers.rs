@@ -1,6 +1,6 @@
 //! Client event handlers.
 
-use crate::state::{DisplayedMessage, SharedState};
+use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState};
 use crate::voice::{decode_voice_frame, VoiceEvent};
 
 fn extract_msg_id(data: &serde_json::Value) -> String {
@@ -25,6 +25,25 @@ fn short_id(id: &str) -> String {
     }
 }
 
+fn format_scope_label(scope: &str) -> String {
+    if scope.starts_with("dm:") {
+        scope.to_string()
+    } else {
+        format!("#{}", scope)
+    }
+}
+
+fn trust_warning_summary(warning: &KeyChangeWarning) -> String {
+    format!(
+        "key change detected for {}: trusted {} but observed {}. Re-verify with /fingerprint {} and /trust {} <fingerprint>",
+        warning.user,
+        ClientState::format_fingerprint_for_display(&warning.trusted_fingerprint),
+        ClientState::format_fingerprint_for_display(&warning.observed_fingerprint),
+        warning.user,
+        warning.user
+    )
+}
+
 fn print_live_message(message: &DisplayedMessage, reaction_summary: &str) {
     if message.sender == "system" {
         println!("[system] {}", message.content);
@@ -32,27 +51,193 @@ fn print_live_message(message: &DisplayedMessage, reaction_summary: &str) {
     }
 
     let id = short_id(&message.id);
+    let scope = format_scope_label(&message.channel);
     if reaction_summary.is_empty() {
-        println!(
-            "[{}] #{} {}: {}",
-            id, message.channel, message.sender, message.content
-        );
+        println!("[{}] {} {}: {}", id, scope, message.sender, message.content);
     } else {
         println!(
-            "[{}] #{} {}: {} {}",
-            id, message.channel, message.sender, message.content, reaction_summary
+            "[{}] {} {}: {} {}",
+            id, scope, message.sender, message.content, reaction_summary
         );
     }
+}
+
+fn value_as_u64(value: Option<&serde_json::Value>) -> u64 {
+    value
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+                .or_else(|| {
+                    v.as_f64().and_then(|n| {
+                        if n.is_finite() && n >= 0.0 {
+                            Some(n as u64)
+                        } else {
+                            None
+                        }
+                    })
+                })
+        })
+        .unwrap_or(0)
+}
+
+fn value_as_f64(value: Option<&serde_json::Value>) -> f64 {
+    value
+        .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
+        .unwrap_or(0.0)
+}
+
+fn print_db_pool_summary(data: &serde_json::Value) {
+    let active = value_as_u64(data.get("db_pool_active"));
+    let idle = value_as_u64(data.get("db_pool_idle"));
+    let total = value_as_u64(data.get("db_pool_total"));
+    let waiters = value_as_u64(data.get("db_pool_waiters"));
+
+    println!(
+        "DB pool: active={} idle={} total={} waiters={}",
+        active, idle, total, waiters
+    );
+}
+
+fn print_db_latency_budget(data: &serde_json::Value) {
+    let budget = data
+        .get("db_latency_budget_ms")
+        .unwrap_or(&serde_json::Value::Null);
+    let warning = value_as_f64(budget.get("warning_p95"));
+    let critical = value_as_f64(budget.get("critical_p95"));
+    let min_samples = value_as_u64(budget.get("min_samples"));
+
+    if warning > 0.0 || critical > 0.0 || min_samples > 0 {
+        println!(
+            "DB latency budget p95(ms): warning={:.1} critical={:.1} min_samples={}",
+            warning, critical, min_samples
+        );
+    }
+}
+
+fn print_db_top_ops(data: &serde_json::Value) {
+    let Some(top_ops) = data.get("db_top_ops").and_then(|v| v.as_array()) else {
+        println!("DB top ops: no samples yet.");
+        return;
+    };
+
+    if top_ops.is_empty() {
+        println!("DB top ops: no samples yet.");
+        return;
+    }
+
+    println!("DB top ops (by p95):");
+    for (idx, op) in top_ops.iter().enumerate() {
+        let name = op
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let p50 = value_as_f64(op.get("p50_ms"));
+        let p95 = value_as_f64(op.get("p95_ms"));
+        let p99 = value_as_f64(op.get("p99_ms"));
+        let avg = value_as_f64(op.get("avg_ms"));
+        let samples = value_as_u64(op.get("samples"));
+        let errors = value_as_u64(op.get("errors"));
+        let error_rate = value_as_f64(op.get("error_rate"));
+
+        println!(
+            "  {}. {} p50={:.2}ms p95={:.2}ms p99={:.2}ms avg={:.2}ms samples={} errors={} err_rate={:.4}",
+            idx + 1,
+            name,
+            p50,
+            p95,
+            p99,
+            avg,
+            samples,
+            errors,
+            error_rate
+        );
+    }
+}
+
+fn print_db_alerts(data: &serde_json::Value) {
+    let Some(alerts) = data.get("db_alerts").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    if alerts.is_empty() {
+        println!("DB alerts: none");
+        return;
+    }
+
+    println!("DB alerts:");
+    for alert in alerts {
+        let operation = alert
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let severity = alert
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("warning")
+            .to_ascii_uppercase();
+        let p95 = value_as_f64(alert.get("p95_ms"));
+        let samples = value_as_u64(alert.get("samples"));
+        println!(
+            "  [{}] {} p95={:.2}ms samples={}",
+            severity, operation, p95, samples
+        );
+    }
+}
+
+pub async fn handle_metrics_event(_state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let messages_sent = value_as_u64(data.get("messages_sent"));
+    let messages_received = value_as_u64(data.get("messages_received"));
+    let bytes_sent = value_as_u64(data.get("bytes_sent"));
+    let bytes_received = value_as_u64(data.get("bytes_received"));
+    let errors = value_as_u64(data.get("errors"));
+    let connections_accepted = value_as_u64(data.get("connections_accepted"));
+    let connections_closed = value_as_u64(data.get("connections_closed"));
+    let active_connections = value_as_u64(data.get("active_connections"));
+    let cache_hits = value_as_u64(data.get("cache_hits"));
+    let cache_misses = value_as_u64(data.get("cache_misses"));
+    let cache_hit_rate = value_as_f64(data.get("cache_hit_rate"));
+
+    println!("Metrics snapshot:");
+    println!(
+        "Traffic: messages sent={} received={} bytes sent={} received={}",
+        messages_sent, messages_received, bytes_sent, bytes_received
+    );
+    println!(
+        "Connections: accepted={} closed={} active={}",
+        connections_accepted, connections_closed, active_connections
+    );
+    println!(
+        "Cache: hits={} misses={} hit_rate={:.2}%",
+        cache_hits,
+        cache_misses,
+        cache_hit_rate * 100.0
+    );
+    println!("Errors: {}", errors);
+
+    print_db_pool_summary(data);
+    print_db_latency_budget(data);
+    print_db_top_ops(data);
+    print_db_alerts(data);
+}
+
+pub async fn handle_db_profile_event(_state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    println!("DB profile snapshot:");
+    print_db_pool_summary(data);
+    print_db_latency_budget(data);
+    print_db_top_ops(data);
+    print_db_alerts(data);
 }
 
 pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts: u64) {
     let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
     let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
     let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+    let pk = data.get("pk").and_then(|v| v.as_str()).unwrap_or("");
     let msg_id = extract_msg_id(data);
     let event_ts = extract_ts(data, ts);
 
     let mut state_lock = state.lock().await;
+    let trust_audit_len_before = state_lock.trust_store.audit_log.len();
     let message = DisplayedMessage {
         id: msg_id.clone(),
         ts: event_ts,
@@ -63,10 +248,90 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
         edited: false,
     };
     state_lock.add_message(message.clone());
+    let trust_warning = state_lock.observe_user_key(u, pk);
+    if let Some(warning) = trust_warning.as_ref() {
+        state_lock.add_message(DisplayedMessage {
+            id: String::new(),
+            ts: event_ts,
+            channel: String::new(),
+            sender: "system".to_string(),
+            content: trust_warning_summary(warning),
+            encrypted: false,
+            edited: false,
+        });
+    }
+    if state_lock.trust_store.audit_log.len() != trust_audit_len_before {
+        if let Err(err) = state_lock.save_trust_store() {
+            eprintln!("failed to persist trust store: {}", err);
+        }
+    }
     let reaction_summary = state_lock.reaction_summary(&msg_id);
     drop(state_lock);
 
     print_live_message(&message, &reaction_summary);
+    if let Some(warning) = trust_warning {
+        eprintln!("[trust-warning] {}", trust_warning_summary(&warning));
+    }
+}
+
+pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: u64) {
+    let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+    let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("");
+    let content = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+    let pk = data.get("pk").and_then(|v| v.as_str()).unwrap_or("");
+    let msg_id = extract_msg_id(data);
+    let event_ts = extract_ts(data, ts);
+
+    let mut state_lock = state.lock().await;
+    let trust_audit_len_before = state_lock.trust_store.audit_log.len();
+
+    let my_user = state_lock.me.clone();
+    let from_is_me = !my_user.is_empty() && from.eq_ignore_ascii_case(&my_user);
+    let peer = if from_is_me { to } else { from };
+    let scope = format!("dm:{}", peer.to_ascii_lowercase());
+
+    let message = DisplayedMessage {
+        id: msg_id.clone(),
+        ts: event_ts,
+        channel: scope,
+        sender: from.to_string(),
+        content: content.to_string(),
+        encrypted: true,
+        edited: false,
+    };
+    state_lock.add_message(message.clone());
+
+    let trust_warning = if from_is_me {
+        None
+    } else {
+        state_lock.observe_user_key(from, pk)
+    };
+
+    if let Some(warning) = trust_warning.as_ref() {
+        state_lock.add_message(DisplayedMessage {
+            id: String::new(),
+            ts: event_ts,
+            channel: String::new(),
+            sender: "system".to_string(),
+            content: trust_warning_summary(warning),
+            encrypted: false,
+            edited: false,
+        });
+    }
+
+    if state_lock.trust_store.audit_log.len() != trust_audit_len_before {
+        if let Err(err) = state_lock.save_trust_store() {
+            eprintln!("failed to persist trust store: {}", err);
+        }
+    }
+
+    let reaction_summary = state_lock.reaction_summary(&msg_id);
+    drop(state_lock);
+
+    print_live_message(&message, &reaction_summary);
+    if let Some(warning) = trust_warning {
+        eprintln!("[trust-warning] {}", trust_warning_summary(&warning));
+    }
 }
 
 pub async fn handle_err_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
@@ -104,8 +369,120 @@ pub async fn handle_ok_event(state: &SharedState, data: &serde_json::Value, _ts:
         encrypted: false,
         edited: false,
     });
+    if let Err(err) = state_lock.send_json(serde_json::json!({"t": "users"})) {
+        eprintln!("failed to request users directory: {}", err);
+    }
     drop(state_lock);
     println!("Connected successfully.");
+}
+
+async fn ingest_timeline_events(
+    state: &SharedState,
+    scope: &str,
+    events: &[serde_json::Value],
+) -> (usize, Vec<String>) {
+    let mut state_lock = state.lock().await;
+    let mut reaction_events = 0usize;
+
+    for event in events.iter().rev() {
+        let t = event.get("t").and_then(|v| v.as_str()).unwrap_or("msg");
+        match t {
+            "msg" => {
+                let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                let sender = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
+                let event_ts = extract_ts(event, 0);
+                state_lock.add_message(DisplayedMessage {
+                    id: extract_msg_id(event),
+                    ts: event_ts,
+                    channel: scope.to_string(),
+                    sender: sender.to_string(),
+                    content: content.to_string(),
+                    encrypted: true,
+                    edited: false,
+                });
+            }
+            "dm" => {
+                let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                let sender = event
+                    .get("from")
+                    .or_else(|| event.get("u"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let event_ts = extract_ts(event, 0);
+                state_lock.add_message(DisplayedMessage {
+                    id: extract_msg_id(event),
+                    ts: event_ts,
+                    channel: scope.to_string(),
+                    sender: sender.to_string(),
+                    content: content.to_string(),
+                    encrypted: true,
+                    edited: false,
+                });
+            }
+            "reaction" => {
+                let msg_id = event.get("msg_id").and_then(|v| v.as_str()).unwrap_or("");
+                let emoji = event.get("emoji").and_then(|v| v.as_str()).unwrap_or("");
+                let user = event
+                    .get("user")
+                    .or_else(|| event.get("u"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if msg_id.is_empty() || emoji.is_empty() {
+                    continue;
+                }
+
+                let applied = if user.is_empty() {
+                    state_lock.add_reaction(msg_id, emoji);
+                    true
+                } else {
+                    state_lock.add_reaction_event(msg_id, emoji, user)
+                };
+
+                if applied {
+                    reaction_events += 1;
+                }
+            }
+            "sys" => {
+                let content = event.get("m").and_then(|v| v.as_str()).unwrap_or("");
+                let event_ts = extract_ts(event, 0);
+                state_lock.add_message(DisplayedMessage {
+                    id: String::new(),
+                    ts: event_ts,
+                    channel: scope.to_string(),
+                    sender: "system".to_string(),
+                    content: content.to_string(),
+                    encrypted: false,
+                    edited: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let preview: Vec<String> = state_lock
+        .message_history
+        .iter()
+        .rev()
+        .filter(|msg| msg.channel == scope && !msg.id.is_empty())
+        .take(5)
+        .map(|msg| {
+            let summary = state_lock.reaction_summary(&msg.id);
+            if summary.is_empty() {
+                format!("  [{}] {}: {}", short_id(&msg.id), msg.sender, msg.content)
+            } else {
+                format!(
+                    "  [{}] {}: {} {}",
+                    short_id(&msg.id),
+                    msg.sender,
+                    msg.content,
+                    summary
+                )
+            }
+        })
+        .collect();
+
+    (reaction_events, preview)
 }
 
 pub async fn handle_history_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
@@ -116,94 +493,55 @@ pub async fn handle_history_event(state: &SharedState, data: &serde_json::Value,
         .and_then(|v| v.as_array());
 
     if let Some(events) = events {
-        let mut state_lock = state.lock().await;
-        let mut reaction_events = 0usize;
-
-        for event in events.iter().rev() {
-            let t = event.get("t").and_then(|v| v.as_str()).unwrap_or("msg");
-            match t {
-                "msg" => {
-                    let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                    let sender = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
-                    let event_ts = extract_ts(event, 0);
-                    state_lock.add_message(DisplayedMessage {
-                        id: extract_msg_id(event),
-                        ts: event_ts,
-                        channel: ch.to_string(),
-                        sender: sender.to_string(),
-                        content: content.to_string(),
-                        encrypted: true,
-                        edited: false,
-                    });
-                }
-                "reaction" => {
-                    let msg_id = event.get("msg_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let emoji = event.get("emoji").and_then(|v| v.as_str()).unwrap_or("");
-                    let user = event
-                        .get("user")
-                        .or_else(|| event.get("u"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-
-                    if msg_id.is_empty() || emoji.is_empty() {
-                        continue;
-                    }
-
-                    let applied = if user.is_empty() {
-                        state_lock.add_reaction(msg_id, emoji);
-                        true
-                    } else {
-                        state_lock.add_reaction_event(msg_id, emoji, user)
-                    };
-
-                    if applied {
-                        reaction_events += 1;
-                    }
-                }
-                "sys" => {
-                    let content = event.get("m").and_then(|v| v.as_str()).unwrap_or("");
-                    let event_ts = extract_ts(event, 0);
-                    state_lock.add_message(DisplayedMessage {
-                        id: String::new(),
-                        ts: event_ts,
-                        channel: ch.to_string(),
-                        sender: "system".to_string(),
-                        content: content.to_string(),
-                        encrypted: false,
-                        edited: false,
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let preview: Vec<String> = state_lock
-            .message_history
-            .iter()
-            .rev()
-            .filter(|msg| msg.channel == ch && !msg.id.is_empty())
-            .take(5)
-            .map(|msg| {
-                let summary = state_lock.reaction_summary(&msg.id);
-                if summary.is_empty() {
-                    format!("  [{}] {}: {}", short_id(&msg.id), msg.sender, msg.content)
-                } else {
-                    format!(
-                        "  [{}] {}: {} {}",
-                        short_id(&msg.id),
-                        msg.sender,
-                        msg.content,
-                        summary
-                    )
-                }
-            })
-            .collect();
-        drop(state_lock);
+        let (reaction_events, preview) = ingest_timeline_events(state, ch, events).await;
 
         println!(
-            "Loaded {} events for #{} ({} reaction events).",
+            "Loaded {} events for {} ({} reaction events).",
             events.len(),
-            ch,
+            format_scope_label(ch),
+            reaction_events
+        );
+        for line in preview.iter().rev() {
+            println!("{}", line);
+        }
+    }
+}
+
+pub async fn handle_search_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let query = data.get("q").and_then(|v| v.as_str()).unwrap_or("");
+    let events = data.get("events").and_then(|v| v.as_array());
+
+    if let Some(events) = events {
+        let (reaction_events, preview) = ingest_timeline_events(state, ch, events).await;
+        println!(
+            "Search '{}' returned {} events in {} ({} reaction events).",
+            query,
+            events.len(),
+            format_scope_label(ch),
+            reaction_events
+        );
+        for line in preview.iter().rev() {
+            println!("{}", line);
+        }
+    }
+}
+
+pub async fn handle_replay_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let from_ts = data
+        .get("from_ts")
+        .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
+        .unwrap_or(0.0);
+    let events = data.get("events").and_then(|v| v.as_array());
+
+    if let Some(events) = events {
+        let (reaction_events, preview) = ingest_timeline_events(state, ch, events).await;
+        println!(
+            "Replay from ts={} returned {} events for {} ({} reaction events).",
+            from_ts,
+            events.len(),
+            format_scope_label(ch),
             reaction_events
         );
         for line in preview.iter().rev() {
@@ -217,15 +555,38 @@ pub async fn handle_users_event(state: &SharedState, data: &serde_json::Value, _
 
     if let Some(users) = users {
         let mut state_lock = state.lock().await;
+        let trust_audit_len_before = state_lock.trust_store.audit_log.len();
         state_lock.users.clear();
+        let mut warnings = Vec::new();
         for user in users {
             let u = user.get("u").and_then(|v| v.as_str()).unwrap_or("");
             let pk = user.get("pk").and_then(|v| v.as_str()).unwrap_or("");
-            state_lock.users.insert(u.to_string(), pk.to_string());
+
+            if let Some(warning) = state_lock.observe_user_key(u, pk) {
+                let summary = trust_warning_summary(&warning);
+                state_lock.add_message(DisplayedMessage {
+                    id: String::new(),
+                    ts: 0.0,
+                    channel: String::new(),
+                    sender: "system".to_string(),
+                    content: summary.clone(),
+                    encrypted: false,
+                    edited: false,
+                });
+                warnings.push(summary);
+            }
+        }
+        if state_lock.trust_store.audit_log.len() != trust_audit_len_before {
+            if let Err(err) = state_lock.save_trust_store() {
+                eprintln!("failed to persist trust store: {}", err);
+            }
         }
         let count = state_lock.users.len();
         drop(state_lock);
         println!("Users online: {}", count);
+        for warning in warnings {
+            eprintln!("[trust-warning] {}", warning);
+        }
     }
 }
 
@@ -266,6 +627,42 @@ pub async fn handle_joined_event(state: &SharedState, data: &serde_json::Value, 
         })
         .to_string(),
     );
+}
+
+pub async fn handle_left_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let ch = data
+        .get("ch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("general")
+        .to_string();
+    let already_left = data
+        .get("already_left")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut state_lock = state.lock().await;
+    if state_lock.ch == ch {
+        state_lock.ch = "general".to_string();
+    }
+
+    let summary = if already_left {
+        format!("Left #{} (already inactive)", ch)
+    } else {
+        format!("Left #{}", ch)
+    };
+
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: ch.clone(),
+        sender: "system".to_string(),
+        content: summary.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", summary);
 }
 
 pub async fn handle_sys_event(state: &SharedState, data: &serde_json::Value, ts: u64) {
@@ -500,6 +897,9 @@ pub async fn dispatch_event(
         "msg" => {
             handle_msg_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
+        "dm" => {
+            handle_dm_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
         "err" => {
             handle_err_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
@@ -508,6 +908,12 @@ pub async fn dispatch_event(
         }
         "history" => {
             handle_history_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "search" => {
+            handle_search_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "replay" => {
+            handle_replay_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
         "users" => {
             handle_users_event(state, &serde_json::Value::Object(data.clone()), ts).await;
@@ -518,8 +924,17 @@ pub async fn dispatch_event(
         "joined" => {
             handle_joined_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
+        "left" => {
+            handle_left_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
         "status_update" => {
             handle_status_update_event(state, &serde_json::Value::Object(data.clone())).await;
+        }
+        "metrics" => {
+            handle_metrics_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "db_profile" => {
+            handle_db_profile_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
         "reaction" => {
             handle_reaction_event(state, &serde_json::Value::Object(data.clone()), ts).await;

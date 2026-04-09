@@ -1295,7 +1295,7 @@ fn handle_system_msg(data: &PayloadMap, metrics: &Arc<BridgeMetrics>) {
     metrics.inc_chatify_ingress();
     let m = data.get("m").and_then(|v| v.as_str()).unwrap_or("");
     metrics.inc_chatify_forwarded();
-    info!("event=chatify_system message={}", m);
+    info!("event=chatify_system message_len={}", m.len());
 }
 
 /// Handle Chatify direct messages between users

@@ -1,14 +1,10 @@
 # Chatify
 
-<div align="center">
-
 [![CI](https://github.com/kill74/Chatify/actions/workflows/ci.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/ci.yml)
 [![Windows Release Package](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml)
 [![Release Security Report](https://github.com/kill74/Chatify/actions/workflows/release-security-report.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/release-security-report.yml)
 [![Release](https://img.shields.io/github/v/release/kill74/Chatify)](https://github.com/kill74/Chatify/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-</div>
 
 Self-hosted, terminal-native chat server written in Rust. Ships a WebSocket server, a terminal dashboard client, and an optional Discord relay bridge. Designed for controlled deployments where operational transparency and protocol correctness matter more than UI polish.
 
@@ -51,7 +47,7 @@ Most self-hosted chat systems are web-first and treat the protocol as a second-c
 
 ## System Overview
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                        clicord-server                        │
 │                                                              │
@@ -151,16 +147,17 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ### Server — `clicord-server`
 
-| Flag         | Default      | Notes                                                                       |
-| ------------ | ------------ | --------------------------------------------------------------------------- |
-| `--host`     | `0.0.0.0`    | Bind address                                                                |
-| `--port`     | `8765`       | Bind port                                                                   |
-| `--db`       | `chatify.db` | SQLite database path                                                        |
-| `--db-key`   | _(auto)_     | 32-byte encryption key, hex-encoded (64 chars). See resolution order below. |
-| `--tls`      | `false`      | Enable TLS (`wss://`). Requires `--tls-cert` and `--tls-key`.               |
-| `--tls-cert` | `cert.pem`   | PEM certificate path                                                        |
-| `--tls-key`  | `key.pem`    | PEM private key path                                                        |
-| `--log`      | `false`      | Structured logging to stderr                                                |
+| Flag              | Default      | Notes                                                                                      |
+| ----------------- | ------------ | ------------------------------------------------------------------------------------------ |
+| `--host`          | `0.0.0.0`    | Bind address                                                                               |
+| `--port`          | `8765`       | Bind port                                                                                  |
+| `--db`            | `chatify.db` | SQLite database path                                                                       |
+| `--db-durability` | `max-safety` | SQLite durability profile: `balanced` (faster) or `max-safety` (stronger crash durability) |
+| `--db-key`        | _(auto)_     | 32-byte encryption key, hex-encoded (64 chars). See resolution order below.                |
+| `--tls`           | `false`      | Enable TLS (`wss://`). Requires `--tls-cert` and `--tls-key`.                              |
+| `--tls-cert`      | `cert.pem`   | PEM certificate path                                                                       |
+| `--tls-key`       | `key.pem`    | PEM private key path                                                                       |
+| `--log`           | `false`      | Structured logging to stderr                                                               |
 
 **DB key resolution order:**
 
@@ -189,6 +186,7 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 | `/help [command]`                 | General help, or detailed usage for a specific command                     |
 | `/join <channel>`                 | Join or create a channel                                                   |
 | `/switch <channel>`               | Alias for `/join`                                                          |
+| `/leave [channel]`                | Leave a previously joined channel (defaults to current channel)            |
 | `/dm <user> <message>`            | Send an encrypted direct message                                           |
 | `/typing [on\|off] [scope]`       | Broadcast typing indicator to `#channel` or `dm:<user>`                    |
 | `/image <path>`                   | Transfer an image to the current channel (chunked, ≤100 MB)                |

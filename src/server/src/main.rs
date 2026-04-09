@@ -58,6 +58,7 @@
 //! | `--port` | `8765`           | TCP port                           |
 //! | `--log`  | off              | Enable structured logging          |
 //! | `--db`   | `chatify.db`     | SQLite database file path          |
+//! | `--db-durability` | `max-safety` | SQLite durability profile       |
 //!
 //! ## Protocol
 //!
@@ -70,21 +71,21 @@
 
 mod plugin_runtime;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use clifford::crypto;
 use clifford::error::{ChatifyError, ChatifyResult};
 use clifford::metrics::PrometheusMetrics;
 use clifford::performance::{Metrics as PerfMetrics, VecCache};
 use clifford::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use clifford::voice::{relay::VoiceBroadcast, VoiceRelay};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use plugin_runtime::{
@@ -117,6 +118,61 @@ use tokio_tungstenite::{
 /// Parsed once at startup by [clap]; the fields are consumed into [`State`]
 /// and the bind address, and are not referenced again after `main` returns
 /// from its setup phase.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DbDurabilityMode {
+    /// Throughput-friendly durability profile.
+    /// Uses WAL and `synchronous=NORMAL`.
+    Balanced,
+    /// Crash-resilient durability profile.
+    /// Uses WAL and `synchronous=FULL`.
+    MaxSafety,
+}
+
+impl DbDurabilityMode {
+    fn db_pragmas(self) -> &'static str {
+        match self {
+            DbDurabilityMode::Balanced => {
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                PRAGMA wal_autocheckpoint = 1000;
+                PRAGMA cache_size = -2000;
+                PRAGMA temp_store = MEMORY;
+                PRAGMA foreign_keys = ON;
+                PRAGMA mmap_size = 268435456;
+                PRAGMA page_size = 4096;
+                "
+            }
+            DbDurabilityMode::MaxSafety => {
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = FULL;
+                PRAGMA wal_autocheckpoint = 256;
+                PRAGMA cache_size = -2000;
+                PRAGMA temp_store = MEMORY;
+                PRAGMA foreign_keys = ON;
+                PRAGMA mmap_size = 268435456;
+                PRAGMA page_size = 4096;
+                "
+            }
+        }
+    }
+
+    fn startup_checkpoint_pragma(self) -> &'static str {
+        match self {
+            DbDurabilityMode::Balanced => "PRAGMA wal_checkpoint(PASSIVE);",
+            DbDurabilityMode::MaxSafety => "PRAGMA wal_checkpoint(FULL);",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DbDurabilityMode::Balanced => "balanced (WAL + synchronous=NORMAL)",
+            DbDurabilityMode::MaxSafety => "max-safety (WAL + synchronous=FULL)",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "clicord-server")]
 struct Args {
@@ -139,6 +195,13 @@ struct Args {
     /// ephemeral in-process storage in tests.
     #[arg(long, default_value = "chatify.db")]
     db: String,
+
+    /// SQLite durability profile.
+    ///
+    /// `balanced` favors throughput.
+    /// `max-safety` favors persistence guarantees after crashes/power loss.
+    #[arg(long, value_enum, default_value_t = DbDurabilityMode::MaxSafety)]
+    db_durability: DbDurabilityMode,
 
     /// Hex-encoded encryption key for the SQLite database (SQLCipher).
     /// Must be exactly 64 hex characters (32 bytes).
@@ -238,7 +301,7 @@ const MAX_HANDSHAKE_HEADERS: usize = 64;
 /// The migration path in [`EventStore::migrate`] upgrades from any lower
 /// version to this one. If the stored version is *higher*, the server logs a
 /// warning and continues without modifying the schema (no downgrade).
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// Default number of events returned by a `history` request.
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -663,15 +726,6 @@ impl Mute {
 const DB_POOL_SIZE: u32 = 8;
 const DB_POOL_MIN_IDLE: u32 = 2;
 const DB_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
-const DB_PRAGMAS: &str = "
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    PRAGMA cache_size = -2000;
-    PRAGMA temp_store = MEMORY;
-    PRAGMA foreign_keys = ON;
-    PRAGMA mmap_size = 268435456;
-    PRAGMA page_size = 4096;
-";
 
 #[derive(Clone)]
 struct PooledConnection {
@@ -679,13 +733,19 @@ struct PooledConnection {
     path: String,
     #[allow(dead_code)]
     encryption_key: Option<Vec<u8>>,
+    durability_mode: DbDurabilityMode,
 }
 
 impl PooledConnection {
-    fn new(path: String, encryption_key: Option<Vec<u8>>) -> Self {
+    fn new(
+        path: String,
+        encryption_key: Option<Vec<u8>>,
+        durability_mode: DbDurabilityMode,
+    ) -> Self {
         Self {
             path,
             encryption_key,
+            durability_mode,
         }
     }
 }
@@ -697,7 +757,7 @@ impl r2d2::ManageConnection for PooledConnection {
     fn connect(&self) -> Result<Self::Connection, Self::Error> {
         let conn = Connection::open(&self.path)?;
         if self.path != ":memory:" {
-            conn.execute_batch(DB_PRAGMAS)?;
+            conn.execute_batch(self.durability_mode.db_pragmas())?;
         } else {
             conn.execute_batch("PRAGMA foreign_keys = ON")?;
         }
@@ -720,12 +780,17 @@ struct DbPool {
     path: String,
     #[allow(dead_code)]
     encryption_key: Option<Vec<u8>>,
+    durability_mode: DbDurabilityMode,
     pool: r2d2::Pool<PooledConnection>,
 }
 
 impl DbPool {
-    fn new(path: String, encryption_key: Option<Vec<u8>>) -> Result<Self, r2d2::Error> {
-        let manager = PooledConnection::new(path.clone(), encryption_key.clone());
+    fn new(
+        path: String,
+        encryption_key: Option<Vec<u8>>,
+        durability_mode: DbDurabilityMode,
+    ) -> Result<Self, r2d2::Error> {
+        let manager = PooledConnection::new(path.clone(), encryption_key.clone(), durability_mode);
         let pool = r2d2::Pool::builder()
             .max_size(DB_POOL_SIZE)
             .min_idle(Some(DB_POOL_MIN_IDLE))
@@ -739,6 +804,7 @@ impl DbPool {
             pool,
             path,
             encryption_key,
+            durability_mode,
         })
     }
 }
@@ -746,6 +812,7 @@ impl DbPool {
 #[derive(Clone)]
 struct EventStore {
     pool: DbPool,
+    prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
     #[cfg(feature = "batch-writes")]
     write_queue: Option<StdArc<WriteQueue>>,
 }
@@ -754,8 +821,13 @@ type RoleRow = (i64, String, i32, bool, bool, bool, bool, bool);
 type BanMuteRow = (String, String, String, Option<String>, f64, Option<f64>);
 
 impl EventStore {
-    fn new(path: String, encryption_key: Option<Vec<u8>>) -> Self {
-        let pool = DbPool::new(path.clone(), encryption_key.clone())
+    fn new(
+        path: String,
+        encryption_key: Option<Vec<u8>>,
+        durability_mode: DbDurabilityMode,
+        prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+    ) -> Self {
+        let pool = DbPool::new(path.clone(), encryption_key.clone(), durability_mode)
             .expect("failed to create database pool");
         #[cfg(feature = "batch-writes")]
         let write_queue = {
@@ -765,11 +837,33 @@ impl EventStore {
         };
         let store = Self {
             pool,
+            prometheus,
             #[cfg(feature = "batch-writes")]
             write_queue,
         };
         store.init().expect("failed to initialise event store Ã¢â‚¬â€ check database path, permissions, and encryption key");
+        store.run_startup_checkpoint();
         store
+    }
+
+    fn record_db_observation(&self, operation: &str, started: Instant, error: bool) {
+        let Some(prometheus) = self.prometheus.as_ref() else {
+            return;
+        };
+        let Ok(metrics) = prometheus.try_lock() else {
+            return;
+        };
+
+        metrics.record_db_query(operation, started.elapsed());
+        if error {
+            metrics.record_db_error(operation);
+        }
+
+        let state = self.pool.pool.state();
+        metrics.update_db_pool_stats(
+            (state.connections - state.idle_connections) as usize,
+            state.idle_connections as usize,
+        );
     }
 
     fn is_encrypted(&self) -> bool {
@@ -800,6 +894,22 @@ impl EventStore {
         let version = Self::schema_version(&conn)?;
         self.migrate(&conn, version)?;
         Ok(())
+    }
+
+    fn run_startup_checkpoint(&self) {
+        if self.pool.path == ":memory:" {
+            return;
+        }
+        let Some(conn) = self.get_connection() else {
+            return;
+        };
+        if let Err(err) = conn.execute_batch(self.pool.durability_mode.startup_checkpoint_pragma())
+        {
+            warn!("startup WAL checkpoint failed: {}", err);
+        }
+        if let Err(err) = conn.execute_batch("PRAGMA optimize;") {
+            warn!("startup PRAGMA optimize failed: {}", err);
+        }
     }
 
     fn get_connection(&self) -> Option<r2d2::PooledConnection<PooledConnection>> {
@@ -1010,13 +1120,6 @@ impl EventStore {
             Self::set_schema_version(conn, version)?;
         }
 
-        if version > CURRENT_SCHEMA_VERSION {
-            warn!(
-                "Database schema version {} is newer than supported version {}",
-                version, CURRENT_SCHEMA_VERSION
-            );
-        }
-
         if version < 6 {
             conn.execute_batch(
                 "
@@ -1073,77 +1176,149 @@ impl EventStore {
             Self::set_schema_version(conn, version)?;
         }
 
+        if version < 7 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS user_presence_snapshots (
+                    username        TEXT PRIMARY KEY,
+                    status_payload  TEXT NOT NULL,
+                    updated_at      REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS user_channel_subscriptions (
+                    username      TEXT NOT NULL,
+                    channel       TEXT NOT NULL,
+                    subscribed_at REAL NOT NULL,
+                    last_seen_at  REAL NOT NULL,
+                    PRIMARY KEY(username, channel)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_channel_subscriptions_user
+                    ON user_channel_subscriptions(username, last_seen_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_user_channel_subscriptions_channel
+                    ON user_channel_subscriptions(channel, last_seen_at DESC);
+                ",
+            )?;
+
+            version = 7;
+            Self::set_schema_version(conn, version)?;
+        }
+
+        if version > CURRENT_SCHEMA_VERSION {
+            warn!(
+                "Database schema version {} is newer than supported version {}",
+                version, CURRENT_SCHEMA_VERSION
+            );
+        }
+
         Ok(())
     }
 
-    fn encrypt_field(&self, plaintext: &str) -> String {
+    fn encrypt_field(&self, plaintext: &str) -> Option<String> {
         if let Some(ref key) = self.pool.encryption_key {
             match crypto::enc_bytes(key, plaintext.as_bytes()) {
-                Ok(ct) => serde_json::json!({"ct": hex::encode(ct)}).to_string(),
+                Ok(ct) => Some(serde_json::json!({"ct": hex::encode(ct)}).to_string()),
                 Err(e) => {
-                    warn!("encryption failed, storing plaintext: {}", e);
-                    plaintext.to_string()
+                    warn!("encryption failed; dropping persistence write: {}", e);
+                    None
                 }
             }
         } else {
-            plaintext.to_string()
+            Some(plaintext.to_string())
         }
     }
 
-    fn decrypt_field(&self, stored: &str) -> String {
+    fn decrypt_field(&self, stored: &str) -> Option<String> {
         if let Some(ref key) = self.pool.encryption_key {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(stored) {
-                if let Some(ct_hex) = val.get("ct").and_then(|v| v.as_str()) {
-                    if let Ok(ct_bytes) = hex::decode(ct_hex) {
-                        match crypto::dec_bytes(key, &ct_bytes) {
-                            Ok(pt) => return String::from_utf8_lossy(&pt).to_string(),
-                            Err(e) => {
-                                warn!("decryption failed: {}", e);
-                                return stored.to_string();
-                            }
-                        }
-                    }
+            let val = match serde_json::from_str::<serde_json::Value>(stored) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Backward-compatible read path for legacy plaintext rows.
+                    // New writes remain fail-closed in encrypt_field.
+                    warn!("legacy plaintext row encountered while encryption is enabled");
+                    return Some(stored.to_string());
+                }
+            };
+            let Some(ct_hex) = val.get("ct").and_then(|v| v.as_str()) else {
+                warn!("legacy plaintext row encountered while encryption is enabled");
+                return Some(stored.to_string());
+            };
+            let Ok(ct_bytes) = hex::decode(ct_hex) else {
+                warn!("encrypted payload has invalid ciphertext encoding; dropping row");
+                return None;
+            };
+            match crypto::dec_bytes(key, &ct_bytes) {
+                Ok(pt) => Some(String::from_utf8_lossy(&pt).to_string()),
+                Err(e) => {
+                    warn!("decryption failed; dropping row: {}", e);
+                    None
                 }
             }
+        } else {
+            Some(stored.to_string())
         }
-        stored.to_string()
     }
 
-    fn decode_rows(rows: Vec<String>) -> Vec<Value> {
-        rows.into_iter()
-            .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
-            .collect()
-    }
-
-    fn query_events<P>(&self, sql: &str, params: P) -> Vec<Value>
+    fn query_events<P>(&self, operation: &str, sql: &str, params: P) -> Vec<Value>
     where
         P: rusqlite::Params,
     {
+        let started = Instant::now();
         let Some(conn) = self.get_connection() else {
+            self.record_db_observation(operation, started, true);
             return Vec::new();
         };
-        let mut stmt = match conn.prepare(sql) {
+        let mut stmt = match conn.prepare_cached(sql) {
             Ok(s) => s,
             Err(e) => {
                 warn!("event query prepare failed: {}", e);
+                self.record_db_observation(operation, started, true);
                 return Vec::new();
             }
         };
 
-        let rows = match stmt.query_map(params, |row| row.get::<_, String>(0)) {
+        let mut rows = match stmt.query(params) {
             Ok(r) => r,
             Err(e) => {
                 warn!("event query execute failed: {}", e);
+                self.record_db_observation(operation, started, true);
                 return Vec::new();
             }
         };
 
-        let decrypted: Vec<String> = rows
-            .filter_map(|r| r.ok())
-            .map(|raw| self.decrypt_field(&raw))
-            .collect();
+        let mut out = Vec::new();
+        let mut had_error = false;
+        loop {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("event query row iteration failed: {}", e);
+                    had_error = true;
+                    break;
+                }
+            };
 
-        Self::decode_rows(decrypted)
+            let raw = match row.get::<_, String>(0) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("event query row decode failed: {}", e);
+                    had_error = true;
+                    continue;
+                }
+            };
+
+            let Some(decrypted) = self.decrypt_field(&raw) else {
+                continue;
+            };
+
+            if let Ok(payload) = serde_json::from_str::<Value>(&decrypted) {
+                out.push(payload);
+            }
+        }
+
+        self.record_db_observation(operation, started, had_error);
+        out
     }
 
     fn persist(
@@ -1155,49 +1330,95 @@ impl EventStore {
         payload: &Value,
         search_text: &str,
     ) {
+        let started = Instant::now();
         #[cfg(feature = "batch-writes")]
         if let Some(ref queue) = self.write_queue {
             let payload_json = payload.to_string();
+            let Some(enc_payload) = self.encrypt_field(&payload_json) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=payload_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_enqueue", started, true);
+                return;
+            };
+            let Some(enc_search) = self.encrypt_field(&search_text.to_lowercase()) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=search_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_enqueue", started, true);
+                return;
+            };
             queue.push(EventRow {
                 event_type: event_type.to_string(),
                 channel: channel.to_string(),
                 sender: sender.to_string(),
                 target: target.map(String::from),
-                payload: self.encrypt_field(&payload_json),
-                search_text: self.encrypt_field(&search_text.to_lowercase()),
+                payload: enc_payload,
+                search_text: enc_search,
                 ts: now(),
             });
+            self.record_db_observation("persist_enqueue", started, false);
             return;
         }
 
         #[cfg(not(feature = "batch-writes"))]
         {
             let Some(conn) = self.get_connection() else {
+                self.record_db_observation("persist_insert", started, true);
                 return;
             };
             let payload_json = payload.to_string();
-            let enc_payload = self.encrypt_field(&payload_json);
-            let enc_search = self.encrypt_field(&search_text.to_lowercase());
-            if let Err(e) = conn.execute(
+            let Some(enc_payload) = self.encrypt_field(&payload_json) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=payload_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_insert", started, true);
+                return;
+            };
+            let Some(enc_search) = self.encrypt_field(&search_text.to_lowercase()) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=search_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_insert", started, true);
+                return;
+            };
+            let mut stmt = match conn.prepare_cached(
                 "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    now(),
-                    event_type,
-                    channel,
-                    sender,
-                    target,
-                    enc_payload,
-                    enc_search,
-                ],
             ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    warn!("event persist prepare failed: {}", e);
+                    self.record_db_observation("persist_insert", started, true);
+                    return;
+                }
+            };
+
+            if let Err(e) = stmt.execute(params![
+                now(),
+                event_type,
+                channel,
+                sender,
+                target,
+                enc_payload,
+                enc_search,
+            ]) {
                 warn!("event persist failed: {}", e);
+                self.record_db_observation("persist_insert", started, true);
+                return;
             }
+
+            self.record_db_observation("persist_insert", started, false);
         }
     }
 
     fn history(&self, channel: &str, limit: usize) -> Vec<Value> {
         self.query_events(
+            "history",
             "SELECT payload FROM events
              WHERE channel = ?1
              ORDER BY ts DESC
@@ -1208,6 +1429,7 @@ impl EventStore {
 
     fn reaction_events(&self, channel: &str, limit: usize) -> Vec<Value> {
         self.query_events(
+            "reaction_events",
             "SELECT payload FROM events
              WHERE channel = ?1 AND event_type = 'reaction'
              ORDER BY ts DESC
@@ -1218,6 +1440,7 @@ impl EventStore {
 
     fn history_since(&self, channel: &str, from_ts: f64, limit: usize) -> Vec<Value> {
         self.query_events(
+            "history_since",
             "SELECT payload FROM events
                          WHERE channel = ?1 AND ts >= ?2
                          ORDER BY ts DESC
@@ -1228,8 +1451,14 @@ impl EventStore {
 
     fn dm_history(&self, username: &str, peer: &str, limit: usize) -> Vec<Value> {
         self.query_events(
-            "SELECT payload FROM events
-             WHERE event_type = 'dm' AND ((sender = ?1 AND target = ?2) OR (sender = ?2 AND target = ?1))
+            "dm_history",
+            "SELECT payload FROM (
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2
+                 UNION ALL
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1
+             )
              ORDER BY ts DESC
              LIMIT ?3",
             params![username, peer, limit as i64],
@@ -1239,8 +1468,14 @@ impl EventStore {
     fn dm_rewind(&self, username: &str, peer: &str, seconds: u64, limit: usize) -> Vec<Value> {
         let cutoff = (now() - seconds as f64).max(0.0);
         self.query_events(
-            "SELECT payload FROM events
-             WHERE event_type = 'dm' AND ts >= ?3 AND ((sender = ?1 AND target = ?2) OR (sender = ?2 AND target = ?1))
+            "dm_rewind",
+            "SELECT payload FROM (
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2 AND ts >= ?3
+                 UNION ALL
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1 AND ts >= ?3
+             )
              ORDER BY ts DESC
              LIMIT ?4",
             params![username, peer, cutoff, limit as i64],
@@ -1255,8 +1490,14 @@ impl EventStore {
         limit: usize,
     ) -> Vec<Value> {
         self.query_events(
-            "SELECT payload FROM events
-             WHERE event_type = 'dm' AND ts >= ?3 AND ((sender = ?1 AND target = ?2) OR (sender = ?2 AND target = ?1))
+            "dm_history_since",
+            "SELECT payload FROM (
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?1 AND target = ?2 AND ts >= ?3
+                 UNION ALL
+                 SELECT ts, payload FROM events
+                 WHERE event_type = 'dm' AND sender = ?2 AND target = ?1 AND ts >= ?3
+             )
              ORDER BY ts DESC
              LIMIT ?4",
             params![username, peer, from_ts, limit as i64],
@@ -1274,36 +1515,82 @@ impl EventStore {
     where
         P: rusqlite::Params,
     {
+        let operation = if label == "dm" {
+            "search_encrypted_dm"
+        } else {
+            "search_encrypted_channel"
+        };
+        if limit == 0 {
+            self.record_db_observation(operation, Instant::now(), false);
+            return Vec::new();
+        }
+
+        let started = Instant::now();
         let Some(conn) = self.get_connection() else {
+            self.record_db_observation(operation, started, true);
             return Vec::new();
         };
-        let mut stmt = match conn.prepare(sql) {
+        let mut stmt = match conn.prepare_cached(sql) {
             Ok(s) => s,
             Err(e) => {
                 warn!("{} search query prepare failed: {}", label, e);
+                self.record_db_observation(operation, started, true);
                 return Vec::new();
             }
         };
-        let rows: Vec<(String, String)> = stmt
-            .query_map(params, |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map(|r| r.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
+        let mut rows = match stmt.query(params) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("{} search query execute failed: {}", label, e);
+                self.record_db_observation(operation, started, true);
+                return Vec::new();
+            }
+        };
 
-        let mut results = Vec::new();
-        for (enc_payload, enc_search) in rows {
-            let search_text = self.decrypt_field(&enc_search);
+        let mut results = Vec::with_capacity(limit.min(64));
+        let mut had_error = false;
+        while results.len() < limit {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("{} search row iteration failed: {}", label, e);
+                    had_error = true;
+                    break;
+                }
+            };
+
+            let enc_payload = match row.get::<_, String>(0) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("{} search payload decode failed: {}", label, e);
+                    had_error = true;
+                    continue;
+                }
+            };
+            let enc_search = match row.get::<_, String>(1) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("{} search index decode failed: {}", label, e);
+                    had_error = true;
+                    continue;
+                }
+            };
+
+            let Some(search_text) = self.decrypt_field(&enc_search) else {
+                continue;
+            };
             if search_text.contains(query_lower) {
-                let decrypted = self.decrypt_field(&enc_payload);
+                let Some(decrypted) = self.decrypt_field(&enc_payload) else {
+                    continue;
+                };
                 if let Ok(val) = serde_json::from_str::<Value>(&decrypted) {
                     results.push(val);
                 }
-                if results.len() >= limit {
-                    break;
-                }
             }
         }
+
+        self.record_db_observation(operation, started, had_error);
         results
     }
 
@@ -1331,6 +1618,7 @@ impl EventStore {
         } else {
             let like = Self::like_pattern(query);
             self.query_events(
+                "search_plain",
                 "SELECT payload FROM events
                  WHERE channel = ?1 AND search_text LIKE ?2 ESCAPE '\\'
                  ORDER BY ts DESC
@@ -1361,6 +1649,7 @@ impl EventStore {
         } else {
             let like = Self::like_pattern(query);
             self.query_events(
+                "dm_search_plain",
                 "SELECT payload FROM (
                      SELECT ts, payload FROM events
                      WHERE event_type = 'dm'
@@ -1382,6 +1671,7 @@ impl EventStore {
     fn rewind(&self, channel: &str, seconds: u64, limit: usize) -> Vec<Value> {
         let cutoff = (now() - seconds as f64).max(0.0);
         self.query_events(
+            "rewind",
             "SELECT payload FROM events
              WHERE channel = ?1 AND ts >= ?2
              ORDER BY ts DESC
@@ -1391,8 +1681,12 @@ impl EventStore {
     }
 
     fn load_user_2fa(&self, username: &str) -> Option<User2FA> {
-        let conn = self.get_connection()?;
-        let row = conn
+        let started = Instant::now();
+        let Some(conn) = self.get_connection() else {
+            self.record_db_observation("auth_load_user_2fa", started, true);
+            return None;
+        };
+        let row = match conn
             .query_row(
                 "SELECT enabled, secret, backup_codes, enabled_at, last_verified
                  FROM user_2fa
@@ -1408,9 +1702,17 @@ impl EventStore {
                     ))
                 },
             )
-            .optional();
+            .optional()
+        {
+            Ok(v) => v,
+            Err(_) => {
+                self.record_db_observation("auth_load_user_2fa", started, true);
+                return None;
+            }
+        };
 
-        let Ok(Some((enabled, secret, backup_codes_json, enabled_at, last_verified))) = row else {
+        let Some((enabled, secret, backup_codes_json, enabled_at, last_verified)) = row else {
+            self.record_db_observation("auth_load_user_2fa", started, false);
             return None;
         };
 
@@ -1426,6 +1728,8 @@ impl EventStore {
             algorithm: "SHA256".to_string(),
         });
 
+        self.record_db_observation("auth_load_user_2fa", started, false);
+
         Some(User2FA {
             username: username.to_string(),
             enabled,
@@ -1437,7 +1741,9 @@ impl EventStore {
     }
 
     fn upsert_user_2fa(&self, user: &User2FA) {
+        let started = Instant::now();
         let Some(conn) = self.get_connection() else {
+            self.record_db_observation("auth_upsert_user_2fa", started, true);
             return;
         };
 
@@ -1464,36 +1770,58 @@ impl EventStore {
             ],
         ) {
             warn!("2fa upsert failed for user {}: {}", user.username, e);
+            self.record_db_observation("auth_upsert_user_2fa", started, true);
+            return;
         }
+
+        self.record_db_observation("auth_upsert_user_2fa", started, false);
     }
 
     fn load_pw_hash(&self, username: &str) -> Result<Option<String>, &'static str> {
+        let started = Instant::now();
         let Some(conn) = self.get_connection() else {
+            self.record_db_observation("auth_load_pw_hash", started, true);
             return Err("store_unavailable");
         };
-        conn.query_row(
-            "SELECT pw_hash FROM user_credentials WHERE username = ?1",
-            params![username],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| {
-            if let SqlError::SqliteFailure(_, Some(ref msg)) = e {
-                if msg.contains("no such table: user_credentials") {
-                    warn!(
-                        "credential table missing for user '{}'; allowing compatibility auth path",
-                        username
-                    );
-                    return "credentials_table_missing";
-                }
+        let result = conn
+            .query_row(
+                "SELECT pw_hash FROM user_credentials WHERE username = ?1",
+                params![username],
+                |row| row.get::<_, String>(0),
+            )
+            .optional();
+
+        match result {
+            Ok(v) => {
+                self.record_db_observation("auth_load_pw_hash", started, false);
+                Ok(v)
             }
-            warn!("credential lookup failed for user '{}': {}", username, e);
-            "store_query_failed"
-        })
+            Err(e) => {
+                let code = if let SqlError::SqliteFailure(_, Some(ref msg)) = e {
+                    if msg.contains("no such table: user_credentials") {
+                        warn!(
+                            "credential table missing for user '{}'; allowing compatibility auth path",
+                            username
+                        );
+                        "credentials_table_missing"
+                    } else {
+                        warn!("credential lookup failed for user '{}': {}", username, e);
+                        "store_query_failed"
+                    }
+                } else {
+                    warn!("credential lookup failed for user '{}': {}", username, e);
+                    "store_query_failed"
+                };
+                self.record_db_observation("auth_load_pw_hash", started, true);
+                Err(code)
+            }
+        }
     }
 
     fn upsert_credentials(&self, username: &str, pw_hash: &str) {
+        let started = Instant::now();
         let Some(conn) = self.get_connection() else {
+            self.record_db_observation("auth_upsert_credentials", started, true);
             return;
         };
         let ts = now();
@@ -1507,7 +1835,165 @@ impl EventStore {
             params![username, pw_hash, ts],
         ) {
             warn!("credential upsert failed for user {}: {}", username, e);
+            self.record_db_observation("auth_upsert_credentials", started, true);
+            return;
         }
+
+        self.record_db_observation("auth_upsert_credentials", started, false);
+    }
+
+    fn upsert_presence_snapshot(&self, username: &str, status: &Value) {
+        let normalized_status = match validate_status_field(Some(status)) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "presence snapshot ignored for user {} due to invalid status: {}",
+                    username, e
+                );
+                return;
+            }
+        };
+
+        let Some(conn) = self.get_connection() else {
+            return;
+        };
+
+        let status_json = normalized_status.to_string();
+        let Some(encrypted_status) = self.encrypt_field(&status_json) else {
+            warn!(
+                "presence snapshot upsert skipped for user {} due to encryption failure",
+                username
+            );
+            return;
+        };
+        let ts = now();
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO user_presence_snapshots(username, status_payload, updated_at)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(username) DO UPDATE SET
+                 status_payload = excluded.status_payload,
+                 updated_at = excluded.updated_at",
+            params![username, encrypted_status, ts],
+        ) {
+            warn!(
+                "presence snapshot upsert failed for user {}: {}",
+                username, e
+            );
+        }
+    }
+
+    fn load_presence_snapshot(&self, username: &str) -> Option<Value> {
+        let conn = self.get_connection()?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT status_payload FROM user_presence_snapshots WHERE username = ?1",
+                params![username],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()?;
+
+        let stored = stored?;
+        let decrypted = self.decrypt_field(&stored)?;
+        let parsed = serde_json::from_str::<Value>(&decrypted).ok()?;
+        validate_status_field(Some(&parsed)).ok()
+    }
+
+    fn upsert_channel_subscription(&self, username: &str, channel: &str) {
+        let normalized_channel = safe_ch(channel);
+        if normalized_channel.starts_with(DM_CHANNEL_PREFIX) {
+            return;
+        }
+
+        let Some(conn) = self.get_connection() else {
+            return;
+        };
+        let ts = now();
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO user_channel_subscriptions(username, channel, subscribed_at, last_seen_at)
+             VALUES(?1, ?2, ?3, ?3)
+             ON CONFLICT(username, channel) DO UPDATE SET
+                 last_seen_at = excluded.last_seen_at",
+            params![username, normalized_channel, ts],
+        ) {
+            warn!(
+                "channel subscription upsert failed for user {} channel {}: {}",
+                username, channel, e
+            );
+        }
+    }
+
+    fn remove_channel_subscription(&self, username: &str, channel: &str) -> bool {
+        let normalized_channel = safe_ch(channel);
+        if normalized_channel == "general" || normalized_channel.starts_with(DM_CHANNEL_PREFIX) {
+            return false;
+        }
+
+        let Some(conn) = self.get_connection() else {
+            return false;
+        };
+
+        match conn.execute(
+            "DELETE FROM user_channel_subscriptions WHERE username = ?1 AND channel = ?2",
+            params![username, normalized_channel],
+        ) {
+            Ok(affected) => affected > 0,
+            Err(e) => {
+                warn!(
+                    "channel subscription delete failed for user {} channel {}: {}",
+                    username, channel, e
+                );
+                false
+            }
+        }
+    }
+
+    fn list_channel_subscriptions(&self, username: &str) -> Vec<String> {
+        let Some(conn) = self.get_connection() else {
+            return Vec::new();
+        };
+
+        let mut stmt = match conn.prepare_cached(
+            "SELECT channel FROM user_channel_subscriptions
+             WHERE username = ?1
+             ORDER BY last_seen_at DESC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                warn!(
+                    "channel subscription query prepare failed for user {}: {}",
+                    username, e
+                );
+                return Vec::new();
+            }
+        };
+
+        let rows = match stmt.query_map(params![username], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    "channel subscription query failed for user {}: {}",
+                    username, e
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut unique = HashSet::new();
+        let mut channels = Vec::new();
+        for raw in rows.filter_map(|r| r.ok()) {
+            let normalized = safe_ch(&raw);
+            if normalized.starts_with(DM_CHANNEL_PREFIX) {
+                continue;
+            }
+            if unique.insert(normalized.clone()) {
+                channels.push(normalized);
+            }
+        }
+
+        channels
     }
 
     fn verify_credential(
@@ -1891,28 +2377,43 @@ impl EventStore {
     // -------------------------------------------------------------------------
 
     fn get_lockout_status(&self, username: &str) -> Option<(i32, f64)> {
-        let conn = self.get_connection()?;
+        let started = Instant::now();
+        let Some(conn) = self.get_connection() else {
+            self.record_db_observation("auth_get_lockout_status", started, true);
+            return None;
+        };
         let result: rusqlite::Result<(i32, f64)> = conn.query_row(
             "SELECT failed_attempts, locked_until FROM user_credentials WHERE username = ?1",
             params![username],
             |row| Ok((row.get::<_, i32>(0)?, row.get::<_, f64>(1)?)),
         );
         match result {
-            Ok((failed, locked)) => Some((failed, locked)),
-            Err(_) => None,
+            Ok((failed, locked)) => {
+                self.record_db_observation("auth_get_lockout_status", started, false);
+                Some((failed, locked))
+            }
+            Err(_) => {
+                self.record_db_observation("auth_get_lockout_status", started, true);
+                None
+            }
         }
     }
 
     fn record_failed_login(&self, username: &str, max_attempts: i32) -> (bool, i32) {
+        let started = Instant::now();
         let mut conn = match self.get_connection() {
             Some(c) => c,
-            None => return (false, 0),
+            None => {
+                self.record_db_observation("auth_record_failed_login", started, true);
+                return (false, 0);
+            }
         };
 
         let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(tx) => tx,
             Err(e) => {
                 warn!("failed to start lockout transaction: {}", e);
+                self.record_db_observation("auth_record_failed_login", started, true);
                 return (false, 0);
             }
         };
@@ -1928,6 +2429,7 @@ impl EventStore {
             Ok(v) => v.unwrap_or(0),
             Err(e) => {
                 warn!("failed to load lockout status: {}", e);
+                self.record_db_observation("auth_record_failed_login", started, true);
                 return (false, 0);
             }
         };
@@ -1944,38 +2446,56 @@ impl EventStore {
             params![new_attempts, locked_until, username],
         ) {
             warn!("failed to record failed login: {}", e);
+            self.record_db_observation("auth_record_failed_login", started, true);
             return (false, new_attempts);
         }
 
         if let Err(e) = tx.commit() {
             warn!("failed to commit lockout transaction: {}", e);
+            self.record_db_observation("auth_record_failed_login", started, true);
             return (false, new_attempts);
         }
+
+        self.record_db_observation("auth_record_failed_login", started, false);
 
         (locked_until > 0.0, new_attempts)
     }
 
     fn clear_failed_logins(&self, username: &str) {
+        let started = Instant::now();
         if let Some(conn) = self.get_connection() {
             if let Err(e) = conn.execute(
                 "UPDATE user_credentials SET failed_attempts = 0, locked_until = 0 WHERE username = ?1",
                 params![username],
             ) {
                 warn!("failed to clear failed logins: {}", e);
+                self.record_db_observation("auth_clear_failed_logins", started, true);
+                return;
             }
+            self.record_db_observation("auth_clear_failed_logins", started, false);
+            return;
         }
+
+        self.record_db_observation("auth_clear_failed_logins", started, true);
     }
 
     fn unlock_account(&self, username: &str) -> Result<(), String> {
-        let conn = self
-            .get_connection()
-            .ok_or("database connection unavailable")?;
+        let started = Instant::now();
+        let conn = self.get_connection().ok_or_else(|| {
+            self.record_db_observation("auth_unlock_account", started, true);
+            "database connection unavailable"
+        })?;
 
         conn.execute(
             "UPDATE user_credentials SET failed_attempts = 0, locked_until = 0 WHERE username = ?1",
             params![username],
         )
-        .map_err(|e| format!("failed to unlock account: {}", e))?;
+        .map_err(|e| {
+            self.record_db_observation("auth_unlock_account", started, true);
+            format!("failed to unlock account: {}", e)
+        })?;
+
+        self.record_db_observation("auth_unlock_account", started, false);
 
         Ok(())
     }
@@ -2224,12 +2744,13 @@ impl State {
     fn new(
         db_path: String,
         db_key: Option<Vec<u8>>,
+        db_durability: DbDurabilityMode,
         prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
         plugin_runtime: PluginRuntime,
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
     ) -> Arc<Self> {
-        let store = EventStore::new(db_path, db_key);
+        let store = EventStore::new(db_path, db_key, db_durability, prometheus.clone());
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
@@ -2909,6 +3430,39 @@ fn spawn_broadcast_forwarder(
     });
 }
 
+fn spawn_channel_forwarder(
+    mut rx: broadcast::Receiver<String>,
+    out_tx: mpsc::UnboundedSender<String>,
+    joined_channels: Arc<DashSet<String>>,
+    channel: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            if !joined_channels.contains(&channel) {
+                break;
+            }
+
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(message)) => {
+                    if !joined_channels.contains(&channel) {
+                        break;
+                    }
+                    if out_tx.send(message).is_err() {
+                        break;
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    continue;
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_voice_relay_forwarder(
     mut rx: broadcast::Receiver<VoiceBroadcast>,
     out_tx: mpsc::UnboundedSender<String>,
@@ -2954,6 +3508,7 @@ fn spawn_voice_relay_forwarder(
 /// | `img`         | Broadcast a base64-encoded image to a channel       |
 /// | `dm`          | Send an encrypted direct message to a single user   |
 /// | `join`        | Subscribe to a channel and receive its history      |
+/// | `leave`       | Unsubscribe from a previously joined channel        |
 /// | `history`     | Fetch persisted history for a channel               |
 /// | `reaction_sync` | Fetch aggregated reaction counts for a channel    |
 /// | `search`      | Full-text search over a channel's plaintext index   |
@@ -2983,6 +3538,7 @@ async fn handle_event(
     username: &str,
     out_tx: &mpsc::UnboundedSender<String>,
     voice_room: &mut Option<String>,
+    joined_channels: &Arc<DashSet<String>>,
 ) {
     let t = d["t"].as_str().unwrap_or("");
     let event_channel = d
@@ -3293,6 +3849,11 @@ async fn handle_event(
             let target = d["to"].as_str().unwrap_or("").to_string();
             let c = d["c"].as_str().unwrap_or("").to_string();
             let ptxt = d["p"].as_str().unwrap_or("").to_string();
+            let searchable = if ptxt.is_empty() {
+                c.as_str()
+            } else {
+                ptxt.as_str()
+            };
             if c.is_empty() || target.is_empty() {
                 return;
             }
@@ -3314,7 +3875,7 @@ async fn handle_event(
                 username,
                 Some(&target),
                 &event,
-                &ptxt,
+                searchable,
             );
             let _ = state.chan(&dm_channel_name(&target)).tx.send(p.clone());
             let _ = state.chan(&dm_channel_name(username)).tx.send(p.clone());
@@ -3339,7 +3900,19 @@ async fn handle_event(
             if hist.is_empty() {
                 hist = chan.hist().await;
             }
-            spawn_broadcast_forwarder(chan.tx.subscribe(), out_tx.clone());
+
+            // Avoid duplicate forwarders when the same channel is joined
+            // multiple times during one connection lifetime.
+            if joined_channels.insert(ch.clone()) {
+                spawn_channel_forwarder(
+                    chan.tx.subscribe(),
+                    out_tx.clone(),
+                    joined_channels.clone(),
+                    ch.clone(),
+                );
+            }
+
+            state.store.upsert_channel_subscription(username, &ch);
             send_out_json(
                 out_tx,
                 serde_json::json!({"t":"joined","ch":ch,"hist":hist}),
@@ -3375,6 +3948,57 @@ async fn handle_event(
 
             // Check for raid patterns
             state.check_and_alert_raid(username, &ch);
+        }
+        "leave" => {
+            let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
+            if ch == "general" {
+                send_err(out_tx, "cannot leave #general", &state.metrics);
+                return;
+            }
+
+            let was_joined = joined_channels.remove(&ch).is_some();
+            state.store.remove_channel_subscription(username, &ch);
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({"t":"left","ch":ch,"already_left":!was_joined}),
+            );
+
+            if !was_joined {
+                return;
+            }
+
+            let leave_msg = serde_json::json!({
+                "t":"sys",
+                "m":format!("{} left #{}", username, ch),
+                "ts":now()
+            });
+            let leave_event = serde_json::json!({
+                "t":"leave",
+                "ch":ch,
+                "u":username,
+                "ts":now()
+            });
+
+            state.store.persist(
+                "sys",
+                &ch,
+                username,
+                None,
+                &leave_msg,
+                &format!("{} left", username),
+            );
+            state.store.persist(
+                "leave",
+                &ch,
+                username,
+                None,
+                &leave_event,
+                &format!("{} left", username),
+            );
+
+            let chan = state.chan(&ch);
+            let _ = chan.tx.send(leave_msg.to_string());
         }
         "history" => {
             // Return persisted events for a channel or DM scope.
@@ -3624,9 +4248,30 @@ async fn handle_event(
             );
         }
         "metrics" => {
+            const DB_TOP_OPS_LIMIT: usize = 8;
+            const DB_WARNING_P95_MS: f64 = 50.0;
+            const DB_CRITICAL_P95_MS: f64 = 200.0;
+            const DB_MIN_SAMPLES: u64 = 5;
+
             let snapshot = state.metrics.snapshot();
             let cache_stats = state.message_cache.stats();
             let pool_stats = state.store.get_pool_stats();
+            let (db_top_ops, db_alerts) = state
+                .prometheus
+                .as_ref()
+                .and_then(|metrics| metrics.try_lock().ok())
+                .map(|metrics| {
+                    (
+                        metrics.top_db_operations_by_p95(DB_TOP_OPS_LIMIT),
+                        metrics.db_latency_alerts(
+                            DB_TOP_OPS_LIMIT,
+                            DB_WARNING_P95_MS,
+                            DB_CRITICAL_P95_MS,
+                            DB_MIN_SAMPLES,
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
             send_out_json(
                 out_tx,
                 serde_json::json!({
@@ -3646,6 +4291,56 @@ async fn handle_event(
                     "db_pool_idle": pool_stats.idle_connections,
                     "db_pool_total": pool_stats.total_connections,
                     "db_pool_waiters": pool_stats.wait_count,
+                    "db_top_ops": db_top_ops,
+                    "db_alerts": db_alerts,
+                    "db_latency_budget_ms": {
+                        "warning_p95": DB_WARNING_P95_MS,
+                        "critical_p95": DB_CRITICAL_P95_MS,
+                        "min_samples": DB_MIN_SAMPLES,
+                    },
+                    "ts": now(),
+                }),
+            );
+        }
+        "db_profile" => {
+            const DB_TOP_OPS_LIMIT: usize = 8;
+            const DB_WARNING_P95_MS: f64 = 50.0;
+            const DB_CRITICAL_P95_MS: f64 = 200.0;
+            const DB_MIN_SAMPLES: u64 = 5;
+
+            let pool_stats = state.store.get_pool_stats();
+            let (db_top_ops, db_alerts) = state
+                .prometheus
+                .as_ref()
+                .and_then(|metrics| metrics.try_lock().ok())
+                .map(|metrics| {
+                    (
+                        metrics.top_db_operations_by_p95(DB_TOP_OPS_LIMIT),
+                        metrics.db_latency_alerts(
+                            DB_TOP_OPS_LIMIT,
+                            DB_WARNING_P95_MS,
+                            DB_CRITICAL_P95_MS,
+                            DB_MIN_SAMPLES,
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t": "db_profile",
+                    "db_top_ops": db_top_ops,
+                    "db_alerts": db_alerts,
+                    "db_pool_active": pool_stats.active_connections,
+                    "db_pool_idle": pool_stats.idle_connections,
+                    "db_pool_total": pool_stats.total_connections,
+                    "db_pool_waiters": pool_stats.wait_count,
+                    "db_latency_budget_ms": {
+                        "warning_p95": DB_WARNING_P95_MS,
+                        "critical_p95": DB_CRITICAL_P95_MS,
+                        "min_samples": DB_MIN_SAMPLES,
+                    },
                     "ts": now(),
                 }),
             );
@@ -3962,10 +4657,20 @@ async fn handle_event(
         "status" => {
             // Broadcast a presence update to all channels so every connected
             // client can update its member list without polling.
-            if let Some(status_val) = d.get("status") {
+            if let Some(status_raw) = d.get("status") {
+                let status_val = match validate_status_field(Some(status_raw)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        send_err(out_tx, e.to_string(), &state.metrics);
+                        return;
+                    }
+                };
+
                 state
                     .user_statuses
                     .insert(username.to_string(), status_val.clone());
+                state.store.upsert_presence_snapshot(username, &status_val);
+
                 let status_update = Arc::new(
                     serde_json::json!({
                         "t":"status_update","user":username,"status":status_val
@@ -4672,6 +5377,19 @@ fn safe_ch(raw: &str) -> String {
     clifford::normalize_channel(raw).unwrap_or_else(|| "general".into())
 }
 
+fn is_default_online_status(status: &Value) -> bool {
+    status
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(|text| text.trim().eq_ignore_ascii_case("online"))
+        .unwrap_or(false)
+        && status
+            .get("emoji")
+            .and_then(|v| v.as_str())
+            .map(|emoji| emoji.trim().is_empty())
+            .unwrap_or(true)
+}
+
 fn row_to_audit_log(row: &rusqlite::Row) -> rusqlite::Result<AuditLog> {
     Ok(AuditLog {
         action: row.get(0)?,
@@ -5215,7 +5933,7 @@ fn enforce_2fa_on_auth(
 ///
 /// Only mutating events that change server state or carry sensitive content
 /// are protected. Read-only queries (`"history"`, `"search"`, `"users"`,
-/// `"info"`, `"ping"`) and control events (`"join"`, `"vjoin"`) are excluded
+/// `"info"`, `"ping"`) and control events (`"join"`, `"leave"`, `"vjoin"`) are excluded
 /// because replaying them is either idempotent or harmless.
 fn requires_fresh_protection(event_type: &str) -> bool {
     matches!(
@@ -5510,7 +6228,7 @@ where
     let AuthInfo {
         username,
         pw_hash,
-        status,
+        mut status,
         pubkey,
         otp_code,
         is_bridge,
@@ -5630,13 +6348,35 @@ where
         return;
     }
 
+    if is_default_online_status(&status) {
+        if let Some(snapshot_status) = state.store.load_presence_snapshot(&username) {
+            status = snapshot_status;
+        }
+    }
+
     // Generate a session token for this connection.
     let _session_token = state.create_session(&username);
 
     // ---- Phase 2: register user and send welcome response -------------------
 
-    state.user_statuses.insert(username.clone(), status);
+    state.user_statuses.insert(username.clone(), status.clone());
     state.user_pubkeys.insert(username.clone(), pubkey);
+    state.store.upsert_presence_snapshot(&username, &status);
+    state
+        .store
+        .upsert_channel_subscription(&username, "general");
+
+    let status_update = Arc::new(
+        serde_json::json!({
+            "t":"status_update",
+            "user":username,
+            "status":status.clone()
+        })
+        .to_string(),
+    );
+    for chan_entry in state.channels.iter() {
+        let _ = chan_entry.tx.send(status_update.as_ref().clone());
+    }
 
     // Register bridge if the client identified as one.
     if is_bridge {
@@ -5658,6 +6398,7 @@ where
     // that arrive between the response send and the subscription.
     let general = state.chan("general");
     let gen_rx = general.tx.subscribe();
+    let dm_rx = state.chan(&dm_channel_name(&username)).tx.subscribe();
     let mut hist = state.store.history("general", HISTORY_CAP);
     if hist.is_empty() {
         hist = general.hist().await;
@@ -5678,6 +6419,36 @@ where
 
     // Forward "general" broadcast to the outbound queue.
     spawn_broadcast_forwarder(gen_rx, out_tx.clone());
+    // Forward this user's DM broadcast channel to the outbound queue.
+    spawn_broadcast_forwarder(dm_rx, out_tx.clone());
+
+    // Track subscribed channels for this connection to prevent duplicate
+    // forwarders, support reconnect recovery, and allow leave-time cleanup.
+    let joined_channels: Arc<DashSet<String>> = Arc::new(DashSet::new());
+    joined_channels.insert("general".to_string());
+
+    let mut restored_subscriptions = 0usize;
+    for channel in state.store.list_channel_subscriptions(&username) {
+        if channel == "general" {
+            continue;
+        }
+        if joined_channels.insert(channel.clone()) {
+            let chan = state.chan(&channel);
+            spawn_channel_forwarder(
+                chan.tx.subscribe(),
+                out_tx.clone(),
+                joined_channels.clone(),
+                channel.clone(),
+            );
+            restored_subscriptions += 1;
+        }
+    }
+    if restored_subscriptions > 0 {
+        info!(
+            "rehydrated channel subscriptions user={} count={}",
+            username, restored_subscriptions
+        );
+    }
 
     // Sink writer task: drains out_rx and writes to the WebSocket sink.
     // Runs until out_rx is closed (out_tx is dropped at function exit).
@@ -5745,7 +6516,15 @@ where
         state.metrics.inc_received(1);
         state.metrics.inc_bytes_received(raw.len());
 
-        handle_event(&d, &state, &username, &out_tx, &mut voice_room).await;
+        handle_event(
+            &d,
+            &state,
+            &username,
+            &out_tx,
+            &mut voice_room,
+            &joined_channels,
+        )
+        .await;
     }
 
     // ---- Phase 5: cleanup ---------------------------------------------------
@@ -6175,6 +6954,7 @@ async fn main() -> ChatifyResult<()> {
     let state = State::new(
         args.db.clone(),
         db_key,
+        args.db_durability,
         metrics.clone(),
         plugin_runtime,
         args.max_msgs_per_minute,
@@ -6199,6 +6979,7 @@ async fn main() -> ChatifyResult<()> {
     println!(" Chatify running on {}://{}", proto, addr);
     println!(" Encryption: {} |   IP Privacy: On", enc_label);
     println!(" Event store: {}", args.db);
+    println!(" DB durability: {}", args.db_durability.label());
     println!(
         " User rate limit: {} msgs/min",
         if args.enable_user_rate_limit {
@@ -6377,6 +7158,7 @@ mod tests {
         let state = State::new(
             ":memory:".to_string(),
             None,
+            DbDurabilityMode::MaxSafety,
             None,
             plugin_runtime,
             60,
@@ -6402,5 +7184,46 @@ mod tests {
         }
 
         assert_eq!(state.active_connection_count(), 0);
+    }
+
+    #[test]
+    fn event_store_persists_presence_and_channel_subscriptions() {
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            ":memory:".to_string(),
+            None,
+            DbDurabilityMode::MaxSafety,
+            None,
+            plugin_runtime,
+            60,
+            false,
+        );
+
+        let status = serde_json::json!({"text": "Deep work", "emoji": ""});
+        state.store.upsert_presence_snapshot("alice", &status);
+        let loaded_status = state
+            .store
+            .load_presence_snapshot("alice")
+            .expect("presence snapshot should load");
+        assert_eq!(loaded_status, status);
+
+        state.store.upsert_channel_subscription("alice", "general");
+        state.store.upsert_channel_subscription("alice", "Rust");
+        state.store.upsert_channel_subscription("alice", "rust");
+        state
+            .store
+            .upsert_channel_subscription("alice", "__dm__bob");
+
+        let mut channels = state.store.list_channel_subscriptions("alice");
+        channels.sort();
+        assert_eq!(channels, vec!["general".to_string(), "rust".to_string()]);
+
+        assert!(state.store.remove_channel_subscription("alice", "rust"));
+        assert!(!state.store.remove_channel_subscription("alice", "general"));
+
+        let mut channels_after_remove = state.store.list_channel_subscriptions("alice");
+        channels_after_remove.sort();
+        assert_eq!(channels_after_remove, vec!["general".to_string()]);
     }
 }

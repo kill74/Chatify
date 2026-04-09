@@ -1133,6 +1133,92 @@ async fn join_contract_normalizes_channel_name() {
     );
 }
 
+/// Verifies that leaving `general` is explicitly rejected.
+#[tokio::test]
+async fn leave_contract_rejects_general_channel() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"leave","ch":"general"}).to_string(),
+        ))
+        .await
+        .expect("attempt leave on general");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("cannot leave #general")
+    );
+}
+
+/// Verifies that leave is acknowledged and persisted exactly once.
+#[tokio::test]
+async fn leave_contract_acknowledges_and_persists_event() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"join","ch":"leave-room"}).to_string(),
+        ))
+        .await
+        .expect("join leave-room");
+    let _ = recv_by_type(&mut alice, "joined").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"leave","ch":"leave-room"}).to_string(),
+        ))
+        .await
+        .expect("leave leave-room");
+    let left = recv_by_type(&mut alice, "left").await;
+    assert_eq!(left.get("ch").and_then(|v| v.as_str()), Some("leave-room"));
+    assert_eq!(
+        left.get("already_left").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    // Second leave should be idempotent and not create another persisted leave event.
+    alice
+        .send(Message::Text(
+            json!({"t":"leave","ch":"leave-room"}).to_string(),
+        ))
+        .await
+        .expect("leave leave-room again");
+    let left_again = recv_by_type(&mut alice, "left").await;
+    assert_eq!(
+        left_again.get("already_left").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    alice
+        .send(Message::Text(
+            json!({"t": "history", "ch": "leave-room", "limit": 100}).to_string(),
+        ))
+        .await
+        .expect("request leave-room history");
+    let history = recv_by_type(&mut alice, "history").await;
+    let events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history events must be an array");
+
+    let leave_events = events
+        .iter()
+        .filter(|event| {
+            event.get("t").and_then(|v| v.as_str()) == Some("leave")
+                && event.get("u").and_then(|v| v.as_str()) == Some("alice")
+                && event.get("ch").and_then(|v| v.as_str()) == Some("leave-room")
+        })
+        .count();
+    assert_eq!(
+        leave_events, 1,
+        "expected exactly one persisted leave event for an idempotent leave sequence"
+    );
+}
+
 /// Verifies that status updates are broadcast to other connected clients.
 ///
 /// Presence changes are part of the public runtime contract, so updates must
@@ -2261,20 +2347,21 @@ async fn schema_meta_contains_current_version() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-    assert_eq!(version, "6");
+    assert_eq!(version, "7");
 }
 
-/// Verifies that a server migrates a `v0` database to schema `v6` on startup.
+/// Verifies that a server migrates a `v0` database to schema `v7` on startup.
 ///
 /// Migration correctness is verified by:
 ///
-/// 1. Confirming `schema_meta.schema_version` is updated to `"6"`.
+/// 1. Confirming `schema_meta.schema_version` is updated to `"7"`.
 /// 2. Confirming the `events` table exists (created by `v1` migration).
 /// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
 /// 4. Confirming the `user_credentials` table exists (created by `v3` migration).
 /// 5. Confirming append-only and query indexes from `v4` exist.
 /// 6. Confirming roles/permissions tables from `v5` exist.
 /// 7. Confirming audit_logs and suspicious_activity tables from `v6` exist.
+/// 8. Confirming presence/subscription snapshot tables and indexes from `v7` exist.
 ///
 /// All assertions are made directly against SQLite rather than through the
 /// server API to keep migration tests independent of server protocol changes.
@@ -2290,8 +2377,8 @@ async fn schema_migrates_from_version_zero_to_current() {
     let conn = Connection::open(&db_path).expect("open migrated db");
     assert_eq!(
         read_schema_version(&db_path),
-        "6",
-        "expected migration to set schema version to 6"
+        "7",
+        "expected migration to set schema version to 7"
     );
 
     let events_exists: i64 = conn
@@ -2412,6 +2499,54 @@ async fn schema_migrates_from_version_zero_to_current() {
     assert_eq!(
         suspicious_activity_exists, 1,
         "suspicious_activity table should exist after migration"
+    );
+
+    let user_presence_snapshots_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_presence_snapshots'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for user_presence_snapshots");
+    assert_eq!(
+        user_presence_snapshots_exists, 1,
+        "user_presence_snapshots table should exist after migration"
+    );
+
+    let user_channel_subscriptions_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_channel_subscriptions'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for user_channel_subscriptions");
+    assert_eq!(
+        user_channel_subscriptions_exists, 1,
+        "user_channel_subscriptions table should exist after migration"
+    );
+
+    let subscription_user_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_user_channel_subscriptions_user'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for idx_user_channel_subscriptions_user");
+    assert_eq!(
+        subscription_user_index_exists, 1,
+        "idx_user_channel_subscriptions_user should exist after migration"
+    );
+
+    let subscription_channel_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_user_channel_subscriptions_channel'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for idx_user_channel_subscriptions_channel");
+    assert_eq!(
+        subscription_channel_index_exists, 1,
+        "idx_user_channel_subscriptions_channel should exist after migration"
     );
 
     let failed_attempts_column: i64 = conn

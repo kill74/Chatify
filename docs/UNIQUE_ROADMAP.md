@@ -38,13 +38,13 @@ Chatify should feel differentiated by default in three ways:
 
 ## Current Portfolio Status
 
-| Phase                                 | Status                  | Confidence | Reality Check                                                          | Next Decision                                  |
-| ------------------------------------- | ----------------------- | ---------- | ---------------------------------------------------------------------- | ---------------------------------------------- |
-| Phase 1 Durable Timeline and Search   | In progress             | High       | Server support is strong; default client command surface is incomplete | Close CLI parity and ship                      |
-| Phase 2 Identity and Trust UX         | Foundation only         | Medium     | Trust data structures exist; trust workflow UX is missing              | Prioritize user-facing commands                |
-| Phase 3 Discord Bridge Re-Enable      | In progress (alpha)     | Medium     | Bridge runtime, route mapping, and status visibility exist             | Stabilize and decide default-off vs default-on |
-| Phase 4 Terminal-Native Rich Messages | In progress             | Medium     | Markdown and ANSI are good; media UX is incomplete                     | Ship one media milestone cleanly               |
-| Phase 5 Plugin Runtime                | In progress (hardening) | High       | API v1 and built-ins are shipped; ecosystem UX is still maturing       | Add client-facing plugin command UX            |
+| Phase                                 | Status                  | Confidence | Reality Check                                                                     | Next Decision                                  |
+| ------------------------------------- | ----------------------- | ---------- | --------------------------------------------------------------------------------- | ---------------------------------------------- |
+| Phase 1 Durable Timeline and Search   | Complete                | High       | Queryable event stream is available server-side and exposed in default client CLI | Keep latency and compatibility guardrails      |
+| Phase 2 Identity and Trust UX         | Complete                | High       | CLI trust workflow, key-change protection, and audit export are now shipped       | Monitor UX friction and tune defaults          |
+| Phase 3 Discord Bridge Re-Enable      | In progress (alpha)     | Medium     | Bridge runtime, route mapping, and status visibility exist                        | Stabilize and decide default-off vs default-on |
+| Phase 4 Terminal-Native Rich Messages | In progress             | Medium     | Markdown and ANSI are good; media UX is incomplete                                | Ship one media milestone cleanly               |
+| Phase 5 Plugin Runtime                | In progress (hardening) | High       | API v1 and built-ins are shipped; ecosystem UX is still maturing                  | Add client-facing plugin command UX            |
 
 ## Program Health Metrics
 
@@ -60,18 +60,19 @@ Track these as release-level gates, not vanity metrics:
 
 Goal: move from memory-first chat to a queryable event stream.
 
-Status: In progress.
+Status: Complete.
 
 Completed:
 
 - SQLite-backed persistence for timeline events is in place.
 - Server-side history, search, and replay events are implemented.
 - Contract coverage includes restart durability, DM scope, replay behavior, and high-volume latency checks.
+- Default client CLI now exposes `/history`, `/search`, and `/replay`.
+- CLI help and command grammar are aligned with protocol scopes (`#channel`, `dm:user`) and optional limits.
 
 Remaining:
 
-- Add first-class `/search` and `/replay` commands to the default client CLI.
-- Align CLI help text and command behavior with protocol capabilities.
+- None for core Phase 1 capability. Continue performance and compatibility monitoring.
 
 Exit Criteria:
 
@@ -84,17 +85,20 @@ Exit Criteria:
 
 Goal: practical trust model without heavy enterprise complexity.
 
-Status: Foundation only.
+Status: Complete.
 
 Completed:
 
 - Client-side trust model scaffolding exists (`TrustStore`, peer fingerprint metadata, audit entry structures).
+- Default client now exposes `/fingerprint`, `/trust`, and `/trust-audit`.
+- Key-change warnings are emitted on reconnect/key-directory refresh and incoming key observations.
+- Trust store and trust audit data are persisted per user/server profile across restarts.
+- DM send path now enforces trust policy and blocks on untrusted or changed keys by default.
+- `/trust-export` produces deterministic trust-audit JSON suitable for incident attachments.
 
 Remaining:
 
-- Add `/fingerprint [user]` and `/trust <user> <fingerprint>` commands.
-- Show key-change warnings on reconnect in a clear, non-silent way.
-- Add trust audit output suitable for incident review.
+- None for core Phase 2 capability. Continue monitoring trust UX and policy ergonomics.
 
 Exit Criteria:
 
@@ -182,15 +186,15 @@ Exit Criteria:
 
 ## Next 2-Week Execution Plan
 
-Cycle goal: close operator UX gaps and de-risk the next promotion decision.
+Cycle goal: complete trust UX and de-risk the next promotion decisions.
 
-| Workstream           | Deliverable                                                 | Acceptance Criteria                                                         |
-| -------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------ | -------------------------------------------- |
-| CLI parity           | Add `/search` and `/replay` to default client               | Commands are discoverable in help output and validated by integration tests |
-| Plugin UX            | Add `/plugin list                                           | install                                                                     | disable` client wrappers | Admin workflows run without raw JSON framing |
-| Trust kickoff        | Implement `/fingerprint` and `/trust` command paths         | End-to-end happy path works with audit output                               |
-| Bridge hardening     | Execute targeted reconnect/loop-prevention stress pass      | No loop regressions in scripted stress test scenarios                       |
-| Rich media increment | Ship one media milestone (`image preview` or `audio notes`) | Feature works with explicit fallback and can be disabled globally           |
+| Workstream              | Deliverable                                                                  | Acceptance Criteria                                                     |
+| ----------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Query UX follow-through | Publish usage examples for `/history`, `/search`, and `/replay`              | Operator docs match implemented CLI grammar and protocol scope behavior |
+| Plugin UX               | Add `/plugin list`, `/plugin install`, and `/plugin disable` client wrappers | Admin workflows run without raw JSON framing                            |
+| Trust kickoff           | Implement `/fingerprint` and `/trust` command paths                          | End-to-end happy path works with audit output                           |
+| Bridge hardening        | Execute targeted reconnect/loop-prevention stress pass                       | No loop regressions in scripted stress test scenarios                   |
+| Rich media increment    | Ship one media milestone (`image preview` or `audio notes`)                  | Feature works with explicit fallback and can be disabled globally       |
 
 ## Active Risks and Mitigations
 
