@@ -1,0 +1,19 @@
+   Compiling clifford v0.2.0 (C:\Users\Guilherme Sales\Documents\Projects\Chatify)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.86s
+     Running tests\message_contracts.rs (target\debug\deps\message_contracts-76274cc1aeb37c79.exe)
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.37
+   Compiling rustls v0.22.4
+   Compiling rustls-webpki v0.103.10
+   Compiling x509-parser v0.16.0
+   Compiling stun v0.17.1
+   Compiling rustls-webpki v0.102.8
+   Compiling turn v0.17.1
+   Compiling rcgen v0.13.2
+   Compiling webrtc-ice v0.17.1
+   Compiling tokio-rustls v0.25.0
+   Compiling dtls v0.17.1
+   Compiling webrtc v0.17.1
+   Compiling clifford v0.2.0 (C:\Users\Guilherme Sales\Documents\Projects\Chatify)
+   Compiling clifford-server v0.2.0 (C:\Users\Guilherme Sales\Documents\Projects\Chatify\src\server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.55s

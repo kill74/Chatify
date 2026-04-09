@@ -1,0 +1,54 @@
+
+running 49 tests
+test auth_contract_rejects_sql_injection_like_username ... ok
+test auth_contract_rejects_invalid_public_key ... ok
+test auth_contract_rejects_malformed_json ... ok
+test auth_contract_rejects_unexpected_status_object_field ... ok
+test auth_contract_rejects_oversized_otp_input ... ok
+test auth_contract_rejects_non_auth_first_frame ... ok
+test auth_contract_rejects_invalid_username ... ok
+test auth_contract_rejects_oversized_auth_frame ... ok
+test auth_contract_rejects_non_object_status_field ... ok
+test auth_contract_rejects_when_2fa_enabled_without_code ... ok
+test file_contract_rejects_oversized_file_metadata ... ok
+test history_contract_persists_join_events ... ok
+test compatibility_contract_client_bootstrap_flow_stays_stable ... ok
+test history_contract_returns_persisted_events ... ok
+test auth_contract_accepts_backup_code_and_consumes_it ... ok
+test auth_contract_returns_expected_fields ... ok
+test file_contract_relays_media_metadata_and_chunks ... ok
+test history_contract_supports_dm_scope ... ok
+test history_contract_respects_seconds_window_filter ... ok
+test join_contract_normalizes_channel_name ... ok
+test leave_contract_rejects_general_channel ... ok
+test leave_contract_acknowledges_and_persists_event ... ok
+test msg_contract_preserves_bridge_source_and_relay_markers ... ok
+test msg_contract_roundtrips_channel_payload ... ok
+test history_contract_survives_server_restart ... ok
+test protocol_contract_advertises_backward_compatible_version ... ok
+test protocol_contract_fuzz_corpus_rejects_malformed_and_non_object_frames ... ok
+test protocol_contract_rejects_invalid_nonce_format ... ok
+test protocol_contract_rejects_missing_timestamp_when_nonce_present ... ok
+test history_and_search_latency_stays_low_with_100k_local_events ... ok
+test protocol_contract_rejects_oversized_runtime_payload ... ok
+test protocol_contract_rejects_replay_nonce_flood ... ok
+test protocol_contract_rejects_replayed_nonce ... ok
+test protocol_contract_rejects_stale_timestamp_on_mutating_event ... ok
+test auth_contract_blocks_repeated_wrong_otp_attempts ... ok
+test reaction_contract_rejects_invalid_msg_id ... ok
+test rewind_contract_returns_recent_events ... ok
+test schema_meta_contains_current_version ... ok
+test reaction_contract_broadcasts_and_syncs_aggregated_counts ... ok
+test schema_migrates_from_version_zero_to_current ... ok
+test schema_newer_version_is_not_downgraded_and_server_auth_still_works ... ok
+test search_contract_filters_by_plaintext_index ... ok
+test replay_contract_returns_events_from_timestamp ... ok
+test search_contract_supports_dm_scope ... ok
+test status_contract_broadcasts_status_update_to_other_clients ... ok
+test typing_contract_routes_dm_scope_updates ... ok
+test typing_contract_broadcasts_channel_scope_updates ... ok
+test users_contract_returns_user_objects_with_public_keys ... ok
+test voice_contract_forwards_vdata_between_room_members ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.95s
+

@@ -180,33 +180,30 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ## Client Command Reference
 
-| Command                           | Description                                                                |
-| --------------------------------- | -------------------------------------------------------------------------- |
-| `/commands [filter]`              | List all commands, optionally filtered by prefix                           |
-| `/help [command]`                 | General help, or detailed usage for a specific command                     |
-| `/join <channel>`                 | Join or create a channel                                                   |
-| `/switch <channel>`               | Alias for `/join`                                                          |
-| `/leave [channel]`                | Leave a previously joined channel (defaults to current channel)            |
-| `/dm <user> <message>`            | Send an encrypted direct message                                           |
-| `/typing [on\|off] [scope]`       | Broadcast typing indicator to `#channel` or `dm:<user>`                    |
-| `/image <path>`                   | Transfer an image to the current channel (chunked, ≤100 MB)                |
-| `/video <path>`                   | Transfer a video to the current channel (chunked, ≤100 MB)                 |
-| `/me [action]`                    | Display your profile or send an action-style message                       |
-| `/users`                          | List currently online users                                                |
-| `/channels`                       | List available channels                                                    |
-| `/voice [room]`                   | Toggle voice presence in a room                                            |
-| `/history [channel] [window]`     | Load persisted event history for a channel or DM scope                     |
-| `/search <query>`                 | Search persisted events in the current channel                             |
-| `/replay <timestamp>`             | Reconstruct channel state from an absolute timestamp                       |
-| `/rewind <time> [n]`              | Replay the last N events within a relative window (`15m`, `2h`)            |
-| `/recent [n]`                     | Show recent message IDs for quick reaction targeting                       |
-| `/react <msg_id\|#index> <emoji>` | React to a message using a stable `msg_id` or recent index                 |
-| `/sync`                           | Request reaction snapshot sync for the active channel                      |
-| `/fingerprint [user]`             | Inspect trust state and key fingerprint for a peer                         |
-| `/trust <user> <fingerprint>`     | Record a peer fingerprint as trusted after out-of-band verification        |
-| `/edit [#N] <new text>`           | Edit your most recent (or Nth) message. Renders `(edited)` suffix in feed. |
-| `/clear`                          | Clear terminal output                                                      |
-| `/quit` `/exit` `/q`              | Disconnect and exit                                                        |
+| Command                                      | Description                                                       |
+| -------------------------------------------- | ----------------------------------------------------------------- |
+| `/help`                                      | Show command help                                                 |
+| `/join <channel>`                            | Join or switch to a channel                                       |
+| `/switch <channel>`                          | Alias for `/join`                                                 |
+| `/leave [channel]`                           | Leave a channel (defaults to current channel)                     |
+| `/part [channel]`                            | Alias for `/leave`                                                |
+| `/history [ch\|dm:user] [limit]`             | Load channel or DM history                                        |
+| `/search [#ch\|dm:user] <query> [limit=N]`   | Search timeline events                                            |
+| `/replay <from_ts> [#ch\|dm:user] [limit=N]` | Replay events from a unix timestamp                               |
+| `/users`                                     | Refresh online users and key directory                            |
+| `/metrics`                                   | Show runtime counters plus DB pool and DB latency summaries       |
+| `/db-profile` or `/dbprofile`                | Show focused DB latency profile and alerts                        |
+| `/dm <user> <message>`                       | Send encrypted direct message (trust-verified)                    |
+| `/fingerprint [user]`                        | Show peer key fingerprint(s) and trust status                     |
+| `/trust <user> <fingerprint>`                | Mark a peer fingerprint as trusted after out-of-band verification |
+| `/trust-audit [n]`                           | Show recent trust audit entries                                   |
+| `/trust-export [path]`                       | Export deterministic trust audit JSON                             |
+| `/recent [n]`                                | Show recent message IDs for quick reaction targeting              |
+| `/react <msg_id\|#index> <emoji>`            | React to a message by stable `msg_id` or recent index             |
+| `/sync`                                      | Request reaction sync for the active channel                      |
+| `/quit` `/exit` `/q`                         | Disconnect and exit                                               |
+
+Any non-command text is sent as a channel message to the active scope.
 
 ### Reactions and Message IDs
 
@@ -215,7 +212,13 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 - Clients can bootstrap reaction state with `reaction_sync` after join/reconnect.
 - For terminal UX, `/react #1 +1` targets the most recent visible message ID.
 
-### Media Transfer
+### Runtime and Database Profiling
+
+- `/metrics` returns runtime traffic counters, cache hit-rate, DB pool stats, DB top operations (p50/p95/p99/avg), and DB alerts.
+- `/db-profile` (or `/dbprofile`) returns a DB-focused view with top operations, pool pressure, and latency alerts.
+- Current default DB latency budget thresholds are `warning_p95=50ms`, `critical_p95=200ms`, with `min_samples=5`.
+
+### Media Transfer (Protocol Capability)
 
 Transfer uses `file_meta` + `file_chunk` framing over the existing WebSocket connection — no separate HTTP endpoint, no second auth context.
 
@@ -230,6 +233,8 @@ Received files are written to:
 - **Linux/macOS:** `$HOME/.chatify/media/`
 
 Image transfers render an ASCII preview inline in the terminal feed. Video transfers produce a metadata card (sender, filename, size, local path). The 100 MB cap is enforced at the application layer on the sender side.
+
+Note: the current CLI command parser does not expose `/image` and `/video` commands directly.
 
 ---
 
@@ -296,7 +301,7 @@ Key changes are never silent. A rotation transitions the peer to `changed` and i
 - No certificate pinning. A valid CA-signed cert is sufficient for a successful TLS handshake. A compromised CA is not detected.
 - Session tokens are ephemeral. All clients must re-authenticate after a server restart.
 - Encrypted search is a linear scan. Timing side-channels are possible on large corpora.
-- No RBAC, audit log, or account lockout beyond connection-level rate limiting.
+- No RBAC and no centralized admin audit trail.
 - No independent third-party security audit.
 
 See [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md) for the full threat model and scope boundaries.
@@ -444,12 +449,12 @@ All checks above are enforced in CI on every push to `main`. A failing check blo
 
 Tracked explicitly rather than omitted:
 
-- **`/edit` is incomplete.** The command is parsed but the end-to-end edit flow is not fully implemented. Do not depend on it in current releases.
 - **No certificate pinning.** The client does not pin the server certificate. A valid CA-signed cert is sufficient for a successful TLS handshake.
 - **Ephemeral session tokens.** All clients must re-authenticate after a server restart. There is no token persistence or refresh mechanism.
 - **Linear search.** `/search` decrypts and scans all stored events. Performance degrades linearly with event count. Not suitable for large corpora without architectural changes.
 - **Single-node only.** The server is single-process with no shared state backend. Horizontal scaling is not supported.
-- **Minimal auth model.** No RBAC, no audit log, no account lockout beyond connection-level rate limiting.
+- **Minimal auth model.** No RBAC and no centralized admin audit trail.
+- **CLI command surface is intentionally narrow.** Media upload commands are currently protocol-level capabilities and are not exposed as direct slash commands in this release.
 - **No independent security audit.**
 
 ---
