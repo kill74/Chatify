@@ -58,6 +58,7 @@ pub struct ClientState {
     pub input_buffer: String,
     pub input_cursor: usize,
     pub command_history: Vec<String>,
+    pub draft: Option<(String, String)>, // (channel, content)
     pub history_index: Option<usize>,
     pub scroll_offset: usize,
     pub cached_header: String,
@@ -219,6 +220,7 @@ impl ClientState {
             cached_subtitle: String::new(),
             needs_redraw: true,
             client_config,
+            draft: None,
         }
     }
 
@@ -927,6 +929,51 @@ impl ClientState {
             "ch": channel,
             "limit": limit,
         }))
+    }
+
+    pub fn send_file_meta(
+        &self,
+        channel: &str,
+        filename: &str,
+        file_type: &str,
+        size: u64,
+    ) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "file_meta",
+            "ch": channel,
+            "name": filename,
+            "type": file_type,
+            "size": size,
+            "ts": clifford::now(),
+            "n": clifford::fresh_nonce_hex(),
+        }))
+    }
+
+    pub fn send_file_chunk(&self, channel: &str, data: &[u8]) -> Result<(), String> {
+        let chunk_b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        self.send_json(serde_json::json!({
+            "t": "file_chunk",
+            "ch": channel,
+            "data": chunk_b64,
+            "ts": clifford::now(),
+            "n": clifford::fresh_nonce_hex(),
+        }))
+    }
+
+    pub fn save_draft(&mut self) {
+        if !self.input_buffer.is_empty() {
+            self.draft = Some((self.ch.clone(), self.input_buffer.clone()));
+        }
+    }
+
+    pub fn load_draft(&mut self) -> bool {
+        if let Some((ch, content)) = self.draft.take() {
+            if ch == self.ch {
+                self.input_buffer = content;
+                return true;
+            }
+        }
+        false
     }
 }
 

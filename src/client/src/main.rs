@@ -8,6 +8,7 @@ use clap::Parser;
 use clifford::crypto::{new_keypair, pub_b64, pw_hash_client};
 use clifford::notifications::NotificationService;
 use futures_util::{SinkExt, StreamExt};
+#[allow(unused_imports)]
 use log::info;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
@@ -161,6 +162,18 @@ const COMMANDS: &[CommandHelp] = &[
         name: "/sync",
         usage: "/sync",
         summary: "Request reaction sync for active channel",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/image",
+        usage: "/image \"<path>\"",
+        summary: "Send an image file to the current channel",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/video",
+        usage: "/video \"<path>\"",
+        summary: "Send a video file to the current channel",
         aliases: &[],
     },
     CommandHelp {
@@ -637,7 +650,7 @@ fn print_help() {
 }
 
 fn print_prompt() {
-    print!("> ");
+    print!("\x1b[32m>\x1b[0m ");
     let _ = io::stdout().flush();
 }
 
@@ -683,8 +696,11 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
     if !trimmed.starts_with('/') {
         let state_lock = state.lock().await;
         let channel = state_lock.ch.clone();
+        let username = state_lock.me.clone();
         if let Err(err) = state_lock.send_message(&channel, trimmed) {
             eprintln!("failed to send message: {}", err);
+        } else {
+            println!("[sending] {} {}: {}", channel, username, trimmed);
         }
         return true;
     }
@@ -1546,6 +1562,63 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 eprintln!("failed to sync reactions: {}", err);
             }
         }
+        "/image" | "/video" => {
+            let Some(path_str) = parts.next() else {
+                println!("Usage: {} \"<path>\"", cmd);
+                return true;
+            };
+            let path_str = path_str.trim().trim_matches('"');
+            let path = std::path::Path::new(path_str);
+            if !path.exists() {
+                eprintln!("file not found: {}", path_str);
+                return true;
+            }
+            let metadata = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("cannot read file {}: {}", path_str, e);
+                    return true;
+                }
+            };
+            let file_size = metadata.len();
+            const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+            if file_size > MAX_FILE_SIZE {
+                eprintln!(
+                    "file too large: {} bytes (max {})",
+                    file_size, MAX_FILE_SIZE
+                );
+                return true;
+            }
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            let file_type = if cmd == "/image" { "image" } else { "video" };
+
+            let state_lock = state.lock().await;
+            let channel = state_lock.ch.clone();
+            if let Err(e) = state_lock.send_file_meta(&channel, filename, file_type, file_size) {
+                eprintln!("failed to send file metadata: {}", e);
+                return true;
+            }
+
+            match std::fs::read(path) {
+                Ok(data) => {
+                    const CHUNK_SIZE: usize = 16 * 1024;
+                    for chunk in data.chunks(CHUNK_SIZE) {
+                        if let Err(e) = state_lock.send_file_chunk(&channel, chunk) {
+                            eprintln!("failed to send file chunk: {}", e);
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("failed to read file: {}", e);
+                }
+            }
+            println!("[sent] {} {} to #{}", file_type, filename, channel);
+        }
         "/react" => {
             let Some(msg_ref) = parts.next() else {
                 println!("Usage: /react <msg_id|#index> <emoji>");
@@ -1694,6 +1767,7 @@ async fn main() -> ChatifyResult<()> {
     });
 
     let recv_state = state.clone();
+    let _uri = uri.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(msg) = read.next().await {
             match msg {
@@ -1704,8 +1778,14 @@ async fn main() -> ChatifyResult<()> {
                         }
                     }
                 }
-                Ok(Message::Close(_)) => break,
-                Err(_) => break,
+                Ok(Message::Close(_)) => {
+                    eprintln!("\n[disconnected] Connection closed. Please restart the client.");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("\n[error] Connection error: {}. Please restart.", e);
+                    break;
+                }
                 _ => {}
             }
         }
