@@ -86,26 +86,12 @@ use clifford::performance::{Metrics as PerfMetrics, VecCache};
 use clifford::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
 use clifford::voice::{relay::VoiceBroadcast, VoiceRelay};
 use dashmap::{DashMap, DashSet};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use plugin_runtime::{
-    PluginRuntime, DEFAULT_BUILTIN_PLUGINS, PLUGIN_API_VERSION,
+    MessageHookResult, PluginMessage, PluginMessageTarget, PluginRuntime, PLUGIN_API_VERSION,
 };
-use prometheus::Encoder;
-use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
-use serde_json::Value;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Notify, RwLock};
-use tokio::time::{sleep, Duration};
-use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::{
-    accept_hdr_async, connect_async, tungstenite::Message, Connector,
-};
-
-use crate::validation::AuthInfo;
 use prometheus::Encoder;
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
@@ -262,10 +248,6 @@ struct Args {
     #[arg(long)]
     shutdown_endpoint: bool,
 
-    /// Secret token required for shutdown endpoint.
-    #[arg(long, default_value = "")]
-    shutdown_token: String,
-
     /// Maximum messages per user per minute (0 = unlimited).
     #[arg(long, default_value_t = 60)]
     max_msgs_per_minute: u32,
@@ -274,9 +256,33 @@ struct Args {
     #[arg(long)]
     enable_user_rate_limit: bool,
 
+    /// Enable self-registration via WebSocket (disabled by default).
+    #[arg(long)]
+    enable_self_registration: bool,
+
     /// Database connection pool size.
     #[arg(long, default_value_t = 8)]
     db_pool_size: u32,
+
+    /// Register a new user (admin operation). Requires --user-password.
+    #[arg(long, requires = "user_password")]
+    register_user: Option<String>,
+
+    /// Password for --register-user operation.
+    #[arg(long)]
+    user_password: Option<String>,
+
+    /// Make the registered user an admin.
+    #[arg(long)]
+    make_admin: bool,
+
+    /// Enable 2FA for a user (admin operation).
+    #[arg(long)]
+    enable_2fa_for: Option<String>,
+
+    /// Disable 2FA for a user (admin operation).
+    #[arg(long)]
+    disable_2fa_for: Option<String>,
 
     /// Internal mode: run a built-in plugin worker process.
     #[arg(long, hide = true)]
@@ -430,10 +436,10 @@ const MAX_REACTION_EMOJI_LEN: usize = 32;
 /// Validated, strongly-typed representation of a successful auth frame parse.
 ///
 /// Created by [`validate_auth_payload`] after all field-level validation
-/// passes. Using a typed struct here — rather than passing `&Value` through
-/// downstream functions — makes it impossible to accidentally skip validation
+/// passes. Using a typed struct here ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â rather than passing `&Value` through
+/// downstream functions ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â makes it impossible to accidentally skip validation
 /// or misread a field name.
-/// The struct is defined in `validation.rs` and re-exported here via `use crate::validation::AuthInfo`.
+struct AuthInfo {
     /// Validated username (ASCII alphanumeric / `-` / `_`, ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 32 chars).
     username: String,
 
@@ -812,11 +818,10 @@ impl DbPool {
         path: String,
         encryption_key: Option<Vec<u8>>,
         durability_mode: DbDurabilityMode,
-        pool_size: u32,
     ) -> Result<Self, r2d2::Error> {
         let manager = PooledConnection::new(path.clone(), encryption_key.clone(), durability_mode);
         let pool = r2d2::Pool::builder()
-            .max_size(pool_size)
+            .max_size(DB_POOL_SIZE)
             .min_idle(Some(DB_POOL_MIN_IDLE))
             .idle_timeout(Some(std::time::Duration::from_secs(
                 DB_POOL_IDLE_TIMEOUT_SECS,
@@ -850,9 +855,8 @@ impl EventStore {
         encryption_key: Option<Vec<u8>>,
         durability_mode: DbDurabilityMode,
         prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
-        pool_size: u32,
     ) -> Self {
-        let pool = DbPool::new(path.clone(), encryption_key.clone(), durability_mode, pool_size)
+        let pool = DbPool::new(path.clone(), encryption_key.clone(), durability_mode)
             .expect("failed to create database pool");
         #[cfg(feature = "batch-writes")]
         let write_queue = {
@@ -1040,6 +1044,20 @@ impl EventStore {
         if version < 4 {
             conn.execute_batch(
                 "
+                CREATE TABLE IF NOT EXISTS events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          REAL    NOT NULL,
+                    event_type  TEXT    NOT NULL,
+                    channel     TEXT    NOT NULL,
+                    sender      TEXT,
+                    target      TEXT,
+                    payload     TEXT    NOT NULL,
+                    search_text TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_channel_ts
+                    ON events(channel, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_search
+                    ON events(search_text);
                 CREATE INDEX IF NOT EXISTS idx_events_dm_route_ts
                     ON events(event_type, sender, target, ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_channel_search_ts
@@ -1175,23 +1193,12 @@ impl EventStore {
             conn.execute(
                 "ALTER TABLE user_credentials ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
                 [],
-            ).map_err(|e| {
-                if !e.to_string().contains("duplicate column name") {
-                    return e;
-                }
-                rusqlite::Error::QueryReturnedNoRows
-            }).ok();
+            ).ok();
 
             conn.execute(
                 "ALTER TABLE user_credentials ADD COLUMN locked_until REAL NOT NULL DEFAULT 0",
                 [],
             )
-            .map_err(|e| {
-                if !e.to_string().contains("duplicate column name") {
-                    return e;
-                }
-                rusqlite::Error::QueryReturnedNoRows
-            })
             .ok();
 
             version = 6;
@@ -2757,12 +2764,16 @@ struct State {
     /// Whether per-user rate limiting is enabled.
     user_rate_limit_enabled: bool,
 
+    /// Whether self-registration is enabled via CLI flag.
+    self_registration_enabled: bool,
+
     /// Plugin runtime manager (API v1).
     plugin_runtime: PluginRuntime,
 }
 
 impl State {
     /// Creates the initial server state, pre-populating the `"general"` channel.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         db_path: String,
         db_key: Option<Vec<u8>>,
@@ -2771,9 +2782,9 @@ impl State {
         plugin_runtime: PluginRuntime,
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
-        db_pool_size: u32,
+        self_registration_enabled: bool,
     ) -> Arc<Self> {
-        let store = EventStore::new(db_path, db_key, db_durability, prometheus.clone(), db_pool_size);
+        let store = EventStore::new(db_path, db_key, db_durability, prometheus.clone());
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
@@ -2797,6 +2808,7 @@ impl State {
             user_msg_rate: DashMap::new(),
             max_msgs_per_minute,
             user_rate_limit_enabled,
+            self_registration_enabled,
             plugin_runtime,
         });
         s.channels.insert("general".into(), Channel::new());
@@ -3035,6 +3047,22 @@ impl State {
 
     /// Removes the session token associated with `username`.
     fn remove_session(&self, username: &str) {
+        self.session_tokens.retain(|_, v| v != username);
+    }
+
+    /// Validates a session token for a user.
+    fn validate_session_token(&self, username: &str, token: Option<&str>) -> bool {
+        let Some(token) = token else {
+            return false;
+        };
+        self.session_tokens
+            .get(token)
+            .map(|t| t.as_str() == username)
+            .unwrap_or(false)
+    }
+
+    /// Invalidates all sessions for a user (e.g., when password changes)
+    fn invalidate_all_user_sessions(&self, username: &str) {
         self.session_tokens.retain(|_, v| v != username);
     }
 
@@ -3548,13 +3576,110 @@ fn spawn_voice_relay_forwarder(
 /// | `file_chunk`  | Stream a chunk of a file transfer                   |
 /// | `typing`      | Broadcast typing state for channel or DM scope      |
 /// | `status`      | Update the caller's presence status                 |
-/// | `reaction`    | Add an emoji reaction to a message                  |
-/// | `2fa_setup`   | Begin the TOTP enrollment flow                      |
-/// | `2fa_enable`  | Finalise TOTP enrollment with a verification code   |
-/// | `2fa_disable` | Disable 2-FA for the current user                   |
-/// | `2fa_verify`  | Verify a TOTP or backup code post-auth              |
-///
-/// Unknown event types are silently ignored.
+async fn handle_self_registration<S>(
+    state: &Arc<State>,
+    d: &Value,
+    _addr: &SocketAddr,
+    sink: &mut SplitSink<tokio_tungstenite::WebSocketStream<S>, tungstenite::Message>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    if !state.self_registration_enabled {
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({
+                    "t": "err",
+                    "m": "self-registration is disabled"
+                })
+                .to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    let username = match d.get("u").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t": "err", "m": "missing username"}).to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    if !is_valid_username(username) {
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({"t": "err", "m": "invalid username"}).to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    let pw = match d.get("pw").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t": "err", "m": "missing password"}).to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    if pw.len() > MAX_PASSWORD_FIELD_LEN {
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({"t": "err", "m": "password too long"}).to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    let _pubkey = match d.get("pk").and_then(|v| v.as_str()) {
+        Some(pk) if is_valid_pubkey_b64(pk) => pk,
+        _ => {
+            let _ = sink
+                .send(Message::Text(
+                    serde_json::json!({"t": "err", "m": "invalid public key"}).to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    if state.store.load_pw_hash(username).ok().flatten().is_some() {
+        let _ = sink
+            .send(Message::Text(
+                serde_json::json!({
+                    "t": "err",
+                    "m": "username already exists"
+                })
+                .to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    let server_hash = crypto::pw_hash(pw);
+    state.store.upsert_credentials(username, &server_hash);
+
+    info!("self-registered new user: {}", username);
+
+    let _ = sink
+        .send(Message::Text(
+            serde_json::json!({
+                "t": "registered",
+                "m": "account created successfully"
+            })
+            .to_string(),
+        ))
+        .await;
+}
+
 async fn handle_event(
     d: &Value,
     state: &Arc<State>,
@@ -3599,6 +3724,22 @@ async fn handle_event(
             send_err(
                 out_tx,
                 format!("protocol validation failed: {}", e),
+                &state.metrics,
+            );
+            return;
+        }
+    }
+
+    // --- Token validation for non-read-only operations ---
+    let read_only_ops = [
+        "ping", "users", "channels", "history", "search", "rewind", "plugin", "password",
+    ];
+    if !read_only_ops.contains(&t) {
+        let provided_token = d.get("token").and_then(|v| v.as_str());
+        if !state.validate_session_token(username, provided_token) {
+            send_err(
+                out_tx,
+                "invalid or expired session token. Please reconnect.",
                 &state.metrics,
             );
             return;
@@ -4816,6 +4957,47 @@ async fn handle_event(
                 serde_json::json!({"t":"2fa_disabled","enabled":false,"ts":now()}),
             );
         }
+        "password" => {
+            let current_hash = d.get("current").and_then(|v| v.as_str()).unwrap_or("");
+            let new_pw = d.get("new").and_then(|v| v.as_str()).unwrap_or("");
+
+            if current_hash.is_empty() || new_pw.is_empty() {
+                send_err(
+                    out_tx,
+                    "password change requires 'current' and 'new' password hashes",
+                    &state.metrics,
+                );
+                return;
+            }
+
+            if new_pw.len() > MAX_PASSWORD_FIELD_LEN {
+                send_err(out_tx, "new password too long", &state.metrics);
+                return;
+            }
+
+            match state.store.verify_credential(username, current_hash) {
+                Ok(true) => {
+                    let server_hash = crypto::pw_hash(new_pw);
+                    state.store.upsert_credentials(username, &server_hash);
+                    state.invalidate_all_user_sessions(username);
+                    send_out_json(
+                        out_tx,
+                        serde_json::json!({"t":"password_changed","ts":now()}),
+                    );
+                    info!("password changed for user={}", username);
+                }
+                Ok(false) => {
+                    send_err(out_tx, "current password is incorrect", &state.metrics);
+                }
+                Err(e) => {
+                    send_err(
+                        out_tx,
+                        format!("password change failed: {}", e),
+                        &state.metrics,
+                    );
+                }
+            }
+        }
         "role" => {
             let sub = d["sub"].as_str().unwrap_or("");
             let target = d["target"].as_str().unwrap_or("");
@@ -5483,7 +5665,6 @@ async fn start_health_server(
     metrics: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
     metrics_enabled: bool,
     shutdown_endpoint_enabled: bool,
-    shutdown_token: String,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     loop {
@@ -5510,7 +5691,7 @@ async fn start_health_server(
                                 Ok(n) => {
                                     let request = String::from_utf8_lossy(&buffer[..n]);
 
-                                    let (endpoint, method, auth) = parse_http_request(&request);
+                                    let (endpoint, method) = parse_http_request(&request);
 
                                     let response = match endpoint {
                                         "/health" | "/health/" => {
@@ -5523,16 +5704,7 @@ async fn start_health_server(
                                             create_ready_response(&state)
                                         }
                                         "/shutdown" | "/shutdown/" if shutdown_endpoint_enabled && method == "POST" => {
-                                            if !shutdown_token.is_empty() {
-                                                if auth != Some(shutdown_token.as_str()) {
-                                                    create_unauthorized_response()
-                                                } else if state.initiate_shutdown() {
-                                                    let _ = shutdown_tx.send(()).await;
-                                                    create_shutdown_response("initiated")
-                                                } else {
-                                                    create_shutdown_response("already_in_progress")
-                                                }
-                                            } else if state.initiate_shutdown() {
+                                            if state.initiate_shutdown() {
                                                 let _ = shutdown_tx.send(()).await;
                                                 create_shutdown_response("initiated")
                                             } else {
@@ -5576,20 +5748,15 @@ async fn start_health_server(
     }
 }
 
-fn parse_http_request(request: &str) -> (&str, &str, Option<&str>) {
+fn parse_http_request(request: &str) -> (&str, &str) {
     let lines: Vec<&str> = request.lines().collect();
     if let Some(first_line) = lines.first() {
         let parts: Vec<&str> = first_line.split_whitespace().collect();
         if parts.len() >= 2 {
-            let path = parts[1];
-            let method = parts[0];
-            let auth = lines.iter()
-                .find(|l| l.to_lowercase().starts_with("authorization:"))
-                .map(|l| l.split(':').skip(1).collect::<Vec<_>>().join(":").trim());
-            return (path, method, auth);
+            return (parts[1], parts[0]);
         }
     }
-    ("/", "GET", None)
+    ("/", "GET")
 }
 
 fn create_health_response(state: &Arc<State>) -> String {
@@ -5690,15 +5857,6 @@ fn create_method_not_allowed_response() -> String {
     )
 }
 
-fn create_unauthorized_response() -> String {
-    let body = "Unauthorized: invalid or missing token";
-    format!(
-        "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    )
-}
-
 fn create_live_response() -> String {
     let body = "OK";
     format!(
@@ -5712,11 +5870,15 @@ fn create_live_response() -> String {
 ///
 /// Inline construction here (rather than in the caller) keeps all protocol
 /// field names in one place, making it easier to evolve the auth contract.
-fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>, session_token: &str) -> String {
-    serde_json::json!({
+fn create_ok_response(
+    username: &str,
+    state: &Arc<State>,
+    hist: Vec<Value>,
+    session_token: Option<&str>,
+) -> String {
+    let mut response = serde_json::json!({
         "t": "ok",
         "u": username,
-        "session_token": session_token,
         "users": state.users_with_keys_json(),
         "channels": state.channels_json(),
         "hist": hist,
@@ -5724,8 +5886,13 @@ fn create_ok_response(username: &str, state: &Arc<State>, hist: Vec<Value>, sess
             "v": PROTOCOL_VERSION,
             "max_payload_bytes": MAX_BYTES
         }
-    })
-    .to_string()
+    });
+
+    if let Some(token) = session_token {
+        response["token"] = token.into();
+    }
+
+    response.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -6246,6 +6413,13 @@ where
         }
     };
 
+    let msg_type = d.get("t").and_then(|v| v.as_str()).unwrap_or("");
+
+    if msg_type == "register" {
+        handle_self_registration(&state, &d, &addr, &mut sink).await;
+        return;
+    }
+
     let auth = match validate_auth_payload(&d) {
         Ok(a) => a,
         Err(err) => {
@@ -6452,7 +6626,7 @@ where
         hist = general.hist().await;
     }
 
-    let ok = create_ok_response(&username, &state, hist, &session_token);
+    let ok = create_ok_response(&username, &state, hist, Some(&session_token));
     if sink.send(Message::Text(ok)).await.is_err() {
         return;
     }
@@ -6632,6 +6806,97 @@ impl tokio::io::AsyncWrite for ChatifyTlsStream {
 }
 
 impl Unpin for ChatifyTlsStream {}
+
+/// Handles CLI admin commands (register-user, enable-2fa, disable-2fa).
+fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
+    let db_key = resolve_db_key(&args.db, args.db_key.as_deref())?;
+
+    let plugin_runtime = match std::env::current_exe() {
+        Ok(path) => PluginRuntime::new(path),
+        Err(e) => {
+            return Err(ChatifyError::Message(format!(
+                "failed to resolve exe: {}",
+                e
+            )))
+        }
+    };
+
+    let state = State::new(
+        args.db.clone(),
+        db_key,
+        args.db_durability,
+        None,
+        plugin_runtime,
+        60,
+        false,
+        false,
+    );
+
+    if let Some(username) = &args.register_user {
+        let password = args.user_password.as_ref().ok_or_else(|| {
+            ChatifyError::Message("--user-password required with --register-user".to_string())
+        })?;
+
+        let server_hash = crypto::pw_hash(password);
+        state.store.upsert_credentials(username, &server_hash);
+
+        if args.make_admin {
+            state
+                .store
+                .assign_role(username, "general", "admin", "cli")
+                .map_err(ChatifyError::Message)?;
+            println!("Created admin user: {}", username);
+        } else {
+            println!("Created user: {}", username);
+        }
+        return Ok(());
+    }
+
+    if let Some(username) = &args.enable_2fa_for {
+        let secret = clifford::totp::generate_secret();
+        let qr_url = clifford::totp::generate_qr_url(username, "Chatify", &secret);
+
+        let mut user_2fa = clifford::totp::User2FA::new(username.clone());
+        user_2fa.enable(secret);
+
+        state.store.upsert_user_2fa(&user_2fa);
+
+        // Safe access - enable() sets totp_config, so this is an internal invariant check
+        let config = match &user_2fa.totp_config {
+            Some(c) => c,
+            None => {
+                eprintln!("internal error: 2FA config not initialized after enable()");
+                return Err(ChatifyError::Message(
+                    "internal error: 2FA configuration state inconsistent".into(),
+                ));
+            }
+        };
+
+        println!("2FA enabled for: {}", username);
+        println!("  Secret: {}", config.secret);
+        println!("  QR URL: {}", qr_url);
+        println!("  Backup codes:");
+        for code in user_2fa.backup_codes.iter().take(10) {
+            println!("    {}", code);
+        }
+        return Ok(());
+    }
+
+    if let Some(username) = &args.disable_2fa_for {
+        if let Some(mut user_2fa) = state.store.load_user_2fa(username) {
+            user_2fa.disable();
+            state.store.upsert_user_2fa(&user_2fa);
+            println!("2FA disabled for: {}", username);
+        } else {
+            println!("No 2FA configuration found for: {}", username);
+        }
+        return Ok(());
+    }
+
+    Err(ChatifyError::Message(
+        "No admin command specified".to_string(),
+    ))
+}
 
 /// Holds either a plain TCP stream or a TLS-wrapped stream.
 enum StreamType {
@@ -6951,6 +7216,15 @@ async fn accept_loop_unix(
 async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
 
+    // Handle CLI admin commands (non-server mode)
+    if args.register_user.is_some()
+        || args.enable_2fa_for.is_some()
+        || args.disable_2fa_for.is_some()
+    {
+        handle_admin_commands(&args)?;
+        return Ok(());
+    }
+
     if let Some(plugin_name) = args.chatify_plugin_worker.as_deref() {
         plugin_runtime::run_builtin_plugin_worker(
             plugin_name,
@@ -7007,7 +7281,7 @@ async fn main() -> ChatifyResult<()> {
         plugin_runtime,
         args.max_msgs_per_minute,
         args.enable_user_rate_limit,
-        args.db_pool_size,
+        args.enable_self_registration,
     );
 
     for plugin_name in plugin_runtime::DEFAULT_BUILTIN_PLUGINS {
@@ -7047,7 +7321,6 @@ async fn main() -> ChatifyResult<()> {
         let health_state = state.clone();
         let health_enabled = args.metrics_enabled;
         let shutdown_endpoint_enabled = args.shutdown_endpoint;
-        let shutdown_token = args.shutdown_token.clone();
         let health_shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let addr = format!("0.0.0.0:{}", args.health_port);
@@ -7063,7 +7336,6 @@ async fn main() -> ChatifyResult<()> {
                         health_metrics,
                         health_enabled,
                         shutdown_endpoint_enabled,
-                        shutdown_token,
                         health_shutdown_tx,
                     )
                     .await;
@@ -7214,6 +7486,7 @@ mod tests {
             plugin_runtime,
             60,
             false,
+            false,
         );
         assert_eq!(state.active_connection_count(), 0);
 
@@ -7248,6 +7521,7 @@ mod tests {
             None,
             plugin_runtime,
             60,
+            false,
             false,
         );
 

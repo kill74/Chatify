@@ -98,3 +98,9 @@ impl From<std::string::FromUtf8Error> for ChatifyError {
         ChatifyError::Validation(format!("UTF-8 decode error: {}", value))
     }
 }
+
+impl From<r2d2::Error> for ChatifyError {
+    fn from(value: r2d2::Error) -> Self {
+        ChatifyError::Database(format!("connection pool error: {}", value))
+    }
+}

@@ -58,6 +58,9 @@ pub struct Args {
 
     #[arg(long)]
     pub enable_user_rate_limit: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub enable_self_registration: bool,
 }
 
 // Protocol constants

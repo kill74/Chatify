@@ -130,7 +130,7 @@ where
         return;
     }
 
-    let _session_token = state.create_session(&username);
+    let session_token = state.create_session(&username);
 
     state.user_statuses.insert(username.clone(), status);
     state.user_pubkeys.insert(username.clone(), pubkey);
@@ -154,7 +154,7 @@ where
     let gen_rx = general.tx.subscribe();
     let hist = general.hist(HISTORY_CAP);
 
-    let ok = crate::http::create_ok_response(&username, &state, hist);
+    let ok = crate::http::create_ok_response(&username, &state, hist, Some(&session_token));
     if sink.send(Message::Text(ok)).await.is_err() {
         return;
     }
@@ -315,18 +315,24 @@ pub async fn handle_event(
             let ch = crate::http::safe_ch(d["ch"].as_str().unwrap_or("general"));
             let chan = state.chan(&ch);
             let hist = chan.hist(100);
-            let _ = out_tx.send(serde_json::json!({
-                "t": "joined",
-                "ch": ch,
-                "hist": hist
-            }).to_string());
+            let _ = out_tx.send(
+                serde_json::json!({
+                    "t": "joined",
+                    "ch": ch,
+                    "hist": hist
+                })
+                .to_string(),
+            );
         }
         "leave" => {
             let ch = crate::http::safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let _ = out_tx.send(serde_json::json!({
-                "t": "left",
-                "ch": ch
-            }).to_string());
+            let _ = out_tx.send(
+                serde_json::json!({
+                    "t": "left",
+                    "ch": ch
+                })
+                .to_string(),
+            );
         }
         "reaction" => {
             let msg_id = d["msg_id"].as_str().unwrap_or("");

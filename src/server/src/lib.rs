@@ -27,7 +27,7 @@ mod tests {
             "pk": "dGVzdGtleQ==",
             "status": {"text": "Online", "emoji": ""}
         });
-        
+
         assert_eq!(payload.get("t").and_then(|v| v.as_str()), Some("auth"));
         assert_eq!(payload.get("u").and_then(|v| v.as_str()), Some("testuser"));
     }
@@ -39,7 +39,7 @@ mod tests {
             "pw": "hash123",
             "pk": "dGVzdGtleQ=="
         });
-        
+
         assert!(payload.get("u").is_none());
     }
 
@@ -56,7 +56,10 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let sanitized = input.trim().to_lowercase().chars()
+            let sanitized = input
+                .trim()
+                .to_lowercase()
+                .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                 .collect::<String>();
             assert_eq!(sanitized, expected, "input: {}", input);
@@ -74,7 +77,7 @@ mod tests {
     fn test_rate_limit_check() {
         let max_per_minute = 60u32;
         let window_secs = 60.0;
-        
+
         assert!(max_per_minute > 0);
         assert!(window_secs > 0.0);
     }

@@ -232,6 +232,7 @@ pub fn create_ok_response(
     username: &str,
     state: &crate::state::State,
     hist: Vec<serde_json::Value>,
+    session_token: Option<&str>,
 ) -> String {
     let users: Vec<_> = state
         .user_pubkeys
@@ -239,12 +240,17 @@ pub fn create_ok_response(
         .map(|e| serde_json::json!({"u": e.key(), "pk": e.value()}))
         .collect();
 
-    serde_json::json!({
+    let mut response = serde_json::json!({
         "t": "ok",
         "u": username,
         "channels": state.channels_json(),
         "users": users,
         "history": hist
-    })
-    .to_string()
+    });
+
+    if let Some(token) = session_token {
+        response["token"] = token.into();
+    }
+
+    response.to_string()
 }

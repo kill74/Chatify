@@ -359,6 +359,8 @@ async fn start_server_with_db(db_path: PathBuf) -> TestServer {
         .arg(port.to_string())
         .arg("--db")
         .arg(db_path.to_string_lossy().to_string())
+        .arg("--enable-self-registration")
+        .arg("--log")
         // Suppress server stdout/stderr to keep test output clean. To debug a
         // flaky test, swap Stdio::null() for Stdio::inherit() temporarily.
         .stdout(Stdio::null())
