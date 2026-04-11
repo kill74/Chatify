@@ -7405,7 +7405,8 @@ async fn main() -> ChatifyResult<()> {
 
     #[cfg(not(unix))]
     {
-        accept_loop(listener, state.clone(), tls_acceptor, shutdown_rx, &args).await;
+        let state_for_accept = state.clone();
+        accept_loop(listener, state_for_accept, tls_acceptor, shutdown_rx, &args).await;
     }
 
     // Graceful drain: wait for connections to close.
