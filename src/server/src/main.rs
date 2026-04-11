@@ -7370,6 +7370,7 @@ async fn main() -> ChatifyResult<()> {
 
     #[cfg(unix)]
     {
+        #[allow(unused_mut)]
         let (sighup_tx, mut sighup_rx) = tokio::sync::mpsc::channel::<()>(1);
         if args.enable_hot_reload {
             use tokio::signal::unix::{Signal, SignalKind};
