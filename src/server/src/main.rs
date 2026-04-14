@@ -69,7 +69,9 @@
 //! See [`validate_auth_payload`] for the full auth contract and
 //! [`handle_event`] for the complete set of post-auth event types.
 
+mod args;
 mod plugin_runtime;
+use crate::args::{Args, DbDurabilityMode};
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -78,7 +80,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use clifford::crypto;
 use clifford::error::{ChatifyError, ChatifyResult};
 use clifford::metrics::PrometheusMetrics;
@@ -114,322 +116,10 @@ use tokio_tungstenite::{
 // CLI configuration
 // ---------------------------------------------------------------------------
 
-/// Command-line arguments for `clicord-server`.
-///
-/// Parsed once at startup by [clap]; the fields are consumed into [`State`]
-/// and the bind address, and are not referenced again after `main` returns
-/// from its setup phase.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum DbDurabilityMode {
-    /// Throughput-friendly durability profile.
-    /// Uses WAL and `synchronous=NORMAL`.
-    Balanced,
-    /// Crash-resilient durability profile.
-    /// Uses WAL and `synchronous=FULL`.
-    MaxSafety,
-}
-
-impl DbDurabilityMode {
-    fn db_pragmas(self) -> &'static str {
-        match self {
-            DbDurabilityMode::Balanced => {
-                "
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-                PRAGMA wal_autocheckpoint = 1000;
-                PRAGMA cache_size = -2000;
-                PRAGMA temp_store = MEMORY;
-                PRAGMA foreign_keys = ON;
-                PRAGMA mmap_size = 268435456;
-                PRAGMA page_size = 4096;
-                "
-            }
-            DbDurabilityMode::MaxSafety => {
-                "
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = FULL;
-                PRAGMA wal_autocheckpoint = 256;
-                PRAGMA cache_size = -2000;
-                PRAGMA temp_store = MEMORY;
-                PRAGMA foreign_keys = ON;
-                PRAGMA mmap_size = 268435456;
-                PRAGMA page_size = 4096;
-                "
-            }
-        }
-    }
-
-    fn startup_checkpoint_pragma(self) -> &'static str {
-        match self {
-            DbDurabilityMode::Balanced => "PRAGMA wal_checkpoint(PASSIVE);",
-            DbDurabilityMode::MaxSafety => "PRAGMA wal_checkpoint(FULL);",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            DbDurabilityMode::Balanced => "balanced (WAL + synchronous=NORMAL)",
-            DbDurabilityMode::MaxSafety => "max-safety (WAL + synchronous=FULL)",
-        }
-    }
-}
-
-#[derive(Parser)]
-#[command(name = "clicord-server")]
-struct Args {
-    /// IP address the server will bind to. Use `127.0.0.1` to restrict to
-    /// loopback (useful for testing behind a reverse proxy).
-    #[arg(long, default_value = "0.0.0.0")]
-    host: String,
-
-    /// TCP port to listen on.
-    #[arg(long, default_value_t = 8765)]
-    port: u16,
-
-    /// Enable structured logging via `env_logger`. When off, the server is
-    /// completely silent except for the startup banner.
-    #[arg(long)]
-    log: bool,
-
-    /// Path to the SQLite database file. The file is created automatically on
-    /// first run and migrated to the current schema. Use `:memory:` for
-    /// ephemeral in-process storage in tests.
-    #[arg(long, default_value = "chatify.db")]
-    db: String,
-
-    /// SQLite durability profile.
-    ///
-    /// `balanced` favors throughput.
-    /// `max-safety` favors persistence guarantees after crashes/power loss.
-    #[arg(long, value_enum, default_value_t = DbDurabilityMode::MaxSafety)]
-    db_durability: DbDurabilityMode,
-
-    /// Hex-encoded encryption key for the SQLite database (SQLCipher).
-    /// Must be exactly 64 hex characters (32 bytes).
-    /// If omitted, the server looks for a `<db>.key` file. If neither
-    /// exists, a new random key is generated and saved to `<db>.key`.
-    /// Use `:memory:` databases (tests) to skip encryption entirely.
-    #[arg(long)]
-    db_key: Option<String>,
-
-    /// Enable TLS for WebSocket connections (wss://).
-    /// Requires `--tls-cert` and `--tls-key`.
-    #[arg(long)]
-    tls: bool,
-
-    /// Path to the TLS certificate file (PEM format).
-    /// Used when `--tls` is enabled.
-    #[arg(long, default_value = "cert.pem")]
-    tls_cert: String,
-
-    /// Path to the TLS private key file (PEM format).
-    /// Used when `--tls` is enabled.
-    #[arg(long, default_value = "key.pem")]
-    tls_key: String,
-
-    /// TCP port for health check and metrics endpoints.
-    /// Set to 0 to disable the HTTP server.
-    #[arg(long, default_value_t = 8080)]
-    health_port: u16,
-
-    /// Enable Prometheus metrics endpoint.
-    #[arg(long, default_value_t = true)]
-    metrics_enabled: bool,
-
-    /// Maximum time in seconds to wait for connections to drain during shutdown.
-    #[arg(long, default_value_t = 30)]
-    shutdown_timeout_secs: u64,
-
-    /// Enable handling SIGHUP for config hot-reload.
-    #[arg(long)]
-    enable_hot_reload: bool,
-
-    /// Enable shutdown HTTP endpoint for orchestration (POST /shutdown).
-    #[arg(long)]
-    shutdown_endpoint: bool,
-
-    /// Maximum messages per user per minute (0 = unlimited).
-    #[arg(long, default_value_t = 60)]
-    max_msgs_per_minute: u32,
-
-    /// Enable per-user rate limiting.
-    #[arg(long)]
-    enable_user_rate_limit: bool,
-
-    /// Enable self-registration via WebSocket (disabled by default).
-    #[arg(long)]
-    enable_self_registration: bool,
-
-    /// Database connection pool size.
-    #[arg(long, default_value_t = 8)]
-    db_pool_size: u32,
-
-    /// Register a new user (admin operation). Requires --user-password.
-    #[arg(long, requires = "user_password")]
-    register_user: Option<String>,
-
-    /// Password for --register-user operation.
-    #[arg(long)]
-    user_password: Option<String>,
-
-    /// Make the registered user an admin.
-    #[arg(long)]
-    make_admin: bool,
-
-    /// Enable 2FA for a user (admin operation).
-    #[arg(long)]
-    enable_2fa_for: Option<String>,
-
-    /// Disable 2FA for a user (admin operation).
-    #[arg(long)]
-    disable_2fa_for: Option<String>,
-
-    /// Internal mode: run a built-in plugin worker process.
-    #[arg(long, hide = true)]
-    chatify_plugin_worker: Option<String>,
-
-    /// Internal mode: plugin operation (`manifest`, `slash`, `message_hook`).
-    #[arg(long, hide = true, default_value = "manifest")]
-    chatify_plugin_op: String,
-
-    /// Internal mode: slash command identifier for plugin slash dispatch.
-    #[arg(long, hide = true)]
-    chatify_plugin_command: Option<String>,
-}
-
+// Protocol constants (imported from library)
 // ---------------------------------------------------------------------------
-// Protocol constants
-// ---------------------------------------------------------------------------
+use clifford_server::protocol::*;
 
-/// Maximum number of messages kept in the per-channel in-memory ring buffer.
-/// Older entries are evicted when the buffer is full. Persistent history is
-/// unbounded in SQLite; this cap only affects the in-process hot cache.
-const HISTORY_CAP: usize = 50;
-
-/// Maximum byte length for any post-auth WebSocket frame.
-/// Frames exceeding this are rejected before JSON parsing to limit memory
-/// pressure from a single misbehaving or malicious client.
-const MAX_BYTES: usize = 16_000;
-
-/// Maximum byte length for the initial auth frame.
-/// Tighter than [`MAX_BYTES`] because the auth payload is parsed before the
-/// client is known/trusted, making it a potential amplification target.
-const MAX_AUTH_BYTES: usize = 4_096;
-
-/// Maximum HTTP header size during WebSocket handshake (CVE-2023-43668 mitigation).
-/// Limits the total size of HTTP headers during the WebSocket upgrade handshake
-/// to prevent denial-of-service attacks via excessive header length.
-/// Tungstenite 0.21.0+ includes this fix, but we enforce it explicitly.
-const MAX_HANDSHAKE_HEADER_SIZE: usize = 8192;
-
-/// Maximum number of HTTP headers during WebSocket handshake.
-/// Limits the number of individual headers to prevent resource exhaustion.
-const MAX_HANDSHAKE_HEADERS: usize = 64;
-
-/// SQLite schema version this binary was built against.
-/// The migration path in [`EventStore::migrate`] upgrades from any lower
-/// version to this one. If the stored version is *higher*, the server logs a
-/// warning and continues without modifying the schema (no downgrade).
-const CURRENT_SCHEMA_VERSION: i64 = 7;
-
-/// Default number of events returned by a `history` request.
-const DEFAULT_HISTORY_LIMIT: usize = 50;
-
-/// Default number of events returned by a `search` request.
-const DEFAULT_SEARCH_LIMIT: usize = 30;
-
-/// Default look-back window in seconds for a `rewind` request (1 hour).
-const DEFAULT_REWIND_SECONDS: u64 = 3600;
-
-/// Default number of events returned by a `rewind` request.
-const DEFAULT_REWIND_LIMIT: usize = 100;
-
-/// DM channel name prefix - avoids repeated format!() calls.
-const DM_CHANNEL_PREFIX: &str = "__dm__";
-
-/// Creates a DM channel name for a given user.
-fn dm_channel_name(user: &str) -> String {
-    format!("{}{}", DM_CHANNEL_PREFIX, user)
-}
-
-/// WebSocket sub-protocol version advertised in the `"ok"` auth response.
-/// Clients can use this to detect incompatible server versions.
-const PROTOCOL_VERSION: u64 = 1;
-
-/// Maximum allowed username length in characters (ASCII only).
-const MAX_USERNAME_LEN: usize = 32;
-
-/// Maximum allowed length for the `"pw"` (password hash) field in the auth
-/// frame. This covers SHA-256 hex strings (64 chars) with generous headroom
-/// for other hash schemes.
-const MAX_PASSWORD_FIELD_LEN: usize = 256;
-
-/// Maximum allowed length for the `"pk"` (public key) base64 field.
-const MAX_PUBLIC_KEY_FIELD_LEN: usize = 256;
-
-/// Allowed clock skew in seconds between the client-supplied `"ts"` timestamp
-/// and the server's wall clock. A window of Ãƒâ€šÃ‚Â±300 s accommodates clients with
-/// moderately drifted clocks while still preventing stale-message replay.
-const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
-
-/// Maximum length of a nonce string in the `"n"` field. This bounds the
-/// nonce-cache entry size and prevents artificially long strings from being
-/// used as a timing oracle.
-const MAX_NONCE_LEN: usize = 64;
-
-/// Maximum number of recently seen nonces remembered per user.
-/// Once the deque is full the oldest entry is evicted. Choosing a cap large
-/// enough to cover the clock-skew window prevents replay within that window
-/// while bounding per-user memory to `NONCE_CACHE_CAP * MAX_NONCE_LEN` bytes.
-const NONCE_CACHE_CAP: usize = 256;
-
-/// How often the nonce cleanup task runs (seconds).
-/// The sweep is cheap ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â it only iterates `nonce_last_seen`, which has at most
-/// one entry per connected user.
-const NONCE_CLEANUP_INTERVAL_SECS: u64 = 60;
-
-/// Age threshold for nonce eviction (seconds).
-/// Users whose nonce cache has not been updated within this window are removed.
-/// Set to 2ÃƒÆ’Ã¢â‚¬â€ the clock-skew window: any frame older than `MAX_CLOCK_SKEW_SECS`
-/// is already rejected by `validate_timestamp_skew`, so the extra margin is
-/// pure safety against clock jitter.
-const NONCE_MAX_AGE_SECS: f64 = MAX_CLOCK_SKEW_SECS * 2.0;
-
-/// Maximum number of concurrent connections from a single IP address.
-/// Connections beyond this are rejected with a rate-limit error.
-const MAX_CONNECTIONS_PER_IP: usize = 5;
-
-/// Minimum interval in seconds between auth attempts from the same IP.
-/// Attempts within this window are rejected to slow brute-force attacks.
-/// Set to 0.5s ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â enough to throttle automated tools while allowing
-/// rapid legitimate connections (e.g. from integration tests).
-const AUTH_RATE_LIMIT_SECS: f64 = 0.5;
-
-/// Maximum file transfer size in bytes (100 MB).
-const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
-
-/// Maximum filename length accepted in `file_meta` announcements.
-const MAX_FILE_NAME_LEN: usize = 256;
-
-/// Maximum transfer identifier length accepted in `file_meta` announcements.
-const MAX_FILE_ID_LEN: usize = 128;
-
-/// Maximum MIME type length accepted in `file_meta` announcements.
-const MAX_MEDIA_MIME_LEN: usize = 128;
-
-/// Maximum allowed length for a status text field.
-const MAX_STATUS_TEXT_LEN: usize = 128;
-
-/// Maximum allowed length for a status emoji field.
-const MAX_STATUS_EMOJI_LEN: usize = 16;
-
-/// Maximum allowed length for server-issued message IDs.
-const MAX_MSG_ID_LEN: usize = 64;
-
-/// Maximum allowed length for reaction emoji payload.
-const MAX_REACTION_EMOJI_LEN: usize = 32;
-
-// ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
 
@@ -3288,10 +2978,6 @@ impl Drop for ConnectionGuard {
 /// This prevents clients from requesting zero or unreasonably large result
 /// sets while still allowing the server to apply sensible per-endpoint
 /// maximums without duplicating clamping logic in each handler.
-fn clamp_limit(raw: Option<u64>, default: usize, max: usize) -> usize {
-    raw.map(|v| v as usize).unwrap_or(default).clamp(1, max)
-}
-
 /// Builds a deterministic reaction snapshot (`msg_id` + `emoji` + `count`)
 /// from a list of persisted channel events.
 fn build_reaction_snapshot(events: &[Value]) -> Vec<Value> {
@@ -7087,6 +6773,7 @@ fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<
 /// 5. Accepts connections in a `tokio::select!` loop until Ctrl+C.
 /// 6. Broadcasts a shutdown notice and waits up to 10 s for connections to
 ///    drain before returning.
+#[cfg(not(unix))]
 async fn accept_loop(
     listener: TcpListener,
     state: Arc<State>,
@@ -7146,6 +6833,7 @@ async fn accept_loop(
     }
 }
 
+/// Unix-specific server entry point with SIGHUP support.
 #[cfg(unix)]
 async fn accept_loop_unix(
     listener: TcpListener,
