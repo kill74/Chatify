@@ -21,6 +21,7 @@ use clifford_client::{
     args::Args,
     handlers,
     state::{ClientState, SharedState},
+    voice::{start_voice_session, VoiceEvent},
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -109,6 +110,18 @@ const COMMANDS: &[CommandHelp] = &[
         usage: "/typing [on|off] [#ch|dm:user]",
         summary: "Broadcast ephemeral typing state",
         aliases: &[],
+    },
+    CommandHelp {
+        name: "/voice",
+        usage: "/voice <on|off|mute|unmute|deafen|undeafen|status> [room]",
+        summary: "Control voice session and signaling",
+        aliases: &["/vc"],
+    },
+    CommandHelp {
+        name: "/screen",
+        usage: "/screen <start|stop|status> [room]",
+        summary: "Control screen-share signaling",
+        aliases: &["/ss"],
     },
     CommandHelp {
         name: "/notify",
@@ -966,6 +979,301 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
             } else {
                 let status = if typing { "on" } else { "off" };
                 println!("typing={} for {}", status, format_scope_for_help(&scope));
+            }
+        }
+        "/voice" | "/vc" => {
+            let subcommand = parts.next().unwrap_or("status").to_ascii_lowercase();
+
+            match subcommand.as_str() {
+                "on" | "start" | "join" => {
+                    let room_arg = parts.next();
+                    if parts.next().is_some() {
+                        println!("Usage: /voice on [room]");
+                        return true;
+                    }
+
+                    let requested_room = room_arg
+                        .and_then(clifford::normalize_channel)
+                        .unwrap_or_default();
+
+                    let (media_enabled, already_active, ws_tx, default_room) = {
+                        let state_lock = state.lock().await;
+                        let default_room = if state_lock.ch.starts_with("dm:") {
+                            "general".to_string()
+                        } else {
+                            clifford::normalize_channel(&state_lock.ch)
+                                .unwrap_or_else(|| "general".to_string())
+                        };
+
+                        (
+                            state_lock.media_enabled,
+                            state_lock.voice_active,
+                            state_lock.ws_tx.clone(),
+                            default_room,
+                        )
+                    };
+
+                    if !media_enabled {
+                        println!(
+                            "Voice is disabled by client media settings (--no_media or config)."
+                        );
+                        return true;
+                    }
+
+                    if already_active {
+                        println!("Voice is already active.");
+                        return true;
+                    }
+
+                    let room = if requested_room.is_empty() {
+                        default_room
+                    } else {
+                        requested_room
+                    };
+
+                    let started = match start_voice_session(room.clone(), ws_tx) {
+                        Ok(session) => session,
+                        Err(err) => {
+                            eprintln!("failed to start local voice session: {}", err);
+                            return true;
+                        }
+                    };
+                    let event_tx = started.event_tx;
+
+                    let mut state_lock = state.lock().await;
+                    if state_lock.voice_active {
+                        let _ = event_tx.send(VoiceEvent::Stop);
+                        println!("Voice became active concurrently; keeping existing session.");
+                        return true;
+                    }
+
+                    if let Err(err) = state_lock.send_voice_join(&room) {
+                        let _ = event_tx.send(VoiceEvent::Stop);
+                        eprintln!("failed to join voice room: {}", err);
+                        return true;
+                    }
+
+                    state_lock.voice_session = Some(clifford_client::state::VoiceSession {
+                        room: room.clone(),
+                        event_tx,
+                    });
+                    state_lock.voice_active = true;
+                    state_lock.voice_muted = false;
+                    state_lock.voice_deafened = false;
+                    state_lock.voice_speaking = false;
+
+                    println!("Voice started in room #{}.", room);
+                }
+                "off" | "stop" | "leave" => {
+                    if parts.next().is_some() {
+                        println!("Usage: /voice off");
+                        return true;
+                    }
+
+                    let mut state_lock = state.lock().await;
+                    let Some(session) = state_lock.voice_session.take() else {
+                        println!("Voice is not active.");
+                        return true;
+                    };
+
+                    let room = session.room.clone();
+                    let _ = session.event_tx.send(VoiceEvent::Stop);
+
+                    if let Err(err) = state_lock.send_voice_leave(&room) {
+                        eprintln!("failed to leave voice room: {}", err);
+                    }
+
+                    state_lock.voice_active = false;
+                    state_lock.voice_muted = false;
+                    state_lock.voice_deafened = false;
+                    state_lock.voice_speaking = false;
+                    state_lock.voice_members.clear();
+
+                    println!("Voice stopped for room #{}.", room);
+                }
+                "mute" => {
+                    if parts.next().is_some() {
+                        println!("Usage: /voice mute");
+                        return true;
+                    }
+
+                    let mut state_lock = state.lock().await;
+                    if !state_lock.voice_active {
+                        println!("Voice is not active.");
+                        return true;
+                    }
+
+                    if let Err(err) = state_lock.send_voice_state(Some(true), None) {
+                        eprintln!("failed to send mute state: {}", err);
+                    }
+                    state_lock.voice_muted = true;
+                    println!("Voice muted.");
+                }
+                "unmute" => {
+                    if parts.next().is_some() {
+                        println!("Usage: /voice unmute");
+                        return true;
+                    }
+
+                    let mut state_lock = state.lock().await;
+                    if !state_lock.voice_active {
+                        println!("Voice is not active.");
+                        return true;
+                    }
+
+                    if let Err(err) = state_lock.send_voice_state(Some(false), None) {
+                        eprintln!("failed to send mute state: {}", err);
+                    }
+                    state_lock.voice_muted = false;
+                    println!("Voice unmuted.");
+                }
+                "deafen" => {
+                    if parts.next().is_some() {
+                        println!("Usage: /voice deafen");
+                        return true;
+                    }
+
+                    let mut state_lock = state.lock().await;
+                    if !state_lock.voice_active {
+                        println!("Voice is not active.");
+                        return true;
+                    }
+
+                    if let Err(err) = state_lock.send_voice_state(None, Some(true)) {
+                        eprintln!("failed to send deafen state: {}", err);
+                    }
+                    state_lock.voice_deafened = true;
+                    println!("Voice deafened.");
+                }
+                "undeafen" => {
+                    if parts.next().is_some() {
+                        println!("Usage: /voice undeafen");
+                        return true;
+                    }
+
+                    let mut state_lock = state.lock().await;
+                    if !state_lock.voice_active {
+                        println!("Voice is not active.");
+                        return true;
+                    }
+
+                    if let Err(err) = state_lock.send_voice_state(None, Some(false)) {
+                        eprintln!("failed to send deafen state: {}", err);
+                    }
+                    state_lock.voice_deafened = false;
+                    println!("Voice undeafened.");
+                }
+                "status" => {
+                    if parts.next().is_some() {
+                        println!("Usage: /voice status");
+                        return true;
+                    }
+
+                    let state_lock = state.lock().await;
+                    if !state_lock.voice_active {
+                        println!("Voice status: OFF");
+                    } else if let Some(session) = &state_lock.voice_session {
+                        println!(
+                            "Voice status: ON room=#{} muted={} deafened={} speaking={} members={}",
+                            session.room,
+                            state_lock.voice_muted,
+                            state_lock.voice_deafened,
+                            state_lock.voice_speaking,
+                            state_lock.voice_members.len()
+                        );
+                    } else {
+                        println!("Voice status: ON (session metadata unavailable)");
+                    }
+                }
+                _ => {
+                    println!("Usage: /voice <on|off|mute|unmute|deafen|undeafen|status> [room]");
+                }
+            }
+        }
+        "/screen" | "/ss" => {
+            let subcommand = parts.next().unwrap_or("status").to_ascii_lowercase();
+
+            match subcommand.as_str() {
+                "on" | "start" => {
+                    let room_arg = parts.next();
+                    if parts.next().is_some() {
+                        println!("Usage: /screen start [room]");
+                        return true;
+                    }
+
+                    let room = if let Some(raw_room) = room_arg {
+                        clifford::normalize_channel(raw_room)
+                            .unwrap_or_else(|| "general".to_string())
+                    } else {
+                        let current = state.lock().await.ch.clone();
+                        if current.starts_with("dm:") {
+                            "general".to_string()
+                        } else {
+                            clifford::normalize_channel(&current)
+                                .unwrap_or_else(|| "general".to_string())
+                        }
+                    };
+
+                    let state_lock = state.lock().await;
+                    if let Err(err) = state_lock.send_screen_start(&room) {
+                        eprintln!("failed to send screen-share start request: {}", err);
+                    } else {
+                        println!("Requested screen-share start for room #{}.", room);
+                    }
+                }
+                "off" | "stop" => {
+                    let room_arg = parts.next();
+                    if parts.next().is_some() {
+                        println!("Usage: /screen stop [room]");
+                        return true;
+                    }
+
+                    let room = if let Some(raw_room) = room_arg {
+                        clifford::normalize_channel(raw_room)
+                            .unwrap_or_else(|| "general".to_string())
+                    } else {
+                        let current = state.lock().await.ch.clone();
+                        if current.starts_with("dm:") {
+                            "general".to_string()
+                        } else {
+                            clifford::normalize_channel(&current)
+                                .unwrap_or_else(|| "general".to_string())
+                        }
+                    };
+
+                    let state_lock = state.lock().await;
+                    if let Err(err) = state_lock.send_screen_stop(&room) {
+                        eprintln!("failed to send screen-share stop request: {}", err);
+                    } else {
+                        println!("Requested screen-share stop for room #{}.", room);
+                    }
+                }
+                "status" => {
+                    if parts.next().is_some() {
+                        println!("Usage: /screen status");
+                        return true;
+                    }
+
+                    let state_lock = state.lock().await;
+                    let active = state_lock.screen_share.is_some();
+                    println!(
+                        "Screen-share status: {} viewing={} frames={} last_from={} last_seq={}",
+                        if active { "ON" } else { "OFF" },
+                        state_lock.screen_viewing,
+                        state_lock.screen_frames_received,
+                        state_lock
+                            .screen_last_frame_from
+                            .as_deref()
+                            .unwrap_or("n/a"),
+                        state_lock
+                            .screen_last_frame_seq
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "n/a".to_string())
+                    );
+                }
+                _ => {
+                    println!("Usage: /screen <start|stop|status> [room]");
+                }
             }
         }
         "/notify" => {

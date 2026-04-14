@@ -1,4 +1,4 @@
-﻿//! # `clifford-server` Integration Test Suite
+//! # `clifford-server` Integration Test Suite
 //!
 //! End-to-end contract tests for the `clifford-server` WebSocket binary.
 //!
@@ -1740,6 +1740,117 @@ async fn voice_contract_forwards_vdata_between_room_members() {
         vdata.get("a").and_then(|v| v.as_str()),
         Some("ZmFrZS1hdWRpby1wYXlsb2Fk")
     );
+}
+
+/// Verifies that screen-share metadata and frame payloads are relayed to
+/// other members in the same screen-share room.
+#[tokio::test]
+async fn screen_share_contract_relays_meta_and_frames_between_room_members() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"ss_start","r":"room-screen"}).to_string(),
+        ))
+        .await
+        .expect("alice starts screen room");
+    bob.send(Message::Text(
+        json!({"t":"ss_start","r":"room-screen"}).to_string(),
+    ))
+    .await
+    .expect("bob subscribes to screen room");
+
+    let alice_state = recv_by_type(&mut alice, "ss_state").await;
+    assert_eq!(
+        alice_state.get("enabled").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        alice_state.get("status").and_then(|v| v.as_str()),
+        Some("active")
+    );
+
+    let bob_state = recv_by_type(&mut bob, "ss_state").await;
+    assert_eq!(
+        bob_state.get("enabled").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    // Allow subscriptions to settle before relaying metadata/frames.
+    sleep(Duration::from_millis(150)).await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"ss_meta",
+                "r":"room-screen",
+                "stream_id":"stream-1",
+                "codec":"raw-b64-v1",
+                "width":1280,
+                "height":720,
+                "fps":24
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("alice sends screen metadata");
+
+    let meta = recv_by_type(&mut bob, "ss_meta").await;
+    assert_eq!(meta.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(
+        meta.get("room").and_then(|v| v.as_str()),
+        Some("room-screen")
+    );
+    assert_eq!(
+        meta.get("stream_id").and_then(|v| v.as_str()),
+        Some("stream-1")
+    );
+    assert_eq!(
+        meta.get("codec").and_then(|v| v.as_str()),
+        Some("raw-b64-v1")
+    );
+    assert_eq!(meta.get("width").and_then(|v| v.as_u64()), Some(1280));
+    assert_eq!(meta.get("height").and_then(|v| v.as_u64()), Some(720));
+    assert_eq!(meta.get("fps").and_then(|v| v.as_u64()), Some(24));
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"ss_frame",
+                "r":"room-screen",
+                "stream_id":"stream-1",
+                "a":"c2NyZWVuLWZyYW1lLWRhdGE=",
+                "seq":7,
+                "capture_ts_ms":123_456_u64,
+                "keyframe":true
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("alice sends screen frame");
+
+    let frame = recv_by_type(&mut bob, "ss_frame").await;
+    assert_eq!(frame.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(
+        frame.get("room").and_then(|v| v.as_str()),
+        Some("room-screen")
+    );
+    assert_eq!(
+        frame.get("stream_id").and_then(|v| v.as_str()),
+        Some("stream-1")
+    );
+    assert_eq!(
+        frame.get("a").and_then(|v| v.as_str()),
+        Some("c2NyZWVuLWZyYW1lLWRhdGE=")
+    );
+    assert_eq!(frame.get("seq").and_then(|v| v.as_u64()), Some(7));
+    assert_eq!(
+        frame.get("capture_ts_ms").and_then(|v| v.as_u64()),
+        Some(123_456_u64)
+    );
+    assert_eq!(frame.get("keyframe").and_then(|v| v.as_bool()), Some(true));
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 //! Client event handlers.
 
 use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState, TypingPresence};
-use crate::voice::{decode_voice_frame, VoiceEvent};
+use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
 use clifford::notifications::NotificationService;
 
 const TYPING_TTL_SECS: u64 = 30;
@@ -493,6 +493,33 @@ pub async fn handle_err_event(state: &SharedState, data: &serde_json::Value, _ts
 }
 
 pub async fn handle_ok_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let voice_capability = data
+        .get("media")
+        .and_then(|m| m.get("voice"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let screen_capability = data
+        .get("media")
+        .and_then(|m| m.get("screen_share"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let voice_codecs = data
+        .get("media")
+        .and_then(|m| m.get("voice"))
+        .and_then(|v| v.get("codecs"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+
     let mut state_lock = state.lock().await;
     state_lock.me = data
         .get("u")
@@ -513,6 +540,16 @@ pub async fn handle_ok_event(state: &SharedState, data: &serde_json::Value, _ts:
     }
     drop(state_lock);
     println!("Connected successfully.");
+    println!(
+        "Media capabilities: voice={} codecs=[{}] screen_share={}",
+        if voice_capability { "on" } else { "off" },
+        if voice_codecs.is_empty() {
+            "none"
+        } else {
+            &voice_codecs
+        },
+        if screen_capability { "on" } else { "off" }
+    );
 }
 
 async fn ingest_timeline_events(
@@ -1033,11 +1070,179 @@ pub async fn handle_reaction_sync_event(state: &SharedState, data: &serde_json::
 
 pub async fn handle_vdata_event(state: &SharedState, data: &serde_json::Value) {
     let payload = data.get("a").and_then(|v| v.as_str()).unwrap_or("");
+    let source = data
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("remote")
+        .to_string();
+    let seq = data.get("seq").and_then(|v| v.as_u64());
+    let capture_ts_ms = data.get("capture_ts_ms").and_then(|v| v.as_u64());
+
     if let Some(frame) = decode_voice_frame(payload) {
         if let Some(session) = &state.lock().await.voice_session {
-            let _ = session.event_tx.send(VoiceEvent::Playback(frame));
+            let _ = session
+                .event_tx
+                .send(VoiceEvent::PlaybackPacket(VoicePlaybackPacket {
+                    source,
+                    seq,
+                    capture_ts_ms,
+                    frame,
+                }));
         }
     }
+}
+
+pub async fn handle_ss_meta_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let room = data
+        .get("room")
+        .or_else(|| data.get("r"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("general");
+    let from = data
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("remote");
+    let codec = data
+        .get("codec")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let width = data.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+    let height = data.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let fps = data.get("fps").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let content = if width > 0 && height > 0 && fps > 0 {
+        format!(
+            "🖥 screen stream from {} in #{} ({}, {}x{} @ {}fps)",
+            from, room, codec, width, height, fps
+        )
+    } else {
+        format!("🖥 screen stream from {} in #{} ({})", from, room, codec)
+    };
+
+    let mut state_lock = state.lock().await;
+    state_lock.screen_share = Some(());
+    state_lock.screen_viewing = true;
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: String::new(),
+        sender: "system".to_string(),
+        content: content.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", content);
+}
+
+pub async fn handle_ss_frame_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let payload = data
+        .get("a")
+        .or_else(|| data.get("data"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if payload.is_empty() {
+        return;
+    }
+
+    let room = data
+        .get("room")
+        .or_else(|| data.get("r"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("general");
+    let from = data
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("remote")
+        .to_string();
+    let seq = data.get("seq").and_then(|v| v.as_u64());
+    let keyframe = data
+        .get("keyframe")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut state_lock = state.lock().await;
+    state_lock.screen_share = Some(());
+    state_lock.screen_viewing = true;
+    state_lock.screen_frames_received = state_lock.screen_frames_received.saturating_add(1);
+    if let Some(seq) = seq {
+        state_lock.screen_last_frame_seq = Some(seq);
+    }
+    state_lock.screen_last_frame_from = Some(from.clone());
+    let frame_count = state_lock.screen_frames_received;
+    drop(state_lock);
+
+    if keyframe || frame_count == 1 {
+        if let Some(seq) = seq {
+            println!(
+                "🖥 receiving screen frames from {} in #{} (frame={} seq={}{})",
+                from,
+                room,
+                frame_count,
+                seq,
+                if keyframe { ", keyframe" } else { "" }
+            );
+        } else {
+            println!(
+                "🖥 receiving screen frames from {} in #{} (frame={}{})",
+                from,
+                room,
+                frame_count,
+                if keyframe { ", keyframe" } else { "" }
+            );
+        }
+    }
+}
+
+pub async fn handle_ss_state_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let room = data
+        .get("room")
+        .or_else(|| data.get("r"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("general");
+    let enabled = data
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let status = data
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if enabled { "active" } else { "inactive" });
+    let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+
+    let mut state_lock = state.lock().await;
+    state_lock.screen_share = if enabled { Some(()) } else { None };
+    state_lock.screen_viewing = enabled;
+    if !enabled {
+        state_lock.screen_frames_received = 0;
+        state_lock.screen_last_frame_seq = None;
+        state_lock.screen_last_frame_from = None;
+    }
+
+    let content = if enabled {
+        format!("🖥 screen share active in #{} ({})", room, status)
+    } else if reason.is_empty() {
+        format!("🖥 screen share unavailable in #{} ({})", room, status)
+    } else {
+        format!(
+            "🖥 screen share unavailable in #{} ({}, reason={})",
+            room, status, reason
+        )
+    };
+
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: String::new(),
+        sender: "system".to_string(),
+        content: content.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", content);
 }
 
 pub async fn handle_vusers_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
@@ -1209,6 +1414,15 @@ pub async fn dispatch_event(
         }
         "vleave" => {
             handle_vleave_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "ss_meta" => {
+            handle_ss_meta_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "ss_frame" => {
+            handle_ss_frame_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "ss_state" => {
+            handle_ss_state_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
         _ => {
             return false;

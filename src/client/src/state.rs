@@ -50,6 +50,9 @@ pub struct ClientState {
     pub config: clifford::config::Config,
     pub screen_share: Option<()>,
     pub screen_viewing: bool,
+    pub screen_frames_received: u64,
+    pub screen_last_frame_seq: Option<u64>,
+    pub screen_last_frame_from: Option<String>,
     pub voice_members: Vec<String>,
     pub voice_muted: bool,
     pub voice_deafened: bool,
@@ -206,6 +209,9 @@ impl ClientState {
             config,
             screen_share: None,
             screen_viewing: false,
+            screen_frames_received: 0,
+            screen_last_frame_seq: None,
+            screen_last_frame_from: None,
             voice_members: Vec::new(),
             voice_muted: false,
             voice_deafened: false,
@@ -819,6 +825,56 @@ impl ClientState {
         }))
     }
 
+    pub fn send_voice_join(&self, room: &str) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "vjoin",
+            "r": room,
+        }))
+    }
+
+    pub fn send_voice_leave(&self, room: &str) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "vleave",
+            "r": room,
+        }))
+    }
+
+    pub fn send_voice_state(
+        &self,
+        muted: Option<bool>,
+        deafened: Option<bool>,
+    ) -> Result<(), String> {
+        let mut payload = serde_json::json!({ "t": "vstate" });
+        if let Some(muted) = muted {
+            payload["muted"] = serde_json::json!(muted);
+        }
+        if let Some(deafened) = deafened {
+            payload["deafened"] = serde_json::json!(deafened);
+        }
+        self.send_json(payload)
+    }
+
+    pub fn send_voice_speaking(&self, speaking: bool) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "vspeaking",
+            "speaking": speaking,
+        }))
+    }
+
+    pub fn send_screen_start(&self, room: &str) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "ss_start",
+            "r": room,
+        }))
+    }
+
+    pub fn send_screen_stop(&self, room: &str) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "ss_stop",
+            "r": room,
+        }))
+    }
+
     pub fn send_history(&self, channel: &str, limit: usize) -> Result<(), String> {
         self.send_json(serde_json::json!({
             "t": "history",
@@ -1116,6 +1172,66 @@ mod tests {
             Some("deploy failed")
         );
         assert_eq!(parsed.get("limit").and_then(|v| v.as_u64()), Some(25));
+    }
+
+    #[test]
+    fn send_voice_join_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_voice_join("room-a")
+            .expect("send_voice_join should serialize");
+
+        let frame = rx.try_recv().expect("voice join frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("vjoin"));
+        assert_eq!(parsed.get("r").and_then(|v| v.as_str()), Some("room-a"));
+    }
+
+    #[test]
+    fn send_voice_state_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_voice_state(Some(true), Some(false))
+            .expect("send_voice_state should serialize");
+
+        let frame = rx.try_recv().expect("voice state frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("vstate"));
+        assert_eq!(parsed.get("muted").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            parsed.get("deafened").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn send_screen_start_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_screen_start("general")
+            .expect("send_screen_start should serialize");
+
+        let frame = rx.try_recv().expect("screen start frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("ss_start"));
+        assert_eq!(parsed.get("r").and_then(|v| v.as_str()), Some("general"));
+    }
+
+    #[test]
+    fn send_screen_stop_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_screen_stop("general")
+            .expect("send_screen_stop should serialize");
+
+        let frame = rx.try_recv().expect("screen stop frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("ss_stop"));
+        assert_eq!(parsed.get("r").and_then(|v| v.as_str()), Some("general"));
     }
 
     #[test]

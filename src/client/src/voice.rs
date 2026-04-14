@@ -1,6 +1,6 @@
 //! Voice session management for client.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 
@@ -13,10 +13,93 @@ use rodio::{OutputStream, Sink};
 use clifford::error::{ChatifyError, ChatifyResult};
 use clifford::voice::AudioProcessor;
 
+const SPEAKING_RMS_THRESHOLD: f32 = 0.010;
+const SPEAKING_SIGNAL_COOLDOWN_MS: u64 = 150;
+const SPEAKING_SIGNAL_SILENCE_MS: u64 = 450;
+
+const JITTER_BUFFER_TARGET_FRAMES: usize = 3;
+const JITTER_BUFFER_MAX_FRAMES: usize = 24;
+const JITTER_BUFFER_GAP_RESET_THRESHOLD: u64 = 12;
+
 pub struct VoiceFrame {
     pub sample_rate: u32,
     pub channels: u16,
     pub samples: Vec<i16>,
+}
+
+pub struct VoicePlaybackPacket {
+    pub source: String,
+    pub seq: Option<u64>,
+    pub capture_ts_ms: Option<u64>,
+    pub frame: VoiceFrame,
+}
+
+#[derive(Default)]
+struct PerSourceJitterBuffer {
+    pending: BTreeMap<u64, VoiceFrame>,
+    next_seq: Option<u64>,
+    started: bool,
+}
+
+impl PerSourceJitterBuffer {
+    fn push(&mut self, seq: Option<u64>, frame: VoiceFrame) -> Vec<VoiceFrame> {
+        let Some(seq) = seq else {
+            return vec![frame];
+        };
+
+        if self.pending.contains_key(&seq) {
+            return Vec::new();
+        }
+
+        self.pending.insert(seq, frame);
+        if self.next_seq.is_none() {
+            self.next_seq = self.pending.keys().next().copied();
+        }
+
+        if !self.started && self.pending.len() >= JITTER_BUFFER_TARGET_FRAMES {
+            self.started = true;
+        }
+
+        let mut ready = Vec::new();
+
+        if self.started {
+            self.drain_contiguous(&mut ready);
+        }
+
+        if self.pending.len() > JITTER_BUFFER_MAX_FRAMES {
+            if let Some((&first_seq, _)) = self.pending.iter().next() {
+                self.next_seq = Some(first_seq);
+                self.started = true;
+                self.drain_contiguous(&mut ready);
+            }
+        }
+
+        if self.started {
+            if let (Some(expected), Some((&first_seq, _))) =
+                (self.next_seq, self.pending.iter().next())
+            {
+                if first_seq > expected
+                    && first_seq.saturating_sub(expected) > JITTER_BUFFER_GAP_RESET_THRESHOLD
+                {
+                    self.next_seq = Some(first_seq);
+                    self.drain_contiguous(&mut ready);
+                }
+            }
+        }
+
+        ready
+    }
+
+    fn drain_contiguous(&mut self, out: &mut Vec<VoiceFrame>) {
+        while let Some(expected) = self.next_seq {
+            if let Some(frame) = self.pending.remove(&expected) {
+                out.push(frame);
+                self.next_seq = Some(expected.wrapping_add(1));
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 pub struct VoiceSession {
@@ -28,6 +111,7 @@ pub struct VoiceSession {
 pub enum VoiceEvent {
     Captured(VoiceFrame),
     Playback(VoiceFrame),
+    PlaybackPacket(VoicePlaybackPacket),
     #[allow(dead_code)]
     MuteState(bool),
     #[allow(dead_code)]
@@ -99,6 +183,11 @@ pub fn start_voice_session(
         };
 
         let mut audio_processor = AudioProcessor::new(sample_rate, channels.into());
+        let mut voice_sequence: u64 = 0;
+        let mut speaking_state = false;
+        let mut last_voice_activity_ms = 0u64;
+        let mut last_speaking_emit_ms = 0u64;
+        let mut playback_jitter: HashMap<String, PerSourceJitterBuffer> = HashMap::new();
 
         let pending = Arc::new(Mutex::new(VecDeque::<i16>::new()));
 
@@ -149,14 +238,67 @@ pub fn start_voice_session(
                     let processed = audio_processor.process_capture(&frame.samples);
                     let encoded = audio_processor.encode(&processed);
                     let payload = general_purpose::STANDARD.encode(&encoded);
+                    let capture_ts_ms = now_ms();
+                    let seq = voice_sequence;
+                    voice_sequence = voice_sequence.wrapping_add(1);
+
+                    let voiced = is_voiced_frame(&processed);
+                    if voiced {
+                        last_voice_activity_ms = capture_ts_ms;
+                    }
+
+                    let desired_speaking = voiced
+                        || (speaking_state
+                            && capture_ts_ms.saturating_sub(last_voice_activity_ms)
+                                <= SPEAKING_SIGNAL_SILENCE_MS);
+
+                    if desired_speaking != speaking_state
+                        && (last_speaking_emit_ms == 0
+                            || capture_ts_ms.saturating_sub(last_speaking_emit_ms)
+                                >= SPEAKING_SIGNAL_COOLDOWN_MS)
+                    {
+                        speaking_state = desired_speaking;
+                        last_speaking_emit_ms = capture_ts_ms;
+                        let _ = ws_tx_task.send(
+                            serde_json::json!({
+                                "t": "vspeaking",
+                                "speaking": speaking_state
+                            })
+                            .to_string(),
+                        );
+                    }
+
                     let _ = ws_tx_task.send(
                         serde_json::json!({
                             "t": "vdata",
                             "r": room_task.clone(),
-                            "a": payload
+                            "a": payload,
+                            "seq": seq,
+                            "capture_ts_ms": capture_ts_ms,
                         })
                         .to_string(),
                     );
+                }
+                VoiceEvent::PlaybackPacket(packet) => {
+                    let source = if packet.source.trim().is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        packet.source
+                    };
+
+                    let frames = playback_jitter
+                        .entry(source)
+                        .or_default()
+                        .push(packet.seq, packet.frame);
+
+                    for frame in frames {
+                        let processed = audio_processor.process_playback(&frame.samples);
+                        sink.append(SamplesBuffer::new(
+                            frame.channels,
+                            frame.sample_rate,
+                            processed,
+                        ));
+                    }
                 }
                 VoiceEvent::Playback(frame) => {
                     let processed = audio_processor.process_playback(&frame.samples);
@@ -167,7 +309,18 @@ pub fn start_voice_session(
                     ));
                 }
                 VoiceEvent::MuteState(_) | VoiceEvent::SpeakingState(_) => {}
-                VoiceEvent::Stop => break,
+                VoiceEvent::Stop => {
+                    if speaking_state {
+                        let _ = ws_tx_task.send(
+                            serde_json::json!({
+                                "t": "vspeaking",
+                                "speaking": false
+                            })
+                            .to_string(),
+                        );
+                    }
+                    break;
+                }
             }
         }
         sink.stop();
@@ -296,6 +449,30 @@ pub fn stop_voice_session(session: VoiceSession) {
     let _ = session.event_tx.send(VoiceEvent::Stop);
     let _ = session.task.join();
     let _ = room;
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn is_voiced_frame(samples: &[i16]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+
+    let sum_sq: f32 = samples
+        .iter()
+        .map(|sample| {
+            let normalized = *sample as f32 / i16::MAX as f32;
+            normalized * normalized
+        })
+        .sum();
+
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    rms >= SPEAKING_RMS_THRESHOLD
 }
 
 pub fn encode_voice_frame(frame: &VoiceFrame) -> String {

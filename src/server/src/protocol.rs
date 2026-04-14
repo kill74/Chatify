@@ -46,6 +46,13 @@ pub const DM_CHANNEL_PREFIX: &str = "__dm__";
 /// WebSocket sub-protocol version advertised in the `"ok"` auth response.
 pub const PROTOCOL_VERSION: u64 = 1;
 
+/// Optional media capability envelope version.
+///
+/// This is additive and intentionally independent from [`PROTOCOL_VERSION`]
+/// so legacy clients can ignore unknown media fields while continuing to
+/// operate on protocol v1.
+pub const MEDIA_CAPABILITIES_VERSION: u64 = 1;
+
 /// Maximum allowed username length in characters (ASCII only).
 pub const MAX_USERNAME_LEN: usize = 32;
 
@@ -152,6 +159,14 @@ pub mod msg_type {
     pub const VLEAVE: &str = "vleave";
     /// Voice data.
     pub const VDATA: &str = "vdata";
+    /// Start screen share session.
+    pub const SS_START: &str = "ss_start";
+    /// Stop screen share session.
+    pub const SS_STOP: &str = "ss_stop";
+    /// Screen share stream metadata.
+    pub const SS_META: &str = "ss_meta";
+    /// Screen share encoded frame payload.
+    pub const SS_FRAME: &str = "ss_frame";
     /// Ban a user.
     pub const BAN: &str = "ban";
     /// Unban a user.
@@ -216,6 +231,12 @@ pub mod srv_type {
     pub const VLEFT: &str = "vleft";
     /// Voice data.
     pub const VDATA: &str = "vdata";
+    /// Screen-share state update.
+    pub const SS_STATE: &str = "ss_state";
+    /// Screen-share stream metadata relay.
+    pub const SS_META: &str = "ss_meta";
+    /// Screen-share frame relay.
+    pub const SS_FRAME: &str = "ss_frame";
     /// Banned notification.
     pub const BANNED: &str = "banned";
     /// Unbanned notification.
@@ -294,6 +315,8 @@ pub fn requires_replay_protection(event_type: &str) -> bool {
         msg_type::MSG
             | msg_type::DM
             | msg_type::VDATA
+            | msg_type::SS_META
+            | msg_type::SS_FRAME
             | msg_type::EDIT
             | msg_type::FILE_META
             | msg_type::FILE_CHUNK
@@ -338,6 +361,26 @@ pub fn auth_ok_response(
         "proto": {
             "v": proto_version,
             "max_payload_bytes": max_payload
+        },
+        "media": {
+            "capabilities_version": MEDIA_CAPABILITIES_VERSION,
+            "voice": {
+                "enabled": true,
+                "codecs": ["pcm-rle-v1"],
+                "features": {
+                    "seq": true,
+                    "capture_ts_ms": true
+                }
+            },
+            "screen_share": {
+                "enabled": true,
+                "status": "relay",
+                "codecs": ["raw-b64-v1"],
+                "features": {
+                    "frame_seq": true,
+                    "keyframe": true
+                }
+            }
         }
     });
 

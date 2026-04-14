@@ -2430,6 +2430,9 @@ struct State {
     /// Per-room voice broadcast senders, keyed by room name.
     voice: DashMap<String, broadcast::Sender<String>>,
 
+    /// Per-room screen-share relay senders, keyed by room name.
+    screen: DashMap<String, broadcast::Sender<String>>,
+
     /// Current status value for each online user
     /// (e.g. `{"text":"Online","emoji":"ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢"}`).
     /// Presence in this map is the authoritative signal that a user is online.
@@ -2548,6 +2551,7 @@ impl State {
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
+            screen: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
             recent_nonces: DashMap::new(),
@@ -2621,6 +2625,18 @@ impl State {
     /// via `vtx.subscribe()` when they call `"vjoin"`.
     fn voice_tx(&self, room: &str) -> broadcast::Sender<String> {
         self.voice
+            .entry(room.into())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(128);
+                tx
+            })
+            .clone()
+    }
+
+    /// Returns the screen-share relay sender for `room`, creating it lazily
+    /// on first access.
+    fn screen_tx(&self, room: &str) -> broadcast::Sender<String> {
+        self.screen
             .entry(room.into())
             .or_insert_with(|| {
                 let (tx, _) = broadcast::channel(128);
@@ -3390,6 +3406,9 @@ fn spawn_voice_relay_forwarder(mut rx: broadcast::Receiver<VoiceBroadcast>, out_
 /// | `vjoin`       | Join a voice room                                   |
 /// | `vleave`      | Leave the current voice room                        |
 /// | `vdata`       | Forward audio data to all members of a voice room   |
+/// | `ss_start`    | Join/create a screen-share relay room               |
+/// | `ss_meta`     | Relay screen stream metadata to room participants   |
+/// | `ss_frame`    | Relay encoded screen frame payload to participants  |
 /// | `ping`        | Heartbeat ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â server replies with `pong`              |
 /// | `edit`        | Edit a previously sent message (in-memory only)     |
 /// | `file_meta`   | Announce a file transfer to a channel               |
@@ -3506,6 +3525,7 @@ async fn handle_event(
     username: &str,
     out_tx: &OutboundTx,
     voice_room: &mut Option<String>,
+    screen_room: &mut Option<String>,
     joined_channels: &Arc<DashSet<String>>,
 ) {
     let t = d["t"].as_str().unwrap_or("");
@@ -4458,15 +4478,182 @@ async fn handle_event(
             // The sender's username is injected so receivers know who is
             // speaking without a separate signalling round-trip.
             let a = d["a"].as_str().unwrap_or("").to_string();
+            let seq = d.get("seq").and_then(|v| v.as_u64());
+            let capture_ts_ms = d.get("capture_ts_ms").and_then(|v| v.as_u64());
             if a.is_empty() {
                 return;
             }
             if let Some(ref room) = voice_room {
                 if let Some(vtx) = state.voice.get(room) {
-                    let _ = vtx
-                        .send(serde_json::json!({"t":"vdata","from":username,"a":a}).to_string());
+                    let mut payload = serde_json::json!({
+                        "t": "vdata",
+                        "from": username,
+                        "a": a,
+                    });
+
+                    if let Some(seq) = seq {
+                        payload["seq"] = serde_json::json!(seq);
+                    }
+                    if let Some(capture_ts_ms) = capture_ts_ms {
+                        payload["capture_ts_ms"] = serde_json::json!(capture_ts_ms);
+                    }
+
+                    let _ = vtx.send(payload.to_string());
                 }
             }
+        }
+        "ss_start" => {
+            let room = d
+                .get("r")
+                .or_else(|| d.get("ch"))
+                .and_then(|v| v.as_str())
+                .map(safe_ch)
+                .unwrap_or_else(|| "general".to_string());
+
+            if screen_room.as_ref() != Some(&room) {
+                let stx = state.screen_tx(&room);
+                spawn_broadcast_forwarder(stx.subscribe(), out_tx.clone());
+                *screen_room = Some(room.clone());
+            }
+
+            if let Some(stx) = state.screen.get(&room) {
+                let _ = stx.send(
+                    serde_json::json!({
+                        "t": "ss_state",
+                        "room": room,
+                        "from": username,
+                        "enabled": true,
+                        "status": "active",
+                        "ts": now(),
+                    })
+                    .to_string(),
+                );
+            }
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t": "ss_state",
+                    "room": room,
+                    "enabled": true,
+                    "status": "active",
+                    "ts": now(),
+                }),
+            );
+        }
+        "ss_meta" => {
+            let room = match screen_room.as_ref() {
+                Some(r) => r.clone(),
+                None => {
+                    send_err(out_tx, "not in a screen-share room", &state.metrics);
+                    return;
+                }
+            };
+
+            if let Some(stx) = state.screen.get(&room) {
+                let mut payload = serde_json::json!({
+                    "t": "ss_meta",
+                    "room": room,
+                    "from": username,
+                    "ts": now(),
+                });
+
+                for key in [
+                    "stream_id",
+                    "codec",
+                    "mime",
+                    "width",
+                    "height",
+                    "fps",
+                    "quality",
+                    "frame_seq",
+                    "keyframe_interval",
+                ] {
+                    if let Some(value) = d.get(key) {
+                        payload[key] = value.clone();
+                    }
+                }
+
+                if let Some(meta) = d.get("meta") {
+                    payload["meta"] = meta.clone();
+                }
+
+                let _ = stx.send(payload.to_string());
+            }
+        }
+        "ss_frame" => {
+            let room = match screen_room.as_ref() {
+                Some(r) => r.clone(),
+                None => {
+                    send_err(out_tx, "not in a screen-share room", &state.metrics);
+                    return;
+                }
+            };
+
+            let frame_payload = d
+                .get("a")
+                .or_else(|| d.get("data"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if frame_payload.is_empty() {
+                return;
+            }
+
+            if let Some(stx) = state.screen.get(&room) {
+                let mut payload = serde_json::json!({
+                    "t": "ss_frame",
+                    "room": room,
+                    "from": username,
+                    "a": frame_payload,
+                    "ts": now(),
+                });
+
+                for key in ["seq", "capture_ts_ms", "stream_id", "keyframe", "mime"] {
+                    if let Some(value) = d.get(key) {
+                        payload[key] = value.clone();
+                    }
+                }
+
+                let _ = stx.send(payload.to_string());
+            }
+        }
+        "ss_stop" => {
+            let requested_room = d
+                .get("r")
+                .or_else(|| d.get("ch"))
+                .and_then(|v| v.as_str())
+                .map(safe_ch);
+
+            let room = screen_room
+                .take()
+                .or(requested_room)
+                .unwrap_or_else(|| "general".to_string());
+
+            if let Some(stx) = state.screen.get(&room) {
+                let _ = stx.send(
+                    serde_json::json!({
+                        "t": "ss_state",
+                        "room": room,
+                        "from": username,
+                        "enabled": false,
+                        "status": "inactive",
+                        "ts": now(),
+                    })
+                    .to_string(),
+                );
+            }
+
+            send_out_json(
+                out_tx,
+                serde_json::json!({
+                    "t": "ss_state",
+                    "room": room,
+                    "enabled": false,
+                    "status": "inactive",
+                    "ts": now(),
+                }),
+            );
         }
         "ping" => {
             // Heartbeat ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â keep-alive for clients behind proxies with idle
@@ -5712,6 +5899,26 @@ fn create_ok_response(
         "proto": {
             "v": PROTOCOL_VERSION,
             "max_payload_bytes": MAX_BYTES
+        },
+        "media": {
+            "capabilities_version": MEDIA_CAPABILITIES_VERSION,
+            "voice": {
+                "enabled": true,
+                "codecs": ["pcm-rle-v1"],
+                "features": {
+                    "seq": true,
+                    "capture_ts_ms": true
+                }
+            },
+            "screen_share": {
+                "enabled": true,
+                "status": "relay",
+                "codecs": ["raw-b64-v1"],
+                "features": {
+                    "frame_seq": true,
+                    "keyframe": true
+                }
+            }
         }
     });
 
@@ -5984,6 +6191,8 @@ fn requires_fresh_protection(event_type: &str) -> bool {
             | "img"
             | "dm"
             | "vdata"
+            | "ss_meta"
+            | "ss_frame"
             | "edit"
             | "file_meta"
             | "file_chunk"
@@ -6522,6 +6731,8 @@ where
 
     // Tracks the current voice room so vleave / vdata know which room to act on.
     let mut voice_room: Option<String> = None;
+    // Tracks the current screen-share room for ss_meta / ss_frame relay.
+    let mut screen_room: Option<String> = None;
 
     loop {
         let msg = tokio::select! {
@@ -6593,12 +6804,30 @@ where
             &username,
             &out_tx,
             &mut voice_room,
+            &mut screen_room,
             &joined_channels,
         )
         .await;
     }
 
     // ---- Phase 5: cleanup ---------------------------------------------------
+    if let Some(room) = screen_room.take() {
+        if let Some(stx) = state.screen.get(&room) {
+            let _ = stx.send(
+                serde_json::json!({
+                    "t": "ss_state",
+                    "room": room,
+                    "from": username,
+                    "enabled": false,
+                    "status": "inactive",
+                    "reason": "disconnect",
+                    "ts": now(),
+                })
+                .to_string(),
+            );
+        }
+    }
+
     // Remove user presence so they no longer appear in the user directory.
     state.user_statuses.remove(&username);
     state.user_pubkeys.remove(&username);
