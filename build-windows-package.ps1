@@ -11,6 +11,21 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
 
+$ReleaseTargetsLibrary = Join-Path $RepoRoot "scripts/release-targets.ps1"
+if (-not (Test-Path -Path $ReleaseTargetsLibrary)) {
+  throw "Missing release target library script: $ReleaseTargetsLibrary"
+}
+
+. $ReleaseTargetsLibrary
+
+function Assert-CommandAvailable {
+  param([Parameter(Mandatory = $true)][string]$CommandName)
+
+  if (-not (Get-Command $CommandName -ErrorAction SilentlyContinue)) {
+    throw "Required command '$CommandName' was not found in PATH."
+  }
+}
+
 function Get-CargoVersion {
   param([string]$CargoTomlPath)
 
@@ -52,12 +67,43 @@ function Resolve-IsccPath {
   return $null
 }
 
+function Get-ReleaseBinaryPath {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Binary
+  )
+
+  $binaryPath = Join-Path $RepoRoot ("target/release/{0}.exe" -f $Binary)
+  if (-not (Test-Path -Path $binaryPath)) {
+    throw ("Expected release binary was not found: {0}" -f $binaryPath)
+  }
+
+  return $binaryPath
+}
+
+function Invoke-CargoReleaseBuild {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Package,
+    [Parameter(Mandatory = $true)]
+    [string]$Binary
+  )
+
+  Write-Host ("Building {0} ({1})..." -f $Binary, $Package)
+  & cargo build --release --locked -p $Package --bin $Binary
+  if ($LASTEXITCODE -ne 0) {
+    throw ("Build failed for binary '{0}' in package '{1}'." -f $Binary, $Package)
+  }
+}
+
+Assert-CommandAvailable -CommandName "cargo"
+$ReleaseTargets = Assert-ChatifyReleaseTargets
+
 $Version = Get-CargoVersion -CargoTomlPath (Join-Path $RepoRoot "Cargo.toml")
 
 Write-Host "Building release binaries..."
-cargo build --release --locked --bin chatify-server --bin chatify-client
-if ($LASTEXITCODE -ne 0) {
-  throw "Build failed."
+foreach ($target in $ReleaseTargets) {
+  Invoke-CargoReleaseBuild -Package $target.Package -Binary $target.Binary
 }
 
 $PackageRoot = Join-Path $RepoRoot $OutputDir
@@ -80,8 +126,11 @@ if (Test-Path "$InstallerPath.sha256") {
 
 New-Item -ItemType Directory -Path $PackageDir -Force | Out-Null
 
-Copy-Item (Join-Path $RepoRoot "target/release/chatify-server.exe") (Join-Path $PackageDir "chatify-server.exe")
-Copy-Item (Join-Path $RepoRoot "target/release/chatify-client.exe") (Join-Path $PackageDir "chatify-client.exe")
+$serverBinaryPath = Get-ReleaseBinaryPath -Binary "chatify-server"
+$clientBinaryPath = Get-ReleaseBinaryPath -Binary "chatify-client"
+
+Copy-Item $serverBinaryPath (Join-Path $PackageDir "chatify-server.exe")
+Copy-Item $clientBinaryPath (Join-Path $PackageDir "chatify-client.exe")
 Copy-Item (Join-Path $RepoRoot "LICENSE") (Join-Path $PackageDir "LICENSE")
 
 $ServerBat = @"

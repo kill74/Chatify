@@ -35,6 +35,10 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Validate workspace release targets
+        shell: pwsh
+        run: .\scripts\assert-release-targets.ps1
+
       - name: Validate manual tag input
         if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: pwsh
@@ -53,6 +57,35 @@ jobs:
       - name: Build Windows package
         shell: pwsh
         run: .\build-windows-package.ps1
+
+      - name: Smoke test packaged binaries
+        shell: pwsh
+        run: |
+          $packageDir = "dist/chatify-windows-x64"
+          $serverExe = Join-Path $packageDir "chatify-server.exe"
+          $clientExe = Join-Path $packageDir "chatify-client.exe"
+
+          foreach ($exe in @($serverExe, $clientExe)) {
+            if (-not (Test-Path -Path $exe)) {
+              throw "Missing packaged executable: $exe"
+            }
+          }
+
+          $serverHelp = (& $serverExe --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "chatify-server --help failed with exit code $LASTEXITCODE"
+          }
+          if ([string]::IsNullOrWhiteSpace($serverHelp)) {
+            throw "chatify-server --help returned empty output"
+          }
+
+          $clientHelp = (& $clientExe --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "chatify-client --help failed with exit code $LASTEXITCODE"
+          }
+          if ([string]::IsNullOrWhiteSpace($clientHelp)) {
+            throw "chatify-client --help returned empty output"
+          }
 
       - name: Validate release artifacts
         shell: pwsh

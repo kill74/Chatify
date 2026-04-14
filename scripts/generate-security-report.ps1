@@ -49,6 +49,21 @@ function Parse-TestSummary {
   }
 }
 
+function ConvertFrom-JsonCompat {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$JsonText,
+    [ValidateRange(2, 1000)]
+    [int]$Depth = 100
+  )
+
+  if ($PSVersionTable.PSVersion.Major -ge 6) {
+    return ($JsonText | ConvertFrom-Json -Depth $Depth)
+  }
+
+  return ($JsonText | ConvertFrom-Json)
+}
+
 function Parse-CargoAuditData {
   param([string[]]$OutputLines)
 
@@ -65,7 +80,7 @@ function Parse-CargoAuditData {
 
   $jsonText = $joined.Substring($start, $end - $start + 1)
   try {
-    $audit = $jsonText | ConvertFrom-Json -Depth 100
+    $audit = ConvertFrom-JsonCompat -JsonText $jsonText -Depth 100
   }
   catch {
     return $null
@@ -107,6 +122,8 @@ function Invoke-ReportCheck {
     [string]$Command,
     [string[]]$Args = @(),
     [bool]$Required = $true,
+    [ValidateRange(1, 7200)]
+    [int]$TimeoutSeconds = 1800,
     [switch]$AuditMode
   )
 
@@ -121,8 +138,11 @@ function Invoke-ReportCheck {
   $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
   $outputLines = @()
   $exitCode = 1
-  $tmpOut = Join-Path $ReportDir ("{0}.stdout.tmp" -f $safeName)
-  $tmpErr = Join-Path $ReportDir ("{0}.stderr.tmp" -f $safeName)
+  $timedOut = $false
+  $job = $null
+  $tmpToken = [guid]::NewGuid().ToString("N")
+  $tmpOut = Join-Path $ReportDir (".tmp-{0}-{1}.stdout" -f $safeName, $tmpToken)
+  $tmpErr = Join-Path $ReportDir (".tmp-{0}-{1}.stderr" -f $safeName, $tmpToken)
   try {
     if (Test-Path $tmpOut) {
       Remove-Item -Force $tmpOut
@@ -131,19 +151,62 @@ function Invoke-ReportCheck {
       Remove-Item -Force $tmpErr
     }
 
-    $proc = Start-Process -FilePath $Command -ArgumentList $Args -NoNewWindow -Wait -PassThru `
-      -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
-    $exitCode = $proc.ExitCode
+    $job = Start-Job -ScriptBlock {
+      param(
+        [string]$CommandName,
+        [string[]]$CommandArgs,
+        [string]$StdOutPath,
+        [string]$StdErrPath,
+        [string]$WorkingDirectory
+      )
+
+      Set-Location $WorkingDirectory
+      try {
+        & $CommandName @CommandArgs 1> $StdOutPath 2> $StdErrPath
+        if ($null -eq $LASTEXITCODE) {
+          return 0
+        }
+        return [int]$LASTEXITCODE
+      }
+      catch {
+        $_.Exception.Message | Out-File -FilePath $StdErrPath -Append -Encoding UTF8
+        return 1
+      }
+    } -ArgumentList $Command, $Args, $tmpOut, $tmpErr, $RepoRoot
+
+    $jobResult = Wait-Job -Job $job -Timeout $TimeoutSeconds
+    if ($null -eq $jobResult) {
+      $timedOut = $true
+      Stop-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+      $exitCode = 124
+    }
+    else {
+      $jobOutput = @()
+      $jobOutput = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
+      if ($jobOutput.Count -gt 0 -and $null -ne $jobOutput[-1]) {
+        $exitCode = [int]$jobOutput[-1]
+      }
+      else {
+        $exitCode = 1
+      }
+    }
 
     $stdout = if (Test-Path $tmpOut) { Get-Content -Path $tmpOut } else { @() }
     $stderr = if (Test-Path $tmpErr) { Get-Content -Path $tmpErr } else { @() }
     $outputLines = @($stdout + $stderr)
+
+    if ($timedOut) {
+      $outputLines += ("check timed out after {0} seconds" -f $TimeoutSeconds)
+    }
   }
   catch {
     $outputLines = @($_.Exception.Message)
     $exitCode = 1
   }
   finally {
+    if ($null -ne $job) {
+      Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+    }
     if (Test-Path $tmpOut) {
       Remove-Item -Force $tmpOut
     }
@@ -166,6 +229,11 @@ function Invoke-ReportCheck {
   }
 
   $status = if ($exitCode -eq 0) { "pass" } else { "fail" }
+
+  if ($timedOut) {
+    $notes.Add(("timed out after {0} seconds" -f $TimeoutSeconds))
+    $status = "fail"
+  }
 
   if ($AuditMode) {
     $auditData = Parse-CargoAuditData -OutputLines $outputLines
@@ -222,12 +290,12 @@ if ($env:GITHUB_SERVER_URL -and $env:GITHUB_REPOSITORY -and $env:GITHUB_RUN_ID) 
 }
 
 $checks = @()
-$checks += Invoke-ReportCheck -Name "security_contract_suite" -Command "cargo" -Args @("test", "--test", "message_contracts", "--locked") -Required $true
-$checks += Invoke-ReportCheck -Name "bridge_reconnect_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "bridge_supervisor_reconnects_after_disconnect") -Required $true
-$checks += Invoke-ReportCheck -Name "bridge_channel_map_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "parse_channel_map_filters_and_normalizes_entries") -Required $true
-$checks += Invoke-ReportCheck -Name "bridge_self_source_match_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "self_source_filter_matches_only_non_empty_identical_source") -Required $true
-$checks += Invoke-ReportCheck -Name "bridge_self_source_type_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "self_source_filter_ignores_non_string_src_values") -Required $true
-$checks += Invoke-ReportCheck -Name "dependency_audit" -Command "cargo" -Args @("audit", "--json") -Required $false -AuditMode
+$checks += Invoke-ReportCheck -Name "security_contract_suite" -Command "cargo" -Args @("test", "--test", "message_contracts", "--locked") -Required $true -TimeoutSeconds 2400
+$checks += Invoke-ReportCheck -Name "bridge_reconnect_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "bridge_supervisor_reconnects_after_disconnect") -Required $true -TimeoutSeconds 1800
+$checks += Invoke-ReportCheck -Name "bridge_channel_map_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "parse_channel_map_filters_and_normalizes_entries") -Required $true -TimeoutSeconds 900
+$checks += Invoke-ReportCheck -Name "bridge_self_source_match_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "self_source_filter_matches_only_non_empty_identical_source") -Required $true -TimeoutSeconds 900
+$checks += Invoke-ReportCheck -Name "bridge_self_source_type_regression" -Command "cargo" -Args @("test", "--features", "discord-bridge", "--bin", "discord_bot", "--locked", "self_source_filter_ignores_non_string_src_values") -Required $true -TimeoutSeconds 900
+$checks += Invoke-ReportCheck -Name "dependency_audit" -Command "cargo" -Args @("audit", "--json") -Required $false -TimeoutSeconds 600 -AuditMode
 
 $requiredChecks = @($checks | Where-Object { $_.required -eq $true })
 $requiredFailed = @($requiredChecks | Where-Object { $_.status -ne "pass" })

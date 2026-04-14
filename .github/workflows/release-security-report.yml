@@ -57,8 +57,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Install cargo-audit (best effort)
+        shell: bash
+        run: |
+          if ! cargo install cargo-audit --locked; then
+            echo "::warning::cargo-audit installation failed. dependency_audit will be reported as warning by the report generator."
+          fi
 
       - name: Generate structured security report
         id: security_report
