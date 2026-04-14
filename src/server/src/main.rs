@@ -75,7 +75,7 @@ use crate::args::{Args, DbDurabilityMode};
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -442,9 +442,45 @@ impl Mute {
 // EventStore Ã¢â‚¬â€ SQLite persistence layer with connection pooling
 // ---------------------------------------------------------------------------
 
-const DB_POOL_SIZE: u32 = 8;
+const DB_POOL_SIZE_DEFAULT: u32 = 8;
+const DB_POOL_SIZE_MIN: u32 = 1;
+const DB_POOL_SIZE_MAX: u32 = 128;
 const DB_POOL_MIN_IDLE: u32 = 2;
 const DB_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
+const DB_BUSY_TIMEOUT_SECS: u64 = 5;
+const OUTBOUND_QUEUE_CAPACITY_DEFAULT: usize = 1024;
+const OUTBOUND_QUEUE_CAPACITY_MIN: usize = 64;
+const OUTBOUND_QUEUE_CAPACITY_MAX: usize = 16_384;
+const SLOW_CLIENT_DROP_BURST_DEFAULT: usize = 64;
+const SLOW_CLIENT_DROP_BURST_MIN: usize = 1;
+const SLOW_CLIENT_DROP_BURST_MAX: usize = 4096;
+
+fn normalize_db_pool_size(requested: u32) -> u32 {
+    let requested = if requested == 0 {
+        DB_POOL_SIZE_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(DB_POOL_SIZE_MIN, DB_POOL_SIZE_MAX)
+}
+
+fn normalize_outbound_queue_capacity(requested: usize) -> usize {
+    let requested = if requested == 0 {
+        OUTBOUND_QUEUE_CAPACITY_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(OUTBOUND_QUEUE_CAPACITY_MIN, OUTBOUND_QUEUE_CAPACITY_MAX)
+}
+
+fn normalize_slow_client_drop_burst(requested: usize) -> usize {
+    let requested = if requested == 0 {
+        SLOW_CLIENT_DROP_BURST_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(SLOW_CLIENT_DROP_BURST_MIN, SLOW_CLIENT_DROP_BURST_MAX)
+}
 
 #[derive(Clone)]
 struct PooledConnection {
@@ -475,6 +511,7 @@ impl r2d2::ManageConnection for PooledConnection {
 
     fn connect(&self) -> Result<Self::Connection, Self::Error> {
         let conn = Connection::open(&self.path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(DB_BUSY_TIMEOUT_SECS))?;
         if self.path != ":memory:" {
             conn.execute_batch(self.durability_mode.db_pragmas())?;
         } else {
@@ -500,6 +537,7 @@ struct DbPool {
     #[allow(dead_code)]
     encryption_key: Option<Vec<u8>>,
     durability_mode: DbDurabilityMode,
+    max_size: u32,
     pool: r2d2::Pool<PooledConnection>,
 }
 
@@ -508,11 +546,14 @@ impl DbPool {
         path: String,
         encryption_key: Option<Vec<u8>>,
         durability_mode: DbDurabilityMode,
+        pool_size: u32,
     ) -> Result<Self, r2d2::Error> {
         let manager = PooledConnection::new(path.clone(), encryption_key.clone(), durability_mode);
+        let pool_size = normalize_db_pool_size(pool_size);
+        let min_idle = pool_size.min(DB_POOL_MIN_IDLE);
         let pool = r2d2::Pool::builder()
-            .max_size(DB_POOL_SIZE)
-            .min_idle(Some(DB_POOL_MIN_IDLE))
+            .max_size(pool_size)
+            .min_idle(Some(min_idle))
             .idle_timeout(Some(std::time::Duration::from_secs(
                 DB_POOL_IDLE_TIMEOUT_SECS,
             )))
@@ -524,6 +565,7 @@ impl DbPool {
             path,
             encryption_key,
             durability_mode,
+            max_size: pool_size,
         })
     }
 }
@@ -544,10 +586,16 @@ impl EventStore {
         path: String,
         encryption_key: Option<Vec<u8>>,
         durability_mode: DbDurabilityMode,
+        db_pool_size: u32,
         prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
     ) -> Self {
-        let pool = DbPool::new(path.clone(), encryption_key.clone(), durability_mode)
-            .expect("failed to create database pool");
+        let pool = DbPool::new(
+            path.clone(),
+            encryption_key.clone(),
+            durability_mode,
+            db_pool_size,
+        )
+        .expect("failed to create database pool");
         #[cfg(feature = "batch-writes")]
         let write_queue = {
             let queue = StdArc::new(WriteQueue::new(pool.clone()));
@@ -646,6 +694,10 @@ impl EventStore {
             acquisition_count: 0,
             release_count: 0,
         }
+    }
+
+    fn configured_pool_size(&self) -> u32 {
+        self.pool.max_size
     }
 
     fn schema_version(conn: &Connection) -> rusqlite::Result<i64> {
@@ -2457,6 +2509,13 @@ struct State {
     /// Whether self-registration is enabled via CLI flag.
     self_registration_enabled: bool,
 
+    /// Per-connection outbound queue capacity.
+    outbound_queue_capacity: usize,
+
+    /// Number of consecutive dropped non-blocking outbound messages that
+    /// triggers a slow-client disconnect.
+    slow_client_drop_burst: usize,
+
     /// Plugin runtime manager (API v1).
     plugin_runtime: PluginRuntime,
 }
@@ -2468,13 +2527,24 @@ impl State {
         db_path: String,
         db_key: Option<Vec<u8>>,
         db_durability: DbDurabilityMode,
+        db_pool_size: u32,
         prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
         plugin_runtime: PluginRuntime,
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
         self_registration_enabled: bool,
+        outbound_queue_capacity: usize,
+        slow_client_drop_burst: usize,
     ) -> Arc<Self> {
-        let store = EventStore::new(db_path, db_key, db_durability, prometheus.clone());
+        let outbound_queue_capacity = normalize_outbound_queue_capacity(outbound_queue_capacity);
+        let slow_client_drop_burst = normalize_slow_client_drop_burst(slow_client_drop_burst);
+        let store = EventStore::new(
+            db_path,
+            db_key,
+            db_durability,
+            db_pool_size,
+            prometheus.clone(),
+        );
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
@@ -2499,6 +2569,8 @@ impl State {
             max_msgs_per_minute,
             user_rate_limit_enabled,
             self_registration_enabled,
+            outbound_queue_capacity,
+            slow_client_drop_burst,
             plugin_runtime,
         });
         s.channels.insert("general".into(), Channel::new());
@@ -3025,34 +3097,102 @@ fn build_reaction_snapshot(events: &[Value]) -> Vec<Value> {
 /// The error from `send` is intentionally ignored: if the receiver has been
 /// dropped (e.g. because the WebSocket sink task exited), the connection is
 /// already being torn down and there is nowhere meaningful to report the error.
-fn send_out_json(out_tx: &mpsc::UnboundedSender<String>, payload: Value) {
-    let _ = out_tx.send(payload.to_string());
+#[derive(Clone)]
+struct OutboundTx {
+    tx: mpsc::Sender<String>,
+    slow_client_tx: mpsc::Sender<()>,
+    prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+    dropped_streak: Arc<AtomicUsize>,
+    disconnect_notified: Arc<AtomicBool>,
+    drop_burst_limit: usize,
+}
+
+impl OutboundTx {
+    fn new(
+        tx: mpsc::Sender<String>,
+        slow_client_tx: mpsc::Sender<()>,
+        drop_burst_limit: usize,
+        prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+    ) -> Self {
+        Self {
+            tx,
+            slow_client_tx,
+            prometheus,
+            dropped_streak: Arc::new(AtomicUsize::new(0)),
+            disconnect_notified: Arc::new(AtomicBool::new(false)),
+            drop_burst_limit: normalize_slow_client_drop_burst(drop_burst_limit),
+        }
+    }
+
+    fn record_outbound_drop_metric(&self) {
+        if let Some(prometheus) = &self.prometheus {
+            if let Ok(metrics) = prometheus.try_lock() {
+                metrics.record_outbound_queue_drop();
+            }
+        }
+    }
+
+    fn record_slow_client_disconnect_metric(&self) {
+        if let Some(prometheus) = &self.prometheus {
+            if let Ok(metrics) = prometheus.try_lock() {
+                metrics.record_slow_client_disconnect();
+            }
+        }
+    }
+
+    fn try_send(&self, payload: String) {
+        match self.tx.try_send(payload) {
+            Ok(()) => {
+                self.dropped_streak.store(0, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.record_outbound_drop_metric();
+                let streak = self.dropped_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                debug!(
+                    "outbound queue full; dropping message streak={} limit={}",
+                    streak, self.drop_burst_limit
+                );
+
+                if streak >= self.drop_burst_limit
+                    && !self.disconnect_notified.swap(true, Ordering::Relaxed)
+                {
+                    self.record_slow_client_disconnect_metric();
+                    let _ = self.slow_client_tx.try_send(());
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    async fn send(&self, payload: String) -> Result<(), mpsc::error::SendError<String>> {
+        let result = self.tx.send(payload).await;
+        if result.is_ok() {
+            self.dropped_streak.store(0, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+fn send_out_json(out_tx: &OutboundTx, payload: Value) {
+    out_tx.try_send(payload.to_string());
 }
 
 #[allow(dead_code)]
-fn send_out_json_with_metrics(
-    out_tx: &mpsc::UnboundedSender<String>,
-    payload: Value,
-    metrics: &PerfMetrics,
-) {
+fn send_out_json_with_metrics(out_tx: &OutboundTx, payload: Value, metrics: &PerfMetrics) {
     let serialized = payload.to_string();
     let bytes = serialized.len();
     metrics.inc_sent(1);
     metrics.inc_bytes_sent(bytes);
-    let _ = out_tx.send(serialized);
+    out_tx.try_send(serialized);
 }
 
-fn send_err(
-    out_tx: &mpsc::UnboundedSender<String>,
-    msg: impl std::fmt::Display,
-    metrics: &PerfMetrics,
-) {
+fn send_err(out_tx: &OutboundTx, msg: impl std::fmt::Display, metrics: &PerfMetrics) {
     let payload = serde_json::json!({"t":"err","m":msg.to_string()});
     let serialized = payload.to_string();
     let bytes = serialized.len();
     metrics.inc_sent(1);
     metrics.inc_bytes_sent(bytes);
-    let _ = out_tx.send(serialized);
+    out_tx.try_send(serialized);
 }
 
 fn parse_slash_invocation(input: &str) -> Option<(String, Vec<String>)> {
@@ -3073,7 +3213,7 @@ fn parse_slash_invocation(input: &str) -> Option<(String, Vec<String>)> {
 
 fn emit_plugin_messages(
     state: &Arc<State>,
-    out_tx: &mpsc::UnboundedSender<String>,
+    out_tx: &OutboundTx,
     channel: &str,
     messages: &[PluginMessage],
 ) {
@@ -3090,7 +3230,7 @@ fn emit_plugin_messages(
                 let _ = state.chan(channel).tx.send(payload);
             }
             PluginMessageTarget::Sender => {
-                let _ = out_tx.send(payload);
+                out_tx.try_send(payload);
             }
         }
     }
@@ -3148,15 +3288,12 @@ async fn run_plugin_message_hooks(
 /// Lagged messages (`RecvError::Lagged`) are silently skipped ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the client
 /// will see a gap in the message stream, which is preferable to crashing the
 /// connection.
-fn spawn_broadcast_forwarder(
-    mut rx: broadcast::Receiver<String>,
-    out_tx: mpsc::UnboundedSender<String>,
-) {
+fn spawn_broadcast_forwarder(mut rx: broadcast::Receiver<String>, out_tx: OutboundTx) {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(m) => {
-                    if out_tx.send(m).is_err() {
+                    if out_tx.send(m).await.is_err() {
                         break;
                     }
                 }
@@ -3169,7 +3306,7 @@ fn spawn_broadcast_forwarder(
 
 fn spawn_channel_forwarder(
     mut rx: broadcast::Receiver<String>,
-    out_tx: mpsc::UnboundedSender<String>,
+    out_tx: OutboundTx,
     joined_channels: Arc<DashSet<String>>,
     channel: String,
 ) {
@@ -3184,7 +3321,7 @@ fn spawn_channel_forwarder(
                     if !joined_channels.contains(&channel) {
                         break;
                     }
-                    if out_tx.send(message).is_err() {
+                    if out_tx.send(message).await.is_err() {
                         break;
                     }
                 }
@@ -3200,16 +3337,13 @@ fn spawn_channel_forwarder(
     });
 }
 
-fn spawn_voice_relay_forwarder(
-    mut rx: broadcast::Receiver<VoiceBroadcast>,
-    out_tx: mpsc::UnboundedSender<String>,
-) {
+fn spawn_voice_relay_forwarder(mut rx: broadcast::Receiver<VoiceBroadcast>, out_tx: OutboundTx) {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
                     let json = serde_json::to_string(&event).unwrap_or_default();
-                    if out_tx.send(json).is_err() {
+                    if out_tx.send(json).await.is_err() {
                         break;
                     }
                 }
@@ -3370,7 +3504,7 @@ async fn handle_event(
     d: &Value,
     state: &Arc<State>,
     username: &str,
-    out_tx: &mpsc::UnboundedSender<String>,
+    out_tx: &OutboundTx,
     voice_room: &mut Option<String>,
     joined_channels: &Arc<DashSet<String>>,
 ) {
@@ -3416,13 +3550,12 @@ async fn handle_event(
         }
     }
 
-    // --- Token validation for non-read-only operations ---
-    let read_only_ops = [
-        "ping", "users", "channels", "history", "search", "rewind", "plugin", "password",
-    ];
-    if !read_only_ops.contains(&t) {
-        let provided_token = d.get("token").and_then(|v| v.as_str());
-        if !state.validate_session_token(username, provided_token) {
+    // --- Optional session token validation (backward compatible) ---
+    // Protocol v1 clients do not send session tokens on most events.
+    // To preserve compatibility, only validate when a token is explicitly
+    // provided by the client.
+    if let Some(provided_token) = d.get("token").and_then(|v| v.as_str()) {
+        if !state.validate_session_token(username, Some(provided_token)) {
             send_err(
                 out_tx,
                 "invalid or expired session token. Please reconnect.",
@@ -4106,7 +4239,7 @@ async fn handle_event(
             let snapshot = state.metrics.snapshot();
             let cache_stats = state.message_cache.stats();
             let pool_stats = state.store.get_pool_stats();
-            let (db_top_ops, db_alerts) = state
+            let (db_top_ops, db_alerts, outbound_queue_drops, slow_client_disconnects) = state
                 .prometheus
                 .as_ref()
                 .and_then(|metrics| metrics.try_lock().ok())
@@ -4119,9 +4252,11 @@ async fn handle_event(
                             DB_CRITICAL_P95_MS,
                             DB_MIN_SAMPLES,
                         ),
+                        metrics.outbound_queue_drops_total.get(),
+                        metrics.slow_client_disconnects_total.get(),
                     )
                 })
-                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+                .unwrap_or_else(|| (Vec::new(), Vec::new(), 0, 0));
             send_out_json(
                 out_tx,
                 serde_json::json!({
@@ -4141,6 +4276,8 @@ async fn handle_event(
                     "db_pool_idle": pool_stats.idle_connections,
                     "db_pool_total": pool_stats.total_connections,
                     "db_pool_waiters": pool_stats.wait_count,
+                    "outbound_queue_drops": outbound_queue_drops,
+                    "slow_client_disconnects": slow_client_disconnects,
                     "db_top_ops": db_top_ops,
                     "db_alerts": db_alerts,
                     "db_latency_budget_ms": {
@@ -4159,7 +4296,7 @@ async fn handle_event(
             const DB_MIN_SAMPLES: u64 = 5;
 
             let pool_stats = state.store.get_pool_stats();
-            let (db_top_ops, db_alerts) = state
+            let (db_top_ops, db_alerts, outbound_queue_drops, slow_client_disconnects) = state
                 .prometheus
                 .as_ref()
                 .and_then(|metrics| metrics.try_lock().ok())
@@ -4172,9 +4309,11 @@ async fn handle_event(
                             DB_CRITICAL_P95_MS,
                             DB_MIN_SAMPLES,
                         ),
+                        metrics.outbound_queue_drops_total.get(),
+                        metrics.slow_client_disconnects_total.get(),
                     )
                 })
-                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+                .unwrap_or_else(|| (Vec::new(), Vec::new(), 0, 0));
 
             send_out_json(
                 out_tx,
@@ -4186,6 +4325,8 @@ async fn handle_event(
                     "db_pool_idle": pool_stats.idle_connections,
                     "db_pool_total": pool_stats.total_connections,
                     "db_pool_waiters": pool_stats.wait_count,
+                    "outbound_queue_drops": outbound_queue_drops,
+                    "slow_client_disconnects": slow_client_disconnects,
                     "db_latency_budget_ms": {
                         "warning_p95": DB_WARNING_P95_MS,
                         "critical_p95": DB_CRITICAL_P95_MS,
@@ -4330,7 +4471,7 @@ async fn handle_event(
         "ping" => {
             // Heartbeat ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â keep-alive for clients behind proxies with idle
             // connection timeouts.
-            let _ = out_tx.send(r#"{"t":"pong"}"#.into());
+            out_tx.try_send(r#"{"t":"pong"}"#.to_string());
         }
         "edit" => {
             // In-memory edit of the most recent matching message.
@@ -6017,7 +6158,7 @@ impl Callback for HandshakeValidator {
 ///
 /// The WebSocket stream is read sequentially in this task. Outbound messages
 /// from broadcast channels and other connection tasks are queued via an
-/// `mpsc::unbounded_channel` and drained by a dedicated sink-writer task.
+/// bounded `mpsc::channel` and drained by a dedicated sink-writer task.
 /// This decouples the read path from the write path, preventing a slow write
 /// from blocking event processing.
 async fn handle<S>(stream: S, addr: SocketAddr, state: Arc<State>)
@@ -6323,7 +6464,16 @@ where
     // ---- Phase 3: set up bidirectional message routing ----------------------
 
     // mpsc channel: all tasks that want to send to this client queue here.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Bounded to prevent unbounded memory growth on slow or stalled clients.
+    let (outbound_sender, mut out_rx) =
+        tokio::sync::mpsc::channel::<String>(state.outbound_queue_capacity);
+    let (slow_client_tx, mut slow_client_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let out_tx = OutboundTx::new(
+        outbound_sender,
+        slow_client_tx,
+        state.slow_client_drop_burst,
+        state.prometheus.clone(),
+    );
 
     // Forward "general" broadcast to the outbound queue.
     spawn_broadcast_forwarder(gen_rx, out_tx.clone());
@@ -6374,13 +6524,26 @@ where
     let mut voice_room: Option<String> = None;
 
     loop {
-        let msg = match stream.next().await {
+        let msg = tokio::select! {
+            signal = slow_client_rx.recv() => {
+                if signal.is_some() {
+                    warn!(
+                        "disconnecting slow client user={} queue_capacity={} drop_burst={}",
+                        username,
+                        state.outbound_queue_capacity,
+                        state.slow_client_drop_burst,
+                    );
+                }
+                break;
+            }
+            next = stream.next() => match next {
             Some(Ok(msg)) => msg,
             Some(Err(e)) => {
                 info!("ws recv error for {}: {}", username, e);
                 break;
             }
             None => break, // Client closed the connection cleanly.
+            }
         };
 
         let raw = match msg {
@@ -6511,11 +6674,14 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
         args.db.clone(),
         db_key,
         args.db_durability,
+        args.db_pool_size,
         None,
         plugin_runtime,
         60,
         false,
         false,
+        OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+        SLOW_CLIENT_DROP_BURST_DEFAULT,
     );
 
     if let Some(username) = &args.register_user {
@@ -6965,11 +7131,14 @@ async fn main() -> ChatifyResult<()> {
         args.db.clone(),
         db_key,
         args.db_durability,
+        args.db_pool_size,
         metrics.clone(),
         plugin_runtime,
         args.max_msgs_per_minute,
         args.enable_user_rate_limit,
         args.enable_self_registration,
+        args.outbound_queue_capacity,
+        args.slow_client_drop_burst,
     );
 
     for plugin_name in plugin_runtime::DEFAULT_BUILTIN_PLUGINS {
@@ -6991,6 +7160,19 @@ async fn main() -> ChatifyResult<()> {
     println!(" Encryption: {} |   IP Privacy: On", enc_label);
     println!(" Event store: {}", args.db);
     println!(" DB durability: {}", args.db_durability.label());
+    println!(
+        " DB pool size: requested={} effective={}",
+        args.db_pool_size,
+        state.store.configured_pool_size()
+    );
+    println!(
+        " Outbound queue: requested={} effective={}",
+        args.outbound_queue_capacity, state.outbound_queue_capacity
+    );
+    println!(
+        " Slow-client drop burst: requested={} effective={}",
+        args.slow_client_drop_burst, state.slow_client_drop_burst
+    );
     println!(
         " User rate limit: {} msgs/min",
         if args.enable_user_rate_limit {
@@ -7180,11 +7362,14 @@ mod tests {
             ":memory:".to_string(),
             None,
             DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
             None,
             plugin_runtime,
             60,
             false,
             false,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
         assert_eq!(state.active_connection_count(), 0);
 
@@ -7216,11 +7401,14 @@ mod tests {
             ":memory:".to_string(),
             None,
             DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
             None,
             plugin_runtime,
             60,
             false,
             false,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
 
         let status = serde_json::json!({"text": "Deep work", "emoji": ""});
@@ -7248,5 +7436,73 @@ mod tests {
         let mut channels_after_remove = state.store.list_channel_subscriptions("alice");
         channels_after_remove.sort();
         assert_eq!(channels_after_remove, vec!["general".to_string()]);
+    }
+
+    #[test]
+    fn normalization_clamps_outbound_settings() {
+        assert_eq!(
+            normalize_outbound_queue_capacity(0),
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT
+        );
+        assert_eq!(
+            normalize_outbound_queue_capacity(OUTBOUND_QUEUE_CAPACITY_MAX + 1),
+            OUTBOUND_QUEUE_CAPACITY_MAX
+        );
+        assert_eq!(
+            normalize_outbound_queue_capacity(OUTBOUND_QUEUE_CAPACITY_MIN - 1),
+            OUTBOUND_QUEUE_CAPACITY_MIN
+        );
+
+        assert_eq!(
+            normalize_slow_client_drop_burst(0),
+            SLOW_CLIENT_DROP_BURST_DEFAULT
+        );
+        assert_eq!(
+            normalize_slow_client_drop_burst(SLOW_CLIENT_DROP_BURST_MAX + 1),
+            SLOW_CLIENT_DROP_BURST_MAX
+        );
+        assert_eq!(
+            normalize_slow_client_drop_burst(SLOW_CLIENT_DROP_BURST_MIN),
+            SLOW_CLIENT_DROP_BURST_MIN
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_tx_signals_slow_client_after_drop_burst() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let (slow_client_tx, mut slow_client_rx) = mpsc::channel::<()>(1);
+        let outbound = OutboundTx::new(tx, slow_client_tx, 2, None);
+
+        outbound.try_send("first".to_string());
+        outbound.try_send("second".to_string());
+        outbound.try_send("third".to_string());
+
+        let signal = tokio::time::timeout(Duration::from_millis(100), slow_client_rx.recv())
+            .await
+            .expect("slow-client signal timeout");
+        assert!(signal.is_some(), "slow-client signal was not emitted");
+    }
+
+    #[tokio::test]
+    async fn outbound_tx_records_prometheus_metrics_on_backpressure() {
+        let metrics = Arc::new(std::sync::Mutex::new(
+            PrometheusMetrics::new().expect("metrics init"),
+        ));
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let (slow_client_tx, mut slow_client_rx) = mpsc::channel::<()>(1);
+        let outbound = OutboundTx::new(tx, slow_client_tx, 2, Some(metrics.clone()));
+
+        outbound.try_send("first".to_string());
+        outbound.try_send("second".to_string());
+        outbound.try_send("third".to_string());
+
+        let signal = tokio::time::timeout(Duration::from_millis(100), slow_client_rx.recv())
+            .await
+            .expect("slow-client signal timeout");
+        assert!(signal.is_some(), "slow-client signal was not emitted");
+
+        let guard = metrics.lock().expect("metrics lock");
+        assert_eq!(guard.outbound_queue_drops_total.get(), 2);
+        assert_eq!(guard.slow_client_disconnects_total.get(), 1);
     }
 }

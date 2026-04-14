@@ -3,7 +3,7 @@
 ## Required Checks (in order)
 
 ```bash
-cargo check --bins && cargo fmt --all --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --workspace --all-targets --locked
+cargo check --workspace --bins --locked && cargo fmt --all --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --workspace --all-targets --locked
 
 # Protocol contract tests (separate from workspace tests)
 cargo test --locked --test message_contracts auth_contract_returns_expected_fields
@@ -13,21 +13,21 @@ cargo test --locked --test message_contracts file_contract_relays_media_metadata
 
 # Feature-gated builds
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check --features bridge-client --bin clicord-client --locked
+cargo check --features bridge-client --locked
 ```
 
 **Always use `--locked`** — CI enforces this for reproducible builds.
 
 ## Project Structure
 
-| Path | Purpose |
-|------|---------|
-| `src/server/` | WebSocket server, event store, auth — workspace member |
-| `src/client/` | Terminal dashboard — workspace member |
-| `src/discord_bot.rs` | Discord bridge — separate binary, feature-gated |
-| `tests/message_contracts/` | Protocol contract tests — not in workspace test suite |
+| Path                       | Purpose                                                |
+| -------------------------- | ------------------------------------------------------ |
+| `src/server/`              | WebSocket server, event store, auth — workspace member |
+| `src/client/`              | Terminal dashboard — workspace member                  |
+| `src/discord_bot.rs`       | Discord bridge — separate binary, feature-gated        |
+| `tests/message_contracts/` | Protocol contract tests — not in workspace test suite  |
 
-**Binaries:** `clicord-server`, `clicorn-client`, `discord_bot` (feature-gated)
+**Binaries:** `chatify-server`, `chatify-client`, `discord_bot` (feature-gated)
 
 ## Critical Conventions
 
@@ -55,6 +55,6 @@ cargo check --features bridge-client --bin clicord-client --locked
 ## Reference
 
 - Full docs: [README.md](README.md)
-- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)  
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Security notes: [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md)

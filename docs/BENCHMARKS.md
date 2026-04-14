@@ -63,7 +63,7 @@ cargo build --release
 Run server:
 
 ```bash
-./target/release/clicord-server --host 127.0.0.1 --port 8765
+./target/release/chatify-server --host 127.0.0.1 --port 8765
 ```
 
 Run client workloads from separate terminals or benchmark harnesses.

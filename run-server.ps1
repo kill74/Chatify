@@ -39,7 +39,7 @@ if (-not (Test-Path -LiteralPath $runner)) {
 
 & $runner `
   -Mode server `
-  -Profile $Profile `
+  -BuildProfile $Profile `
   -ProgramArgs $ProgramArgs `
   -MaxAgeDays $MaxAgeDays `
   -MaxTargetSizeGB $MaxTargetSizeGB `

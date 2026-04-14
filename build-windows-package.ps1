@@ -55,7 +55,7 @@ function Resolve-IsccPath {
 $Version = Get-CargoVersion -CargoTomlPath (Join-Path $RepoRoot "Cargo.toml")
 
 Write-Host "Building release binaries..."
-cargo build --release --bin clicord-server --bin clicord-client
+cargo build --release --locked --bin chatify-server --bin chatify-client
 if ($LASTEXITCODE -ne 0) {
   throw "Build failed."
 }
@@ -80,8 +80,8 @@ if (Test-Path "$InstallerPath.sha256") {
 
 New-Item -ItemType Directory -Path $PackageDir -Force | Out-Null
 
-Copy-Item (Join-Path $RepoRoot "target/release/clicord-server.exe") (Join-Path $PackageDir "clicord-server.exe")
-Copy-Item (Join-Path $RepoRoot "target/release/clicord-client.exe") (Join-Path $PackageDir "clicord-client.exe")
+Copy-Item (Join-Path $RepoRoot "target/release/chatify-server.exe") (Join-Path $PackageDir "chatify-server.exe")
+Copy-Item (Join-Path $RepoRoot "target/release/chatify-client.exe") (Join-Path $PackageDir "chatify-client.exe")
 Copy-Item (Join-Path $RepoRoot "LICENSE") (Join-Path $PackageDir "LICENSE")
 
 $ServerBat = @"
@@ -97,7 +97,7 @@ if not "%~1"=="" set HOST=%~1
 if not "%~2"=="" set PORT=%~2
 
 echo Starting Chatify server on %HOST%:%PORT%
-clicord-server.exe --host %HOST% --port %PORT%
+chatify-server.exe --host %HOST% --port %PORT%
 "@
 
 $ClientBat = @"
@@ -113,7 +113,7 @@ if not "%~1"=="" set HOST=%~1
 if not "%~2"=="" set PORT=%~2
 
 echo Starting Chatify client to %HOST%:%PORT%
-clicord-client.exe --host %HOST% --port %PORT%
+chatify-client.exe --host %HOST% --port %PORT%
 "@
 
 $StartAllBat = @"
@@ -129,9 +129,9 @@ if not "%~1"=="" set HOST=%~1
 if not "%~2"=="" set PORT=%~2
 
 echo Launching Chatify server and client...
-start "Chatify Server" cmd /k "cd /d %~dp0 && clicord-server.exe --host 0.0.0.0 --port %PORT%"
+start "Chatify Server" cmd /k "cd /d %~dp0 && chatify-server.exe --host 0.0.0.0 --port %PORT%"
 timeout /t 1 /nobreak >nul
-start "Chatify Client" cmd /k "cd /d %~dp0 && clicord-client.exe --host %HOST% --port %PORT%"
+start "Chatify Client" cmd /k "cd /d %~dp0 && chatify-client.exe --host %HOST% --port %PORT%"
 "@
 
 $LauncherCmd = @"
@@ -168,11 +168,11 @@ set /p PORT=Server port [%DEFAULT_PORT%]:
 if "%PORT%"=="" set PORT=%DEFAULT_PORT%
 
 echo Starting server on 0.0.0.0:%PORT%
-start "Chatify Server" cmd /k "cd /d %~dp0 && clicord-server.exe --host 0.0.0.0 --port %PORT%"
+start "Chatify Server" cmd /k "cd /d %~dp0 && chatify-server.exe --host 0.0.0.0 --port %PORT%"
 timeout /t 1 /nobreak >nul
 
 echo Connecting local client to 127.0.0.1:%PORT%
-start "Chatify Client" cmd /k "cd /d %~dp0 && clicord-client.exe --host 127.0.0.1 --port %PORT%"
+start "Chatify Client" cmd /k "cd /d %~dp0 && chatify-client.exe --host 127.0.0.1 --port %PORT%"
 exit /b 0
 
 :join
@@ -184,7 +184,7 @@ set /p PORT=Server port [%DEFAULT_PORT%]:
 if "%PORT%"=="" set PORT=%DEFAULT_PORT%
 
 echo Connecting to %HOST%:%PORT%
-clicord-client.exe --host %HOST% --port %PORT%
+chatify-client.exe --host %HOST% --port %PORT%
 exit /b %ERRORLEVEL%
 "@
 
@@ -193,8 +193,8 @@ Chatify Windows Package
 =======================
 
 Files:
-- clicord-server.exe
-- clicord-client.exe
+- chatify-server.exe
+- chatify-client.exe
 - chatify-launcher.cmd
 - start-chatify.bat
 - start-server.bat

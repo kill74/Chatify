@@ -133,9 +133,17 @@ pub struct Args {
     #[arg(long)]
     pub enable_self_registration: bool,
 
-    /// Database connection pool size.
+    /// Database connection pool size (0 falls back to the server default).
     #[arg(long, default_value_t = 8)]
     pub db_pool_size: u32,
+
+    /// Per-connection outbound queue capacity (0 falls back to default).
+    #[arg(long, default_value_t = 1024)]
+    pub outbound_queue_capacity: usize,
+
+    /// Consecutive dropped outbound messages before disconnecting a slow client.
+    #[arg(long, default_value_t = 64)]
+    pub slow_client_drop_burst: usize,
 
     /// Register a new user (admin operation).
     #[arg(long, requires = "user_password")]

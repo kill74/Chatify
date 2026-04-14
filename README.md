@@ -49,7 +49,7 @@ Most self-hosted chat systems are web-first and treat the protocol as a second-c
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│                        clicord-server                        │
+│                        chatify-server                        │
 │                                                              │
 │  WebSocket listener → Auth / rate-limit → Message router     │
 │         ↓                                                    │
@@ -60,7 +60,7 @@ Most self-hosted chat systems are web-first and treat the protocol as a second-c
                          │ ws:// or wss://
           ┌──────────────┴──────────────┐
           │                             │
-   clicord-client                  discord_bot
+  chatify-client                  discord_bot
    (terminal dashboard)        (optional bridge)
                                         │
                                  Discord API (serenity)
@@ -68,8 +68,8 @@ Most self-hosted chat systems are web-first and treat the protocol as a second-c
 
 | Binary           | Purpose                                                  |
 | ---------------- | -------------------------------------------------------- |
-| `clicord-server` | WebSocket server, event persistence, auth, rate limiting |
-| `clicord-client` | Terminal dashboard: channels, DMs, media, search, trust  |
+| `chatify-server` | WebSocket server, event persistence, auth, rate limiting |
+| `chatify-client` | Terminal dashboard: channels, DMs, media, search, trust  |
 | `discord_bot`    | Discord ↔ Chatify relay bridge (feature-gated)           |
 
 **Terminal dashboard layout:**
@@ -109,10 +109,10 @@ Requires the Rust stable toolchain.
 cargo build --release
 
 # Server — binds all interfaces by default
-./target/release/clicord-server --host 0.0.0.0 --port 8765
+./target/release/chatify-server --host 0.0.0.0 --port 8765
 
 # Client — separate terminal
-./target/release/clicord-client --host 127.0.0.1 --port 8765
+./target/release/chatify-client --host 127.0.0.1 --port 8765
 ```
 
 > **Windows:** substitute `.\` for `./` and append `.exe` to binary names.
@@ -121,10 +121,10 @@ cargo build --release
 
 ```bash
 # Terminal 1
-cargo run --bin clicord-server
+cargo run --bin chatify-server
 
 # Terminal 2
-cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
+cargo run --bin chatify-client -- --host 127.0.0.1 --port 8765
 ```
 
 **Windows dev scripts with automatic artifact cleanup:**
@@ -145,7 +145,7 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 ## Configuration Reference
 
-### Server — `clicord-server`
+### Server — `chatify-server`
 
 | Flag              | Default      | Notes                                                                                      |
 | ----------------- | ------------ | ------------------------------------------------------------------------------------------ |
@@ -167,7 +167,7 @@ cargo run --bin clicord-client -- --host 127.0.0.1 --port 8765
 
 > Never commit `*.db.key`, `cert.pem`, or `key.pem`. Rotate immediately on exposure. Keep runtime secrets out of shell history and version control.
 
-### Client — `clicord-client`
+### Client — `chatify-client`
 
 | Flag     | Default     | Notes                   |
 | -------- | ----------- | ----------------------- |
@@ -438,7 +438,7 @@ The [windows-release-package](.github/workflows/windows-release-package.yml) wor
 **Required checks — all must pass before merge:**
 
 ```bash
-cargo check --bins
+cargo check --workspace --bins --locked
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --locked
@@ -457,7 +457,7 @@ cargo test --locked --test message_contracts file_contract_relays_media_metadata
 
 ```bash
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check --features bridge-client --bin clicord-client --locked
+cargo check --features bridge-client --locked
 ```
 
 All checks above are enforced in CI on every push to `main`. A failing check blocks merge.

@@ -10,7 +10,7 @@ exceeded, it runs profile-specific cargo clean as a hard reset.
 .PARAMETER Mode
 Selects which binary to run: client or server.
 
-.PARAMETER Profile
+.PARAMETER BuildProfile
 Selects cargo profile: dev or release.
 
 .PARAMETER ProgramArgs
@@ -40,7 +40,7 @@ param(
   [string]$Mode = "client",
 
   [ValidateSet("dev", "release")]
-  [string]$Profile = "dev",
+  [string]$BuildProfile = "dev",
 
   [string[]]$ProgramArgs = @(),
 
@@ -85,6 +85,7 @@ function Get-DirectorySizeBytes {
 }
 
 function Remove-OldChildren {
+  [CmdletBinding(SupportsShouldProcess = $true)]
   param(
     [Parameter(Mandatory = $true)][string]$Path,
     [Parameter(Mandatory = $true)][datetime]$Cutoff,
@@ -115,8 +116,7 @@ function Remove-OldChildren {
     return $stats
   }
 
-  $targetMessage = "$Label entries in $Path (count=$($stats.CandidateCount))"
-  if (-not $PSCmdlet.ShouldProcess($targetMessage, "Remove old entries")) {
+  if ($WhatIfPreference) {
     return $stats
   }
 
@@ -232,10 +232,10 @@ function Invoke-AutoCleanup {
 function Invoke-Main {
   Assert-CommandAvailable -CommandName "cargo"
 
-  $binary = if ($Mode -eq "server") { "clicord-server" } else { "clicord-client" }
+  $binary = if ($Mode -eq "server") { "chatify-server" } else { "chatify-client" }
 
   if (-not $SkipCleanup) {
-    Invoke-AutoCleanup -RetentionDays $MaxAgeDays -SizeBudgetGB $MaxTargetSizeGB -RequestedProfile $Profile
+    Invoke-AutoCleanup -RetentionDays $MaxAgeDays -SizeBudgetGB $MaxTargetSizeGB -RequestedProfile $BuildProfile
   }
   else {
     Write-Host "Cleanup skipped (-SkipCleanup)."
@@ -247,7 +247,7 @@ function Invoke-Main {
   }
 
   $cargoArgs = @("run")
-  if ($Profile -eq "release") {
+  if ($BuildProfile -eq "release") {
     $cargoArgs += "--release"
   }
 

@@ -32,7 +32,7 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
-UninstallDisplayIcon={app}\clicord-client.exe
+UninstallDisplayIcon={app}\chatify-client.exe
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -41,8 +41,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\clicord-server.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceDir}\clicord-client.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\chatify-server.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\chatify-client.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\chatify-launcher.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\start-server.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\start-client.bat"; DestDir: "{app}"; Flags: ignoreversion

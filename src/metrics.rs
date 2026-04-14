@@ -46,6 +46,8 @@ pub struct PrometheusMetrics {
 
     pub messages_sent_total: IntCounterVec,
     pub messages_failed_total: IntCounter,
+    pub outbound_queue_drops_total: IntCounter,
+    pub slow_client_disconnects_total: IntCounter,
 
     pub users_online: IntGauge,
 
@@ -154,6 +156,18 @@ impl PrometheusMetrics {
             "Total number of failed message sends",
         ))?;
         registry.register(Box::new(messages_failed_total.clone()))?;
+
+        let outbound_queue_drops_total = IntCounter::with_opts(Opts::new(
+            "chatify_outbound_queue_drops_total",
+            "Total number of dropped outbound messages due to full per-connection queues",
+        ))?;
+        registry.register(Box::new(outbound_queue_drops_total.clone()))?;
+
+        let slow_client_disconnects_total = IntCounter::with_opts(Opts::new(
+            "chatify_slow_client_disconnects_total",
+            "Total number of client disconnects triggered by outbound queue backpressure",
+        ))?;
+        registry.register(Box::new(slow_client_disconnects_total.clone()))?;
 
         let users_online = IntGauge::with_opts(Opts::new(
             "chatify_users_online",
@@ -274,6 +288,8 @@ impl PrometheusMetrics {
             errors,
             messages_sent_total,
             messages_failed_total,
+            outbound_queue_drops_total,
+            slow_client_disconnects_total,
             users_online,
             db_query_duration_seconds,
             db_query_errors_total,
@@ -351,6 +367,14 @@ impl PrometheusMetrics {
 
     pub fn record_message_failed(&self) {
         self.messages_failed_total.inc();
+    }
+
+    pub fn record_outbound_queue_drop(&self) {
+        self.outbound_queue_drops_total.inc();
+    }
+
+    pub fn record_slow_client_disconnect(&self) {
+        self.slow_client_disconnects_total.inc();
     }
 
     pub fn set_users_online(&self, count: usize) {
@@ -660,6 +684,8 @@ mod tests {
         metrics.record_connection_accepted();
         metrics.record_connection_closed();
         metrics.record_message_sent("general");
+        metrics.record_outbound_queue_drop();
+        metrics.record_slow_client_disconnect();
         metrics.set_users_online(10);
         metrics.record_cache_hit();
         metrics.record_cache_miss();
@@ -667,6 +693,8 @@ mod tests {
         assert_eq!(metrics.auth_attempts_total.get(), 1);
         assert_eq!(metrics.auth_success_total.get(), 1);
         assert_eq!(metrics.connections_accepted.get(), 1);
+        assert_eq!(metrics.outbound_queue_drops_total.get(), 1);
+        assert_eq!(metrics.slow_client_disconnects_total.get(), 1);
         assert_eq!(metrics.cache_hits_total.get(), 1);
     }
 
