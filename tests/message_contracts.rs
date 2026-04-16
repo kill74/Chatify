@@ -105,6 +105,7 @@ type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Protocol version this test suite expects to remain backward-compatible.
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
+const TEST_DB_KEY_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 static BUILD_SERVER_BINARY_ONCE: Once = Once::new();
 
 // ---------------------------------------------------------------------------
@@ -346,27 +347,37 @@ fn resolve_server_binary() -> PathBuf {
 ///
 /// Panics if the server does not become ready within the polling window, which
 /// prevents tests from hanging indefinitely in CI.
-async fn start_server_with_db(db_path: PathBuf) -> TestServer {
+async fn start_server_with_db_internal(
+    db_path: PathBuf,
+    enable_self_registration: bool,
+) -> TestServer {
     let port = allocate_port();
     let url = format!("ws://127.0.0.1:{}", port);
     // Resolve binary via env var, target/debug lookup, or one-time cargo build.
     let server_bin = resolve_server_binary();
 
-    let child = Command::new(server_bin)
+    let mut command = Command::new(server_bin);
+    command
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
         .arg("--db")
         .arg(db_path.to_string_lossy().to_string())
-        .arg("--enable-self-registration")
-        .arg("--log")
-        // Suppress server stdout/stderr to keep test output clean. To debug a
-        // flaky test, swap Stdio::null() for Stdio::inherit() temporarily.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn server");
+        .arg("--db-key")
+        .arg(TEST_DB_KEY_HEX);
+    if enable_self_registration {
+        command.arg("--enable-self-registration");
+    }
+    command.arg("--log");
+    if std::env::var_os("CHATIFY_TEST_VERBOSE").is_some() {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        // Suppress server stdout/stderr to keep test output clean.
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+
+    let child = command.spawn().expect("spawn server");
 
     // Poll with a 100 ms back-off; 50 attempts = 5 s total timeout.
     let mut ready = false;
@@ -386,6 +397,17 @@ async fn start_server_with_db(db_path: PathBuf) -> TestServer {
         db_path,
         cleanup_db: true,
     }
+}
+
+async fn start_server_with_db(db_path: PathBuf) -> TestServer {
+    start_server_with_db_internal(db_path, true).await
+}
+
+async fn start_server_with_db_and_registration(
+    db_path: PathBuf,
+    enable_self_registration: bool,
+) -> TestServer {
+    start_server_with_db_internal(db_path, enable_self_registration).await
 }
 
 /// Convenience wrapper around [`start_server_with_db`] that allocates a fresh
@@ -409,6 +431,10 @@ async fn connect_and_auth(url: &str, username: &str) -> Ws {
     connect_and_auth_with_otp(url, username, None).await
 }
 
+async fn connect_and_auth_with_pw_hash(url: &str, username: &str, pw_hash: &str) -> Ws {
+    connect_and_auth_with_pw_hash_and_otp(url, username, pw_hash, None).await
+}
+
 /// Opens a WebSocket connection and authenticates as `username`, optionally
 /// supplying a TOTP or backup `otp` code.
 ///
@@ -427,19 +453,28 @@ async fn connect_and_auth(url: &str, username: &str) -> Ws {
 /// A fresh ephemeral keypair is generated for every call so tests never share
 /// key material, mirroring real client behaviour.
 async fn connect_and_auth_with_otp(url: &str, username: &str, otp: Option<&str>) -> Ws {
+    connect_and_auth_with_pw_hash_and_otp(url, username, "test-password-hash", otp).await
+}
+
+async fn connect_and_auth_with_pw_hash_and_otp(
+    url: &str,
+    username: &str,
+    pw_hash: &str,
+    otp: Option<&str>,
+) -> Ws {
     let (mut ws, _) = connect_async(url).await.expect("connect websocket");
 
     let auth = match otp {
         Some(code) => json!({
             "t": "auth", "u": username,
-            "pw": "test-password-hash",
+            "pw": pw_hash,
             "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
             "otp": code
         }),
         None => json!({
             "t": "auth", "u": username,
-            "pw": "test-password-hash",
+            "pw": pw_hash,
             "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         }),
@@ -524,6 +559,35 @@ async fn auth_contract_rejects_when_2fa_enabled_without_code() {
     assert_eq!(
         err.get("m").and_then(|v| v.as_str()),
         Some("2FA code required")
+    );
+}
+
+#[tokio::test]
+async fn auth_contract_rejects_first_login_when_self_registration_disabled() {
+    let seed_port = allocate_port();
+    let db_path = temp_db_path(seed_port);
+    let server = start_server_with_db_and_registration(db_path, false).await;
+
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for self-registration policy test");
+    ws.send(Message::Text(
+        json!({
+            "t": "auth",
+            "u": "new-user-no-register",
+            "pw": "test-password-hash",
+            "pk": pub_b64(&new_keypair()).unwrap(),
+            "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send first-login auth");
+
+    let err = recv_by_type(&mut ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("self-registration is disabled")
     );
 }
 
@@ -655,6 +719,62 @@ async fn auth_contract_returns_expected_fields() {
         .and_then(|v| v.as_u64())
         .expect("proto.max_payload_bytes must be numeric");
     assert!(max_payload > 0, "proto.max_payload_bytes must be positive");
+}
+
+#[tokio::test]
+async fn auth_contract_password_change_invalidates_old_password_and_accepts_new_password() {
+    let server = start_server().await;
+    let old_hash = "client-hash-before-change";
+    let new_hash = "client-hash-after-change";
+
+    let mut ws = connect_and_auth_with_pw_hash(&server.url, "alice", old_hash).await;
+    ws.send(Message::Text(
+        json!({
+            "t": "password_change",
+            "current": old_hash,
+            "new": new_hash
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send password_change");
+
+    let changed = recv_by_type(&mut ws, "password_changed").await;
+    assert_eq!(
+        changed.get("t").and_then(|v| v.as_str()),
+        Some("password_changed")
+    );
+    ws.close(None)
+        .await
+        .expect("close socket after password_change");
+
+    let (mut old_ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket with old password");
+    old_ws
+        .send(Message::Text(
+            json!({
+                "t": "auth",
+                "u": "alice",
+                "pw": old_hash,
+                "pk": pub_b64(&new_keypair()).unwrap(),
+                "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send auth with old password");
+    let old_err = recv_by_type(&mut old_ws, "err").await;
+    assert_eq!(
+        old_err.get("m").and_then(|v| v.as_str()),
+        Some("invalid credentials")
+    );
+
+    let mut new_ws = connect_and_auth_with_pw_hash(&server.url, "alice", new_hash).await;
+    new_ws
+        .close(None)
+        .await
+        .expect("close socket after new password auth");
 }
 
 /// Verifies server/client bootstrap compatibility for the runtime startup flow.
@@ -1693,6 +1813,102 @@ async fn file_contract_relays_media_metadata_and_chunks() {
     assert_eq!(chunk.get("data").and_then(|v| v.as_str()), Some(chunk_data));
 }
 
+#[tokio::test]
+async fn file_contract_persists_media_metadata_and_chunks_in_database() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    let file_id = "media-db-contract-1";
+    let chunk_data = "aGVsbG8td29ybGQ=";
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"file_meta",
+                "ch":"general",
+                "filename":"voice-note.ogg",
+                "size": 11_u64,
+                "file_id": file_id,
+                "media_kind": "audio",
+                "mime": "audio/ogg"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send media metadata for db persistence contract");
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"file_chunk",
+                "ch":"general",
+                "file_id": file_id,
+                "index": 0,
+                "data": chunk_data
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send media chunk for db persistence contract");
+
+    sleep(Duration::from_millis(150)).await;
+
+    let conn =
+        Connection::open(&server.db_path).expect("open sqlite db for media persistence checks");
+    let row: (i64, String, String, String, String, Option<String>, i64, i64, i64, bool) = conn
+        .query_row(
+            "SELECT id, channel, sender, filename, media_kind, mime, declared_size, received_size, chunk_count, completed
+             FROM media_objects
+             WHERE channel = ?1 AND file_id = ?2",
+            params!["general", file_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .expect("media_objects row should be persisted");
+
+    let (
+        media_id,
+        channel,
+        sender,
+        filename,
+        media_kind,
+        mime,
+        declared_size,
+        received_size,
+        chunk_count,
+        completed,
+    ) = row;
+    assert_eq!(channel, "general");
+    assert_eq!(sender, "alice");
+    assert_eq!(filename, "voice-note.ogg");
+    assert_eq!(media_kind, "audio");
+    assert_eq!(mime.as_deref(), Some("audio/ogg"));
+    assert_eq!(declared_size, 11);
+    assert_eq!(received_size, 11);
+    assert_eq!(chunk_count, 1);
+    assert!(completed, "media object should be marked completed");
+
+    let chunk_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_chunks WHERE media_id = ?1",
+            params![media_id],
+            |r| r.get(0),
+        )
+        .expect("query media_chunks count");
+    assert_eq!(chunk_rows, 1, "expected one persisted media chunk");
+}
+
 // ---------------------------------------------------------------------------
 // Voice contract tests
 // ---------------------------------------------------------------------------
@@ -2460,14 +2676,14 @@ async fn schema_meta_contains_current_version() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-    assert_eq!(version, "7");
+    assert_eq!(version, "8");
 }
 
-/// Verifies that a server migrates a `v0` database to schema `v7` on startup.
+/// Verifies that a server migrates a `v0` database to schema `v8` on startup.
 ///
 /// Migration correctness is verified by:
 ///
-/// 1. Confirming `schema_meta.schema_version` is updated to `"7"`.
+/// 1. Confirming `schema_meta.schema_version` is updated to `"8"`.
 /// 2. Confirming the `events` table exists (created by `v1` migration).
 /// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
 /// 4. Confirming the `user_credentials` table exists (created by `v3` migration).
@@ -2475,6 +2691,7 @@ async fn schema_meta_contains_current_version() {
 /// 6. Confirming roles/permissions tables from `v5` exist.
 /// 7. Confirming audit_logs and suspicious_activity tables from `v6` exist.
 /// 8. Confirming presence/subscription snapshot tables and indexes from `v7` exist.
+/// 9. Confirming media persistence tables and high-volume indexes from `v8` exist.
 ///
 /// All assertions are made directly against SQLite rather than through the
 /// server API to keep migration tests independent of server protocol changes.
@@ -2490,8 +2707,8 @@ async fn schema_migrates_from_version_zero_to_current() {
     let conn = Connection::open(&db_path).expect("open migrated db");
     assert_eq!(
         read_schema_version(&db_path),
-        "7",
-        "expected migration to set schema version to 7"
+        "8",
+        "expected migration to set schema version to 8"
     );
 
     let events_exists: i64 = conn
@@ -2660,6 +2877,54 @@ async fn schema_migrates_from_version_zero_to_current() {
     assert_eq!(
         subscription_channel_index_exists, 1,
         "idx_user_channel_subscriptions_channel should exist after migration"
+    );
+
+    let media_objects_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_objects'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for media_objects");
+    assert_eq!(
+        media_objects_exists, 1,
+        "media_objects table should exist after migration"
+    );
+
+    let media_chunks_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_chunks'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for media_chunks");
+    assert_eq!(
+        media_chunks_exists, 1,
+        "media_chunks table should exist after migration"
+    );
+
+    let media_channel_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_media_objects_channel_ts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for idx_media_objects_channel_ts");
+    assert_eq!(
+        media_channel_index_exists, 1,
+        "idx_media_objects_channel_ts should exist after migration"
+    );
+
+    let channel_event_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_events_channel_event_ts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for idx_events_channel_event_ts");
+    assert_eq!(
+        channel_event_index_exists, 1,
+        "idx_events_channel_event_ts should exist after migration"
     );
 
     let failed_attempts_column: i64 = conn

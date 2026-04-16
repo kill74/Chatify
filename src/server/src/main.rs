@@ -454,6 +454,17 @@ const OUTBOUND_QUEUE_CAPACITY_MAX: usize = 16_384;
 const SLOW_CLIENT_DROP_BURST_DEFAULT: usize = 64;
 const SLOW_CLIENT_DROP_BURST_MIN: usize = 1;
 const SLOW_CLIENT_DROP_BURST_MAX: usize = 4096;
+const ENCRYPTED_SEARCH_SCAN_CAP: usize = 100_000;
+const MEDIA_CHUNK_ENC_PREFIX: &[u8] = b"cfm1";
+const MEDIA_RETENTION_DAYS_DEFAULT: u32 = 30;
+const MEDIA_RETENTION_DAYS_MIN: u32 = 1;
+const MEDIA_RETENTION_DAYS_MAX: u32 = 3650;
+const MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT: f64 = 20.0;
+const MEDIA_MAX_TOTAL_SIZE_GB_MIN: f64 = 0.5;
+const MEDIA_MAX_TOTAL_SIZE_GB_MAX: f64 = 10_240.0;
+const MEDIA_PRUNE_INTERVAL_SECS_DEFAULT: u64 = 600;
+const MEDIA_PRUNE_INTERVAL_SECS_MIN: u64 = 60;
+const MEDIA_PRUNE_INTERVAL_SECS_MAX: u64 = 86_400;
 
 fn normalize_db_pool_size(requested: u32) -> u32 {
     let requested = if requested == 0 {
@@ -480,6 +491,46 @@ fn normalize_slow_client_drop_burst(requested: usize) -> usize {
         requested
     };
     requested.clamp(SLOW_CLIENT_DROP_BURST_MIN, SLOW_CLIENT_DROP_BURST_MAX)
+}
+
+fn normalize_media_retention_days(requested: u32) -> u32 {
+    let requested = if requested == 0 {
+        MEDIA_RETENTION_DAYS_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(MEDIA_RETENTION_DAYS_MIN, MEDIA_RETENTION_DAYS_MAX)
+}
+
+fn normalize_media_prune_interval_secs(requested: u64) -> u64 {
+    let requested = if requested == 0 {
+        MEDIA_PRUNE_INTERVAL_SECS_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(MEDIA_PRUNE_INTERVAL_SECS_MIN, MEDIA_PRUNE_INTERVAL_SECS_MAX)
+}
+
+fn normalize_media_max_total_size_gb(requested: f64) -> f64 {
+    let requested = if !requested.is_finite() || requested <= 0.0 {
+        MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(MEDIA_MAX_TOTAL_SIZE_GB_MIN, MEDIA_MAX_TOTAL_SIZE_GB_MAX)
+}
+
+fn gib_to_bytes_i64(gib: f64) -> i64 {
+    let bytes = gib * 1024.0 * 1024.0 * 1024.0;
+    bytes.min(i64::MAX as f64).round() as i64
+}
+
+fn clamp_u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn clamp_usize_to_i64(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
 }
 
 #[derive(Clone)]
@@ -608,7 +659,12 @@ impl EventStore {
             #[cfg(feature = "batch-writes")]
             write_queue,
         };
-        store.init().expect("failed to initialise event store Ã¢â‚¬â€ check database path, permissions, and encryption key");
+        store
+            .init()
+            .expect("failed to initialise event store; check database path, permissions, and encryption key");
+        store
+            .verify_encryption_access()
+            .expect("failed to verify database encryption key compatibility");
         store.run_startup_checkpoint();
         store
     }
@@ -635,6 +691,130 @@ impl EventStore {
 
     fn is_encrypted(&self) -> bool {
         self.pool.encryption_key.is_some()
+    }
+
+    fn verify_encryption_access(&self) -> ChatifyResult<()> {
+        if self.pool.encryption_key.is_none() {
+            return Ok(());
+        }
+
+        let Some(conn) = self.get_connection() else {
+            return Err(ChatifyError::Message(
+                "database pool unavailable during encryption verification".to_string(),
+            ));
+        };
+
+        self.verify_encrypted_sample(
+            &conn,
+            r#"SELECT payload FROM events WHERE payload LIKE '{"ct":"%"}' LIMIT 1"#,
+            "events.payload",
+        )?;
+        self.verify_encrypted_sample(
+            &conn,
+            r#"SELECT pw_hash FROM user_credentials WHERE pw_hash LIKE '{"ct":"%"}' LIMIT 1"#,
+            "user_credentials.pw_hash",
+        )?;
+        self.verify_encrypted_sample(
+            &conn,
+            r#"SELECT secret FROM user_2fa WHERE secret IS NOT NULL AND secret LIKE '{"ct":"%"}' LIMIT 1"#,
+            "user_2fa.secret",
+        )?;
+        self.verify_encrypted_sample(
+            &conn,
+            r#"SELECT backup_codes FROM user_2fa WHERE backup_codes IS NOT NULL AND backup_codes LIKE '{"ct":"%"}' LIMIT 1"#,
+            "user_2fa.backup_codes",
+        )?;
+        self.verify_encrypted_blob_sample(
+            &conn,
+            "SELECT chunk_blob FROM media_chunks LIMIT 1",
+            "media_chunks.chunk_blob",
+        )?;
+
+        Ok(())
+    }
+
+    fn verify_encrypted_sample(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        field_label: &str,
+    ) -> ChatifyResult<()> {
+        let sample: Option<String> = match conn.query_row(sql, [], |row| row.get(0)).optional() {
+            Ok(sample) => sample,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no such table") || msg.contains("no such column") {
+                    warn!(
+                        "encryption verification skipped for {} because schema object is missing",
+                        field_label
+                    );
+                    return Ok(());
+                }
+                return Err(ChatifyError::Message(format!(
+                    "failed to read {} sample for encryption verification: {}",
+                    field_label, e
+                )));
+            }
+        };
+
+        if let Some(stored) = sample {
+            if self.decrypt_field(&stored).is_none() {
+                return Err(ChatifyError::Validation(format!(
+                    "database encryption key mismatch: cannot decrypt {}",
+                    field_label
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn verify_encrypted_blob_sample(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        field_label: &str,
+    ) -> ChatifyResult<()> {
+        let Some(ref key) = self.pool.encryption_key else {
+            return Ok(());
+        };
+
+        let sample: Option<Vec<u8>> = match conn.query_row(sql, [], |row| row.get(0)).optional() {
+            Ok(sample) => sample,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no such table") || msg.contains("no such column") {
+                    warn!(
+                        "encryption verification skipped for {} because schema object is missing",
+                        field_label
+                    );
+                    return Ok(());
+                }
+                return Err(ChatifyError::Message(format!(
+                    "failed to read {} sample for encryption verification: {}",
+                    field_label, e
+                )));
+            }
+        };
+
+        if let Some(blob) = sample {
+            if !blob.starts_with(MEDIA_CHUNK_ENC_PREFIX) {
+                warn!(
+                    "legacy plaintext blob encountered while encryption is enabled for {}",
+                    field_label
+                );
+                return Ok(());
+            }
+
+            if crypto::dec_bytes(key, &blob[MEDIA_CHUNK_ENC_PREFIX.len()..]).is_err() {
+                return Err(ChatifyError::Validation(format!(
+                    "database encryption key mismatch: cannot decrypt {}",
+                    field_label
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     fn health_check(&self) -> bool {
@@ -975,6 +1155,64 @@ impl EventStore {
             Self::set_schema_version(conn, version)?;
         }
 
+        if version < 8 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS media_objects (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel       TEXT NOT NULL,
+                    file_id       TEXT NOT NULL,
+                    sender        TEXT NOT NULL,
+                    filename      TEXT NOT NULL,
+                    media_kind    TEXT NOT NULL DEFAULT 'file',
+                    mime          TEXT,
+                    declared_size INTEGER NOT NULL DEFAULT 0,
+                    received_size INTEGER NOT NULL DEFAULT 0,
+                    chunk_count   INTEGER NOT NULL DEFAULT 0,
+                    completed     BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_ts    REAL NOT NULL,
+                    completed_ts  REAL,
+                    UNIQUE(channel, file_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_media_objects_channel_ts
+                    ON media_objects(channel, created_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_media_objects_sender_ts
+                    ON media_objects(sender, created_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_media_objects_kind_ts
+                    ON media_objects(media_kind, created_ts DESC);
+
+                CREATE TABLE IF NOT EXISTS media_chunks (
+                    media_id     INTEGER NOT NULL,
+                    chunk_index  INTEGER NOT NULL,
+                    chunk_blob   BLOB NOT NULL,
+                    chunk_size   INTEGER NOT NULL,
+                    created_ts   REAL NOT NULL,
+                    PRIMARY KEY(media_id, chunk_index),
+                    FOREIGN KEY(media_id) REFERENCES media_objects(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_events_channel_event_ts
+                    ON events(channel, event_type, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_event_channel_ts
+                    ON events(event_type, channel, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_sender_ts
+                    ON events(sender, ts DESC);
+                ",
+            )?;
+
+            version = 8;
+            Self::set_schema_version(conn, version)?;
+        }
+
+        conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_media_objects_retention
+                ON media_objects(completed, completed_ts, created_ts);
+            ",
+        )
+        .ok();
+
         if version > CURRENT_SCHEMA_VERSION {
             warn!(
                 "Database schema version {} is newer than supported version {}",
@@ -1187,6 +1425,400 @@ impl EventStore {
         }
     }
 
+    fn upsert_media_object(
+        &self,
+        channel: &str,
+        file_id: &str,
+        sender: &str,
+        filename: &str,
+        media_kind: &str,
+        mime: Option<&str>,
+        declared_size: u64,
+    ) {
+        let started = Instant::now();
+        let Some(conn) = self.get_connection() else {
+            self.record_db_observation("media_upsert_object", started, true);
+            return;
+        };
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO media_objects(
+                 channel, file_id, sender, filename, media_kind, mime,
+                 declared_size, received_size, chunk_count, completed, created_ts, completed_ts
+             )
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, FALSE, ?8, NULL)
+             ON CONFLICT(channel, file_id) DO UPDATE SET
+                 sender = excluded.sender,
+                 filename = excluded.filename,
+                 media_kind = excluded.media_kind,
+                 mime = excluded.mime,
+                 declared_size = excluded.declared_size",
+            params![
+                channel,
+                file_id,
+                sender,
+                filename,
+                media_kind,
+                mime,
+                clamp_u64_to_i64(declared_size),
+                now()
+            ],
+        ) {
+            warn!(
+                "media object upsert failed channel={} file_id={}: {}",
+                channel, file_id, e
+            );
+            self.record_db_observation("media_upsert_object", started, true);
+            return;
+        }
+
+        self.record_db_observation("media_upsert_object", started, false);
+    }
+
+    fn append_media_chunk(
+        &self,
+        channel: &str,
+        file_id: &str,
+        sender: &str,
+        chunk_index: u64,
+        chunk_bytes: &[u8],
+    ) {
+        if chunk_bytes.is_empty() {
+            return;
+        }
+
+        let started = Instant::now();
+        let Some(mut conn) = self.get_connection() else {
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        };
+
+        let stored_blob = if let Some(ref key) = self.pool.encryption_key {
+            match crypto::enc_bytes(key, chunk_bytes) {
+                Ok(encrypted) => {
+                    let mut wrapped =
+                        Vec::with_capacity(MEDIA_CHUNK_ENC_PREFIX.len() + encrypted.len());
+                    wrapped.extend_from_slice(MEDIA_CHUNK_ENC_PREFIX);
+                    wrapped.extend_from_slice(&encrypted);
+                    wrapped
+                }
+                Err(e) => {
+                    warn!(
+                        "media chunk encryption failed channel={} file_id={} idx={}: {}",
+                        channel, file_id, chunk_index, e
+                    );
+                    self.record_db_observation("media_append_chunk", started, true);
+                    return;
+                }
+            }
+        } else {
+            chunk_bytes.to_vec()
+        };
+
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!(
+                    "media chunk transaction open failed channel={} file_id={} idx={}: {}",
+                    channel, file_id, chunk_index, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        };
+
+        if let Err(e) = tx.execute(
+            "INSERT INTO media_objects(
+                 channel, file_id, sender, filename, media_kind, mime,
+                 declared_size, received_size, chunk_count, completed, created_ts, completed_ts
+             )
+             VALUES(?1, ?2, ?3, 'unknown', 'file', NULL, 0, 0, 0, FALSE, ?4, NULL)
+             ON CONFLICT(channel, file_id) DO NOTHING",
+            params![channel, file_id, sender, now()],
+        ) {
+            warn!(
+                "media object ensure failed channel={} file_id={}: {}",
+                channel, file_id, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        let media_row: Option<(i64, i64, i64)> = match tx
+            .query_row(
+                "SELECT id, declared_size, received_size
+                 FROM media_objects
+                 WHERE channel = ?1 AND file_id = ?2",
+                params![channel, file_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+        {
+            Ok(row) => row,
+            Err(e) => {
+                warn!(
+                    "media object lookup failed channel={} file_id={}: {}",
+                    channel, file_id, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        };
+
+        let Some((media_id, declared_size, received_size)) = media_row else {
+            warn!(
+                "media object missing for chunk persist channel={} file_id={}",
+                channel, file_id
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        };
+
+        let existing_chunk_size: Option<i64> = match tx
+            .query_row(
+                "SELECT chunk_size FROM media_chunks WHERE media_id = ?1 AND chunk_index = ?2",
+                params![media_id, clamp_u64_to_i64(chunk_index)],
+                |row| row.get(0),
+            )
+            .optional()
+        {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(
+                    "media chunk lookup failed channel={} file_id={} idx={}: {}",
+                    channel, file_id, chunk_index, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        };
+
+        let chunk_size = clamp_usize_to_i64(chunk_bytes.len());
+        if let Err(e) = tx.execute(
+            "INSERT INTO media_chunks(media_id, chunk_index, chunk_blob, chunk_size, created_ts)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(media_id, chunk_index) DO UPDATE SET
+                 chunk_blob = excluded.chunk_blob,
+                 chunk_size = excluded.chunk_size,
+                 created_ts = excluded.created_ts",
+            params![
+                media_id,
+                clamp_u64_to_i64(chunk_index),
+                stored_blob,
+                chunk_size,
+                now()
+            ],
+        ) {
+            warn!(
+                "media chunk upsert failed channel={} file_id={} idx={}: {}",
+                channel, file_id, chunk_index, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        let delta = chunk_size - existing_chunk_size.unwrap_or(0);
+        let new_received = (received_size + delta).max(0);
+        if let Err(e) = tx.execute(
+            "UPDATE media_objects SET received_size = ?2 WHERE id = ?1",
+            params![media_id, new_received],
+        ) {
+            warn!(
+                "media received_size update failed channel={} file_id={}: {}",
+                channel, file_id, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        if existing_chunk_size.is_none() {
+            if let Err(e) = tx.execute(
+                "UPDATE media_objects SET chunk_count = chunk_count + 1 WHERE id = ?1",
+                params![media_id],
+            ) {
+                warn!(
+                    "media chunk_count update failed channel={} file_id={}: {}",
+                    channel, file_id, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        }
+
+        if declared_size > 0 && new_received >= declared_size {
+            if let Err(e) = tx.execute(
+                "UPDATE media_objects
+                 SET completed = TRUE,
+                     completed_ts = COALESCE(completed_ts, ?2)
+                 WHERE id = ?1",
+                params![media_id, now()],
+            ) {
+                warn!(
+                    "media completion update failed channel={} file_id={}: {}",
+                    channel, file_id, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            warn!(
+                "media chunk commit failed channel={} file_id={} idx={}: {}",
+                channel, file_id, chunk_index, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        self.record_db_observation("media_append_chunk", started, false);
+    }
+
+    fn prune_media_storage(&self, max_age_secs: u64, max_total_bytes: i64) -> (usize, i64) {
+        let started = Instant::now();
+        let Some(mut conn) = self.get_connection() else {
+            self.record_db_observation("media_prune", started, true);
+            return (0, 0);
+        };
+
+        let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!("media prune transaction start failed: {}", e);
+                self.record_db_observation("media_prune", started, true);
+                return (0, 0);
+            }
+        };
+
+        let mut deleted_objects = 0usize;
+        let mut reclaimed_bytes = 0i64;
+        let cutoff_ts = now() - max_age_secs as f64;
+
+        let aged_candidates: Vec<(i64, i64)> = {
+            let mut stmt = match tx.prepare_cached(
+                "SELECT id,
+                        CASE WHEN received_size > 0 THEN received_size ELSE declared_size END AS stored_size
+                 FROM media_objects
+                 WHERE COALESCE(completed_ts, created_ts) < ?1
+                 ORDER BY COALESCE(completed_ts, created_ts) ASC
+                 LIMIT 4096",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("no such table") {
+                        self.record_db_observation("media_prune", started, false);
+                        return (0, 0);
+                    }
+                    warn!("media prune age prepare failed: {}", e);
+                    self.record_db_observation("media_prune", started, true);
+                    return (0, 0);
+                }
+            };
+
+            let rows = match stmt.query_map(params![cutoff_ts], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!("media prune age query failed: {}", e);
+                    self.record_db_observation("media_prune", started, true);
+                    return (0, 0);
+                }
+            };
+
+            rows.filter_map(|row| row.ok()).collect()
+        };
+
+        for (id, stored_size) in aged_candidates {
+            if let Err(e) = tx.execute("DELETE FROM media_objects WHERE id = ?1", params![id]) {
+                warn!("media prune age delete failed id={}: {}", id, e);
+                self.record_db_observation("media_prune", started, true);
+                return (0, 0);
+            }
+            deleted_objects += 1;
+            reclaimed_bytes += stored_size.max(0);
+        }
+
+        if max_total_bytes > 0 {
+            let total_bytes: i64 = match tx.query_row(
+                "SELECT COALESCE(SUM(CASE WHEN received_size > 0 THEN received_size ELSE declared_size END), 0)
+                 FROM media_objects",
+                [],
+                |row| row.get(0),
+            ) {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!("media prune size query failed: {}", e);
+                    self.record_db_observation("media_prune", started, true);
+                    return (0, 0);
+                }
+            };
+
+            if total_bytes > max_total_bytes {
+                let mut excess = total_bytes - max_total_bytes;
+                let budget_candidates: Vec<(i64, i64)> = {
+                    let mut stmt = match tx.prepare_cached(
+                        "SELECT id,
+                                CASE WHEN received_size > 0 THEN received_size ELSE declared_size END AS stored_size
+                         FROM media_objects
+                         WHERE completed = TRUE
+                         ORDER BY COALESCE(completed_ts, created_ts) ASC
+                         LIMIT 8192",
+                    ) {
+                        Ok(stmt) => stmt,
+                        Err(e) => {
+                            warn!("media prune budget prepare failed: {}", e);
+                            self.record_db_observation("media_prune", started, true);
+                            return (0, 0);
+                        }
+                    };
+
+                    let rows = match stmt
+                        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            warn!("media prune budget query failed: {}", e);
+                            self.record_db_observation("media_prune", started, true);
+                            return (0, 0);
+                        }
+                    };
+
+                    rows.filter_map(|row| row.ok()).collect()
+                };
+
+                for (id, stored_size) in budget_candidates {
+                    if excess <= 0 {
+                        break;
+                    }
+
+                    if let Err(e) =
+                        tx.execute("DELETE FROM media_objects WHERE id = ?1", params![id])
+                    {
+                        warn!("media prune budget delete failed id={}: {}", id, e);
+                        self.record_db_observation("media_prune", started, true);
+                        return (0, 0);
+                    }
+
+                    let accounted = stored_size.max(0);
+                    deleted_objects += 1;
+                    reclaimed_bytes += accounted;
+                    excess = excess.saturating_sub(accounted);
+                }
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            warn!("media prune transaction commit failed: {}", e);
+            self.record_db_observation("media_prune", started, true);
+            return (0, 0);
+        }
+
+        self.record_db_observation("media_prune", started, false);
+        (deleted_objects, reclaimed_bytes)
+    }
+
     fn history(&self, channel: &str, limit: usize) -> Vec<Value> {
         self.query_events(
             "history",
@@ -1320,7 +1952,15 @@ impl EventStore {
 
         let mut results = Vec::with_capacity(limit.min(64));
         let mut had_error = false;
+        let mut scanned_rows = 0usize;
         while results.len() < limit {
+            if scanned_rows >= ENCRYPTED_SEARCH_SCAN_CAP {
+                warn!(
+                    "{} encrypted search scan capped at {} rows",
+                    label, ENCRYPTED_SEARCH_SCAN_CAP
+                );
+                break;
+            }
             let row = match rows.next() {
                 Ok(Some(row)) => row,
                 Ok(None) => break,
@@ -1330,6 +1970,7 @@ impl EventStore {
                     break;
                 }
             };
+            scanned_rows += 1;
 
             let enc_payload = match row.get::<_, String>(0) {
                 Ok(v) => v,
@@ -1487,6 +2128,30 @@ impl EventStore {
             return None;
         };
 
+        let secret = match secret {
+            Some(stored) => match self.decrypt_field(&stored) {
+                Some(decrypted) => Some(decrypted),
+                None => {
+                    warn!("failed to decrypt 2fa secret for user {}", username);
+                    self.record_db_observation("auth_load_user_2fa", started, true);
+                    return None;
+                }
+            },
+            None => None,
+        };
+
+        let backup_codes_json = match backup_codes_json {
+            Some(stored) => match self.decrypt_field(&stored) {
+                Some(decrypted) => Some(decrypted),
+                None => {
+                    warn!("failed to decrypt 2fa backup codes for user {}", username);
+                    self.record_db_observation("auth_load_user_2fa", started, true);
+                    return None;
+                }
+            },
+            None => None,
+        };
+
         let backup_codes = backup_codes_json
             .as_deref()
             .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
@@ -1521,6 +2186,33 @@ impl EventStore {
         let secret = user.totp_config.as_ref().map(|cfg| cfg.secret.clone());
         let backup_codes_json =
             serde_json::to_string(&user.backup_codes).unwrap_or_else(|_| "[]".to_string());
+
+        let secret = match secret {
+            Some(plaintext) => match self.encrypt_field(&plaintext) {
+                Some(encrypted) => Some(encrypted),
+                None => {
+                    warn!(
+                        "2fa upsert skipped for user {} due to secret encryption failure",
+                        user.username
+                    );
+                    self.record_db_observation("auth_upsert_user_2fa", started, true);
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        let backup_codes_json = match self.encrypt_field(&backup_codes_json) {
+            Some(encrypted) => encrypted,
+            None => {
+                warn!(
+                    "2fa upsert skipped for user {} due to backup code encryption failure",
+                    user.username
+                );
+                self.record_db_observation("auth_upsert_user_2fa", started, true);
+                return;
+            }
+        };
 
         if let Err(e) = conn.execute(
             "INSERT INTO user_2fa(username, enabled, secret, backup_codes, enabled_at, last_verified)
@@ -1563,9 +2255,20 @@ impl EventStore {
             .optional();
 
         match result {
-            Ok(v) => {
+            Ok(Some(stored_hash)) => match self.decrypt_field(&stored_hash) {
+                Some(hash) => {
+                    self.record_db_observation("auth_load_pw_hash", started, false);
+                    Ok(Some(hash))
+                }
+                None => {
+                    warn!("credential decrypt failed for user '{}'", username);
+                    self.record_db_observation("auth_load_pw_hash", started, true);
+                    Err("store_decrypt_failed")
+                }
+            },
+            Ok(None) => {
                 self.record_db_observation("auth_load_pw_hash", started, false);
-                Ok(v)
+                Ok(None)
             }
             Err(e) => {
                 let code = if let SqlError::SqliteFailure(_, Some(ref msg)) = e {
@@ -1595,15 +2298,24 @@ impl EventStore {
             self.record_db_observation("auth_upsert_credentials", started, true);
             return;
         };
+        let Some(encrypted_pw_hash) = self.encrypt_field(pw_hash) else {
+            warn!(
+                "credential upsert skipped for user {} due to encryption failure",
+                username
+            );
+            self.record_db_observation("auth_upsert_credentials", started, true);
+            return;
+        };
         let ts = now();
         if let Err(e) = conn.execute(
             "INSERT INTO user_credentials(username, pw_hash, created_at, updated_at, login_count, last_login)
              VALUES(?1, ?2, ?3, ?3, 1, ?3)
              ON CONFLICT(username) DO UPDATE SET
-                 updated_at  = excluded.updated_at,
-                 login_count = login_count + 1,
-                 last_login  = excluded.last_login",
-            params![username, pw_hash, ts],
+                pw_hash     = excluded.pw_hash,
+                updated_at  = excluded.updated_at,
+                login_count = login_count + 1,
+                last_login  = excluded.last_login",
+            params![username, encrypted_pw_hash, ts],
         ) {
             warn!("credential upsert failed for user {}: {}", username, e);
             self.record_db_observation("auth_upsert_credentials", started, true);
@@ -4695,8 +5407,10 @@ async fn handle_event(
             // Announce a pending file transfer to the channel. The `file_id`
             // acts as a correlation key for subsequent `file_chunk` frames.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
-            let filename = d["filename"]
-                .as_str()
+            let filename = d
+                .get("filename")
+                .or_else(|| d.get("name"))
+                .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .trim()
                 .chars()
@@ -4728,8 +5442,10 @@ async fn handle_event(
                     .collect::<String>()
             };
 
-            let media_kind = match d["media_kind"]
-                .as_str()
+            let media_kind = match d
+                .get("media_kind")
+                .or_else(|| d.get("type"))
+                .and_then(|v| v.as_str())
                 .unwrap_or("file")
                 .trim()
                 .to_ascii_lowercase()
@@ -4752,8 +5468,8 @@ async fn handle_event(
                 "size":size,"file_id":file_id,"ch":ch,
                 "media_kind":media_kind,"ts":now()
             });
-            if let Some(mime_value) = mime {
-                file_announce["mime"] = Value::String(mime_value);
+            if let Some(ref mime_value) = mime {
+                file_announce["mime"] = Value::String(mime_value.clone());
             }
             state.store.persist(
                 "file_meta",
@@ -4763,11 +5479,20 @@ async fn handle_event(
                 &file_announce,
                 &format!("{} {}", media_kind, filename),
             );
+            state.store.upsert_media_object(
+                &ch,
+                &file_id,
+                username,
+                &filename,
+                media_kind,
+                mime.as_deref(),
+                size,
+            );
             let _ = state.chan(&ch).tx.send(file_announce.to_string());
         }
         "file_chunk" => {
             // Relay a single chunk of a file transfer to the channel.
-            // Chunks are not persisted ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â they are ephemeral relay frames.
+            // Chunks are also persisted in SQLite for durable media history.
             let ch = safe_ch(d["ch"].as_str().unwrap_or("general"));
             let file_id = d["file_id"].as_str().unwrap_or("").trim().to_string();
             let chunk_data = d["data"].as_str().unwrap_or("").to_string();
@@ -4775,6 +5500,19 @@ async fn handle_event(
                 return;
             }
             let index = d["index"].as_u64().unwrap_or(0);
+            match general_purpose::STANDARD.decode(chunk_data.as_bytes()) {
+                Ok(chunk_bytes) => {
+                    state
+                        .store
+                        .append_media_chunk(&ch, &file_id, username, index, &chunk_bytes);
+                }
+                Err(e) => {
+                    warn!(
+                        "media chunk decode failed channel={} file_id={} idx={}: {}",
+                        ch, file_id, index, e
+                    );
+                }
+            }
             let chunk_msg = serde_json::json!({
                 "t":"file_chunk","from":username,"file_id":file_id,
                 "data":chunk_data,"index":index,"ch":ch,"ts":now()
@@ -4971,7 +5709,7 @@ async fn handle_event(
                 serde_json::json!({"t":"2fa_disabled","enabled":false,"ts":now()}),
             );
         }
-        "password" => {
+        "password" | "password_change" => {
             let current_hash = d.get("current").and_then(|v| v.as_str()).unwrap_or("");
             let new_pw = d.get("new").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -6567,6 +7305,22 @@ where
             return;
         }
         Err("first_login") => {
+            if !state.self_registration_enabled {
+                let _ = sink
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "t": "err",
+                            "m": "self-registration is disabled"
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                warn!(
+                    "auth rejected for unknown user={} because self-registration is disabled",
+                    username
+                );
+                return;
+            }
             // First time this username connects ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â store their credential.
             // The submitted hash is itself a PBKDF2 output, so we wrap it
             // in another salted PBKDF2 layer server-side.
@@ -7149,6 +7903,13 @@ fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<
         return Ok(Some(key));
     }
 
+    if std::path::Path::new(db_path).exists() {
+        return Err(ChatifyError::Validation(format!(
+            "database '{}' exists but key file '{}' is missing; provide --db-key or restore the key file",
+            db_path, key_path
+        )));
+    }
+
     // 4. Generate a new key and write it to disk.
     use rand::{rngs::OsRng, RngCore};
     let mut key = [0u8; 32];
@@ -7402,6 +8163,21 @@ async fn main() -> ChatifyResult<()> {
         " Slow-client drop burst: requested={} effective={}",
         args.slow_client_drop_burst, state.slow_client_drop_burst
     );
+
+    let media_retention_days = normalize_media_retention_days(args.media_retention_days);
+    let media_prune_interval_secs =
+        normalize_media_prune_interval_secs(args.media_prune_interval_secs);
+    let media_max_total_size_gb = normalize_media_max_total_size_gb(args.media_max_total_size_gb);
+    let media_max_total_size_bytes = gib_to_bytes_i64(media_max_total_size_gb);
+    if args.disable_media_retention {
+        println!(" Media retention: disabled");
+    } else {
+        println!(
+            " Media retention: {} days | cap {:.1} GiB | prune interval {}s",
+            media_retention_days, media_max_total_size_gb, media_prune_interval_secs
+        );
+    }
+
     println!(
         " User rate limit: {} msgs/min",
         if args.enable_user_rate_limit {
@@ -7463,6 +8239,28 @@ async fn main() -> ChatifyResult<()> {
                 if evicted > 0 && log_enabled {
                     info!("nonce cache: evicted {} stale user entries", evicted);
                 }
+            }
+        });
+    }
+
+    if !args.disable_media_retention {
+        let retention_state = state.clone();
+        let log_enabled = args.log;
+        tokio::spawn(async move {
+            loop {
+                let (deleted_objects, reclaimed_bytes) = retention_state.store.prune_media_storage(
+                    media_retention_days as u64 * 24 * 3600,
+                    media_max_total_size_bytes,
+                );
+
+                if deleted_objects > 0 && log_enabled {
+                    info!(
+                        "media retention: pruned {} object(s), reclaimed {} bytes",
+                        deleted_objects, reclaimed_bytes
+                    );
+                }
+
+                sleep(Duration::from_secs(media_prune_interval_secs)).await;
             }
         });
     }
@@ -7549,6 +8347,14 @@ async fn main() -> ChatifyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_test_db_path(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}.db"))
+    }
 
     /// Verifies that [`validate_auth_payload`] returns a `ChatifyError::Validation`
     /// variant (not `Message`) for an invalid username, allowing callers to
@@ -7668,6 +8474,243 @@ mod tests {
     }
 
     #[test]
+    fn upsert_credentials_updates_password_hash_on_conflict() {
+        let db_path = unique_test_db_path("chatify-upsert-credentials");
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            db_path.to_string_lossy().to_string(),
+            Some(vec![9u8; 32]),
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime,
+            60,
+            false,
+            true,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        let old_client_hash = "client-hash-old";
+        let old_server_hash = crypto::pw_hash(old_client_hash);
+        state.store.upsert_credentials("alice", &old_server_hash);
+
+        let new_client_hash = "client-hash-new";
+        let new_server_hash = crypto::pw_hash(new_client_hash);
+        state.store.upsert_credentials("alice", &new_server_hash);
+
+        assert_eq!(
+            state.store.verify_credential("alice", old_client_hash),
+            Ok(false)
+        );
+        assert_eq!(
+            state.store.verify_credential("alice", new_client_hash),
+            Ok(true)
+        );
+
+        drop(state);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
+    }
+
+    #[test]
+    fn event_store_encrypts_credentials_and_2fa_fields_when_key_present() {
+        let db_path = unique_test_db_path("chatify-auth-encryption");
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            db_path.to_string_lossy().to_string(),
+            Some(vec![7u8; 32]),
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime,
+            60,
+            false,
+            true,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        let client_hash = "client-password-hash";
+        let server_hash = crypto::pw_hash(client_hash);
+        state.store.upsert_credentials("alice", &server_hash);
+        assert_eq!(
+            state.store.verify_credential("alice", client_hash),
+            Ok(true)
+        );
+
+        let mut user_2fa = User2FA::new("alice".to_string());
+        user_2fa.enabled = true;
+        user_2fa.totp_config = Some(TotpConfig {
+            secret: "top-secret-seed".to_string(),
+            digits: 6,
+            step: 30,
+            algorithm: "SHA256".to_string(),
+        });
+        user_2fa.backup_codes = vec!["backup-code-hash".to_string()];
+        state.store.upsert_user_2fa(&user_2fa);
+
+        let loaded_2fa = state
+            .store
+            .load_user_2fa("alice")
+            .expect("2fa row should load");
+        assert_eq!(
+            loaded_2fa
+                .totp_config
+                .as_ref()
+                .map(|cfg| cfg.secret.as_str()),
+            Some("top-secret-seed")
+        );
+        assert_eq!(
+            loaded_2fa.backup_codes,
+            vec!["backup-code-hash".to_string()]
+        );
+
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        let raw_pw_hash: String = conn
+            .query_row(
+                "SELECT pw_hash FROM user_credentials WHERE username = ?1",
+                params!["alice"],
+                |row| row.get(0),
+            )
+            .expect("read raw pw_hash");
+        assert_ne!(raw_pw_hash, server_hash);
+        assert!(
+            serde_json::from_str::<Value>(&raw_pw_hash)
+                .ok()
+                .and_then(|v| {
+                    v.get("ct")
+                        .and_then(|value| value.as_str().map(|s| s.to_string()))
+                })
+                .is_some(),
+            "pw_hash should be stored as encrypted ct wrapper"
+        );
+
+        let raw_secret: Option<String> = conn
+            .query_row(
+                "SELECT secret FROM user_2fa WHERE username = ?1",
+                params!["alice"],
+                |row| row.get(0),
+            )
+            .expect("read raw 2fa secret");
+        let raw_backup_codes: Option<String> = conn
+            .query_row(
+                "SELECT backup_codes FROM user_2fa WHERE username = ?1",
+                params!["alice"],
+                |row| row.get(0),
+            )
+            .expect("read raw backup codes");
+        let raw_secret = raw_secret.expect("2fa secret must be present");
+        let raw_backup_codes = raw_backup_codes.expect("2fa backup codes must be present");
+
+        assert_ne!(raw_secret, "top-secret-seed");
+        assert!(
+            serde_json::from_str::<Value>(&raw_secret)
+                .ok()
+                .and_then(|v| {
+                    v.get("ct")
+                        .and_then(|value| value.as_str().map(|s| s.to_string()))
+                })
+                .is_some(),
+            "2fa secret should be stored as encrypted ct wrapper"
+        );
+        assert!(
+            serde_json::from_str::<Value>(&raw_backup_codes)
+                .ok()
+                .and_then(|v| {
+                    v.get("ct")
+                        .and_then(|value| value.as_str().map(|s| s.to_string()))
+                })
+                .is_some(),
+            "2fa backup codes should be stored as encrypted ct wrapper"
+        );
+
+        drop(conn);
+        drop(state);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
+    }
+
+    #[test]
+    fn resolve_db_key_rejects_existing_database_without_key_file() {
+        let db_path = unique_test_db_path("chatify-existing-db-no-key");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        Connection::open(&db_path).expect("create sqlite db");
+        let key_path = format!("{}.key", db_path_str);
+        let _ = std::fs::remove_file(&key_path);
+
+        let result = resolve_db_key(&db_path_str, None);
+        assert!(matches!(result, Err(ChatifyError::Validation(msg)) if msg.contains("key file")));
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn state_init_fails_fast_on_encryption_key_mismatch() {
+        let db_path = unique_test_db_path("chatify-key-mismatch");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let plugin_runtime_a =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state_a = State::new(
+            db_path_str.clone(),
+            Some(vec![1u8; 32]),
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime_a,
+            60,
+            false,
+            true,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        let payload = serde_json::json!({"t": "msg", "c": "encrypted history marker"});
+        state_a.store.persist(
+            "msg",
+            "general",
+            "alice",
+            None,
+            &payload,
+            "encrypted history marker",
+        );
+        drop(state_a);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let plugin_runtime_b =
+                PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+            State::new(
+                db_path_str.clone(),
+                Some(vec![2u8; 32]),
+                DbDurabilityMode::MaxSafety,
+                DB_POOL_SIZE_DEFAULT,
+                None,
+                plugin_runtime_b,
+                60,
+                false,
+                true,
+                OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+                SLOW_CLIENT_DROP_BURST_DEFAULT,
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "state initialization should fail when DB encryption key is wrong"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
+    }
+
+    #[test]
     fn normalization_clamps_outbound_settings() {
         assert_eq!(
             normalize_outbound_queue_capacity(0),
@@ -7694,6 +8737,177 @@ mod tests {
             normalize_slow_client_drop_burst(SLOW_CLIENT_DROP_BURST_MIN),
             SLOW_CLIENT_DROP_BURST_MIN
         );
+
+        assert_eq!(
+            normalize_media_retention_days(0),
+            MEDIA_RETENTION_DAYS_DEFAULT
+        );
+        assert_eq!(
+            normalize_media_retention_days(MEDIA_RETENTION_DAYS_MAX + 1),
+            MEDIA_RETENTION_DAYS_MAX
+        );
+
+        assert_eq!(
+            normalize_media_prune_interval_secs(0),
+            MEDIA_PRUNE_INTERVAL_SECS_DEFAULT
+        );
+        assert_eq!(
+            normalize_media_prune_interval_secs(MEDIA_PRUNE_INTERVAL_SECS_MAX + 1),
+            MEDIA_PRUNE_INTERVAL_SECS_MAX
+        );
+        assert_eq!(
+            normalize_media_prune_interval_secs(MEDIA_PRUNE_INTERVAL_SECS_MIN),
+            MEDIA_PRUNE_INTERVAL_SECS_MIN
+        );
+
+        assert_eq!(
+            normalize_media_max_total_size_gb(0.0),
+            MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT
+        );
+        assert_eq!(
+            normalize_media_max_total_size_gb(0.1),
+            MEDIA_MAX_TOTAL_SIZE_GB_MIN
+        );
+        assert_eq!(
+            normalize_media_max_total_size_gb(MEDIA_MAX_TOTAL_SIZE_GB_MAX + 1.0),
+            MEDIA_MAX_TOTAL_SIZE_GB_MAX
+        );
+
+        assert_eq!(gib_to_bytes_i64(1.0), 1_073_741_824);
+    }
+
+    #[test]
+    fn media_prune_storage_enforces_age_and_size_limits() {
+        let db_path = unique_test_db_path("chatify-media-prune");
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            db_path.to_string_lossy().to_string(),
+            None,
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime,
+            60,
+            false,
+            false,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        state.store.upsert_media_object(
+            "general",
+            "old-complete",
+            "alice",
+            "old.bin",
+            "file",
+            Some("application/octet-stream"),
+            10,
+        );
+        state
+            .store
+            .append_media_chunk("general", "old-complete", "alice", 0, b"0123456789");
+
+        state.store.upsert_media_object(
+            "general",
+            "recent-complete",
+            "alice",
+            "recent.bin",
+            "file",
+            Some("application/octet-stream"),
+            20,
+        );
+        state.store.append_media_chunk(
+            "general",
+            "recent-complete",
+            "alice",
+            0,
+            b"01234567890123456789",
+        );
+
+        state.store.upsert_media_object(
+            "general",
+            "partial",
+            "alice",
+            "partial.bin",
+            "file",
+            Some("application/octet-stream"),
+            30,
+        );
+        state
+            .store
+            .append_media_chunk("general", "partial", "alice", 0, b"0123456789");
+
+        let pooled = state
+            .store
+            .get_connection()
+            .expect("obtain pooled sqlite connection");
+        let ts_now = now();
+        pooled
+            .execute(
+                "UPDATE media_objects
+                 SET created_ts = ?1,
+                     completed_ts = ?2
+                 WHERE channel = 'general' AND file_id = 'old-complete'",
+                params![ts_now - 10_000.0, ts_now - 10_000.0],
+            )
+            .expect("set old object timestamps");
+        pooled
+            .execute(
+                "UPDATE media_objects
+                 SET created_ts = ?1,
+                     completed_ts = ?2
+                 WHERE channel = 'general' AND file_id = 'recent-complete'",
+                params![ts_now - 100.0, ts_now - 100.0],
+            )
+            .expect("set recent object timestamps");
+        pooled
+            .execute(
+                "UPDATE media_objects
+                 SET created_ts = ?1
+                 WHERE channel = 'general' AND file_id = 'partial'",
+                params![ts_now - 50.0],
+            )
+            .expect("set partial object timestamp");
+        drop(pooled);
+
+        let (deleted, reclaimed) = state.store.prune_media_storage(500, 15);
+        assert_eq!(deleted, 2);
+        assert_eq!(reclaimed, 30);
+
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        let remaining: Vec<(String, bool, i64, i64)> = {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT file_id, completed, declared_size, received_size
+                     FROM media_objects
+                     ORDER BY file_id ASC",
+                )
+                .expect("prepare remaining media query");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .expect("query remaining media rows");
+            rows.filter_map(|row| row.ok()).collect()
+        };
+
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "partial");
+        assert!(!remaining[0].1);
+        assert_eq!(remaining[0].2, 30);
+        assert_eq!(remaining[0].3, 10);
+
+        drop(conn);
+        drop(state);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
     }
 
     #[tokio::test]

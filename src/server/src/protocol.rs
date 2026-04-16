@@ -26,7 +26,7 @@ pub const MAX_HANDSHAKE_HEADER_SIZE: usize = 8192;
 pub const MAX_HANDSHAKE_HEADERS: usize = 64;
 
 /// SQLite schema version this binary was built against.
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// Default number of events returned by a `history` request.
 pub const DEFAULT_HISTORY_LIMIT: usize = 50;

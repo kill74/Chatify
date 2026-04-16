@@ -21,24 +21,26 @@ impl DbDurabilityMode {
                 "
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
-                PRAGMA wal_autocheckpoint = 1000;
-                PRAGMA cache_size = -2000;
+                PRAGMA wal_autocheckpoint = 4096;
+                PRAGMA cache_size = -16384;
                 PRAGMA temp_store = MEMORY;
                 PRAGMA foreign_keys = ON;
-                PRAGMA mmap_size = 268435456;
+                PRAGMA mmap_size = 1073741824;
                 PRAGMA page_size = 4096;
+                PRAGMA journal_size_limit = 1073741824;
                 "
             }
             DbDurabilityMode::MaxSafety => {
                 "
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = FULL;
-                PRAGMA wal_autocheckpoint = 256;
-                PRAGMA cache_size = -2000;
+                PRAGMA wal_autocheckpoint = 1024;
+                PRAGMA cache_size = -8192;
                 PRAGMA temp_store = MEMORY;
                 PRAGMA foreign_keys = ON;
-                PRAGMA mmap_size = 268435456;
+                PRAGMA mmap_size = 536870912;
                 PRAGMA page_size = 4096;
+                PRAGMA journal_size_limit = 536870912;
                 "
             }
         }
@@ -144,6 +146,22 @@ pub struct Args {
     /// Consecutive dropped outbound messages before disconnecting a slow client.
     #[arg(long, default_value_t = 64)]
     pub slow_client_drop_burst: usize,
+
+    /// Retention window in days for persisted media.
+    #[arg(long, default_value_t = 30)]
+    pub media_retention_days: u32,
+
+    /// Maximum retained media payload volume in GiB before oldest completed transfers are pruned.
+    #[arg(long, default_value_t = 20.0)]
+    pub media_max_total_size_gb: f64,
+
+    /// Interval in seconds between periodic media retention maintenance runs.
+    #[arg(long, default_value_t = 600)]
+    pub media_prune_interval_secs: u64,
+
+    /// Disable periodic media retention pruning.
+    #[arg(long)]
+    pub disable_media_retention: bool,
 
     /// Register a new user (admin operation).
     #[arg(long, requires = "user_password")]

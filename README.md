@@ -147,22 +147,24 @@ cargo run --bin chatify-client -- --host 127.0.0.1 --port 8765
 
 ### Server — `chatify-server`
 
-| Flag              | Default      | Notes                                                                                      |
-| ----------------- | ------------ | ------------------------------------------------------------------------------------------ |
-| `--host`          | `0.0.0.0`    | Bind address                                                                               |
-| `--port`          | `8765`       | Bind port                                                                                  |
-| `--db`            | `chatify.db` | SQLite database path                                                                       |
-| `--db-durability` | `max-safety` | SQLite durability profile: `balanced` (faster) or `max-safety` (stronger crash durability) |
-| `--db-key`        | _(auto)_     | 32-byte encryption key, hex-encoded (64 chars). See resolution order below.                |
-| `--tls`           | `false`      | Enable TLS (`wss://`). Requires `--tls-cert` and `--tls-key`.                              |
-| `--tls-cert`      | `cert.pem`   | PEM certificate path                                                                       |
-| `--tls-key`       | `key.pem`    | PEM private key path                                                                       |
-| `--log`           | `false`      | Structured logging to stderr                                                               |
+- `--host` (default: `0.0.0.0`): Bind address.
+- `--port` (default: `8765`): Bind port.
+- `--db` (default: `chatify.db`): SQLite database path.
+- `--db-durability` (default: `max-safety`): SQLite durability profile; `balanced` is faster and `max-safety` improves crash durability.
+- `--db-key` (default: auto): 32-byte encryption key (hex, 64 chars). See resolution order below.
+- `--tls` (default: `false`): Enable TLS (`wss://`); requires `--tls-cert` and `--tls-key`.
+- `--tls-cert` (default: `cert.pem`): PEM certificate path.
+- `--tls-key` (default: `key.pem`): PEM private key path.
+- `--log` (default: `false`): Structured logging to stderr.
+- `--media-retention-days` (default: `30`): Maximum media age in days before pruning.
+- `--media-max-total-size-gb` (default: `20.0`): Retention budget in GiB; oldest completed media is pruned first when exceeded.
+- `--media-prune-interval-secs` (default: `600`): Interval for periodic retention maintenance.
+- `--disable-media-retention` (default: `false`): Disables periodic media pruning.
 
 **DB key resolution order:**
 
 1. `--db-key` CLI flag
-2. `<db>.key` file — auto-generated on first run if absent
+2. `<db>.key` file - auto-generated only when creating a new DB; existing DBs require the original key file (or `--db-key`)
 3. No encryption when `--db :memory:`
 
 > Never commit `*.db.key`, `cert.pem`, or `key.pem`. Rotate immediately on exposure. Keep runtime secrets out of shell history and version control.
@@ -267,8 +269,17 @@ The event store is **append-only**. Events are inserted once; they are never upd
 
 - Channel history: `(channel, ts DESC)`
 - DM history: `(event_type, sender, target, ts DESC)`
+- High-volume channel/event scans: `(channel, event_type, ts DESC)` and `(event_type, channel, ts DESC)`
+- Sender activity scans: `(sender, ts DESC)`
 
-**Encryption at rest:** `payload` and `search_text` columns are encrypted with the key resolved at startup. The `/search` command decrypts rows in a linear scan — O(n) in stored event count. This is acceptable for single-tenant use; it is not suitable for large corpora without an external index or a separate plaintext search field with access controls.
+**Media durability:**
+
+- `file_meta` and `file_chunk` transfers are persisted in dedicated tables:
+  - `media_objects` (metadata, transfer status, byte counters)
+  - `media_chunks` (chunk payloads keyed by media object + chunk index)
+- Chunk payloads are encrypted at rest when DB encryption is enabled.
+
+**Encryption at rest:** event `payload` and `search_text` columns are encrypted with the key resolved at startup. Media chunk payloads are also encrypted at rest when encryption is enabled. `/search` over encrypted rows still requires decryption in a bounded linear scan.
 
 **CI-verified guarantees:**
 
