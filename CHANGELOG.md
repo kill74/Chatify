@@ -1,10 +1,19 @@
 # Changelog
 
+<!-- markdownlint-disable MD024 -->
+
 All notable changes to this project will be documented in this file.
 
 This format is based on Keep a Changelog and the project follows Semantic Versioning.
 
 ## [Unreleased]
+
+### Planned
+
+- Add reproducible benchmark runs and publish measured results for each tagged release.
+- Continue protocol hardening and trust-model improvements.
+
+## [0.3.0] - 2026-04-16
 
 ### Added
 
@@ -23,11 +32,6 @@ This format is based on Keep a Changelog and the project follows Semantic Versio
 
 - Added contract coverage for reaction broadcast/sync aggregation flow.
 - Added contract coverage for invalid reaction payload rejection (`reaction requires valid msg_id`).
-
-### Planned
-
-- Add reproducible benchmark runs and publish measured results for each tagged release.
-- Continue protocol hardening and trust-model improvements.
 
 ## [0.1.0] - 2026-03-23
 
@@ -71,5 +75,6 @@ Initial public release of Chatify as a terminal-first, self-hosted Rust chat pla
 - Added CI quality gates for formatting, linting, tests, and feature-specific checks.
 - Added release automation for Windows package artifacts on published GitHub releases.
 
-[Unreleased]: https://github.com/kill74/Chatify/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kill74/Chatify/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kill74/Chatify/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/kill74/Chatify/releases/tag/v0.1.0

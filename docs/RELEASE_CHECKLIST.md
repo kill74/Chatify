@@ -1,4 +1,4 @@
-# Release Checklist (v0.1.0)
+# Release Checklist (v0.3.0)
 
 Use this checklist to cut a clean, repeatable release.
 
@@ -13,10 +13,20 @@ Expected: only intentional release-doc changes.
 ## 2. Run Quality Gates
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-cargo check --features discord-bridge --bin discord_bot
+cargo check --workspace --bins --locked
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+
+# Protocol contract tests
+cargo test --locked --test message_contracts auth_contract_returns_expected_fields
+cargo test --locked --test message_contracts compatibility_contract_client_bootstrap_flow_stays_stable
+cargo test --locked --test message_contracts protocol_contract_advertises_backward_compatible_version
+cargo test --locked --test message_contracts file_contract_relays_media_metadata_and_chunks
+
+# Feature-gated checks
+cargo check --features discord-bridge --bin discord_bot --locked
+cargo check --features bridge-client --locked
 ```
 
 ## 3. Build Release Binaries
@@ -40,26 +50,26 @@ Expected artifacts:
 
 ```bash
 git add README.md CHANGELOG.md docs/SECURITY_NOTES.md docs/BENCHMARKS.md docs/ENGINEERING_CASE_STUDY.md docs/RELEASE_CHECKLIST.md
-git commit -m "docs(release): prepare recruiter-facing v0.1.0 package"
+git commit -m "release: prepare v0.3.0"
 ```
 
 ## 6. Create Annotated Tag
 
 ```bash
-git tag -a v0.1.0 -m "v0.1.0"
+git tag -a v0.3.0 -m "v0.3.0"
 ```
 
 ## 7. Push Commit and Tag
 
 ```bash
 git push origin main
-git push origin v0.1.0
+git push origin v0.3.0
 ```
 
 ## 8. Publish GitHub Release
 
-1. Open the v0.1.0 tag in GitHub Releases.
-2. Use the CHANGELOG v0.1.0 section as release notes.
+1. Open the v0.3.0 tag in GitHub Releases.
+2. Use the CHANGELOG v0.3.0 section as release notes.
 3. Publish release.
 4. Verify windows-release-package workflow completes.
 5. Verify release-security-report workflow completes.
@@ -102,10 +112,12 @@ If a major version upgrade is required, update `Cargo.toml` intentionally and do
 ### 10.4 Re-Run Quality Gates
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-cargo check --features discord-bridge --bin discord_bot
+cargo check --workspace --bins --locked
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo check --features discord-bridge --bin discord_bot --locked
+cargo check --features bridge-client --locked
 ```
 
 ### 10.5 Record and Communicate
