@@ -20,6 +20,8 @@ const SPEAKING_SIGNAL_SILENCE_MS: u64 = 450;
 const JITTER_BUFFER_TARGET_FRAMES: usize = 3;
 const JITTER_BUFFER_MAX_FRAMES: usize = 24;
 const JITTER_BUFFER_GAP_RESET_THRESHOLD: u64 = 12;
+const VOICE_FRAME_MAGIC: [u8; 4] = *b"CVR1";
+const VOICE_FRAME_HEADER_LEN: usize = 10;
 
 pub struct VoiceFrame {
     pub sample_rate: u32,
@@ -206,12 +208,13 @@ pub fn start_voice_session(
                 event_tx.clone(),
                 chunk_samples,
             ),
-            _ => {
-                let _ = ready_tx.send(Err(ChatifyError::Audio(
-                    "unsupported sample format".to_string(),
-                )));
-                return;
-            }
+            SampleFormat::F32 => build_input_stream_f32(
+                &input_device,
+                &input_config,
+                pending.clone(),
+                event_tx.clone(),
+                chunk_samples,
+            ),
         };
 
         let input_stream = match result_stream {
@@ -236,13 +239,15 @@ pub fn start_voice_session(
             match event {
                 VoiceEvent::Captured(frame) => {
                     let processed = audio_processor.process_capture(&frame.samples);
-                    let encoded = audio_processor.encode(&processed);
-                    let payload = general_purpose::STANDARD.encode(&encoded);
+                    let voiced = is_voiced_frame(&processed);
+                    let payload = encode_voice_frame(&VoiceFrame {
+                        sample_rate: frame.sample_rate,
+                        channels: frame.channels,
+                        samples: processed,
+                    });
                     let capture_ts_ms = now_ms();
                     let seq = voice_sequence;
                     voice_sequence = voice_sequence.wrapping_add(1);
-
-                    let voiced = is_voiced_frame(&processed);
                     if voiced {
                         last_voice_activity_ms = capture_ts_ms;
                     }
@@ -393,10 +398,7 @@ fn build_input_stream_u16(
         .build_input_stream(
             config,
             move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let converted: Vec<i16> = data
-                    .iter()
-                    .map(|v| (*v as i32 - 32768).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
-                    .collect();
+                let converted: Vec<i16> = data.iter().map(|v| u16_to_i16(*v)).collect();
                 push_pcm_to_chunks(
                     &pending_clone,
                     &converted,
@@ -411,6 +413,48 @@ fn build_input_stream_u16(
             },
         )
         .map_err(|e| ChatifyError::Audio(format!("failed to build u16 input stream: {}", e)))
+}
+
+fn build_input_stream_f32(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    pending: Arc<Mutex<VecDeque<i16>>>,
+    tx: std_mpsc::Sender<VoiceEvent>,
+    chunk_samples: usize,
+) -> ChatifyResult<Stream> {
+    let pending_clone = pending.clone();
+    let tx_clone = tx.clone();
+    let sample_rate = config.sample_rate.0;
+    let channels = config.channels;
+
+    device
+        .build_input_stream(
+            config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let converted: Vec<i16> = data.iter().map(|v| f32_to_i16(*v)).collect();
+                push_pcm_to_chunks(
+                    &pending_clone,
+                    &converted,
+                    chunk_samples,
+                    sample_rate,
+                    channels,
+                    &tx_clone,
+                );
+            },
+            |err| {
+                eprintln!("voice input error: {}", err);
+            },
+        )
+        .map_err(|e| ChatifyError::Audio(format!("failed to build f32 input stream: {}", e)))
+}
+
+fn u16_to_i16(sample: u16) -> i16 {
+    (sample as i32 - 32768).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+fn f32_to_i16(sample: f32) -> i16 {
+    let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round();
+    scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 fn push_pcm_to_chunks(
@@ -476,72 +520,45 @@ fn is_voiced_frame(samples: &[i16]) -> bool {
 }
 
 pub fn encode_voice_frame(frame: &VoiceFrame) -> String {
-    let mut out = Vec::with_capacity(6 + frame.samples.len() * 2);
+    let compressed = AudioProcessor::encode_pcm_rle(&frame.samples);
+
+    let mut out = Vec::with_capacity(VOICE_FRAME_HEADER_LEN + compressed.len());
+    out.extend_from_slice(&VOICE_FRAME_MAGIC);
     out.extend_from_slice(&frame.sample_rate.to_le_bytes());
     out.extend_from_slice(&frame.channels.to_le_bytes());
-    for s in &frame.samples {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
+    out.extend_from_slice(&compressed);
     general_purpose::STANDARD.encode(out)
 }
 
 pub fn decode_voice_frame(payload_b64: &str) -> Option<VoiceFrame> {
     let raw = general_purpose::STANDARD.decode(payload_b64).ok()?;
-    if raw.len() < 6 {
+    if raw.starts_with(&VOICE_FRAME_MAGIC) {
+        return decode_voice_frame_v1(&raw);
+    }
+
+    decode_voice_frame_legacy_raw(&raw)
+}
+
+fn decode_voice_frame_v1(raw: &[u8]) -> Option<VoiceFrame> {
+    if raw.len() < VOICE_FRAME_HEADER_LEN {
         return None;
     }
-    let sample_rate = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-    let channels = u16::from_le_bytes([raw[4], raw[5]]);
+    let sample_rate = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let channels = u16::from_le_bytes([raw[8], raw[9]]);
     if channels == 0 {
         return None;
     }
-    let compressed_data = &raw[6..];
 
-    let mut samples = Vec::with_capacity(compressed_data.len() * 2);
-    let mut i = 0;
-    let mut is_compressed = false;
+    let samples = AudioProcessor::decode_pcm_rle(&raw[VOICE_FRAME_HEADER_LEN..]);
 
-    while i < compressed_data.len() {
-        if i + 1 < compressed_data.len()
-            && compressed_data[i] == 0xFF
-            && compressed_data[i + 1] == 0x00
-        {
-            is_compressed = true;
-            if i + 5 < compressed_data.len() {
-                let length =
-                    u16::from_le_bytes([compressed_data[i + 2], compressed_data[i + 3]]) as usize;
-                let sample = i16::from_le_bytes([compressed_data[i + 4], compressed_data[i + 5]]);
-                for _ in 0..length {
-                    samples.push(sample);
-                }
-                i += 6;
-            } else {
-                break;
-            }
-        } else if i + 1 < compressed_data.len() {
-            samples.push(i16::from_le_bytes([
-                compressed_data[i],
-                compressed_data[i + 1],
-            ]));
-            i += 2;
-        } else {
-            break;
-        }
-    }
-
-    if is_compressed {
-        Some(VoiceFrame {
-            sample_rate,
-            channels,
-            samples,
-        })
-    } else {
-        decode_voice_frame_legacy(payload_b64)
-    }
+    Some(VoiceFrame {
+        sample_rate,
+        channels,
+        samples,
+    })
 }
 
-fn decode_voice_frame_legacy(payload_b64: &str) -> Option<VoiceFrame> {
-    let raw = general_purpose::STANDARD.decode(payload_b64).ok()?;
+fn decode_voice_frame_legacy_raw(raw: &[u8]) -> Option<VoiceFrame> {
     if raw.len() < 6 {
         return None;
     }
@@ -563,4 +580,57 @@ fn decode_voice_frame_legacy(payload_b64: &str) -> Option<VoiceFrame> {
         channels,
         samples,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_decode_voice_frame_roundtrip_v1() {
+        let frame = VoiceFrame {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![255, 255, 255, 255, -257, -257, 1024, -1024],
+        };
+        let encoded = encode_voice_frame(&frame);
+        let decoded = decode_voice_frame(&encoded).expect("frame should decode");
+
+        assert_eq!(decoded.sample_rate, frame.sample_rate);
+        assert_eq!(decoded.channels, frame.channels);
+        assert_eq!(decoded.samples, frame.samples);
+    }
+
+    #[test]
+    fn decode_voice_frame_supports_legacy_raw_layout() {
+        let sample_rate = 44_100u32;
+        let channels = 2u16;
+        let samples = vec![10i16, -10i16, 327, -327];
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&sample_rate.to_le_bytes());
+        raw.extend_from_slice(&channels.to_le_bytes());
+        for sample in &samples {
+            raw.extend_from_slice(&sample.to_le_bytes());
+        }
+        let payload = general_purpose::STANDARD.encode(raw);
+
+        let decoded = decode_voice_frame(&payload).expect("legacy frame should decode");
+        assert_eq!(decoded.sample_rate, sample_rate);
+        assert_eq!(decoded.channels, channels);
+        assert_eq!(decoded.samples, samples);
+    }
+
+    #[test]
+    fn sample_format_conversions_clamp_and_center_correctly() {
+        assert_eq!(u16_to_i16(0), -32768);
+        assert_eq!(u16_to_i16(32768), 0);
+        assert_eq!(u16_to_i16(u16::MAX), 32767);
+
+        assert_eq!(f32_to_i16(-1.0), -32767);
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(1.0), 32767);
+        assert_eq!(f32_to_i16(2.0), 32767);
+        assert_eq!(f32_to_i16(-2.0), -32767);
+    }
 }

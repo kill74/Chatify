@@ -2,7 +2,8 @@ pub struct AudioProcessor {
     noise_gate: NoiseGate,
     agc: AutomaticGainControl,
     compressor: Compressor,
-    high_pass_filter: HighPassFilter,
+    capture_high_pass_filter: HighPassFilter,
+    playback_high_pass_filter: HighPassFilter,
     #[allow(dead_code)]
     sample_rate: u32,
     #[allow(dead_code)]
@@ -15,7 +16,8 @@ impl AudioProcessor {
             noise_gate: NoiseGate::new(),
             agc: AutomaticGainControl::new(),
             compressor: Compressor::new(),
-            high_pass_filter: HighPassFilter::new(sample_rate),
+            capture_high_pass_filter: HighPassFilter::new(sample_rate),
+            playback_high_pass_filter: HighPassFilter::new(sample_rate),
             sample_rate,
             channels,
         }
@@ -24,7 +26,7 @@ impl AudioProcessor {
     pub fn process_capture(&mut self, samples: &[i16]) -> Vec<i16> {
         let mut result = samples.to_vec();
 
-        result = self.high_pass_filter.process(&result);
+        result = self.capture_high_pass_filter.process(&result);
         result = self.noise_gate.process(&result);
         result = self.agc.process(&result);
         result = self.compressor.process(&result);
@@ -34,79 +36,110 @@ impl AudioProcessor {
 
     pub fn process_playback(&mut self, samples: &[i16]) -> Vec<i16> {
         let mut result = samples.to_vec();
-        result = self.high_pass_filter.process(&result);
+        result = self.playback_high_pass_filter.process(&result);
         result
     }
 
     pub fn encode(&self, samples: &[i16]) -> Vec<u8> {
+        Self::encode_pcm_rle(samples)
+    }
+
+    pub fn decode(&self, data: &[u8]) -> Vec<i16> {
+        Self::decode_pcm_rle(data)
+    }
+
+    pub fn encode_pcm_rle(samples: &[i16]) -> Vec<u8> {
+        const OP_LITERAL: u8 = 0;
+        const OP_RUN: u8 = 1;
+        const RUN_THRESHOLD: usize = 4;
+
         let mut encoded = Vec::with_capacity(samples.len() * 2);
+        let mut i = 0usize;
 
-        let mut run_start: Option<usize> = None;
-        let mut run_length: usize = 0;
-
-        for (i, &sample) in samples.iter().enumerate() {
-            if i > 0 && sample == samples[i - 1] {
-                if run_length == 0 {
-                    run_start = Some(i - 1);
-                }
-                run_length += 1;
-            } else {
-                if let Some(start) = run_start {
-                    if run_length >= 3 {
-                        encoded.push(0xFF);
-                        encoded.push(0x00);
-                        encoded.extend_from_slice(&(run_length as u16).to_le_bytes());
-                        encoded.extend_from_slice(&samples[start].to_le_bytes());
-                    } else {
-                        for sample in samples.iter().take(start + run_length + 1).skip(start) {
-                            encoded.extend_from_slice(&sample.to_le_bytes());
-                        }
-                    }
-                }
-                run_start = None;
-                run_length = 0;
-
-                encoded.extend_from_slice(&sample.to_le_bytes());
+        while i < samples.len() {
+            // Find run length for the current sample.
+            let mut run_len = 1usize;
+            while i + run_len < samples.len()
+                && samples[i + run_len] == samples[i]
+                && run_len < u16::MAX as usize
+            {
+                run_len += 1;
             }
-        }
 
-        if let Some(start) = run_start {
-            if run_length >= 3 {
-                encoded.push(0xFF);
-                encoded.push(0x00);
-                encoded.extend_from_slice(&(run_length as u16).to_le_bytes());
-                encoded.extend_from_slice(&samples[start].to_le_bytes());
-            } else {
-                for sample in samples.iter().take(start + run_length + 1).skip(start) {
-                    encoded.extend_from_slice(&sample.to_le_bytes());
+            if run_len >= RUN_THRESHOLD {
+                encoded.push(OP_RUN);
+                encoded.extend_from_slice(&(run_len as u16).to_le_bytes());
+                encoded.extend_from_slice(&samples[i].to_le_bytes());
+                i += run_len;
+                continue;
+            }
+
+            // Build a literal block until the next compressible run.
+            let literal_start = i;
+            let mut literal_len = 0usize;
+            while i < samples.len() && literal_len < u16::MAX as usize {
+                let mut next_run_len = 1usize;
+                while i + next_run_len < samples.len()
+                    && samples[i + next_run_len] == samples[i]
+                    && next_run_len < u16::MAX as usize
+                {
+                    next_run_len += 1;
                 }
+                if next_run_len >= RUN_THRESHOLD {
+                    break;
+                }
+                i += next_run_len;
+                literal_len += next_run_len;
+            }
+
+            encoded.push(OP_LITERAL);
+            encoded.extend_from_slice(&(literal_len as u16).to_le_bytes());
+            for sample in &samples[literal_start..literal_start + literal_len] {
+                encoded.extend_from_slice(&sample.to_le_bytes());
             }
         }
 
         encoded
     }
 
-    pub fn decode(&self, data: &[u8]) -> Vec<i16> {
+    pub fn decode_pcm_rle(data: &[u8]) -> Vec<i16> {
+        const OP_LITERAL: u8 = 0;
+        const OP_RUN: u8 = 1;
+
         let mut decoded = Vec::with_capacity(data.len() / 2);
         let mut i = 0;
 
         while i < data.len() {
-            if i + 1 < data.len() && data[i] == 0xFF && data[i + 1] == 0x00 {
-                if i + 5 < data.len() {
-                    let length = u16::from_le_bytes([data[i + 2], data[i + 3]]) as usize;
-                    let sample = i16::from_le_bytes([data[i + 4], data[i + 5]]);
-                    for _ in 0..length {
+            if i + 2 >= data.len() {
+                break;
+            }
+
+            let op = data[i];
+            let count = u16::from_le_bytes([data[i + 1], data[i + 2]]) as usize;
+            i += 3;
+
+            match op {
+                OP_LITERAL => {
+                    let bytes_needed = count.saturating_mul(2);
+                    if i + bytes_needed > data.len() {
+                        break;
+                    }
+                    for chunk in data[i..i + bytes_needed].chunks_exact(2) {
+                        decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    }
+                    i += bytes_needed;
+                }
+                OP_RUN => {
+                    if i + 1 >= data.len() {
+                        break;
+                    }
+                    let sample = i16::from_le_bytes([data[i], data[i + 1]]);
+                    for _ in 0..count {
                         decoded.push(sample);
                     }
-                    i += 6;
-                } else {
-                    break;
+                    i += 2;
                 }
-            } else if i + 1 < data.len() {
-                decoded.push(i16::from_le_bytes([data[i], data[i + 1]]));
-                i += 2;
-            } else {
-                break;
+                _ => break,
             }
         }
 
@@ -363,7 +396,7 @@ impl Default for HighPassFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::HighPassFilter;
+    use super::{AudioProcessor, HighPassFilter};
 
     #[test]
     fn high_pass_filter_rejects_dc_after_warmup() {
@@ -388,5 +421,23 @@ mod tests {
             output.iter().any(|sample| sample.abs() > 1000),
             "expected impulse response to remain visible after filtering"
         );
+    }
+
+    #[test]
+    fn rle_roundtrip_preserves_short_runs() {
+        let codec = AudioProcessor::new(48_000, 1);
+        let input = vec![100, 100, 200, 200, 200, 300];
+        let encoded = codec.encode(&input);
+        let decoded = codec.decode(&encoded);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn rle_roundtrip_preserves_samples_with_ff00_bytes() {
+        let codec = AudioProcessor::new(48_000, 1);
+        let input = vec![0x00FFi16, -257i16, 0x00FFi16, 1024i16, -1024i16];
+        let encoded = codec.encode(&input);
+        let decoded = codec.decode(&encoded);
+        assert_eq!(decoded, input);
     }
 }
