@@ -102,6 +102,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
@@ -4032,6 +4033,25 @@ fn spawn_broadcast_forwarder(mut rx: broadcast::Receiver<String>, out_tx: Outbou
     });
 }
 
+fn spawn_voice_audio_forwarder(
+    mut rx: broadcast::Receiver<String>,
+    out_tx: OutboundTx,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(message) => {
+                    if out_tx.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(_) => {}
+            }
+        }
+    })
+}
+
 fn spawn_channel_forwarder(
     mut rx: broadcast::Receiver<String>,
     out_tx: OutboundTx,
@@ -4065,11 +4085,37 @@ fn spawn_channel_forwarder(
     });
 }
 
-fn spawn_voice_relay_forwarder(mut rx: broadcast::Receiver<VoiceBroadcast>, out_tx: OutboundTx) {
+fn voice_event_room(event: &VoiceBroadcast) -> &str {
+    match event {
+        VoiceBroadcast::Users { room, .. }
+        | VoiceBroadcast::StateChange { room, .. }
+        | VoiceBroadcast::Speaking { room, .. }
+        | VoiceBroadcast::MemberJoined { room, .. }
+        | VoiceBroadcast::MemberLeft { room, .. } => room.as_str(),
+    }
+}
+
+fn should_forward_voice_event(active_room: Option<&str>, event: &VoiceBroadcast) -> bool {
+    matches!(active_room, Some(room) if room == voice_event_room(event))
+}
+
+fn spawn_voice_relay_forwarder(
+    mut rx: broadcast::Receiver<VoiceBroadcast>,
+    out_tx: OutboundTx,
+    active_room: Arc<RwLock<Option<String>>>,
+) {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    let should_forward = {
+                        let room = active_room.read().await;
+                        should_forward_voice_event(room.as_deref(), &event)
+                    };
+                    if !should_forward {
+                        continue;
+                    }
+
                     let json = serde_json::to_string(&event).unwrap_or_default();
                     if out_tx.send(json).await.is_err() {
                         break;
@@ -4237,6 +4283,9 @@ async fn handle_event(
     username: &str,
     out_tx: &OutboundTx,
     voice_room: &mut Option<String>,
+    active_voice_room: &Arc<RwLock<Option<String>>>,
+    voice_audio_forwarder: &mut Option<JoinHandle<()>>,
+    voice_relay_subscribed: &mut bool,
     screen_room: &mut Option<String>,
     joined_channels: &Arc<DashSet<String>>,
 ) {
@@ -5074,6 +5123,36 @@ async fn handle_event(
             // notify other members.
             let room = safe_ch(d["r"].as_str().unwrap_or("general"));
 
+            // Re-joining the same room should be idempotent and must not spawn
+            // duplicate forwarders for the same connection.
+            if voice_room.as_deref() == Some(room.as_str()) {
+                let members = state.voice_relay.get_members(&room);
+                send_out_json(
+                    out_tx,
+                    serde_json::json!({
+                        "t": "vusers",
+                        "room": room,
+                        "members": members,
+                        "joined": true,
+                        "ts": now()
+                    }),
+                );
+                return;
+            }
+
+            // Switching rooms on one socket should release the previous room
+            // membership and stop forwarding stale room audio.
+            if let Some(previous_room) = voice_room.take() {
+                state.voice_relay.leave_room(&previous_room, username);
+            }
+            if let Some(handle) = voice_audio_forwarder.take() {
+                handle.abort();
+            }
+            {
+                let mut room_guard = active_voice_room.write().await;
+                *room_guard = None;
+            }
+
             // Add user to voice relay and get current members
             let members = state.voice_relay.join_room(&room, username);
 
@@ -5088,7 +5167,7 @@ async fn handle_event(
                 out_tx,
                 serde_json::json!({
                     "t": "vusers",
-                    "room": room,
+                    "room": room.clone(),
                     "members": members,
                     "joined": true,
                     "ts": now()
@@ -5096,8 +5175,20 @@ async fn handle_event(
             );
 
             let vtx = state.voice_tx(&room);
-            spawn_broadcast_forwarder(vtx.subscribe(), out_tx.clone());
-            spawn_voice_relay_forwarder(state.voice_relay.subscribe(), out_tx.clone());
+            *voice_audio_forwarder =
+                Some(spawn_voice_audio_forwarder(vtx.subscribe(), out_tx.clone()));
+            {
+                let mut room_guard = active_voice_room.write().await;
+                *room_guard = Some(room.clone());
+            }
+            if !*voice_relay_subscribed {
+                spawn_voice_relay_forwarder(
+                    state.voice_relay.subscribe(),
+                    out_tx.clone(),
+                    active_voice_room.clone(),
+                );
+                *voice_relay_subscribed = true;
+            }
             *voice_room = Some(room.clone());
             let join_voice = serde_json::json!({
                 "t":"sys",
@@ -5117,8 +5208,15 @@ async fn handle_event(
         "vleave" => {
             // Unsubscribe from the voice room (the broadcast receiver is
             // dropped when the forwarder task exits) and notify other members.
-            if let Some(ref room) = voice_room.take() {
-                state.voice_relay.leave_room(room, username);
+            if let Some(handle) = voice_audio_forwarder.take() {
+                handle.abort();
+            }
+            {
+                let mut room_guard = active_voice_room.write().await;
+                *room_guard = None;
+            }
+            if let Some(room) = voice_room.take() {
+                state.voice_relay.leave_room(&room, username);
 
                 let leave_voice = serde_json::json!({
                     "t":"sys",
@@ -5127,13 +5225,13 @@ async fn handle_event(
                 });
                 state.store.persist(
                     "sys",
-                    room,
+                    &room,
                     username,
                     None,
                     &leave_voice,
                     &format!("{} voice left", username),
                 );
-                let _ = state.chan(room).tx.send(leave_voice.to_string());
+                let _ = state.chan(&room).tx.send(leave_voice.to_string());
             }
         }
         "vstate" => {
@@ -7485,6 +7583,12 @@ where
 
     // Tracks the current voice room so vleave / vdata know which room to act on.
     let mut voice_room: Option<String> = None;
+    // Shared room selector used to filter relay events for this connection.
+    let active_voice_room: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    // Single room-audio forwarder per connection; replaced on room switches.
+    let mut voice_audio_forwarder: Option<JoinHandle<()>> = None;
+    // Relay events are connection-scoped and should only subscribe once.
+    let mut voice_relay_subscribed = false;
     // Tracks the current screen-share room for ss_meta / ss_frame relay.
     let mut screen_room: Option<String> = None;
 
@@ -7558,6 +7662,9 @@ where
             &username,
             &out_tx,
             &mut voice_room,
+            &active_voice_room,
+            &mut voice_audio_forwarder,
+            &mut voice_relay_subscribed,
             &mut screen_room,
             &joined_channels,
         )
@@ -7565,6 +7672,17 @@ where
     }
 
     // ---- Phase 5: cleanup ---------------------------------------------------
+    if let Some(handle) = voice_audio_forwarder.take() {
+        handle.abort();
+    }
+    if let Some(room) = voice_room.take() {
+        state.voice_relay.leave_room(&room, &username);
+    }
+    {
+        let mut room_guard = active_voice_room.write().await;
+        *room_guard = None;
+    }
+
     if let Some(room) = screen_room.take() {
         if let Some(stx) = state.screen.get(&room) {
             let _ = stx.send(
@@ -8354,6 +8472,52 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{nanos}.db"))
+    }
+
+    #[test]
+    fn voice_event_forwarding_respects_active_room() {
+        let event = VoiceBroadcast::MemberJoined {
+            room: "ops".to_string(),
+            user: "alice".to_string(),
+        };
+
+        assert!(should_forward_voice_event(Some("ops"), &event));
+        assert!(!should_forward_voice_event(Some("general"), &event));
+        assert!(!should_forward_voice_event(None, &event));
+    }
+
+    #[test]
+    fn voice_event_room_extracts_room_for_all_variants() {
+        let users = VoiceBroadcast::Users {
+            room: "ops".to_string(),
+            members: Vec::new(),
+        };
+        let state = VoiceBroadcast::StateChange {
+            room: "ops".to_string(),
+            user: "alice".to_string(),
+            muted: Some(true),
+            deafened: Some(false),
+            speaking: None,
+        };
+        let speaking = VoiceBroadcast::Speaking {
+            room: "ops".to_string(),
+            user: "alice".to_string(),
+            speaking: true,
+        };
+        let joined = VoiceBroadcast::MemberJoined {
+            room: "ops".to_string(),
+            user: "alice".to_string(),
+        };
+        let left = VoiceBroadcast::MemberLeft {
+            room: "ops".to_string(),
+            user: "alice".to_string(),
+        };
+
+        assert_eq!(voice_event_room(&users), "ops");
+        assert_eq!(voice_event_room(&state), "ops");
+        assert_eq!(voice_event_room(&speaking), "ops");
+        assert_eq!(voice_event_room(&joined), "ops");
+        assert_eq!(voice_event_room(&left), "ops");
     }
 
     /// Verifies that [`validate_auth_payload`] returns a `ChatifyError::Validation`

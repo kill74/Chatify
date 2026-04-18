@@ -321,7 +321,8 @@ impl Default for Compressor {
 
 pub struct HighPassFilter {
     alpha: f32,
-    last_sample: f32,
+    last_input: f32,
+    last_output: f32,
 }
 
 impl HighPassFilter {
@@ -333,7 +334,8 @@ impl HighPassFilter {
 
         Self {
             alpha,
-            last_sample: 0.0,
+            last_input: 0.0,
+            last_output: 0.0,
         }
     }
 
@@ -342,8 +344,10 @@ impl HighPassFilter {
 
         for &sample in samples {
             let input = sample as f32;
-            let filtered = self.alpha * (self.last_sample + input - self.last_sample);
-            self.last_sample = filtered;
+            // First-order RC high-pass: y[n] = a * (y[n-1] + x[n] - x[n-1]).
+            let filtered = self.alpha * (self.last_output + input - self.last_input);
+            self.last_input = input;
+            self.last_output = filtered;
             output.push(filtered.clamp(-32768.0, 32767.0) as i16);
         }
 
@@ -354,5 +358,35 @@ impl HighPassFilter {
 impl Default for HighPassFilter {
     fn default() -> Self {
         Self::new(48000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HighPassFilter;
+
+    #[test]
+    fn high_pass_filter_rejects_dc_after_warmup() {
+        let mut filter = HighPassFilter::new(48_000);
+        let input = vec![10_000i16; 1024];
+        let output = filter.process(&input);
+        let tail = output.last().copied().unwrap_or_default().abs();
+        assert!(
+            tail < 100,
+            "expected strong DC attenuation in steady state, got tail sample {}",
+            tail
+        );
+    }
+
+    #[test]
+    fn high_pass_filter_preserves_transients() {
+        let mut filter = HighPassFilter::new(48_000);
+        let mut input = vec![0i16; 16];
+        input[0] = 12_000;
+        let output = filter.process(&input);
+        assert!(
+            output.iter().any(|sample| sample.abs() > 1000),
+            "expected impulse response to remain visible after filtering"
+        );
     }
 }

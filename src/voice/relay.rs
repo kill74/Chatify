@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use super::VoiceRoom;
 
 pub struct VoiceRelay {
-    rooms: Arc<RwLock<HashMap<String, VoiceRoom>>>,
+    rooms: Arc<RwLock<HashMap<String, Arc<RwLock<VoiceRoom>>>>>,
     tx: broadcast::Sender<VoiceBroadcast>,
 }
 
@@ -67,10 +67,10 @@ impl VoiceRelay {
 
     pub fn get_or_create_room(&self, name: &str) -> Arc<RwLock<VoiceRoom>> {
         let mut rooms = self.rooms.write();
-        if !rooms.contains_key(name) {
-            rooms.insert(name.to_string(), VoiceRoom::new(name.to_string()));
-        }
-        Arc::new(RwLock::new(rooms.get(name).unwrap().clone()))
+        rooms
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(VoiceRoom::new(name.to_string()))))
+            .clone()
     }
 
     pub fn join_room(&self, room: &str, username: &str) -> Vec<VoiceMemberInfo> {
@@ -158,5 +158,49 @@ impl VoiceRelay {
 impl Default for VoiceRelay {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_room_persists_members_across_calls() {
+        let relay = VoiceRelay::new();
+
+        let joined = relay.join_room("ops", "alice");
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].user, "alice");
+
+        let current = relay.get_members("ops");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].user, "alice");
+    }
+
+    #[test]
+    fn leave_room_removes_existing_member() {
+        let relay = VoiceRelay::new();
+        relay.join_room("ops", "alice");
+
+        assert!(relay.leave_room("ops", "alice"));
+        assert!(relay.get_members("ops").is_empty());
+    }
+
+    #[test]
+    fn update_member_state_is_visible_in_member_snapshots() {
+        let relay = VoiceRelay::new();
+        relay.join_room("ops", "alice");
+
+        relay.update_member_state("ops", "alice", Some(true), Some(true), Some(true));
+
+        let members = relay.get_members("ops");
+        let alice = members
+            .iter()
+            .find(|member| member.user == "alice")
+            .expect("alice should be present after join");
+        assert!(alice.muted);
+        assert!(alice.deafened);
+        assert!(alice.speaking);
     }
 }
