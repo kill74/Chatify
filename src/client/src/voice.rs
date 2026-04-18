@@ -22,6 +22,10 @@ const JITTER_BUFFER_MAX_FRAMES: usize = 24;
 const JITTER_BUFFER_GAP_RESET_THRESHOLD: u64 = 12;
 const VOICE_FRAME_MAGIC: [u8; 4] = *b"CVR1";
 const VOICE_FRAME_HEADER_LEN: usize = 10;
+const MAX_VOICE_FRAME_SAMPLES: usize = 32_768;
+const MAX_VOICE_CHANNELS: u16 = 8;
+const MIN_VOICE_SAMPLE_RATE: u32 = 8_000;
+const MAX_VOICE_SAMPLE_RATE: u32 = 192_000;
 
 pub struct VoiceFrame {
     pub sample_rate: u32,
@@ -545,11 +549,14 @@ fn decode_voice_frame_v1(raw: &[u8]) -> Option<VoiceFrame> {
     }
     let sample_rate = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
     let channels = u16::from_le_bytes([raw[8], raw[9]]);
-    if channels == 0 {
+    if !is_voice_header_supported(sample_rate, channels) {
         return None;
     }
 
-    let samples = AudioProcessor::decode_pcm_rle(&raw[VOICE_FRAME_HEADER_LEN..]);
+    let samples = AudioProcessor::decode_pcm_rle_checked(
+        &raw[VOICE_FRAME_HEADER_LEN..],
+        MAX_VOICE_FRAME_SAMPLES,
+    )?;
 
     Some(VoiceFrame {
         sample_rate,
@@ -564,11 +571,15 @@ fn decode_voice_frame_legacy_raw(raw: &[u8]) -> Option<VoiceFrame> {
     }
     let sample_rate = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let channels = u16::from_le_bytes([raw[4], raw[5]]);
-    if channels == 0 {
+    if !is_voice_header_supported(sample_rate, channels) {
         return None;
     }
     let samples_raw = &raw[6..];
     if samples_raw.len() % 2 != 0 {
+        return None;
+    }
+    let sample_count = samples_raw.len() / 2;
+    if sample_count > MAX_VOICE_FRAME_SAMPLES {
         return None;
     }
     let mut samples = Vec::with_capacity(samples_raw.len() / 2);
@@ -580,6 +591,13 @@ fn decode_voice_frame_legacy_raw(raw: &[u8]) -> Option<VoiceFrame> {
         channels,
         samples,
     })
+}
+
+fn is_voice_header_supported(sample_rate: u32, channels: u16) -> bool {
+    if channels == 0 || channels > MAX_VOICE_CHANNELS {
+        return false;
+    }
+    (MIN_VOICE_SAMPLE_RATE..=MAX_VOICE_SAMPLE_RATE).contains(&sample_rate)
 }
 
 #[cfg(test)]
@@ -632,5 +650,58 @@ mod tests {
         assert_eq!(f32_to_i16(1.0), 32767);
         assert_eq!(f32_to_i16(2.0), 32767);
         assert_eq!(f32_to_i16(-2.0), -32767);
+    }
+
+    #[test]
+    fn decode_voice_frame_rejects_malformed_v1_rle_payload() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&VOICE_FRAME_MAGIC);
+        raw.extend_from_slice(&48_000u32.to_le_bytes());
+        raw.extend_from_slice(&1u16.to_le_bytes());
+        raw.push(1); // OP_RUN
+        raw.extend_from_slice(&10u16.to_le_bytes());
+        raw.push(0x34); // truncated i16 sample payload
+
+        let payload = general_purpose::STANDARD.encode(raw);
+        assert!(decode_voice_frame(&payload).is_none());
+    }
+
+    #[test]
+    fn decode_voice_frame_rejects_v1_decompression_bomb() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&VOICE_FRAME_MAGIC);
+        raw.extend_from_slice(&48_000u32.to_le_bytes());
+        raw.extend_from_slice(&1u16.to_le_bytes());
+        raw.push(1); // OP_RUN
+        raw.extend_from_slice(&(MAX_VOICE_FRAME_SAMPLES as u16 + 1).to_le_bytes());
+        raw.extend_from_slice(&123i16.to_le_bytes());
+
+        let payload = general_purpose::STANDARD.encode(raw);
+        assert!(decode_voice_frame(&payload).is_none());
+    }
+
+    #[test]
+    fn decode_voice_frame_rejects_unsupported_header_values() {
+        let mut invalid_rate = Vec::new();
+        invalid_rate.extend_from_slice(&VOICE_FRAME_MAGIC);
+        invalid_rate.extend_from_slice(&1000u32.to_le_bytes());
+        invalid_rate.extend_from_slice(&1u16.to_le_bytes());
+        invalid_rate.push(0); // OP_LITERAL
+        invalid_rate.extend_from_slice(&1u16.to_le_bytes());
+        invalid_rate.extend_from_slice(&42i16.to_le_bytes());
+
+        let payload = general_purpose::STANDARD.encode(invalid_rate);
+        assert!(decode_voice_frame(&payload).is_none());
+
+        let mut invalid_channels = Vec::new();
+        invalid_channels.extend_from_slice(&VOICE_FRAME_MAGIC);
+        invalid_channels.extend_from_slice(&48_000u32.to_le_bytes());
+        invalid_channels.extend_from_slice(&99u16.to_le_bytes());
+        invalid_channels.push(0); // OP_LITERAL
+        invalid_channels.extend_from_slice(&1u16.to_le_bytes());
+        invalid_channels.extend_from_slice(&42i16.to_le_bytes());
+
+        let payload = general_purpose::STANDARD.encode(invalid_channels);
+        assert!(decode_voice_frame(&payload).is_none());
     }
 }

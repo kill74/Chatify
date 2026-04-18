@@ -4116,7 +4116,13 @@ fn spawn_voice_relay_forwarder(
                         continue;
                     }
 
-                    let json = serde_json::to_string(&event).unwrap_or_default();
+                    let json = match serde_json::to_string(&event) {
+                        Ok(encoded) => encoded,
+                        Err(err) => {
+                            warn!("failed to serialize voice relay event: {}", err);
+                            continue;
+                        }
+                    };
                     if out_tx.send(json).await.is_err() {
                         break;
                     }

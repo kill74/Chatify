@@ -103,6 +103,10 @@ impl AudioProcessor {
     }
 
     pub fn decode_pcm_rle(data: &[u8]) -> Vec<i16> {
+        Self::decode_pcm_rle_checked(data, usize::MAX).unwrap_or_default()
+    }
+
+    pub fn decode_pcm_rle_checked(data: &[u8], max_samples: usize) -> Option<Vec<i16>> {
         const OP_LITERAL: u8 = 0;
         const OP_RUN: u8 = 1;
 
@@ -122,7 +126,10 @@ impl AudioProcessor {
                 OP_LITERAL => {
                     let bytes_needed = count.saturating_mul(2);
                     if i + bytes_needed > data.len() {
-                        break;
+                        return None;
+                    }
+                    if decoded.len().saturating_add(count) > max_samples {
+                        return None;
                     }
                     for chunk in data[i..i + bytes_needed].chunks_exact(2) {
                         decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
@@ -131,7 +138,10 @@ impl AudioProcessor {
                 }
                 OP_RUN => {
                     if i + 1 >= data.len() {
-                        break;
+                        return None;
+                    }
+                    if decoded.len().saturating_add(count) > max_samples {
+                        return None;
                     }
                     let sample = i16::from_le_bytes([data[i], data[i + 1]]);
                     for _ in 0..count {
@@ -139,11 +149,11 @@ impl AudioProcessor {
                     }
                     i += 2;
                 }
-                _ => break,
+                _ => return None,
             }
         }
 
-        decoded
+        Some(decoded)
     }
 }
 
@@ -439,5 +449,22 @@ mod tests {
         let encoded = codec.encode(&input);
         let decoded = codec.decode(&encoded);
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn rle_checked_decode_rejects_invalid_opcode() {
+        let invalid = vec![9u8, 1, 0, 0, 0];
+        assert!(AudioProcessor::decode_pcm_rle_checked(&invalid, 1024).is_none());
+    }
+
+    #[test]
+    fn rle_checked_decode_enforces_max_sample_limit() {
+        let mut payload = Vec::new();
+        payload.push(1); // OP_RUN
+        payload.extend_from_slice(&400u16.to_le_bytes());
+        payload.extend_from_slice(&123i16.to_le_bytes());
+
+        assert!(AudioProcessor::decode_pcm_rle_checked(&payload, 128).is_none());
+        assert!(AudioProcessor::decode_pcm_rle_checked(&payload, 400).is_some());
     }
 }
