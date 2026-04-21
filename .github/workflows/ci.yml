@@ -2,31 +2,38 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  rust:
+  workspace-quality:
+    name: Workspace quality gates
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    defaults:
-      run:
-        shell: bash
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -37,7 +44,54 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
 
-      - name: Install Rust
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Pre-fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Workspace compile check
+        run: cargo check --workspace --bins --locked
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Workspace tests
+        run: cargo test --workspace --all-targets --locked
+
+  protocol-contracts:
+    name: Protocol contract gates
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs: workspace-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        test_name:
+          - auth_contract_returns_expected_fields
+          - compatibility_contract_client_bootstrap_flow_stays_stable
+          - protocol_contract_advertises_backward_compatible_version
+          - file_contract_relays_media_metadata_and_chunks
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
@@ -46,28 +100,49 @@ jobs:
       - name: Pre-fetch dependencies
         run: cargo fetch --locked
 
-      - name: Format check
-        run: cargo fmt --all --check
+      - name: Run contract gate
+        run: cargo test --locked --test message_contracts ${{ matrix.test_name }}
 
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+  feature-builds:
+    name: Feature-gated builds
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs: workspace-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate_name: Discord bridge compile gate
+            cargo_command: cargo check --features discord-bridge --bin discord_bot --locked
+            run_bridge_regressions: true
+          - gate_name: Bridge client compile gate
+            cargo_command: cargo check --features bridge-client --locked
+            run_bridge_regressions: false
 
-      - name: Contract schema gate
-        run: cargo test --locked --test message_contracts auth_contract_returns_expected_fields
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Server/client compatibility gate
-        run: cargo test --locked --test message_contracts compatibility_contract_client_bootstrap_flow_stays_stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libasound2-dev
 
-      - name: Protocol backward compatibility gate
-        run: cargo test --locked --test message_contracts protocol_contract_advertises_backward_compatible_version
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Workspace tests
-        run: cargo test --workspace --all-targets --locked
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
-      - name: Bridge feature compile check
-        run: cargo check --features discord-bridge --bin discord_bot --locked
+      - name: Pre-fetch dependencies
+        run: cargo fetch --locked
 
-      - name: Bridge regression tests
+      - name: ${{ matrix.gate_name }}
+        run: ${{ matrix.cargo_command }}
+
+      - name: Discord bridge regression tests
+        if: ${{ matrix.run_bridge_regressions }}
         run: |
           set -euo pipefail
 
