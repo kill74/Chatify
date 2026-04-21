@@ -73,11 +73,12 @@ mod args;
 mod plugin_runtime;
 use crate::args::{Args, DbDurabilityMode};
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
@@ -95,8 +96,12 @@ use plugin_runtime::{
     MessageHookResult, PluginMessage, PluginMessageTarget, PluginRuntime, PLUGIN_API_VERSION,
 };
 use prometheus::Encoder;
-use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, types::Value as SqlValue, Connection, Error as SqlError,
+    OptionalExtension,
+};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -184,6 +189,7 @@ struct EventRow {
     target: Option<String>,
     payload: String,
     search_text: String,
+    search_terms: Vec<Vec<u8>>,
     ts: f64,
 }
 
@@ -280,6 +286,12 @@ impl WriteQueue {
                     row.search_text
                 ]) {
                     warn!("batch flush insert failed: {}", e);
+                    return Err(rows);
+                }
+
+                let event_id = tx.last_insert_rowid();
+                if let Err(e) = insert_search_terms_tx(&tx, event_id, &row.search_terms) {
+                    warn!("batch flush search index insert failed: {}", e);
                     return Err(rows);
                 }
             }
@@ -456,6 +468,10 @@ const SLOW_CLIENT_DROP_BURST_DEFAULT: usize = 64;
 const SLOW_CLIENT_DROP_BURST_MIN: usize = 1;
 const SLOW_CLIENT_DROP_BURST_MAX: usize = 4096;
 const ENCRYPTED_SEARCH_SCAN_CAP: usize = 100_000;
+const SEARCH_TERM_WINDOW_BYTES: usize = 3;
+const SEARCH_INDEX_CANDIDATE_MULTIPLIER: usize = 8;
+const SEARCH_INDEX_CANDIDATE_LIMIT: usize = 4096;
+const SEARCH_HASH_PREFIX: &[u8] = b"chatify-search-term:v1:";
 const MEDIA_CHUNK_ENC_PREFIX: &[u8] = b"cfm1";
 const MEDIA_RETENTION_DAYS_DEFAULT: u32 = 30;
 const MEDIA_RETENTION_DAYS_MIN: u32 = 1;
@@ -463,6 +479,9 @@ const MEDIA_RETENTION_DAYS_MAX: u32 = 3650;
 const MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT: f64 = 20.0;
 const MEDIA_MAX_TOTAL_SIZE_GB_MIN: f64 = 0.5;
 const MEDIA_MAX_TOTAL_SIZE_GB_MAX: f64 = 10_240.0;
+const MEDIA_SPILL_THRESHOLD_KIB_DEFAULT: u64 = 1024;
+const MEDIA_SPILL_THRESHOLD_KIB_MIN: u64 = 64;
+const MEDIA_SPILL_THRESHOLD_KIB_MAX: u64 = 1_048_576;
 const MEDIA_PRUNE_INTERVAL_SECS_DEFAULT: u64 = 600;
 const MEDIA_PRUNE_INTERVAL_SECS_MIN: u64 = 60;
 const MEDIA_PRUNE_INTERVAL_SECS_MAX: u64 = 86_400;
@@ -521,9 +540,22 @@ fn normalize_media_max_total_size_gb(requested: f64) -> f64 {
     requested.clamp(MEDIA_MAX_TOTAL_SIZE_GB_MIN, MEDIA_MAX_TOTAL_SIZE_GB_MAX)
 }
 
+fn normalize_media_spill_threshold_kib(requested: u64) -> u64 {
+    let requested = if requested == 0 {
+        MEDIA_SPILL_THRESHOLD_KIB_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(MEDIA_SPILL_THRESHOLD_KIB_MIN, MEDIA_SPILL_THRESHOLD_KIB_MAX)
+}
+
 fn gib_to_bytes_i64(gib: f64) -> i64 {
     let bytes = gib * 1024.0 * 1024.0 * 1024.0;
     bytes.min(i64::MAX as f64).round() as i64
+}
+
+fn kib_to_bytes_usize(kib: u64) -> usize {
+    kib.saturating_mul(1024).min(usize::MAX as u64) as usize
 }
 
 fn clamp_u64_to_i64(value: u64) -> i64 {
@@ -532,6 +564,104 @@ fn clamp_u64_to_i64(value: u64) -> i64 {
 
 fn clamp_usize_to_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
+}
+
+fn default_media_spill_root(db_path: &str) -> Option<PathBuf> {
+    if db_path == ":memory:" {
+        None
+    } else {
+        Some(PathBuf::from(format!("{}.media", db_path)))
+    }
+}
+
+fn resolve_media_spill_root(db_path: &str, configured: Option<&str>) -> Option<PathBuf> {
+    configured
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| default_media_spill_root(db_path))
+}
+
+fn hash_search_term(term: &[u8], key: Option<&[u8]>) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    if let Some(key) = key {
+        hasher.update(key);
+    }
+    hasher.update(SEARCH_HASH_PREFIX);
+    hasher.update(term);
+    let digest = hasher.finalize().to_vec();
+
+    digest[..16].to_vec()
+}
+
+fn build_search_term_hashes(search_text: &str, key: Option<&[u8]>) -> Vec<Vec<u8>> {
+    let normalized = search_text.to_lowercase();
+    let bytes = normalized.as_bytes();
+    if bytes.len() < SEARCH_TERM_WINDOW_BYTES {
+        return Vec::new();
+    }
+
+    let mut hashes = BTreeSet::new();
+    for window in bytes.windows(SEARCH_TERM_WINDOW_BYTES) {
+        hashes.insert(hash_search_term(window, key));
+    }
+
+    hashes.into_iter().collect()
+}
+
+fn candidate_limit(limit: usize) -> usize {
+    limit
+        .saturating_mul(SEARCH_INDEX_CANDIDATE_MULTIPLIER)
+        .clamp(limit.max(1), SEARCH_INDEX_CANDIDATE_LIMIT)
+}
+
+fn quote_identifier(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> ChatifyResult<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(dst).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    for entry in std::fs::read_dir(src).map_err(|e| ChatifyError::Io(Box::new(e)))? {
+        let entry = entry.map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        let entry_type = entry
+            .file_type()
+            .map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+            }
+            std::fs::copy(&src_path, &dst_path).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> ChatifyResult<()> {
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    }
+    Ok(())
+}
+
+fn prune_empty_parent_dirs(root: &Path, leaf: &Path) {
+    let mut current = leaf.parent();
+    while let Some(dir) = current {
+        if dir == root {
+            break;
+        }
+        match std::fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(_) => break,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -626,8 +756,36 @@ impl DbPool {
 struct EventStore {
     pool: DbPool,
     prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+    media_storage: MediaStorageConfig,
     #[cfg(feature = "batch-writes")]
     write_queue: Option<StdArc<WriteQueue>>,
+}
+
+#[derive(Clone, Debug)]
+struct MediaStorageConfig {
+    spill_root: Option<PathBuf>,
+    spill_threshold_bytes: usize,
+}
+
+#[derive(Debug)]
+struct IntegrityCheckReport {
+    mode: &'static str,
+    details: Vec<String>,
+    foreign_key_violations: usize,
+}
+
+#[derive(Debug)]
+struct BackupSnapshotReport {
+    db_path: PathBuf,
+    key_path: Option<PathBuf>,
+    media_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct RestoreSnapshotReport {
+    db_path: PathBuf,
+    key_path: Option<PathBuf>,
+    media_path: Option<PathBuf>,
 }
 
 struct MediaObjectUpsert<'a> {
@@ -643,6 +801,25 @@ struct MediaObjectUpsert<'a> {
 type RoleRow = (i64, String, i32, bool, bool, bool, bool, bool);
 type BanMuteRow = (String, String, String, Option<String>, f64, Option<f64>);
 
+fn insert_search_terms_tx(
+    tx: &rusqlite::Transaction<'_>,
+    event_id: i64,
+    search_terms: &[Vec<u8>],
+) -> rusqlite::Result<()> {
+    if search_terms.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = tx.prepare_cached(
+        "INSERT OR IGNORE INTO event_search_terms(event_id, term_hash)
+         VALUES(?1, ?2)",
+    )?;
+    for term_hash in search_terms {
+        stmt.execute(params![event_id, term_hash])?;
+    }
+    Ok(())
+}
+
 impl EventStore {
     fn new(
         path: String,
@@ -650,6 +827,7 @@ impl EventStore {
         durability_mode: DbDurabilityMode,
         db_pool_size: u32,
         prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+        media_storage: MediaStorageConfig,
     ) -> Self {
         let pool = DbPool::new(
             path.clone(),
@@ -667,6 +845,7 @@ impl EventStore {
         let store = Self {
             pool,
             prometheus,
+            media_storage,
             #[cfg(feature = "batch-writes")]
             write_queue,
         };
@@ -677,6 +856,9 @@ impl EventStore {
             .verify_encryption_access()
             .expect("failed to verify database encryption key compatibility");
         store.run_startup_checkpoint();
+        store
+            .run_startup_integrity_check()
+            .expect("failed to verify sqlite integrity on startup");
         store
     }
 
@@ -737,7 +919,9 @@ impl EventStore {
         )?;
         self.verify_encrypted_blob_sample(
             &conn,
-            "SELECT chunk_blob FROM media_chunks LIMIT 1",
+            "SELECT chunk_blob FROM media_chunks
+             WHERE COALESCE(storage_backend, 'db') = 'db'
+             LIMIT 1",
             "media_chunks.chunk_blob",
         )?;
 
@@ -837,7 +1021,7 @@ impl EventStore {
     }
 
     fn init(&self) -> rusqlite::Result<()> {
-        let conn = self
+        let mut conn = self
             .get_connection()
             .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
@@ -850,7 +1034,8 @@ impl EventStore {
             ",
         )?;
         let version = Self::schema_version(&conn)?;
-        self.migrate(&conn, version)?;
+        self.migrate(&mut conn, version)?;
+        self.backfill_missing_search_terms(&mut conn)?;
         Ok(())
     }
 
@@ -868,6 +1053,167 @@ impl EventStore {
         if let Err(err) = conn.execute_batch("PRAGMA optimize;") {
             warn!("startup PRAGMA optimize failed: {}", err);
         }
+    }
+
+    fn run_startup_integrity_check(&self) -> ChatifyResult<()> {
+        if self.pool.path == ":memory:" {
+            return Ok(());
+        }
+
+        let report = self.integrity_check(false)?;
+        if report.details.len() == 1
+            && report.details[0] == "ok"
+            && report.foreign_key_violations == 0
+        {
+            return Ok(());
+        }
+
+        Err(ChatifyError::Validation(format!(
+            "startup sqlite {} failed: details={:?}, foreign_key_violations={}",
+            report.mode, report.details, report.foreign_key_violations
+        )))
+    }
+
+    fn integrity_check(&self, full: bool) -> ChatifyResult<IntegrityCheckReport> {
+        let Some(conn) = self.get_connection() else {
+            return Err(ChatifyError::Message(
+                "database pool unavailable during integrity check".to_string(),
+            ));
+        };
+
+        let pragma = if full {
+            "PRAGMA integrity_check;"
+        } else {
+            "PRAGMA quick_check;"
+        };
+        let mut stmt = conn
+            .prepare(pragma)
+            .map_err(|e| ChatifyError::Message(format!("failed to prepare {}: {}", pragma, e)))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| ChatifyError::Message(format!("failed to execute {}: {}", pragma, e)))?;
+        let details = rows.filter_map(|row| row.ok()).collect::<Vec<_>>();
+
+        let mut fk_stmt = conn.prepare("PRAGMA foreign_key_check;").map_err(|e| {
+            ChatifyError::Message(format!("failed to prepare foreign_key_check: {}", e))
+        })?;
+        let foreign_key_violations = fk_stmt
+            .query_map([], |_| Ok(()))
+            .map_err(|e| {
+                ChatifyError::Message(format!("failed to execute foreign_key_check: {}", e))
+            })?
+            .count();
+
+        Ok(IntegrityCheckReport {
+            mode: if full {
+                "integrity_check"
+            } else {
+                "quick_check"
+            },
+            details: if details.is_empty() {
+                vec!["ok".to_string()]
+            } else {
+                details
+            },
+            foreign_key_violations,
+        })
+    }
+
+    fn create_backup_snapshot(&self, backup_path: &Path) -> ChatifyResult<BackupSnapshotReport> {
+        if self.pool.path == ":memory:" {
+            return Err(ChatifyError::Validation(
+                "cannot create a snapshot backup for ':memory:' databases".to_string(),
+            ));
+        }
+        if backup_path.exists() {
+            return Err(ChatifyError::Validation(format!(
+                "backup target '{}' already exists",
+                backup_path.display()
+            )));
+        }
+
+        if let Some(parent) = backup_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        }
+
+        let backup_media_path = self.media_storage.spill_root.as_ref().and_then(|src_root| {
+            src_root
+                .exists()
+                .then(|| PathBuf::from(format!("{}.media", backup_path.to_string_lossy())))
+        });
+        if let Some(media_path) = backup_media_path.as_ref() {
+            if media_path.exists() {
+                return Err(ChatifyError::Validation(format!(
+                    "backup media target '{}' already exists",
+                    media_path.display()
+                )));
+            }
+        }
+
+        let integrity = self.integrity_check(true)?;
+        if !(integrity.details.len() == 1
+            && integrity.details[0] == "ok"
+            && integrity.foreign_key_violations == 0)
+        {
+            return Err(ChatifyError::Validation(format!(
+                "refusing to back up sqlite database with failing integrity report: details={:?}, foreign_key_violations={}",
+                integrity.details, integrity.foreign_key_violations
+            )));
+        }
+
+        let Some(conn) = self.get_connection() else {
+            return Err(ChatifyError::Message(
+                "database pool unavailable during backup".to_string(),
+            ));
+        };
+        if let Err(err) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;") {
+            return Err(ChatifyError::Message(format!(
+                "failed to checkpoint sqlite WAL before backup: {}",
+                err
+            )));
+        }
+
+        let sql = format!(
+            "VACUUM INTO '{}';",
+            quote_identifier(&backup_path.to_string_lossy())
+        );
+        conn.execute_batch(&sql).map_err(|e| {
+            ChatifyError::Message(format!(
+                "failed to create sqlite snapshot '{}': {}",
+                backup_path.display(),
+                e
+            ))
+        })?;
+
+        let source_key_path = PathBuf::from(format!("{}.key", self.pool.path));
+        let backup_key_path = PathBuf::from(format!("{}.key", backup_path.to_string_lossy()));
+        let key_path = if source_key_path.exists() {
+            std::fs::copy(&source_key_path, &backup_key_path)
+                .map_err(|e| ChatifyError::Io(Box::new(e)))?;
+            Some(backup_key_path)
+        } else {
+            None
+        };
+
+        let media_path = if let (Some(src_root), Some(dst_root)) = (
+            self.media_storage.spill_root.as_ref(),
+            backup_media_path.as_ref(),
+        ) {
+            if src_root.exists() {
+                copy_dir_recursive(src_root, dst_root)?;
+                Some(dst_root.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(BackupSnapshotReport {
+            db_path: backup_path.to_path_buf(),
+            key_path,
+            media_path,
+        })
     }
 
     fn get_connection(&self) -> Option<r2d2::PooledConnection<PooledConnection>> {
@@ -914,7 +1260,67 @@ impl EventStore {
         Ok(())
     }
 
-    fn migrate(&self, conn: &Connection, from_version: i64) -> rusqlite::Result<()> {
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for value in rows {
+            if value? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn backfill_missing_search_terms(&self, conn: &mut Connection) -> rusqlite::Result<usize> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pending_rows: Vec<(i64, String)> = {
+            let mut stmt = match tx.prepare_cached(
+                "SELECT e.id, e.search_text
+                 FROM events e
+                 WHERE e.search_text IS NOT NULL
+                   AND e.search_text != ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM event_search_terms est WHERE est.event_id = e.id
+                   )
+                 ORDER BY e.id ASC",
+            ) {
+                Ok(stmt) => stmt,
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("no such table") || msg.contains("no such column") {
+                        return Ok(0);
+                    }
+                    return Err(err);
+                }
+            };
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|row| row.ok()).collect()
+        };
+
+        let mut indexed_events = 0usize;
+        for (event_id, stored_search_text) in pending_rows {
+            let Some(search_text) = self.decrypt_field(&stored_search_text) else {
+                continue;
+            };
+            let search_terms =
+                build_search_term_hashes(&search_text, self.pool.encryption_key.as_deref());
+            insert_search_terms_tx(&tx, event_id, &search_terms)?;
+            indexed_events += 1;
+        }
+
+        tx.commit()?;
+        if indexed_events > 0 {
+            info!(
+                "backfilled search index rows for {} event(s)",
+                indexed_events
+            );
+        }
+        Ok(indexed_events)
+    }
+
+    fn migrate(&self, conn: &mut Connection, from_version: i64) -> rusqlite::Result<()> {
         let mut version = from_version;
 
         if version < 1 {
@@ -1216,13 +1622,60 @@ impl EventStore {
             Self::set_schema_version(conn, version)?;
         }
 
+        if version < 9 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS event_search_terms (
+                    event_id   INTEGER NOT NULL,
+                    term_hash  BLOB NOT NULL,
+                    PRIMARY KEY(event_id, term_hash),
+                    FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_search_terms_term_event
+                    ON event_search_terms(term_hash, event_id);
+                ",
+            )?;
+            if !Self::column_exists(conn, "media_chunks", "storage_backend")? {
+                conn.execute(
+                    "ALTER TABLE media_chunks ADD COLUMN storage_backend TEXT NOT NULL DEFAULT 'db'",
+                    [],
+                )?;
+            }
+            if !Self::column_exists(conn, "media_chunks", "storage_path")? {
+                conn.execute("ALTER TABLE media_chunks ADD COLUMN storage_path TEXT", [])?;
+            }
+
+            version = 9;
+            Self::set_schema_version(conn, version)?;
+        }
+
         conn.execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS event_search_terms (
+                event_id   INTEGER NOT NULL,
+                term_hash  BLOB NOT NULL,
+                PRIMARY KEY(event_id, term_hash),
+                FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_search_terms_term_event
+                ON event_search_terms(term_hash, event_id);
             CREATE INDEX IF NOT EXISTS idx_media_objects_retention
                 ON media_objects(completed, completed_ts, created_ts);
             ",
         )
         .ok();
+        if !Self::column_exists(conn, "media_chunks", "storage_backend").unwrap_or(false) {
+            conn.execute(
+                "ALTER TABLE media_chunks ADD COLUMN storage_backend TEXT NOT NULL DEFAULT 'db'",
+                [],
+            )
+            .ok();
+        }
+        if !Self::column_exists(conn, "media_chunks", "storage_path").unwrap_or(false) {
+            conn.execute("ALTER TABLE media_chunks ADD COLUMN storage_path TEXT", [])
+                .ok();
+        }
 
         if version > CURRENT_SCHEMA_VERSION {
             warn!(
@@ -1351,6 +1804,9 @@ impl EventStore {
         search_text: &str,
     ) {
         let started = Instant::now();
+        let normalized_search = search_text.to_lowercase();
+        let search_terms =
+            build_search_term_hashes(&normalized_search, self.pool.encryption_key.as_deref());
         #[cfg(feature = "batch-writes")]
         if let Some(ref queue) = self.write_queue {
             let payload_json = payload.to_string();
@@ -1362,7 +1818,7 @@ impl EventStore {
                 self.record_db_observation("persist_enqueue", started, true);
                 return;
             };
-            let Some(enc_search) = self.encrypt_field(&search_text.to_lowercase()) else {
+            let Some(enc_search) = self.encrypt_field(&normalized_search) else {
                 warn!(
                     "event persist dropped: type={} channel={} sender={} reason=search_encrypt_failed",
                     event_type, channel, sender
@@ -1377,6 +1833,7 @@ impl EventStore {
                 target: target.map(String::from),
                 payload: enc_payload,
                 search_text: enc_search,
+                search_terms,
                 ts: now(),
             });
             self.record_db_observation("persist_enqueue", started, false);
@@ -1384,7 +1841,7 @@ impl EventStore {
 
         #[cfg(not(feature = "batch-writes"))]
         {
-            let Some(conn) = self.get_connection() else {
+            let Some(mut conn) = self.get_connection() else {
                 self.record_db_observation("persist_insert", started, true);
                 return;
             };
@@ -1397,7 +1854,7 @@ impl EventStore {
                 self.record_db_observation("persist_insert", started, true);
                 return;
             };
-            let Some(enc_search) = self.encrypt_field(&search_text.to_lowercase()) else {
+            let Some(enc_search) = self.encrypt_field(&normalized_search) else {
                 warn!(
                     "event persist dropped: type={} channel={} sender={} reason=search_encrypt_failed",
                     event_type, channel, sender
@@ -1405,28 +1862,50 @@ impl EventStore {
                 self.record_db_observation("persist_insert", started, true);
                 return;
             };
-            let mut stmt = match conn.prepare_cached(
-                "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            ) {
-                Ok(stmt) => stmt,
+            let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            {
+                Ok(tx) => tx,
                 Err(e) => {
-                    warn!("event persist prepare failed: {}", e);
+                    warn!("event persist transaction start failed: {}", e);
                     self.record_db_observation("persist_insert", started, true);
                     return;
                 }
             };
+            {
+                let mut stmt = match tx.prepare_cached(
+                    "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(e) => {
+                        warn!("event persist prepare failed: {}", e);
+                        self.record_db_observation("persist_insert", started, true);
+                        return;
+                    }
+                };
 
-            if let Err(e) = stmt.execute(params![
-                now(),
-                event_type,
-                channel,
-                sender,
-                target,
-                enc_payload,
-                enc_search,
-            ]) {
-                warn!("event persist failed: {}", e);
+                if let Err(e) = stmt.execute(params![
+                    now(),
+                    event_type,
+                    channel,
+                    sender,
+                    target,
+                    enc_payload,
+                    enc_search,
+                ]) {
+                    warn!("event persist failed: {}", e);
+                    self.record_db_observation("persist_insert", started, true);
+                    return;
+                }
+            }
+            let event_id = tx.last_insert_rowid();
+            if let Err(e) = insert_search_terms_tx(&tx, event_id, &search_terms) {
+                warn!("event search index persist failed: {}", e);
+                self.record_db_observation("persist_insert", started, true);
+                return;
+            }
+            if let Err(e) = tx.commit() {
+                warn!("event persist commit failed: {}", e);
                 self.record_db_observation("persist_insert", started, true);
                 return;
             }
@@ -1476,6 +1955,96 @@ impl EventStore {
         self.record_db_observation("media_upsert_object", started, false);
     }
 
+    fn encode_media_chunk(&self, chunk_bytes: &[u8]) -> Result<Vec<u8>, ChatifyError> {
+        if let Some(ref key) = self.pool.encryption_key {
+            let encrypted = crypto::enc_bytes(key, chunk_bytes).map_err(|e| {
+                ChatifyError::Message(format!("media chunk encryption failed: {}", e))
+            })?;
+            let mut wrapped = Vec::with_capacity(MEDIA_CHUNK_ENC_PREFIX.len() + encrypted.len());
+            wrapped.extend_from_slice(MEDIA_CHUNK_ENC_PREFIX);
+            wrapped.extend_from_slice(&encrypted);
+            Ok(wrapped)
+        } else {
+            Ok(chunk_bytes.to_vec())
+        }
+    }
+
+    fn should_spill_media_chunk(&self, declared_size: i64, chunk_len: usize) -> bool {
+        let threshold = self.media_storage.spill_threshold_bytes;
+        if threshold == 0 || self.media_storage.spill_root.is_none() {
+            return false;
+        }
+
+        (declared_size > 0 && declared_size as usize >= threshold) || chunk_len >= threshold
+    }
+
+    fn media_object_spill_dir(&self, channel: &str, file_id: &str) -> Option<PathBuf> {
+        let _ = self.media_storage.spill_root.as_ref()?;
+        let mut hasher = Sha256::new();
+        hasher.update(channel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file_id.as_bytes());
+        let digest = hex::encode(hasher.finalize());
+        Some(PathBuf::from(&digest[..2]).join(digest))
+    }
+
+    fn next_media_chunk_spill_path(
+        &self,
+        channel: &str,
+        file_id: &str,
+        chunk_index: u64,
+    ) -> Option<String> {
+        let rel_dir = self.media_object_spill_dir(channel, file_id)?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let rel_path = rel_dir.join(format!("{chunk_index:020}-{stamp:032x}.bin"));
+        Some(rel_path.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn resolve_media_spill_path(&self, relative_path: &str) -> Option<PathBuf> {
+        self.media_storage
+            .spill_root
+            .as_ref()
+            .map(|root| root.join(relative_path))
+    }
+
+    fn remove_spilled_media_file(&self, relative_path: &str) {
+        let Some(root) = self.media_storage.spill_root.as_ref() else {
+            return;
+        };
+        let Some(path) = self.resolve_media_spill_path(relative_path) else {
+            return;
+        };
+
+        if let Err(err) = remove_file_if_exists(&path) {
+            warn!(
+                "failed to remove spilled media file '{}' during cleanup: {}",
+                path.display(),
+                err
+            );
+            return;
+        }
+        prune_empty_parent_dirs(root, &path);
+    }
+
+    fn spilled_paths_for_media(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        media_id: i64,
+    ) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = tx.prepare_cached(
+            "SELECT storage_path
+             FROM media_chunks
+             WHERE media_id = ?1
+               AND COALESCE(storage_backend, 'db') = 'fs'
+               AND storage_path IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![media_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
     fn append_media_chunk(
         &self,
         channel: &str,
@@ -1492,28 +2061,6 @@ impl EventStore {
         let Some(mut conn) = self.get_connection() else {
             self.record_db_observation("media_append_chunk", started, true);
             return;
-        };
-
-        let stored_blob = if let Some(ref key) = self.pool.encryption_key {
-            match crypto::enc_bytes(key, chunk_bytes) {
-                Ok(encrypted) => {
-                    let mut wrapped =
-                        Vec::with_capacity(MEDIA_CHUNK_ENC_PREFIX.len() + encrypted.len());
-                    wrapped.extend_from_slice(MEDIA_CHUNK_ENC_PREFIX);
-                    wrapped.extend_from_slice(&encrypted);
-                    wrapped
-                }
-                Err(e) => {
-                    warn!(
-                        "media chunk encryption failed channel={} file_id={} idx={}: {}",
-                        channel, file_id, chunk_index, e
-                    );
-                    self.record_db_observation("media_append_chunk", started, true);
-                    return;
-                }
-            }
-        } else {
-            chunk_bytes.to_vec()
         };
 
         let tx = match conn.transaction() {
@@ -1575,11 +2122,15 @@ impl EventStore {
             return;
         };
 
-        let existing_chunk_size: Option<i64> = match tx
+        let existing_chunk: Option<(i64, String, Option<String>)> = match tx
             .query_row(
-                "SELECT chunk_size FROM media_chunks WHERE media_id = ?1 AND chunk_index = ?2",
+                "SELECT chunk_size,
+                        COALESCE(storage_backend, 'db'),
+                        storage_path
+                 FROM media_chunks
+                 WHERE media_id = ?1 AND chunk_index = ?2",
                 params![media_id, clamp_u64_to_i64(chunk_index)],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
         {
@@ -1595,30 +2146,90 @@ impl EventStore {
         };
 
         let chunk_size = clamp_usize_to_i64(chunk_bytes.len());
+        let wants_spill = self.should_spill_media_chunk(declared_size, chunk_bytes.len());
+        let mut storage_backend = String::from("db");
+        let mut storage_path: Option<String> = None;
+        let mut stored_blob = match self.encode_media_chunk(chunk_bytes) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    "{} channel={} file_id={} idx={}",
+                    err, channel, file_id, chunk_index
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        };
+        let mut pending_spill_cleanup: Option<PathBuf> = None;
+
+        if wants_spill {
+            if let Some(relative_path) =
+                self.next_media_chunk_spill_path(channel, file_id, chunk_index)
+            {
+                if let Some(abs_path) = self.resolve_media_spill_path(&relative_path) {
+                    if let Some(parent) = abs_path.parent() {
+                        if let Err(err) = std::fs::create_dir_all(parent) {
+                            warn!(
+                                "media spill directory create failed channel={} file_id={} idx={} path={}: {}; storing in sqlite",
+                                channel,
+                                file_id,
+                                chunk_index,
+                                parent.display(),
+                                err
+                            );
+                        } else if let Err(err) = std::fs::write(&abs_path, &stored_blob) {
+                            warn!(
+                                "media spill write failed channel={} file_id={} idx={} path={}: {}; storing in sqlite",
+                                channel,
+                                file_id,
+                                chunk_index,
+                                abs_path.display(),
+                                err
+                            );
+                        } else {
+                            pending_spill_cleanup = Some(abs_path);
+                            storage_backend = "fs".to_string();
+                            storage_path = Some(relative_path);
+                            stored_blob.clear();
+                        }
+                    }
+                }
+            }
+        }
+
         if let Err(e) = tx.execute(
-            "INSERT INTO media_chunks(media_id, chunk_index, chunk_blob, chunk_size, created_ts)
-             VALUES(?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO media_chunks(
+                 media_id, chunk_index, chunk_blob, chunk_size, created_ts, storage_backend, storage_path
+             )
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(media_id, chunk_index) DO UPDATE SET
                  chunk_blob = excluded.chunk_blob,
                  chunk_size = excluded.chunk_size,
-                 created_ts = excluded.created_ts",
+                 created_ts = excluded.created_ts,
+                 storage_backend = excluded.storage_backend,
+                 storage_path = excluded.storage_path",
             params![
                 media_id,
                 clamp_u64_to_i64(chunk_index),
                 stored_blob,
                 chunk_size,
-                now()
+                now(),
+                storage_backend,
+                storage_path.clone()
             ],
         ) {
             warn!(
                 "media chunk upsert failed channel={} file_id={} idx={}: {}",
                 channel, file_id, chunk_index, e
             );
+            if let Some(path) = pending_spill_cleanup.as_ref() {
+                let _ = remove_file_if_exists(path);
+            }
             self.record_db_observation("media_append_chunk", started, true);
             return;
         }
 
-        let delta = chunk_size - existing_chunk_size.unwrap_or(0);
+        let delta = chunk_size - existing_chunk.as_ref().map(|row| row.0).unwrap_or(0);
         let new_received = (received_size + delta).max(0);
         if let Err(e) = tx.execute(
             "UPDATE media_objects SET received_size = ?2 WHERE id = ?1",
@@ -1628,11 +2239,14 @@ impl EventStore {
                 "media received_size update failed channel={} file_id={}: {}",
                 channel, file_id, e
             );
+            if let Some(path) = pending_spill_cleanup.as_ref() {
+                let _ = remove_file_if_exists(path);
+            }
             self.record_db_observation("media_append_chunk", started, true);
             return;
         }
 
-        if existing_chunk_size.is_none() {
+        if existing_chunk.is_none() {
             if let Err(e) = tx.execute(
                 "UPDATE media_objects SET chunk_count = chunk_count + 1 WHERE id = ?1",
                 params![media_id],
@@ -1641,6 +2255,9 @@ impl EventStore {
                     "media chunk_count update failed channel={} file_id={}: {}",
                     channel, file_id, e
                 );
+                if let Some(path) = pending_spill_cleanup.as_ref() {
+                    let _ = remove_file_if_exists(path);
+                }
                 self.record_db_observation("media_append_chunk", started, true);
                 return;
             }
@@ -1658,6 +2275,9 @@ impl EventStore {
                     "media completion update failed channel={} file_id={}: {}",
                     channel, file_id, e
                 );
+                if let Some(path) = pending_spill_cleanup.as_ref() {
+                    let _ = remove_file_if_exists(path);
+                }
                 self.record_db_observation("media_append_chunk", started, true);
                 return;
             }
@@ -1668,8 +2288,21 @@ impl EventStore {
                 "media chunk commit failed channel={} file_id={} idx={}: {}",
                 channel, file_id, chunk_index, e
             );
+            if let Some(path) = pending_spill_cleanup.as_ref() {
+                let _ = remove_file_if_exists(path);
+            }
             self.record_db_observation("media_append_chunk", started, true);
             return;
+        }
+
+        if let Some((_, existing_backend, existing_path)) = existing_chunk {
+            if existing_backend == "fs" {
+                if let Some(existing_path) = existing_path {
+                    if storage_path.as_deref() != Some(existing_path.as_str()) {
+                        self.remove_spilled_media_file(&existing_path);
+                    }
+                }
+            }
         }
 
         self.record_db_observation("media_append_chunk", started, false);
@@ -1693,6 +2326,7 @@ impl EventStore {
 
         let mut deleted_objects = 0usize;
         let mut reclaimed_bytes = 0i64;
+        let mut spilled_paths_to_delete = Vec::new();
         let cutoff_ts = now() - max_age_secs as f64;
 
         let aged_candidates: Vec<(i64, i64)> = {
@@ -1732,6 +2366,14 @@ impl EventStore {
         };
 
         for (id, stored_size) in aged_candidates {
+            match self.spilled_paths_for_media(&tx, id) {
+                Ok(paths) => spilled_paths_to_delete.extend(paths),
+                Err(e) => {
+                    warn!("media prune spill lookup failed id={}: {}", id, e);
+                    self.record_db_observation("media_prune", started, true);
+                    return (0, 0);
+                }
+            }
             if let Err(e) = tx.execute("DELETE FROM media_objects WHERE id = ?1", params![id]) {
                 warn!("media prune age delete failed id={}: {}", id, e);
                 self.record_db_observation("media_prune", started, true);
@@ -1794,6 +2436,14 @@ impl EventStore {
                         break;
                     }
 
+                    match self.spilled_paths_for_media(&tx, id) {
+                        Ok(paths) => spilled_paths_to_delete.extend(paths),
+                        Err(e) => {
+                            warn!("media prune spill lookup failed id={}: {}", id, e);
+                            self.record_db_observation("media_prune", started, true);
+                            return (0, 0);
+                        }
+                    }
                     if let Err(e) =
                         tx.execute("DELETE FROM media_objects WHERE id = ?1", params![id])
                     {
@@ -1814,6 +2464,10 @@ impl EventStore {
             warn!("media prune transaction commit failed: {}", e);
             self.record_db_observation("media_prune", started, true);
             return (0, 0);
+        }
+
+        for relative_path in spilled_paths_to_delete {
+            self.remove_spilled_media_file(&relative_path);
         }
 
         self.record_db_observation("media_prune", started, false);
@@ -2007,6 +2661,189 @@ impl EventStore {
         results
     }
 
+    fn search_with_term_index(
+        &self,
+        sql: String,
+        params: Vec<SqlValue>,
+        query_lower: &str,
+        limit: usize,
+        operation: &str,
+    ) -> Vec<Value> {
+        if limit == 0 {
+            self.record_db_observation(operation, Instant::now(), false);
+            return Vec::new();
+        }
+
+        let started = Instant::now();
+        let Some(conn) = self.get_connection() else {
+            self.record_db_observation(operation, started, true);
+            return Vec::new();
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                warn!("indexed search prepare failed: {}", e);
+                self.record_db_observation(operation, started, true);
+                return Vec::new();
+            }
+        };
+        let mut rows = match stmt.query(params_from_iter(params)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("indexed search execute failed: {}", e);
+                self.record_db_observation(operation, started, true);
+                return Vec::new();
+            }
+        };
+
+        let mut results = Vec::with_capacity(limit.min(64));
+        let mut had_error = false;
+        while results.len() < limit {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("indexed search row iteration failed: {}", e);
+                    had_error = true;
+                    break;
+                }
+            };
+
+            let enc_payload = match row.get::<_, String>(0) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("indexed search payload decode failed: {}", e);
+                    had_error = true;
+                    continue;
+                }
+            };
+            let enc_search = match row.get::<_, String>(1) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("indexed search search_text decode failed: {}", e);
+                    had_error = true;
+                    continue;
+                }
+            };
+
+            let Some(search_text) = self.decrypt_field(&enc_search) else {
+                continue;
+            };
+            if !search_text.contains(query_lower) {
+                continue;
+            }
+
+            let Some(decrypted_payload) = self.decrypt_field(&enc_payload) else {
+                continue;
+            };
+            if let Ok(val) = serde_json::from_str::<Value>(&decrypted_payload) {
+                results.push(val);
+            }
+        }
+
+        self.record_db_observation(operation, started, had_error);
+        results
+    }
+
+    fn indexed_channel_search(
+        &self,
+        channel: &str,
+        query_lower: &str,
+        limit: usize,
+    ) -> Option<Vec<Value>> {
+        let term_hashes =
+            build_search_term_hashes(query_lower, self.pool.encryption_key.as_deref());
+        if term_hashes.is_empty() {
+            return None;
+        }
+
+        let term_count = term_hashes.len();
+        let placeholders = (0..term_hashes.len())
+            .map(|idx| format!("?{}", idx + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let term_count_index = term_hashes.len() + 2;
+        let limit_index = term_hashes.len() + 3;
+        let sql = format!(
+            "SELECT e.payload, e.search_text
+             FROM events e
+             JOIN (
+                 SELECT est.event_id, MAX(filtered.ts) AS max_ts
+                 FROM event_search_terms est
+                 JOIN events filtered ON filtered.id = est.event_id
+                 WHERE filtered.channel = ?1
+                   AND est.term_hash IN ({placeholders})
+                 GROUP BY est.event_id
+                 HAVING COUNT(DISTINCT est.term_hash) = ?{term_count_index}
+                 ORDER BY max_ts DESC
+                 LIMIT ?{limit_index}
+             ) candidates ON candidates.event_id = e.id
+             ORDER BY e.ts DESC"
+        );
+        let mut params = vec![SqlValue::Text(channel.to_string())];
+        for term_hash in term_hashes {
+            params.push(SqlValue::Blob(term_hash));
+        }
+        params.push(SqlValue::Integer(term_count as i64));
+        params.push(SqlValue::Integer(candidate_limit(limit) as i64));
+
+        Some(self.search_with_term_index(sql, params, query_lower, limit, "search_indexed_channel"))
+    }
+
+    fn indexed_dm_search(
+        &self,
+        username: &str,
+        peer: &str,
+        query_lower: &str,
+        limit: usize,
+    ) -> Option<Vec<Value>> {
+        let term_hashes =
+            build_search_term_hashes(query_lower, self.pool.encryption_key.as_deref());
+        if term_hashes.is_empty() {
+            return None;
+        }
+
+        let term_count = term_hashes.len();
+        let placeholders = (0..term_hashes.len())
+            .map(|idx| format!("?{}", idx + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let term_count_index = term_hashes.len() + 3;
+        let limit_index = term_hashes.len() + 4;
+        let sql = format!(
+            "SELECT e.payload, e.search_text
+             FROM events e
+             JOIN (
+                 SELECT est.event_id, MAX(filtered.ts) AS max_ts
+                 FROM event_search_terms est
+                 JOIN events filtered ON filtered.id = est.event_id
+                 WHERE filtered.event_type = 'dm'
+                   AND (
+                       (filtered.sender = ?1 AND filtered.target = ?2)
+                       OR
+                       (filtered.sender = ?2 AND filtered.target = ?1)
+                   )
+                   AND est.term_hash IN ({placeholders})
+                 GROUP BY est.event_id
+                 HAVING COUNT(DISTINCT est.term_hash) = ?{term_count_index}
+                 ORDER BY max_ts DESC
+                 LIMIT ?{limit_index}
+             ) candidates ON candidates.event_id = e.id
+             ORDER BY e.ts DESC"
+        );
+        let mut params = vec![
+            SqlValue::Text(username.to_string()),
+            SqlValue::Text(peer.to_string()),
+        ];
+        for term_hash in term_hashes {
+            params.push(SqlValue::Blob(term_hash));
+        }
+        params.push(SqlValue::Integer(term_count as i64));
+        params.push(SqlValue::Integer(candidate_limit(limit) as i64));
+
+        Some(self.search_with_term_index(sql, params, query_lower, limit, "search_indexed_dm"))
+    }
+
     fn like_pattern(query: &str) -> String {
         let escaped = query
             .replace('\\', "\\\\")
@@ -2017,6 +2854,10 @@ impl EventStore {
 
     fn search(&self, channel: &str, query: &str, limit: usize) -> Vec<Value> {
         let query_lower = query.to_lowercase();
+
+        if let Some(results) = self.indexed_channel_search(channel, &query_lower, limit) {
+            return results;
+        }
 
         if self.pool.encryption_key.is_some() {
             self.search_encrypted(
@@ -2043,6 +2884,10 @@ impl EventStore {
 
     fn dm_search(&self, username: &str, peer: &str, query: &str, limit: usize) -> Vec<Value> {
         let query_lower = query.to_lowercase();
+
+        if let Some(results) = self.indexed_dm_search(username, peer, &query_lower, limit) {
+            return results;
+        }
 
         if self.pool.encryption_key.is_some() {
             self.search_encrypted(
@@ -3249,6 +4094,8 @@ impl State {
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
         self_registration_enabled: bool,
+        media_spill_root: Option<PathBuf>,
+        media_spill_threshold_bytes: usize,
         outbound_queue_capacity: usize,
         slow_client_drop_burst: usize,
     ) -> Arc<Self> {
@@ -3260,6 +4107,10 @@ impl State {
             db_durability,
             db_pool_size,
             prometheus.clone(),
+            MediaStorageConfig {
+                spill_root: media_spill_root,
+                spill_threshold_bytes: media_spill_threshold_bytes,
+            },
         );
         let s = Arc::new(Self {
             channels: DashMap::new(),
@@ -7764,8 +8615,52 @@ impl tokio::io::AsyncWrite for ChatifyTlsStream {
 
 impl Unpin for ChatifyTlsStream {}
 
-/// Handles CLI admin commands (register-user, enable-2fa, disable-2fa).
+fn admin_command_count(args: &Args) -> usize {
+    usize::from(args.register_user.is_some())
+        + usize::from(args.enable_2fa_for.is_some())
+        + usize::from(args.disable_2fa_for.is_some())
+        + usize::from(args.db_integrity_check)
+        + usize::from(args.db_backup_to.is_some())
+        + usize::from(args.db_restore_from.is_some())
+}
+
+fn is_admin_command_requested(args: &Args) -> bool {
+    admin_command_count(args) > 0
+}
+
+/// Handles CLI admin commands (register-user, enable-2fa, disable-2fa, storage ops).
 fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
+    if admin_command_count(args) > 1 {
+        return Err(ChatifyError::Validation(
+            "specify exactly one admin command at a time".to_string(),
+        ));
+    }
+
+    let media_spill_root = resolve_media_spill_root(&args.db, args.media_spill_dir.as_deref());
+    let media_spill_threshold_bytes = kib_to_bytes_usize(normalize_media_spill_threshold_kib(
+        args.media_spill_threshold_kib,
+    ));
+
+    if let Some(source_path) = args.db_restore_from.as_deref() {
+        let restore = restore_database_snapshot(
+            Path::new(source_path),
+            Path::new(&args.db),
+            args.db_key.as_deref(),
+            media_spill_root.as_deref(),
+        )?;
+        println!(
+            "Restored database snapshot to {}",
+            restore.db_path.display()
+        );
+        if let Some(key_path) = restore.key_path {
+            println!("Restored DB key to {}", key_path.display());
+        }
+        if let Some(media_path) = restore.media_path {
+            println!("Restored spilled media to {}", media_path.display());
+        }
+        return Ok(());
+    }
+
     let db_key = resolve_db_key(&args.db, args.db_key.as_deref())?;
 
     let plugin_runtime = match std::env::current_exe() {
@@ -7788,9 +8683,33 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
         60,
         false,
         false,
+        media_spill_root,
+        media_spill_threshold_bytes,
         OUTBOUND_QUEUE_CAPACITY_DEFAULT,
         SLOW_CLIENT_DROP_BURST_DEFAULT,
     );
+
+    if args.db_integrity_check {
+        let report = state.store.integrity_check(true)?;
+        println!("SQLite {} result:", report.mode);
+        for detail in report.details {
+            println!("  {}", detail);
+        }
+        println!("Foreign key violations: {}", report.foreign_key_violations);
+        return Ok(());
+    }
+
+    if let Some(target_path) = args.db_backup_to.as_deref() {
+        let backup = state.store.create_backup_snapshot(Path::new(target_path))?;
+        println!("Created database snapshot at {}", backup.db_path.display());
+        if let Some(key_path) = backup.key_path {
+            println!("Copied DB key to {}", key_path.display());
+        }
+        if let Some(media_path) = backup.media_path {
+            println!("Copied spilled media to {}", media_path.display());
+        }
+        return Ok(());
+    }
 
     if let Some(username) = &args.register_user {
         let password = args.user_password.as_ref().ok_or_else(|| {
@@ -8045,6 +8964,105 @@ fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<
     Ok(Some(key.to_vec()))
 }
 
+fn validate_db_key_hex(hex_key: &str) -> ChatifyResult<()> {
+    let key = hex::decode(hex_key)
+        .map_err(|e| ChatifyError::Validation(format!("invalid --db-key hex: {}", e)))?;
+    if key.len() != 32 {
+        return Err(ChatifyError::Validation(format!(
+            "--db-key must be 32 bytes (64 hex chars), got {} bytes",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+fn restore_database_snapshot(
+    source_db: &Path,
+    target_db: &Path,
+    cli_key: Option<&str>,
+    target_media_root: Option<&Path>,
+) -> ChatifyResult<RestoreSnapshotReport> {
+    if !source_db.exists() {
+        return Err(ChatifyError::Validation(format!(
+            "backup source '{}' does not exist",
+            source_db.display()
+        )));
+    }
+    if target_db.exists() {
+        return Err(ChatifyError::Validation(format!(
+            "restore target '{}' already exists; refusing to overwrite",
+            target_db.display()
+        )));
+    }
+
+    let source_key_path = PathBuf::from(format!("{}.key", source_db.to_string_lossy()));
+    let target_key_path = PathBuf::from(format!("{}.key", target_db.to_string_lossy()));
+    if target_key_path.exists() {
+        return Err(ChatifyError::Validation(format!(
+            "restore target key '{}' already exists; refusing to overwrite",
+            target_key_path.display()
+        )));
+    }
+
+    let source_media_path = PathBuf::from(format!("{}.media", source_db.to_string_lossy()));
+    if let Some(target_media_root) = target_media_root {
+        if target_media_root.exists() {
+            return Err(ChatifyError::Validation(format!(
+                "restore target media directory '{}' already exists; refusing to overwrite",
+                target_media_root.display()
+            )));
+        }
+    }
+
+    if let Some(parent) = target_db.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    }
+
+    std::fs::copy(source_db, target_db).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+
+    let key_path = if source_key_path.exists() {
+        if let Some(parent) = target_key_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        }
+        std::fs::copy(&source_key_path, &target_key_path)
+            .map_err(|e| ChatifyError::Io(Box::new(e)))?;
+        Some(target_key_path)
+    } else if let Some(hex_key) = cli_key {
+        validate_db_key_hex(hex_key)?;
+        write_db_key_file(&target_key_path.to_string_lossy(), hex_key)?;
+        Some(target_key_path)
+    } else {
+        remove_file_if_exists(target_db)?;
+        return Err(ChatifyError::Validation(format!(
+            "backup source '{}' is missing '{}'; provide --db-key or restore the key file alongside the backup",
+            source_db.display(),
+            source_key_path.display()
+        )));
+    };
+
+    let media_path = if source_media_path.exists() {
+        let Some(target_media_root) = target_media_root else {
+            remove_file_if_exists(target_db)?;
+            if let Some(key_path) = key_path.as_ref() {
+                let _ = remove_file_if_exists(key_path);
+            }
+            return Err(ChatifyError::Validation(
+                "restore target is missing a media spill directory configuration".to_string(),
+            ));
+        };
+        copy_dir_recursive(&source_media_path, target_media_root)?;
+        Some(target_media_root.to_path_buf())
+    } else {
+        None
+    };
+
+    Ok(RestoreSnapshotReport {
+        db_path: target_db.to_path_buf(),
+        key_path,
+        media_path,
+    })
+}
+
 /// Server entry point.
 ///
 /// 1. Parses CLI args and initialises optional logging.
@@ -8186,10 +9204,7 @@ async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
 
     // Handle CLI admin commands (non-server mode)
-    if args.register_user.is_some()
-        || args.enable_2fa_for.is_some()
-        || args.disable_2fa_for.is_some()
-    {
+    if is_admin_command_requested(&args) {
         handle_admin_commands(&args)?;
         return Ok(());
     }
@@ -8213,6 +9228,10 @@ async fn main() -> ChatifyResult<()> {
     }
 
     let db_key = resolve_db_key(&args.db, args.db_key.as_deref())?;
+    let media_spill_root = resolve_media_spill_root(&args.db, args.media_spill_dir.as_deref());
+    let media_spill_threshold_kib =
+        normalize_media_spill_threshold_kib(args.media_spill_threshold_kib);
+    let media_spill_threshold_bytes = kib_to_bytes_usize(media_spill_threshold_kib);
 
     // Set up TLS if enabled.
     let tls_acceptor = if args.tls {
@@ -8252,6 +9271,8 @@ async fn main() -> ChatifyResult<()> {
         args.max_msgs_per_minute,
         args.enable_user_rate_limit,
         args.enable_self_registration,
+        media_spill_root.clone(),
+        media_spill_threshold_bytes,
         args.outbound_queue_capacity,
         args.slow_client_drop_burst,
     );
@@ -8301,6 +9322,14 @@ async fn main() -> ChatifyResult<()> {
             " Media retention: {} days | cap {:.1} GiB | prune interval {}s",
             media_retention_days, media_max_total_size_gb, media_prune_interval_secs
         );
+    }
+    match media_spill_root.as_ref() {
+        Some(path) => println!(
+            " Media spill: {} for files/chunks >= {} KiB",
+            path.display(),
+            media_spill_threshold_kib
+        ),
+        None => println!(" Media spill: disabled"),
     }
 
     println!(
@@ -8481,6 +9510,17 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{nanos}.db"))
     }
 
+    fn cleanup_db_artifacts(db_path: &Path) {
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
+        let _ = std::fs::remove_file(format!("{}.key", db_path.to_string_lossy()));
+        let spill_root = PathBuf::from(format!("{}.media", db_path.to_string_lossy()));
+        if spill_root.exists() {
+            let _ = std::fs::remove_dir_all(spill_root);
+        }
+    }
+
     #[test]
     fn voice_event_forwarding_respects_active_room() {
         let event = VoiceBroadcast::MemberJoined {
@@ -8574,6 +9614,8 @@ mod tests {
             60,
             false,
             false,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
             OUTBOUND_QUEUE_CAPACITY_DEFAULT,
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
@@ -8613,6 +9655,8 @@ mod tests {
             60,
             false,
             false,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
             OUTBOUND_QUEUE_CAPACITY_DEFAULT,
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
@@ -8659,6 +9703,8 @@ mod tests {
             60,
             false,
             true,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
             OUTBOUND_QUEUE_CAPACITY_DEFAULT,
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
@@ -8701,6 +9747,8 @@ mod tests {
             60,
             false,
             true,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
             OUTBOUND_QUEUE_CAPACITY_DEFAULT,
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
@@ -8838,6 +9886,8 @@ mod tests {
             60,
             false,
             true,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
             OUTBOUND_QUEUE_CAPACITY_DEFAULT,
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
@@ -8866,6 +9916,8 @@ mod tests {
                 60,
                 false,
                 true,
+                None,
+                kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
                 OUTBOUND_QUEUE_CAPACITY_DEFAULT,
                 SLOW_CLIENT_DROP_BURST_DEFAULT,
             )
@@ -8948,6 +10000,316 @@ mod tests {
     }
 
     #[test]
+    fn search_index_backfills_missing_rows_on_restart() {
+        let db_path = unique_test_db_path("chatify-search-index-backfill");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let plugin_runtime_a =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state_a = State::new(
+            db_path_str.clone(),
+            None,
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime_a,
+            60,
+            false,
+            false,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        let conn = state_a
+            .store
+            .get_connection()
+            .expect("obtain pooled sqlite connection");
+        let payload = serde_json::json!({
+            "t": "msg",
+            "ch": "ops",
+            "u": "alice",
+            "c": "bridge reconnect investigation",
+            "ts": now()
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                now(),
+                "msg",
+                "ops",
+                "alice",
+                Option::<String>::None,
+                payload,
+                "bridge reconnect investigation"
+            ],
+        )
+        .expect("insert event without search index rows");
+        let event_id = conn.last_insert_rowid();
+        drop(conn);
+        drop(state_a);
+
+        let plugin_runtime_b =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state_b = State::new(
+            db_path_str,
+            None,
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime_b,
+            60,
+            false,
+            false,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        let indexed_terms: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_search_terms WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .expect("query search-term count");
+        assert!(
+            indexed_terms > 0,
+            "restart should backfill missing search-term index rows"
+        );
+
+        let results = state_b.store.search("ops", "reconnect", 10);
+        assert_eq!(results.len(), 1);
+
+        drop(conn);
+        drop(state_b);
+        cleanup_db_artifacts(&db_path);
+    }
+
+    #[test]
+    fn large_media_chunks_spill_to_filesystem_and_prune_files() {
+        let db_path = unique_test_db_path("chatify-media-spill");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let spill_root = default_media_spill_root(&db_path_str).expect("spill root");
+
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            db_path_str,
+            None,
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime,
+            60,
+            false,
+            false,
+            Some(spill_root.clone()),
+            64,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        state.store.upsert_media_object(MediaObjectUpsert {
+            channel: "general",
+            file_id: "spill-me",
+            sender: "alice",
+            filename: "large.bin",
+            media_kind: "file",
+            mime: Some("application/octet-stream"),
+            declared_size: 256,
+        });
+        let chunk = vec![42u8; 128];
+        state
+            .store
+            .append_media_chunk("general", "spill-me", "alice", 0, &chunk);
+
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        let (media_id, storage_backend, storage_path, blob_len): (
+            i64,
+            String,
+            Option<String>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT mo.id,
+                        mc.storage_backend,
+                        mc.storage_path,
+                        length(mc.chunk_blob)
+                 FROM media_objects mo
+                 JOIN media_chunks mc ON mc.media_id = mo.id
+                 WHERE mo.channel = ?1 AND mo.file_id = ?2 AND mc.chunk_index = 0",
+                params!["general", "spill-me"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query spilled media chunk");
+        assert_eq!(storage_backend, "fs");
+        assert_eq!(blob_len, 0);
+        let spilled_path = spill_root.join(storage_path.expect("spilled path stored"));
+        assert!(spilled_path.exists(), "spilled media file should exist");
+
+        let ts_now = now();
+        conn.execute(
+            "UPDATE media_objects
+             SET created_ts = ?1, completed_ts = ?2, completed = TRUE
+             WHERE id = ?3",
+            params![ts_now - 10_000.0, ts_now - 10_000.0, media_id],
+        )
+        .expect("age spilled media object");
+        drop(conn);
+
+        let (deleted, reclaimed) = state.store.prune_media_storage(500, 0);
+        assert_eq!(deleted, 1);
+        assert_eq!(reclaimed, 128);
+        assert!(
+            !spilled_path.exists(),
+            "spilled media file should be deleted during prune"
+        );
+
+        drop(state);
+        cleanup_db_artifacts(&db_path);
+    }
+
+    #[test]
+    fn backup_and_restore_include_db_key_and_spilled_media() {
+        let db_path = unique_test_db_path("chatify-backup-source");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db_key = resolve_db_key(&db_path_str, None).expect("create db key");
+        let spill_root = default_media_spill_root(&db_path_str).expect("spill root");
+
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            db_path_str.clone(),
+            db_key,
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime,
+            60,
+            false,
+            false,
+            Some(spill_root.clone()),
+            64,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        let payload = serde_json::json!({
+            "t": "msg",
+            "ch": "general",
+            "u": "alice",
+            "c": "backup marker",
+            "ts": now()
+        });
+        state
+            .store
+            .persist("msg", "general", "alice", None, &payload, "backup marker");
+        state.store.upsert_media_object(MediaObjectUpsert {
+            channel: "general",
+            file_id: "backup-spill",
+            sender: "alice",
+            filename: "large.bin",
+            media_kind: "file",
+            mime: Some("application/octet-stream"),
+            declared_size: 512,
+        });
+        state
+            .store
+            .append_media_chunk("general", "backup-spill", "alice", 0, &[7u8; 128]);
+
+        let backup_path = unique_test_db_path("chatify-backup-snapshot");
+        let backup = state
+            .store
+            .create_backup_snapshot(&backup_path)
+            .expect("create backup snapshot");
+        assert!(backup.db_path.exists());
+        assert!(
+            backup.key_path.as_ref().is_some_and(|path| path.exists()),
+            "backup should include db key"
+        );
+        assert!(
+            backup.media_path.as_ref().is_some_and(|path| path.exists()),
+            "backup should include spilled media"
+        );
+        drop(state);
+
+        let restore_path = unique_test_db_path("chatify-backup-restore");
+        let restore_path_str = restore_path.to_string_lossy().to_string();
+        let restore_spill_root =
+            default_media_spill_root(&restore_path_str).expect("restore spill root");
+        let restore = restore_database_snapshot(
+            &backup_path,
+            &restore_path,
+            None,
+            Some(restore_spill_root.as_path()),
+        )
+        .expect("restore backup snapshot");
+        assert!(restore.db_path.exists());
+        assert!(
+            restore.key_path.as_ref().is_some_and(|path| path.exists()),
+            "restore should include db key"
+        );
+        assert!(
+            restore
+                .media_path
+                .as_ref()
+                .is_some_and(|path| path.exists()),
+            "restore should include spilled media"
+        );
+
+        let restored_key = resolve_db_key(&restore_path_str, None).expect("load restored db key");
+        let restored_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let restored_state = State::new(
+            restore_path_str,
+            restored_key,
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            restored_runtime,
+            60,
+            false,
+            false,
+            Some(restore_spill_root.clone()),
+            64,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+        );
+
+        let history = restored_state.store.history("general", 10);
+        assert_eq!(history.len(), 1);
+        let restored_conn = Connection::open(&restore_path).expect("open restored sqlite db");
+        let restored_storage_path: Option<String> = restored_conn
+            .query_row(
+                "SELECT storage_path
+                 FROM media_chunks mc
+                 JOIN media_objects mo ON mo.id = mc.media_id
+                 WHERE mo.file_id = ?1 AND mc.chunk_index = 0",
+                params!["backup-spill"],
+                |row| row.get(0),
+            )
+            .expect("query restored storage path");
+        let restored_spilled_file = restore_spill_root
+            .join(restored_storage_path.expect("restored spilled media path should be stored"));
+        assert!(
+            restored_spilled_file.exists(),
+            "restored spill file should exist on disk"
+        );
+
+        drop(restored_conn);
+        drop(restored_state);
+        cleanup_db_artifacts(&db_path);
+        cleanup_db_artifacts(&backup_path);
+        cleanup_db_artifacts(&restore_path);
+    }
+
+    #[test]
     fn media_prune_storage_enforces_age_and_size_limits() {
         let db_path = unique_test_db_path("chatify-media-prune");
         let plugin_runtime =
@@ -8962,6 +10324,8 @@ mod tests {
             60,
             false,
             false,
+            None,
+            kib_to_bytes_usize(MEDIA_SPILL_THRESHOLD_KIB_DEFAULT),
             OUTBOUND_QUEUE_CAPACITY_DEFAULT,
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );

@@ -29,11 +29,18 @@ jobs:
     timeout-minutes: 45
 
     steps:
+      - name: Checkout workflow sources
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: refs/tags/${{ env.RELEASE_TAG }}
+          path: release-src
 
       - name: Validate manual tag input
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -44,7 +51,7 @@ jobs:
             throw "Input 'tag' is required for manual runs."
           }
 
-          git rev-parse --verify "refs/tags/$tag" | Out-Null
+          git -C release-src describe --tags --exact-match "HEAD" | Out-Null
 
       - name: Install system dependencies
         run: |
@@ -68,9 +75,12 @@ jobs:
         id: security_report
         shell: pwsh
         run: |
+          $releaseRoot = (Resolve-Path "release-src").Path
+          $outputDir = Join-Path $PWD "dist/security-reports"
           ./scripts/generate-security-report.ps1 `
             -Tag "$env:RELEASE_TAG" `
-            -OutputDir "dist/security-reports"
+            -OutputDir $outputDir `
+            -RepoRoot $releaseRoot
 
       - name: Upload report as workflow artifact
         if: always()

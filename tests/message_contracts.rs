@@ -2676,14 +2676,14 @@ async fn schema_meta_contains_current_version() {
     let _alice = connect_and_auth(&server.url, "alice").await;
 
     let version = read_schema_version(&server.db_path);
-    assert_eq!(version, "8");
+    assert_eq!(version, "9");
 }
 
-/// Verifies that a server migrates a `v0` database to schema `v8` on startup.
+/// Verifies that a server migrates a `v0` database to schema `v9` on startup.
 ///
 /// Migration correctness is verified by:
 ///
-/// 1. Confirming `schema_meta.schema_version` is updated to `"8"`.
+/// 1. Confirming `schema_meta.schema_version` is updated to `"9"`.
 /// 2. Confirming the `events` table exists (created by `v1` migration).
 /// 3. Confirming the `user_2fa` table exists (created by `v2` migration).
 /// 4. Confirming the `user_credentials` table exists (created by `v3` migration).
@@ -2692,6 +2692,7 @@ async fn schema_meta_contains_current_version() {
 /// 7. Confirming audit_logs and suspicious_activity tables from `v6` exist.
 /// 8. Confirming presence/subscription snapshot tables and indexes from `v7` exist.
 /// 9. Confirming media persistence tables and high-volume indexes from `v8` exist.
+/// 10. Confirming search-term indexing and media spill metadata from `v9` exist.
 ///
 /// All assertions are made directly against SQLite rather than through the
 /// server API to keep migration tests independent of server protocol changes.
@@ -2707,8 +2708,8 @@ async fn schema_migrates_from_version_zero_to_current() {
     let conn = Connection::open(&db_path).expect("open migrated db");
     assert_eq!(
         read_schema_version(&db_path),
-        "8",
-        "expected migration to set schema version to 8"
+        "9",
+        "expected migration to set schema version to 9"
     );
 
     let events_exists: i64 = conn
@@ -2925,6 +2926,54 @@ async fn schema_migrates_from_version_zero_to_current() {
     assert_eq!(
         channel_event_index_exists, 1,
         "idx_events_channel_event_ts should exist after migration"
+    );
+
+    let search_terms_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_search_terms'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for event_search_terms");
+    assert_eq!(
+        search_terms_exists, 1,
+        "event_search_terms table should exist after migration"
+    );
+
+    let search_terms_index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_event_search_terms_term_event'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for idx_event_search_terms_term_event");
+    assert_eq!(
+        search_terms_index_exists, 1,
+        "idx_event_search_terms_term_event should exist after migration"
+    );
+
+    let storage_backend_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('media_chunks') WHERE name='storage_backend'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query pragma_table_info for media_chunks.storage_backend");
+    assert_eq!(
+        storage_backend_column, 1,
+        "storage_backend column should exist in media_chunks after migration"
+    );
+
+    let storage_path_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('media_chunks') WHERE name='storage_path'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query pragma_table_info for media_chunks.storage_path");
+    assert_eq!(
+        storage_path_column, 1,
+        "storage_path column should exist in media_chunks after migration"
     );
 
     let failed_attempts_column: i64 = conn

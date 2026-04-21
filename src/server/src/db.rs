@@ -265,6 +265,8 @@ impl EventStore {
     /// field, if provided, is used for LIKE-based full-text search and should contain
     /// decrypted plaintext. Message payloads are expected to be pre-encrypted by the client.
     /// See AGENTS.md: "Search is O(n)" — this decrypts and scans all events linearly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_event(
         &self,
         event_type: &str,
         channel: &str,

@@ -2,13 +2,19 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$Tag,
   [string]$OutputDir = "dist/security-reports",
+  [string]$RepoRoot,
   [switch]$FailOnRequiredFailure
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = Split-Path -Parent $PSScriptRoot
+$RepoRoot = if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+  Split-Path -Parent $PSScriptRoot
+}
+else {
+  [System.IO.Path]::GetFullPath($RepoRoot)
+}
 Set-Location $RepoRoot
 
 if ([string]::IsNullOrWhiteSpace($Tag)) {
@@ -139,7 +145,7 @@ function Invoke-ReportCheck {
   $outputLines = @()
   $exitCode = 1
   $timedOut = $false
-  $job = $null
+  $process = $null
   $tmpToken = [guid]::NewGuid().ToString("N")
   $tmpOut = Join-Path $ReportDir (".tmp-{0}-{1}.stdout" -f $safeName, $tmpToken)
   $tmpErr = Join-Path $ReportDir (".tmp-{0}-{1}.stderr" -f $safeName, $tmpToken)
@@ -151,44 +157,33 @@ function Invoke-ReportCheck {
       Remove-Item -Force $tmpErr
     }
 
-    $job = Start-Job -ScriptBlock {
-      param(
-        [string]$CommandName,
-        [string[]]$CommandArgs,
-        [string]$StdOutPath,
-        [string]$StdErrPath,
-        [string]$WorkingDirectory
-      )
+    $process = Start-Process `
+      -FilePath $Command `
+      -ArgumentList $Args `
+      -WorkingDirectory $RepoRoot `
+      -RedirectStandardOutput $tmpOut `
+      -RedirectStandardError $tmpErr `
+      -PassThru
 
-      Set-Location $WorkingDirectory
+    $completed = $process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $completed) {
+      $timedOut = $true
       try {
-        & $CommandName @CommandArgs 1> $StdOutPath 2> $StdErrPath
-        if ($null -eq $LASTEXITCODE) {
-          return 0
-        }
-        return [int]$LASTEXITCODE
+        $process.Kill($true)
       }
       catch {
-        $_.Exception.Message | Out-File -FilePath $StdErrPath -Append -Encoding UTF8
-        return 1
+        try {
+          $process.Kill()
+        }
+        catch {
+        }
       }
-    } -ArgumentList $Command, $Args, $tmpOut, $tmpErr, $RepoRoot
-
-    $jobResult = Wait-Job -Job $job -Timeout $TimeoutSeconds
-    if ($null -eq $jobResult) {
-      $timedOut = $true
-      Stop-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+      $process.WaitForExit()
       $exitCode = 124
     }
     else {
-      $jobOutput = @()
-      $jobOutput = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
-      if ($jobOutput.Count -gt 0 -and $null -ne $jobOutput[-1]) {
-        $exitCode = [int]$jobOutput[-1]
-      }
-      else {
-        $exitCode = 1
-      }
+      $process.WaitForExit()
+      $exitCode = [int]$process.ExitCode
     }
 
     $stdout = if (Test-Path $tmpOut) { Get-Content -Path $tmpOut } else { @() }
@@ -204,8 +199,8 @@ function Invoke-ReportCheck {
     $exitCode = 1
   }
   finally {
-    if ($null -ne $job) {
-      Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+    if ($null -ne $process) {
+      $process.Dispose()
     }
     if (Test-Path $tmpOut) {
       Remove-Item -Force $tmpOut

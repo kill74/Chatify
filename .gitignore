@@ -11,6 +11,10 @@ chatify.db.key
 cert.pem
 key.pem
 build.log
+dist/security-reports/*.log
+dist/security-reports/*.tmp
+dist/security-reports/chatify-security-report-*.json
+dist/security-reports/chatify-security-report-*.md
 
 # IDE and editor
 .vscode/

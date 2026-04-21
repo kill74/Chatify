@@ -155,6 +155,15 @@ pub struct Args {
     #[arg(long, default_value_t = 20.0)]
     pub media_max_total_size_gb: f64,
 
+    /// Optional directory for spilling large media chunks out of SQLite.
+    /// Defaults to `<db>.media` for file-backed databases.
+    #[arg(long)]
+    pub media_spill_dir: Option<String>,
+
+    /// File/chunk size threshold in KiB before media is stored in the spill directory.
+    #[arg(long, default_value_t = 1024)]
+    pub media_spill_threshold_kib: u64,
+
     /// Interval in seconds between periodic media retention maintenance runs.
     #[arg(long, default_value_t = 600)]
     pub media_prune_interval_secs: u64,
@@ -182,6 +191,18 @@ pub struct Args {
     /// Disable 2FA for a user (admin operation).
     #[arg(long)]
     pub disable_2fa_for: Option<String>,
+
+    /// Run a full SQLite integrity check and exit (admin operation).
+    #[arg(long)]
+    pub db_integrity_check: bool,
+
+    /// Create a consistent SQLite backup snapshot at the target path and exit (admin operation).
+    #[arg(long)]
+    pub db_backup_to: Option<String>,
+
+    /// Restore a SQLite backup snapshot from the given path into `--db` and exit (admin operation).
+    #[arg(long)]
+    pub db_restore_from: Option<String>,
 
     /// Internal mode: run a built-in plugin worker process.
     #[arg(long, hide = true)]
