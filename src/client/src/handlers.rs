@@ -1,15 +1,36 @@
-//! Client event handlers.
+//! Client event handlers for WebSocket messages and internal events.
+//!
+//! This module dispatches inbound protocol frames to appropriate handlers that update
+//! the client's UI state, play audio, verify encryption keys, and execute plugins.
+//!
+//! # Key Responsibilities
+//!
+//! - **Message reception**: Parse `chat`, `dm`, `react`, `edit` frames and display them
+//! - **Presence updates**: Track online users, typing indicators, status changes
+//! - **Encryption**: Verify signatures and fingerprints; warn on key changes (trust model)
+//! - **Voice**: Decode and enqueue audio packets for playback
+//! - **System events**: Handle joins, leaves, bans, and admin actions
+//! - **Plugins**: Invoke plugin hooks on specific message types
+//!
+//! # Trust Model
+//!
+//! See AGENTS.md: "Trust model: Explicit fingerprint verification, not TOFU."
+//! When a key changes, the client logs a `KeyChangeWarning` and requires the user to
+//! manually verify via `/trust` and `/fingerprint` commands. Session tokens don't survive
+//! restarts, so key re-verification is expected after server restarts.
 
 use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState, TypingPresence};
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
 use clifford::notifications::NotificationService;
 
+/// Emit a line of output to the UI (with newline).
 macro_rules! println {
     ($($arg:tt)*) => {{
         crate::ui::emit_output_line(format!($($arg)*), false);
     }};
 }
 
+/// Emit a line of error/diagnostic output to the UI.
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
         crate::ui::emit_output_line(format!($($arg)*), true);
@@ -111,6 +132,15 @@ fn mention_target(username: &str) -> String {
     username.trim().trim_start_matches('@').to_ascii_lowercase()
 }
 
+/// Formats message content for mentions, detecting @username patterns.
+///
+/// This function scans the message for `@username` tokens and wraps matches in square
+/// brackets `[@username]` for styling. It respects word boundaries—a character appearing
+/// immediately before `@` must be whitespace, not alphanumeric. This avoids false positives
+/// in email addresses or URLs.
+///
+/// Returns `(formatted_content, was_mentioned)` where `was_mentioned` is true if the
+/// username received a mention.
 pub fn format_content_for_mentions(content: &str, username: &str) -> (String, bool) {
     let target = mention_target(username);
     if target.is_empty() {

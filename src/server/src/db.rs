@@ -1,4 +1,19 @@
 //! Database layer for Chatify server.
+//!
+//! Provides persistent storage for all server state including:
+//! - Event history (messages, DMs, etc.) with full-text search support
+//! - User credentials and authentication metadata
+//! - 2FA configuration (TOTP secrets, backup codes)
+//! - User roles, bans, mutes, and presence information
+//! - Suspicious activity logging for security auditing
+//!
+//! # Design Notes
+//!
+//! - **Append-only events**: The events table never deletes records, enabling full audit trails
+//! - **Schema versioning**: Strict no-downgrade policy—newer servers refuse older schemas
+//! - **Linear search**: Search is O(n) over all events; see AGENTS.md for performance notes
+//! - **Encryption**: Message payloads are client-side encrypted; server stores encrypted blobs
+//! - **WAL mode**: Database uses Write-Ahead Logging for durability and concurrent reads
 
 use std::time::Instant;
 
@@ -214,7 +229,11 @@ impl EventStore {
         Ok(())
     }
 
-    /// Gets a database connection.
+    /// Gets a database connection with WAL mode and pragmas configured.
+    ///
+    /// WAL (Write-Ahead Logging) mode allows concurrent readers while writes are being
+    /// processed, significantly improving throughput under load. PRAGMA synchronous = NORMAL
+    /// balances durability with performance.
     fn get_connection(&self) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(&self.pool.path)?;
         conn.execute_batch(
@@ -225,7 +244,10 @@ impl EventStore {
         Ok(conn)
     }
 
-    /// Records a database observation for metrics.
+    /// Records a database operation timing for metrics collection.
+    ///
+    /// This allows operators to monitor query performance and detect slow operations
+    /// that might indicate database contention or missing indices.
     fn record_db_observation(&self, operation: &str, started: Instant, error: bool) {
         if let Some(p) = &self.prometheus {
             if let Ok(metrics) = p.try_lock() {
@@ -237,9 +259,12 @@ impl EventStore {
         }
     }
 
-    /// Stores an event in the database.
-    #[allow(clippy::too_many_arguments)]
-    pub fn store_event(
+    /// Stores an event in the database (append-only).
+    ///
+    /// Events are immutable and never deleted, ensuring full audit trails. The `search_text`
+    /// field, if provided, is used for LIKE-based full-text search and should contain
+    /// decrypted plaintext. Message payloads are expected to be pre-encrypted by the client.
+    /// See AGENTS.md: "Search is O(n)" — this decrypts and scans all events linearly.
         &self,
         event_type: &str,
         channel: &str,

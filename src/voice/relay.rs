@@ -1,3 +1,8 @@
+//! Voice relay for broadcasting audio and state changes.
+//!
+//! Manages voice rooms and broadcasts voice-related events to all connected clients
+//! subscribed to a room. Uses broadcast channels for efficient fan-out.
+
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6,19 +11,28 @@ use tokio::sync::broadcast;
 
 use super::VoiceRoom;
 
+/// Manages voice rooms and broadcasts voice events.
+///
+/// This is a lock-free relay that maintains voice rooms and broadcasts membership
+/// changes and state updates (mute, deafen, speaking) to all connected subscribers.
 pub struct VoiceRelay {
+    /// Rooms indexed by name, each with read-write protection.
     rooms: Arc<RwLock<HashMap<String, Arc<RwLock<VoiceRoom>>>>>,
+    /// Broadcast channel for voice events.
     tx: broadcast::Sender<VoiceBroadcast>,
 }
 
+/// Voice events to be broadcast to subscribed clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "d")]
 pub enum VoiceBroadcast {
+    /// List of current members in a room (sent on sync or join).
     #[serde(rename = "vusers")]
     Users {
         room: String,
         members: Vec<VoiceMemberInfo>,
     },
+    /// A member's state changed (mute/deafen/speaking flags).
     #[serde(rename = "vstate")]
     StateChange {
         room: String,
@@ -27,28 +41,38 @@ pub enum VoiceBroadcast {
         deafened: Option<bool>,
         speaking: Option<bool>,
     },
+    /// A member's speaking status changed (activity detection).
     #[serde(rename = "vspeaking")]
     Speaking {
         room: String,
         user: String,
         speaking: bool,
     },
+    /// A member joined the room.
     #[serde(rename = "vjoin")]
     MemberJoined { room: String, user: String },
+    /// A member left the room.
     #[serde(rename = "vleave")]
     MemberLeft { room: String, user: String },
 }
 
+/// Snapshot of a member's voice state for distribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceMemberInfo {
+    /// Member's username.
     pub user: String,
+    /// Whether the member's mic is muted.
     pub muted: bool,
+    /// Whether the member's audio is deafened.
     pub deafened: bool,
+    /// Whether the member is currently speaking (activity detected).
     pub speaking: bool,
+    /// When they joined the room (Unix timestamp).
     pub joined_at: f64,
 }
 
 impl VoiceRelay {
+    /// Creates a new voice relay with an empty room registry.
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
@@ -57,14 +81,17 @@ impl VoiceRelay {
         }
     }
 
+    /// Creates a new subscription to broadcast voice events.
     pub fn subscribe(&self) -> broadcast::Receiver<VoiceBroadcast> {
         self.tx.subscribe()
     }
 
+    /// Broadcasts a voice event to all subscribers.
     pub fn broadcast(&self, event: VoiceBroadcast) {
         let _ = self.tx.send(event);
     }
 
+    /// Gets an existing room or creates it if it doesn't exist.
     pub fn get_or_create_room(&self, name: &str) -> Arc<RwLock<VoiceRoom>> {
         let mut rooms = self.rooms.write();
         rooms
@@ -73,6 +100,8 @@ impl VoiceRelay {
             .clone()
     }
 
+    /// Adds a member to a room and broadcasts the join event.
+    /// Returns a snapshot of all current room members.
     pub fn join_room(&self, room: &str, username: &str) -> Vec<VoiceMemberInfo> {
         let room_guard = self.get_or_create_room(room);
         {
@@ -88,6 +117,8 @@ impl VoiceRelay {
         self.get_members_internal(room)
     }
 
+    /// Removes a member from a room and broadcasts the leave event.
+    /// Returns true if the member was present and removed.
     pub fn leave_room(&self, room: &str, username: &str) -> bool {
         let room_guard = self.get_or_create_room(room);
         let removed = {
@@ -106,6 +137,10 @@ impl VoiceRelay {
         }
     }
 
+    /// Updates a member's voice state (mute, deafen, speaking) and broadcasts the change.
+    ///
+    /// Partial updates are allowed—pass `None` for fields that should not change.
+    /// This allows clients to send, e.g., only a speaking flag update without affecting mute state.
     pub fn update_member_state(
         &self,
         room: &str,

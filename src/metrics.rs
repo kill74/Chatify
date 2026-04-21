@@ -1,3 +1,18 @@
+//! Prometheus metrics collection and exposition.
+//!
+//! Collects server telemetry including authentication rates, connection stats,
+//! message throughput, database performance, and latency percentiles.
+//! Metrics can be exported to Prometheus for alerting and dashboarding.
+//!
+//! # Key Metrics
+//!
+//! - **Authentication**: attempts, successes, failures by reason, lockouts
+//! - **Connections**: total accepted, closed, currently active
+//! - **Messages**: sent/received counts, bytes transferred, error rates
+//! - **Database**: query latency histograms, error counts, connection pool stats
+//! - **Cache**: hits and misses for in-memory buffers
+//! - **Latency**: p50/p95/p99 of auth and message processing time
+
 use prometheus::{
     CounterVec, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
     IntGauge, Opts, Registry,
@@ -5,67 +20,116 @@ use prometheus::{
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Summary of database operation performance.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct DbOperationSummary {
+    /// Operation name (e.g., "store_event", "history").
     pub operation: String,
+    /// Number of samples collected in the window.
     pub samples: u64,
+    /// Number of errors encountered.
     pub errors: u64,
+    /// Error rate as a fraction (0.0 to 1.0).
     pub error_rate: f64,
+    /// 50th percentile latency in milliseconds.
     pub p50_ms: f64,
+    /// 95th percentile latency in milliseconds.
     pub p95_ms: f64,
+    /// 99th percentile latency in milliseconds.
     pub p99_ms: f64,
+    /// Average latency in milliseconds.
     pub avg_ms: f64,
 }
 
+/// Alert triggered when database latency exceeds thresholds.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct DbLatencyAlert {
+    /// Operation name.
     pub operation: String,
+    /// Severity level (e.g., "warning", "critical").
     pub severity: String,
+    /// Observed p95 latency.
     pub p95_ms: f64,
+    /// Alert threshold that was exceeded.
     pub threshold_ms: f64,
+    /// Sample count.
     pub samples: u64,
 }
 
+/// Complete Prometheus metrics registry for Chatify server.
+///
+/// Exposes metrics in Prometheus text format for scraping. All counters and gauges
+/// are registered automatically on instantiation.
 pub struct PrometheusMetrics {
+    /// The underlying Prometheus registry.
     pub registry: Registry,
 
+    /// Total authentication attempts.
     pub auth_attempts_total: IntCounter,
+    /// Successful authentications.
     pub auth_success_total: IntCounter,
+    /// Failed authentications by reason.
     pub auth_failures_total: IntCounterVec,
+    /// Authentications rejected due to rate limiting or lockout.
     pub auth_failures_locked: IntCounter,
 
+    /// Total connections accepted.
     pub connections_accepted: IntCounter,
+    /// Total connections closed.
     pub connections_closed: IntCounter,
+    /// Currently active connections (gauge).
     pub connections_active: IntGauge,
 
+    /// Total messages sent to clients.
     pub messages_sent: IntCounter,
+    /// Total messages received from clients.
     pub messages_received: IntCounter,
+    /// Total bytes sent (including WebSocket overhead).
     pub bytes_sent: IntCounter,
+    /// Total bytes received.
     pub bytes_received: IntCounter,
+    /// Total protocol errors.
     pub errors: IntCounter,
 
+    /// Messages sent by type (histogram).
     pub messages_sent_total: IntCounterVec,
+    /// Failed message sends.
     pub messages_failed_total: IntCounter,
+    /// Messages dropped due to full outbound queue.
     pub outbound_queue_drops_total: IntCounter,
+    /// Disconnections caused by slow client writes.
     pub slow_client_disconnects_total: IntCounter,
 
+    /// Currently online users (gauge).
     pub users_online: IntGauge,
 
+    /// Database query latency distribution (histogram by operation).
     pub db_query_duration_seconds: HistogramVec,
+    /// Database query errors by operation.
     pub db_query_errors_total: IntCounterVec,
+    /// Currently active database connections (gauge).
     pub db_connections_active: IntGauge,
+    /// Idle database connections (gauge).
     pub db_connections_idle: IntGauge,
 
+    /// Cache hits (e.g., repeated key queries).
     pub cache_hits_total: IntCounter,
+    /// Cache misses.
     pub cache_misses_total: IntCounter,
 
+    /// HTTP requests by method and status (if applicable).
     pub http_requests_total: CounterVec,
+    /// HTTP request latency distribution.
     pub http_request_duration_seconds: HistogramVec,
 
+    /// Current member count per channel.
     pub channel_members: GaugeVec,
+    /// Total number of channels.
     pub channels_total: IntGauge,
 
+    /// Auth latency (p50, p95, p99).
     pub latency_auth_seconds: Histogram,
+    /// Message processing latency (p50, p95, p99).
     pub latency_message_seconds: Histogram,
 }
 

@@ -1,3 +1,19 @@
+//! Performance optimization utilities for high-throughput server.
+//!
+//! Includes caching layers for frequently-used objects (errors, JSON responses)
+//! and metrics collection to avoid allocation overhead in the hot path.
+//!
+//! # Design Notes
+//!
+//! - **Static JSON cache**: Pre-allocated Arc-wrapped strings for common error responses
+//!   reduce per-connection allocation and serialization time
+//! - **LRU cache**: Bounded-size caches for derived keys (channel encryption keys, etc.)
+//!   prevent unbounded memory growth under adversarial loads
+//! - **VecCache**: Ring buffer for message history allows O(1) append/evict without heap thrashing
+//!
+//! These optimizations are critical for the server to handle thousands of concurrent
+//! connections without latency spikes.
+
 // Performance optimization utilities
 // Designed for high-throughput, low-latency server applications
 

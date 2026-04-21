@@ -1,3 +1,29 @@
+//! Terminal UI client for Chatify.
+//!
+//! This is the primary user-facing application—a full-featured, async terminal dashboard
+//! that connects to the Chatify WebSocket server. It handles:
+//!
+//! - **Connection management**: WebSocket reconnection, auth, TLS if configured
+//! - **Terminal UI**: Real-time message display, command input, presence updates
+//! - **Encryption**: E2E DMs using received public keys, per-channel encryption keys
+//! - **Voice**: Audio relay and spatial awareness in voice rooms
+//! - **Media**: Inline rendering of shared images/videos with fallback to links
+//! - **Search & history**: Full-text search and conversation replay
+//! - **Plugins**: Runtime loading of Lua scripts for extensibility
+//! - **Notifications**: Desktop alerts, sound, and text-to-speech support
+//! - **2FA**: TOTP verification and backup code entry flows
+//!
+//! # Architecture
+//!
+//! The client uses a decoupled actor-like pattern:
+//! - **UI layer** (`clifford_client::ui`): Terminal rendering, theme, markdown
+//! - **State layer** (`ClientState`): Ephemeral session, message history, presence
+//! - **Handlers** (`clifford_client::handlers`): Business logic for commands and protocol events
+//! - **Protocol**: WebSocket communication with first-frame auth guarantee
+//!
+//! Session tokens are ephemeral—they don't survive server restarts, so all clients
+//! must re-authenticate. See AGENTS.md for protocol constraints.
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -24,12 +50,19 @@ use clifford_client::{
     voice::{start_voice_session, VoiceEvent},
 };
 
+/// Emit a line of output to the UI (with newline).
+///
+/// Unlike std::println!, this respects the UI framework's line management and
+/// integrates with the terminal dashboard. Avoids stdout contention.
 macro_rules! println {
     ($($arg:tt)*) => {{
         clifford_client::ui::emit_output_line(format!($($arg)*), false);
     }};
 }
 
+/// Emit a line of error/diagnostic output to the UI.
+///
+/// Same as println! but semantically marked as an error stream for styling.
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
         clifford_client::ui::emit_output_line(format!($($arg)*), true);

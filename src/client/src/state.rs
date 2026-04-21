@@ -1,4 +1,31 @@
-//! Client state management.
+//! Client state management for the Chatify terminal UI.
+//!
+//! This module maintains all ephemeral client-side state:
+//! - Session info (username, auth token, client ID)
+//! - Connection state (WebSocket sender, active channels, online users)
+//! - Encryption state (per-channel keys, per-DM keys, keypair)
+//! - UI state (message history, typing presence, unread markers)
+//! - Trust management (fingerprint store, key change warnings)
+//! - Voice and media state (room membership, speaker tracking, screen share)
+//!
+//! # Key Design Constraints
+//!
+//! **Session tokens are ephemeral** (AGENTS.md): They don't survive server restarts.
+//! After a restart, the client must re-authenticate, and any prior session is invalidated.
+//! This affects how we handle connection recovery and token validation.
+//!
+//! **Trust is explicit** (AGENTS.md): Keys are never assumed trusted (no TOFU).
+//! The client maintains a `TrustStore` of fingerprints and warns on `KeyChangeWarning`
+//! events. Users must manually verify via `/fingerprint` and `/trust` commands.
+//!
+//! **Search is O(n)** (AGENTS.md): Server performs linear decryption/scan. Clients should
+//! not request huge result sets; use pagination and reasonable limits.
+//!
+//! # Caching & Deduplication
+//!
+//! - Message history is bounded to MAX_MESSAGE_HISTORY (1000) to avoid memory bloat
+//! - Reaction events deduplicate via `seen_reaction_events` (bounded by MAX_REACTION_EVENT_DEDUP)
+//! - Typing indicators have TTLs and are periodically purged
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -19,84 +46,160 @@ const MAX_TRUST_AUDIT_ENTRIES: usize = 2_000;
 const MAX_ACTIVITY_LOG: usize = 200;
 const TRUST_STORE_SCHEMA_VERSION: u8 = 1;
 
+/// Complete ephemeral state of a connected client session.
+///
+/// All fields except `client_config` and certain maps are reset when the connection
+/// drops. The UI interacts directly with fields here during rendering and command
+/// processing, so it's important that handlers keep them consistent.
 pub struct ClientState {
+    /// WebSocket sender for outbound messages (first-frame auth, then events).
     pub ws_tx: mpsc::UnboundedSender<String>,
+    /// Authenticated username.
     pub me: String,
+    /// Generated client ID (used for reconciliation and deduplication).
     pub client_id: String,
+    /// Client's password hash (stored locally for re-auth after disconnects).
     pub pw: String,
+    /// Currently active channel name (e.g., "general" or "dm:alice").
     pub ch: String,
+    /// Known channels (name → subscribed flag).
     pub chs: HashMap<String, bool>,
+    /// Online users (username → base64 public key for E2E DM encryption).
     pub users: HashMap<String, String>,
+    /// Trust store: fingerprints, key change audit log.
     pub trust_store: TrustStore,
+    /// Per-channel AES keys: channel_name → 32-byte key (derived from password + channel).
     pub chan_keys: HashMap<String, Vec<u8>>,
+    /// Per-DM user keys: username → 32-byte key (derived from X25519 ECDH).
     pub dm_keys: HashMap<String, Vec<u8>>,
+    /// Client's Ed25519 private key (32 bytes, used to sign DMs).
     pub priv_key: Vec<u8>,
+    /// Whether the connection is active.
     pub running: bool,
+    /// Whether a voice session is active.
     pub voice_active: bool,
+    /// Active voice session details (room, codec, latency).
     pub voice_session: Option<VoiceSession>,
+    /// Theme configuration (reserved for future use).
     pub theme: (),
+    /// In-progress file transfers (id → metadata).
     pub file_transfers: HashMap<String, FileTransfer>,
+    /// Displayed message history (newest last, up to MAX_MESSAGE_HISTORY).
     pub message_history: VecDeque<DisplayedMessage>,
+    /// Message IDs we've already seen (deduplication).
     pub message_ids_seen: HashSet<String>,
+    /// Current user's presence status (online, away, dnd, etc.).
     pub status: Status,
+    /// Reaction tallies: message_id → { emoji → count }.
     pub reactions: HashMap<String, HashMap<String, u32>>,
+    /// Reaction event IDs we've already processed.
     pub seen_reaction_events: HashSet<String>,
+    /// Time-ordered reaction event IDs (for cleanup when bounded).
     pub reaction_event_order: VecDeque<String>,
+    /// Unread message counts per channel.
     pub unread_counts: HashMap<String, usize>,
+    /// Last message index per channel (for visual separators).
     pub unread_markers: HashMap<String, usize>,
+    /// Channels that need an unread message separator.
     pub unread_separator_scopes: HashSet<String>,
+    /// Recent activity hint: (hint_text, timestamp).
     pub activity_hint: Option<(String, u64)>,
+    /// Typing indicators: username → TypingPresence with TTL.
     pub typing_presence: HashMap<String, TypingPresence>,
+    /// Recently sent messages (for edit/delete reconciliation).
     pub recent_sents: VecDeque<SentMessage>,
+    /// Whether message logging is enabled.
     pub log_enabled: bool,
+    /// Persistent user configuration (connection host, UI theme, etc.).
     pub config: clifford::config::Config,
+    /// Screen share session state (reserved).
     pub screen_share: Option<()>,
+    /// Whether currently viewing another user's screen.
     pub screen_viewing: bool,
+    /// Count of screen frames received (metrics).
     pub screen_frames_received: u64,
+    /// Last received frame sequence number.
     pub screen_last_frame_seq: Option<u64>,
+    /// Username of the user whose screen we're viewing.
     pub screen_last_frame_from: Option<String>,
+    /// Usernames of members in the current voice room.
     pub voice_members: Vec<String>,
+    /// Whether this client's microphone is muted in voice.
     pub voice_muted: bool,
+    /// Whether this client is deafened (audio output disabled).
     pub voice_deafened: bool,
+    /// Whether this client is currently speaking (audio detected).
     pub voice_speaking: bool,
+    /// Whether media inline rendering is enabled.
     pub media_enabled: bool,
+    /// Set of online users (from presence broadcasts).
     pub online_users: HashSet<String>,
+    /// Peer presence status (username → Status).
     pub peer_statuses: HashMap<String, Status>,
+    /// Current line of user input in the terminal.
     pub input_buffer: String,
+    /// Cursor position in input_buffer (byte offset).
     pub input_cursor: usize,
+    /// History of previously entered commands.
     pub command_history: Vec<String>,
+    /// Draft messages per channel (channel → draft text).
     pub drafts: HashMap<String, String>,
+    /// Current position in command_history (for up/down navigation).
     pub history_index: Option<usize>,
+    /// Scroll offset in message history view.
     pub scroll_offset: usize,
+    /// Cached channel header (e.g., "# general" or "dm: alice").
     pub cached_header: String,
+    /// Cached subtitle (e.g., "12 online").
     pub cached_subtitle: String,
+    /// Whether the UI needs a full redraw.
     pub needs_redraw: bool,
+    /// Client-specific configuration (cli flags, defaults).
     pub client_config: ClientConfig,
+    /// Activity log for debugging and audit (recent actions).
     pub activity_log: VecDeque<ActivityEntry>,
 }
 
+/// Explicit key trust management.
+///
+/// Implements the trust model described in AGENTS.md: keys must be explicitly verified
+/// by the user, not implicitly trusted on first use (no TOFU). This struct stores
+/// fingerprint mappings and a full audit log of trust changes.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TrustStore {
+    /// Map of peer username → their trusted key fingerprint and metadata.
     pub peers: HashMap<String, PeerTrust>,
+    /// Full audit log of all trust-related actions (key changes, verifications, etc.).
     pub audit_log: Vec<AuditEntry>,
 }
 
+/// Trust metadata for a single peer.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerTrust {
+    /// SHA256 fingerprint of the peer's Ed25519 public key (hex-encoded).
     pub fingerprint: String,
+    /// Unix timestamp when the fingerprint was first trusted by the user.
     pub trusted_at: u64,
+    /// Whether the user has manually verified the fingerprint (via visual inspection, etc.).
     pub verified: bool,
 }
 
+/// Audit log entry for trust changes.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
+    /// Action type: "trust_new", "trust_change", "verify_fingerprint", etc.
     pub action: String,
+    /// Affected peer username.
     pub peer: String,
+    /// Unix timestamp of the action.
     pub timestamp: u64,
+    /// Details (e.g., "changed from abc123... to def456...").
     pub details: String,
 }
 
+/// Warning emitted when a peer's key changes without prior verification.
 pub struct KeyChangeWarning {
+    /// Username of the peer whose key changed.
     pub user: String,
     pub trusted_fingerprint: String,
     pub observed_fingerprint: String,
