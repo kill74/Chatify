@@ -1,6 +1,6 @@
 # Chatify Uniqueness Roadmap
 
-Last updated: 2026-04-09
+Last updated: 2026-04-21
 
 This document is the single source of truth for product execution and release readiness.
 
@@ -44,7 +44,7 @@ Chatify should feel differentiated by default in three ways:
 | Phase 2 Identity and Trust UX         | Complete                | High       | CLI trust workflow, key-change protection, and audit export are now shipped       | Monitor UX friction and tune defaults          |
 | Phase 3 Discord Bridge Re-Enable      | In progress (alpha)     | Medium     | Bridge runtime, route mapping, and status visibility exist                        | Stabilize and decide default-off vs default-on |
 | Phase 4 Terminal-Native Rich Messages | In progress             | Medium     | Markdown and ANSI are good; media UX is incomplete                                | Ship one media milestone cleanly               |
-| Phase 5 Plugin Runtime                | In progress (hardening) | High       | API v1 and built-ins are shipped; ecosystem UX is still maturing                  | Add client-facing plugin command UX            |
+| Phase 5 Plugin Runtime                | In progress (ecosystem enablement) | High       | API v1, built-ins, runtime management, and client plugin command UX are shipped    | Freeze examples and widen third-party validation |
 
 ## Program Health Metrics
 
@@ -169,11 +169,11 @@ Completed:
 - Slash command registration and message hook execution are functional.
 - Built-in plugins shipped: poll, standup, deploy-notifier.
 - Runtime management supports install, list, and disable without restart (protocol-level).
+- Default client now exposes `/plugin list`, `/plugin install`, and `/plugin disable` for operator workflows.
 - Hardening delivered: strict response parsing, bounded I/O, process timeout, stronger termination behavior.
 
 Remaining:
 
-- Add first-class client command wrappers for plugin lifecycle UX.
 - Publish API v1 examples and reference plugin templates.
 - Add wider ecosystem validation for third-party plugin ergonomics.
 
@@ -186,13 +186,13 @@ Exit Criteria:
 
 ## Next 2-Week Execution Plan
 
-Cycle goal: complete trust UX and de-risk the next promotion decisions.
+Cycle goal: complete plugin operator follow-through and de-risk the next promotion decisions.
 
 | Workstream              | Deliverable                                                                  | Acceptance Criteria                                                     |
 | ----------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | Query UX follow-through | Publish usage examples for `/history`, `/search`, and `/replay`              | Operator docs match implemented CLI grammar and protocol scope behavior |
-| Plugin UX               | Add `/plugin list`, `/plugin install`, and `/plugin disable` client wrappers | Admin workflows run without raw JSON framing                            |
-| Trust kickoff           | Implement `/fingerprint` and `/trust` command paths                          | End-to-end happy path works with audit output                           |
+| Plugin UX               | Publish API v1 examples and reference plugin templates                       | Third-party authors can follow documented install and command flows     |
+| Trust follow-through    | Publish operator guidance for `/fingerprint`, `/trust`, and `/trust-export`  | Docs match implemented trust UX and incident-export workflow            |
 | Bridge hardening        | Execute targeted reconnect/loop-prevention stress pass                       | No loop regressions in scripted stress test scenarios                   |
 | Rich media increment    | Ship one media milestone (`image preview` or `audio notes`)                  | Feature works with explicit fallback and can be disabled globally       |
 
@@ -200,10 +200,10 @@ Cycle goal: complete trust UX and de-risk the next promotion decisions.
 
 | Risk                                        | Impact                                            | Mitigation                                        | Owner  |
 | ------------------------------------------- | ------------------------------------------------- | ------------------------------------------------- | ------ |
-| Client UX lags server capability            | Features appear incomplete to users               | Prioritize command-surface parity in next cycle   | Client |
+| Roadmap drift vs shipped reality            | Teams prioritize stale work or miss shipped wins  | Re-baseline roadmap when operator UX lands        | PM/Client |
 | Bridge instability under reconnect churn    | Reliability and trust impact in mixed communities | Keep default-off until stress criteria are met    | Bridge |
 | Plugin ecosystem drift from API v1 contract | Third-party breakage and support burden           | Freeze docs/examples with conformance checks      | Server |
-| Trust UX delay                              | Security posture remains unclear for end users    | Time-box trust commands and warning UX this cycle | Client |
+| Media scope creep                           | Rich-message work can sprawl past terminal UX bar | Ship one milestone with explicit fallback only    | Client |
 
 ## Quality Gates (All Phases)
 
@@ -222,8 +222,8 @@ Cycle goal: complete trust UX and de-risk the next promotion decisions.
 
 ## Re-Baselined Milestones
 
-1. v0.6.0: plugin runtime beta plus client command parity (`/search`, `/replay`, `/plugin ...`)
-2. v0.7.0: trust UX completion (`/fingerprint`, `/trust`, key-change warnings)
-3. v0.8.0: bridge stabilization cycle complete and default-policy decision
-4. v0.9.0: first rich terminal media milestone (image preview or audio notes)
+1. v0.6.0: plugin runtime beta plus client command parity (`/plugin list`, `/plugin install`, `/plugin disable`)
+2. v0.7.0: bridge stabilization cycle complete and default-policy decision
+3. v0.8.0: first rich terminal media milestone (image preview or audio notes)
+4. v0.9.0: plugin docs/examples and ecosystem conformance pass
 5. v1.0.0 candidate: all phases at "Complete" with one stable-cycle validation

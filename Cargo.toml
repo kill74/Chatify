@@ -10,7 +10,6 @@ members = ["src/server", "src/client"]
 [features]
 default = []
 discord-bridge = ["dep:serenity"]
-bridge-client = []
 batch-writes = []
 
 [[bin]]

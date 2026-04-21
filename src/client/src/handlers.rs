@@ -4,6 +4,18 @@ use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState,
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
 use clifford::notifications::NotificationService;
 
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        crate::ui::emit_output_line(format!($($arg)*), false);
+    }};
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::ui::emit_output_line(format!($($arg)*), true);
+    }};
+}
+
 const TYPING_TTL_SECS: u64 = 30;
 
 fn extract_msg_id(data: &serde_json::Value) -> String {
@@ -47,7 +59,33 @@ fn trust_warning_summary(warning: &KeyChangeWarning) -> String {
     )
 }
 
+fn plugin_commands_summary(value: Option<&serde_json::Value>) -> String {
+    let Some(commands) = value.and_then(|v| v.as_array()) else {
+        return "none".to_string();
+    };
+
+    let rendered: Vec<String> = commands
+        .iter()
+        .filter_map(|command| {
+            command
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| format!("/{}", name))
+        })
+        .collect();
+
+    if rendered.is_empty() {
+        "none".to_string()
+    } else {
+        rendered.join(", ")
+    }
+}
+
 fn print_live_message(message: &DisplayedMessage, reaction_summary: &str) {
+    if crate::ui::is_tui_active() {
+        return;
+    }
+
     if message.sender == "system" {
         println!("[system] {}", message.content);
         return;
@@ -327,6 +365,7 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
     let mut state_lock = state.lock().await;
     let trust_audit_len_before = state_lock.trust_store.audit_log.len();
     let current_user = state_lock.me.clone();
+    let from_self = !current_user.is_empty() && u.eq_ignore_ascii_case(&current_user);
     let notification_config = state_lock.config.notifications.clone();
     let message = DisplayedMessage {
         id: msg_id.clone(),
@@ -338,6 +377,7 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
         edited: false,
     };
     state_lock.add_message(message.clone());
+    state_lock.note_incoming_message(ch, from_self);
     let trust_warning = state_lock.observe_user_key(u, pk);
     if let Some(warning) = trust_warning.as_ref() {
         state_lock.add_message(DisplayedMessage {
@@ -364,7 +404,6 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
     rendered_message.content = rendered_content;
     print_live_message(&rendered_message, &reaction_summary);
 
-    let from_self = !current_user.is_empty() && message.sender.eq_ignore_ascii_case(&current_user);
     if !from_self {
         if mentioned_me && notification_config.on_mention {
             notify_message(
@@ -413,6 +452,7 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
         edited: false,
     };
     state_lock.add_message(message.clone());
+    state_lock.note_incoming_message(&message.channel, from_is_me);
 
     let trust_warning = if from_is_me {
         None
@@ -684,8 +724,10 @@ pub async fn handle_history_event(state: &SharedState, data: &serde_json::Value,
             format_scope_label(ch),
             reaction_events
         );
-        for line in preview.iter().rev() {
-            println!("{}", line);
+        if !crate::ui::is_tui_active() {
+            for line in preview.iter().rev() {
+                println!("{}", line);
+            }
         }
     }
 }
@@ -704,8 +746,10 @@ pub async fn handle_search_event(state: &SharedState, data: &serde_json::Value, 
             format_scope_label(ch),
             reaction_events
         );
-        for line in preview.iter().rev() {
-            println!("{}", line);
+        if !crate::ui::is_tui_active() {
+            for line in preview.iter().rev() {
+                println!("{}", line);
+            }
         }
     }
 }
@@ -727,9 +771,196 @@ pub async fn handle_replay_event(state: &SharedState, data: &serde_json::Value, 
             format_scope_label(ch),
             reaction_events
         );
-        for line in preview.iter().rev() {
-            println!("{}", line);
+        if !crate::ui::is_tui_active() {
+            for line in preview.iter().rev() {
+                println!("{}", line);
+            }
         }
+    }
+}
+
+pub async fn handle_plugins_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let plugins = data
+        .get("plugins")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let summary = format!("Plugin inventory refreshed ({} installed).", plugins.len());
+
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: String::new(),
+        sender: "system".to_string(),
+        content: summary.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", summary);
+    if plugins.is_empty() {
+        return;
+    }
+
+    println!("Installed plugins:");
+    for plugin in plugins {
+        let id = plugin
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let enabled = plugin
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let api_version = plugin
+            .get("api_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let message_hook = plugin
+            .get("message_hook")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let source = plugin
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let commands = plugin_commands_summary(plugin.get("commands"));
+
+        println!(
+            "  {} [{}] api=v{} hook={} commands={} source={}",
+            id,
+            if enabled { "enabled" } else { "disabled" },
+            api_version,
+            if message_hook { "on" } else { "off" },
+            commands,
+            source
+        );
+    }
+}
+
+pub async fn handle_plugin_installed_event(
+    state: &SharedState,
+    data: &serde_json::Value,
+    _ts: u64,
+) {
+    let plugin = data
+        .get("plugin")
+        .or_else(|| data.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let api_version = data
+        .get("api_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let message_hook = data
+        .get("message_hook")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let commands = plugin_commands_summary(data.get("commands"));
+    let summary = format!(
+        "Plugin installed: {} (api=v{}, commands={}, message_hook={}).",
+        plugin,
+        api_version,
+        commands,
+        if message_hook { "on" } else { "off" }
+    );
+
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: String::new(),
+        sender: "system".to_string(),
+        content: summary.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", summary);
+}
+
+pub async fn handle_plugin_disabled_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let plugin = data
+        .get("plugin")
+        .or_else(|| data.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let summary = format!("Plugin disabled: {}.", plugin);
+
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: String::new(),
+        sender: "system".to_string(),
+        content: summary.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", summary);
+}
+
+pub async fn handle_bridge_status_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let bridges = data
+        .get("bridges")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let count = data
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(bridges.len() as u64);
+    let summary = format!("Bridge status: {} connected instance(s).", count);
+
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: String::new(),
+        sender: "system".to_string(),
+        content: summary.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", summary);
+    if bridges.is_empty() {
+        return;
+    }
+
+    println!("Connected bridges:");
+    for bridge in bridges {
+        let username = bridge
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let bridge_type = bridge
+            .get("bridge_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let instance_id = bridge
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let route_count = bridge
+            .get("route_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let uptime_secs = bridge
+            .get("uptime_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        println!(
+            "  {} type={} instance={} routes={} uptime={}s",
+            username, bridge_type, instance_id, route_count, uptime_secs
+        );
     }
 }
 
@@ -740,10 +971,22 @@ pub async fn handle_users_event(state: &SharedState, data: &serde_json::Value, _
         let mut state_lock = state.lock().await;
         let trust_audit_len_before = state_lock.trust_store.audit_log.len();
         state_lock.users.clear();
+        let mut online_users = Vec::new();
         let mut warnings = Vec::new();
         for user in users {
             let u = user.get("u").and_then(|v| v.as_str()).unwrap_or("");
             let pk = user.get("pk").and_then(|v| v.as_str()).unwrap_or("");
+            let status = user.get("status").unwrap_or(&serde_json::Value::Null);
+            let status_text = status
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Online");
+            let status_emoji = status.get("emoji").and_then(|v| v.as_str()).unwrap_or("");
+
+            if !u.trim().is_empty() {
+                online_users.push(u.to_string());
+                state_lock.set_peer_status(u, status_text, status_emoji);
+            }
 
             if let Some(warning) = state_lock.observe_user_key(u, pk) {
                 let summary = trust_warning_summary(&warning);
@@ -759,6 +1002,7 @@ pub async fn handle_users_event(state: &SharedState, data: &serde_json::Value, _
                 warnings.push(summary);
             }
         }
+        state_lock.set_online_users(online_users);
         if state_lock.trust_store.audit_log.len() != trust_audit_len_before {
             if let Err(err) = state_lock.save_trust_store() {
                 eprintln!("failed to persist trust store: {}", err);
@@ -782,7 +1026,8 @@ pub async fn handle_joined_event(state: &SharedState, data: &serde_json::Value, 
     let hist = data.get("hist").cloned();
     let ws_tx = {
         let mut state_lock = state.lock().await;
-        state_lock.ch = ch.clone();
+        state_lock.chs.insert(ch.clone(), true);
+        state_lock.switch_scope(ch.clone());
         state_lock.add_message(DisplayedMessage {
             id: String::new(),
             ts: 0.0,
@@ -825,8 +1070,9 @@ pub async fn handle_left_event(state: &SharedState, data: &serde_json::Value, _t
 
     let mut state_lock = state.lock().await;
     if state_lock.ch == ch {
-        state_lock.ch = "general".to_string();
+        state_lock.switch_scope("general".to_string());
     }
+    state_lock.chs.remove(&ch);
 
     let summary = if already_left {
         format!("Left #{} (already inactive)", ch)
@@ -878,8 +1124,18 @@ pub async fn handle_status_update_event(state: &SharedState, data: &serde_json::
         .get("text")
         .and_then(|v| v.as_str())
         .unwrap_or("Online");
+    let emoji = status.get("emoji").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut state_lock = state.lock().await;
+    if !state_lock.me.is_empty() && user.eq_ignore_ascii_case(&state_lock.me) {
+        state_lock.status.text = summary.to_string();
+        state_lock.status.emoji = emoji.to_string();
+    } else {
+        state_lock.set_peer_status(user, summary, emoji);
+        if !user.trim().is_empty() {
+            state_lock.online_users.insert(user.to_string());
+        }
+    }
     state_lock.add_message(DisplayedMessage {
         id: String::new(),
         ts: 0.0,
@@ -978,7 +1234,7 @@ pub async fn handle_typing_event(state: &SharedState, data: &serde_json::Value, 
     active_users.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     drop(state_lock);
 
-    if !typing || active_users.is_empty() {
+    if crate::ui::is_tui_active() || !typing || active_users.is_empty() {
         return;
     }
 
@@ -1308,6 +1564,13 @@ pub async fn handle_vjoin_event(state: &SharedState, data: &serde_json::Value, _
         .and_then(|v| v.as_str())
         .unwrap_or("?");
     let mut state_lock = state.lock().await;
+    if !state_lock
+        .voice_members
+        .iter()
+        .any(|member| member.eq_ignore_ascii_case(user))
+    {
+        state_lock.voice_members.push(user.to_string());
+    }
     state_lock.add_message(DisplayedMessage {
         id: String::new(),
         ts: 0.0,
@@ -1327,6 +1590,9 @@ pub async fn handle_vleave_event(state: &SharedState, data: &serde_json::Value, 
         .and_then(|v| v.as_str())
         .unwrap_or("?");
     let mut state_lock = state.lock().await;
+    state_lock
+        .voice_members
+        .retain(|member| !member.eq_ignore_ascii_case(user));
     state_lock.add_message(DisplayedMessage {
         id: String::new(),
         ts: 0.0,
@@ -1366,6 +1632,19 @@ pub async fn dispatch_event(
         }
         "replay" => {
             handle_replay_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "plugins" => {
+            handle_plugins_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "plugin_installed" => {
+            handle_plugin_installed_event(state, &serde_json::Value::Object(data.clone()), ts)
+                .await;
+        }
+        "plugin_disabled" => {
+            handle_plugin_disabled_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "bridge_status" => {
+            handle_bridge_status_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
         "users" => {
             handle_users_event(state, &serde_json::Value::Object(data.clone()), ts).await;
@@ -1433,7 +1712,27 @@ pub async fn dispatch_event(
 
 #[cfg(test)]
 mod tests {
-    use super::format_content_for_mentions;
+    use super::{dispatch_event, format_content_for_mentions};
+    use crate::{args::ClientConfig, state::ClientState};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Mutex};
+
+    fn make_test_state() -> crate::state::SharedState {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Arc::new(Mutex::new(ClientState::new(
+            tx,
+            ClientConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8765,
+                tls: false,
+                log_enabled: false,
+                markdown_enabled: true,
+                media_enabled: true,
+                animations_enabled: true,
+            },
+            clifford::config::Config::default(),
+        )))
+    }
 
     #[test]
     fn mention_highlights_current_user() {
@@ -1448,5 +1747,99 @@ mod tests {
             format_content_for_mentions("mail alice@example.com then @carol", "alice");
         assert!(!mentioned);
         assert_eq!(rendered, "mail alice@example.com then @carol");
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_handles_plugin_inventory_payload() {
+        let state = make_test_state();
+        let payload = serde_json::json!({
+            "t": "plugins",
+            "plugins": [
+                {
+                    "id": "poll",
+                    "enabled": true,
+                    "api_version": "1",
+                    "message_hook": false,
+                    "commands": [{"name": "poll", "description": "Create a poll"}],
+                    "source": "builtin:poll"
+                }
+            ]
+        });
+
+        let handled = dispatch_event(
+            &state,
+            payload.as_object().expect("payload should be object"),
+        )
+        .await;
+
+        assert!(handled);
+        let state_lock = state.lock().await;
+        let latest = state_lock
+            .message_history
+            .back()
+            .expect("plugin inventory summary should be recorded");
+        assert_eq!(latest.sender, "system");
+        assert_eq!(latest.content, "Plugin inventory refreshed (1 installed).");
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_handles_plugin_installed_payload() {
+        let state = make_test_state();
+        let payload = serde_json::json!({
+            "t": "plugin_installed",
+            "plugin": "poll",
+            "api_version": "1",
+            "message_hook": false,
+            "commands": [{"name": "poll", "description": "Create a poll"}]
+        });
+
+        let handled = dispatch_event(
+            &state,
+            payload.as_object().expect("payload should be object"),
+        )
+        .await;
+
+        assert!(handled);
+        let state_lock = state.lock().await;
+        let latest = state_lock
+            .message_history
+            .back()
+            .expect("plugin installed summary should be recorded");
+        assert_eq!(
+            latest.content,
+            "Plugin installed: poll (api=v1, commands=/poll, message_hook=off)."
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_handles_bridge_status_payload() {
+        let state = make_test_state();
+        let payload = serde_json::json!({
+            "t": "bridge_status",
+            "count": 1,
+            "bridges": [
+                {
+                    "username": "discordbot",
+                    "bridge_type": "discord",
+                    "instance_id": "abc123",
+                    "route_count": 2,
+                    "uptime_secs": 45
+                }
+            ]
+        });
+
+        let handled = dispatch_event(
+            &state,
+            payload.as_object().expect("payload should be object"),
+        )
+        .await;
+
+        assert!(handled);
+        let state_lock = state.lock().await;
+        let latest = state_lock
+            .message_history
+            .back()
+            .expect("bridge status summary should be recorded");
+        assert_eq!(latest.content, "Bridge status: 1 connected instance(s).");
     }
 }

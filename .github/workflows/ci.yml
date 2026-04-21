@@ -62,7 +62,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Workspace tests
         run: cargo test --workspace --all-targets --locked
@@ -116,9 +116,11 @@ jobs:
           - gate_name: Discord bridge compile gate
             cargo_command: cargo check --features discord-bridge --bin discord_bot --locked
             run_bridge_regressions: true
+            run_bridge_client_tests: false
           - gate_name: Bridge client compile gate
-            cargo_command: cargo check --features bridge-client --locked
+            cargo_command: cargo check -p clifford-client --features bridge-client --locked
             run_bridge_regressions: false
+            run_bridge_client_tests: true
 
     steps:
       - name: Checkout
@@ -156,3 +158,7 @@ jobs:
           for test_name in "${bridge_tests[@]}"; do
             cargo test --features discord-bridge --bin discord_bot --locked "${test_name}"
           done
+
+      - name: Bridge client feature tests
+        if: ${{ matrix.run_bridge_client_tests }}
+        run: cargo test -p clifford-client --features bridge-client --locked

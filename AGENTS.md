@@ -3,7 +3,7 @@
 ## Required Checks (in order)
 
 ```bash
-cargo check --workspace --bins --locked && cargo fmt --all --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --workspace --all-targets --locked
+cargo check --workspace --bins --locked && cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --all-targets --locked
 
 # Protocol contract tests (separate from workspace tests)
 cargo test --locked --test message_contracts auth_contract_returns_expected_fields
@@ -13,7 +13,7 @@ cargo test --locked --test message_contracts file_contract_relays_media_metadata
 
 # Feature-gated builds
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check --features bridge-client --locked
+cargo check -p clifford-client --features bridge-client --locked
 ```
 
 **Always use `--locked`** — CI enforces this for reproducible builds.

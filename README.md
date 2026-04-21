@@ -198,6 +198,8 @@ cargo run --bin chatify-client -- --host 127.0.0.1 --port 8765
 | `/db-profile` or `/dbprofile`                | Show focused DB latency profile and alerts                        |
 | `/typing [on\|off] [#ch\|dm:user]`           | Broadcast ephemeral typing state                                  |
 | `/notify [target] [on\|off]`                 | Show, update, reset, or test desktop notification preferences     |
+| `/plugin [list\|install <plugin>\|disable <plugin>]` | List, install, or disable server-side plugins            |
+| `/bridge status`                             | Show connected bridge instances and route health (`bridge-client`) |
 | `/dm <user> <message>`                       | Send encrypted direct message (trust-verified)                    |
 | `/fingerprint [user]`                        | Show peer key fingerprint(s) and trust status                     |
 | `/trust <user> <fingerprint>`                | Mark a peer fingerprint as trusted after out-of-band verification |
@@ -451,7 +453,7 @@ The [windows-release-package](.github/workflows/windows-release-package.yml) wor
 ```bash
 cargo check --workspace --bins --locked
 cargo fmt --all --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 ```
 
@@ -468,7 +470,7 @@ cargo test --locked --test message_contracts file_contract_relays_media_metadata
 
 ```bash
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check --features bridge-client --locked
+cargo check -p clifford-client --features bridge-client --locked
 ```
 
 All checks above are enforced in CI on every push to `main`. A failing check blocks merge.

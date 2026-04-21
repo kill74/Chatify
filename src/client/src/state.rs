@@ -16,6 +16,7 @@ use crate::args::ClientConfig;
 const MAX_MESSAGE_HISTORY: usize = 1000;
 const MAX_REACTION_EVENT_DEDUP: usize = 10_000;
 const MAX_TRUST_AUDIT_ENTRIES: usize = 2_000;
+const MAX_ACTIVITY_LOG: usize = 200;
 const TRUST_STORE_SCHEMA_VERSION: u8 = 1;
 
 pub struct ClientState {
@@ -42,6 +43,7 @@ pub struct ClientState {
     pub seen_reaction_events: HashSet<String>,
     pub reaction_event_order: VecDeque<String>,
     pub unread_counts: HashMap<String, usize>,
+    pub unread_markers: HashMap<String, usize>,
     pub unread_separator_scopes: HashSet<String>,
     pub activity_hint: Option<(String, u64)>,
     pub typing_presence: HashMap<String, TypingPresence>,
@@ -58,16 +60,19 @@ pub struct ClientState {
     pub voice_deafened: bool,
     pub voice_speaking: bool,
     pub media_enabled: bool,
+    pub online_users: HashSet<String>,
+    pub peer_statuses: HashMap<String, Status>,
     pub input_buffer: String,
     pub input_cursor: usize,
     pub command_history: Vec<String>,
-    pub draft: Option<(String, String)>, // (channel, content)
+    pub drafts: HashMap<String, String>,
     pub history_index: Option<usize>,
     pub scroll_offset: usize,
     pub cached_header: String,
     pub cached_subtitle: String,
     pub needs_redraw: bool,
     pub client_config: ClientConfig,
+    pub activity_log: VecDeque<ActivityEntry>,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -143,6 +148,7 @@ pub struct DisplayedMessage {
     pub edited: bool,
 }
 
+#[derive(Clone, Default)]
 pub struct Status {
     pub text: String,
     pub emoji: String,
@@ -158,6 +164,13 @@ pub struct SentMessage {
     pub channel: String,
     pub content: String,
     pub ts: f64,
+}
+
+#[derive(Clone)]
+pub struct ActivityEntry {
+    pub ts: u64,
+    pub text: String,
+    pub is_error: bool,
 }
 
 pub struct VoiceSession {
@@ -201,6 +214,7 @@ impl ClientState {
             seen_reaction_events: HashSet::new(),
             reaction_event_order: VecDeque::new(),
             unread_counts: HashMap::new(),
+            unread_markers: HashMap::new(),
             unread_separator_scopes: HashSet::new(),
             activity_hint: None,
             typing_presence: HashMap::new(),
@@ -217,16 +231,19 @@ impl ClientState {
             voice_deafened: false,
             voice_speaking: false,
             media_enabled: client_config.media_enabled,
+            online_users: HashSet::new(),
+            peer_statuses: HashMap::new(),
             input_buffer: String::new(),
             input_cursor: 0,
             command_history: Vec::new(),
+            drafts: HashMap::new(),
             history_index: None,
             scroll_offset: 0,
             cached_header: String::new(),
             cached_subtitle: String::new(),
             needs_redraw: true,
             client_config,
-            draft: None,
+            activity_log: VecDeque::new(),
         }
     }
 
@@ -246,6 +263,23 @@ impl ClientState {
                     self.message_ids_seen.remove(&removed.id);
                 }
             }
+        }
+    }
+
+    pub fn add_activity(&mut self, text: impl Into<String>, is_error: bool) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+
+        self.activity_log.push_back(ActivityEntry {
+            ts: clifford::now() as u64,
+            text,
+            is_error,
+        });
+        if self.activity_log.len() > MAX_ACTIVITY_LOG {
+            let overflow = self.activity_log.len() - MAX_ACTIVITY_LOG;
+            self.activity_log.drain(0..overflow);
         }
     }
 
@@ -329,6 +363,86 @@ impl ClientState {
             .filter(|msg| msg.channel == channel && !msg.id.is_empty())
             .nth(one_based_index - 1)
             .map(|msg| msg.id.clone())
+    }
+
+    pub fn clear_unread(&mut self, scope: &str) {
+        self.unread_counts.remove(scope);
+        self.unread_separator_scopes.remove(scope);
+    }
+
+    pub fn mark_scope_viewed(&mut self, scope: &str) {
+        let unread = self.unread_counts.remove(scope).unwrap_or(0);
+        if unread > 0 {
+            self.unread_markers.insert(scope.to_string(), unread);
+        }
+        self.unread_separator_scopes.remove(scope);
+    }
+
+    pub fn dismiss_unread_marker(&mut self, scope: &str) {
+        self.unread_markers.remove(scope);
+    }
+
+    pub fn note_incoming_message(&mut self, scope: &str, from_self: bool) {
+        if scope.is_empty() {
+            return;
+        }
+
+        if from_self || scope == self.ch {
+            self.clear_unread(scope);
+            self.dismiss_unread_marker(scope);
+            return;
+        }
+
+        *self.unread_counts.entry(scope.to_string()).or_insert(0) += 1;
+        self.unread_separator_scopes.insert(scope.to_string());
+    }
+
+    pub fn switch_scope(&mut self, scope: String) {
+        if scope.trim().is_empty() {
+            return;
+        }
+
+        if self.ch == scope {
+            self.mark_scope_viewed(&scope);
+            let _ = self.load_draft();
+            return;
+        }
+
+        self.save_draft();
+        self.ch = scope;
+        let current_scope = self.ch.clone();
+        self.mark_scope_viewed(&current_scope);
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.history_index = None;
+        self.scroll_offset = 0;
+        let _ = self.load_draft();
+    }
+
+    pub fn set_online_users<I>(&mut self, users: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.online_users = users.into_iter().collect();
+    }
+
+    pub fn set_peer_status(&mut self, user: &str, text: &str, emoji: &str) {
+        let user = user.trim();
+        if user.is_empty() {
+            return;
+        }
+
+        self.peer_statuses.insert(
+            user.to_string(),
+            Status {
+                text: if text.trim().is_empty() {
+                    "Online".to_string()
+                } else {
+                    text.trim().to_string()
+                },
+                emoji: emoji.trim().to_string(),
+            },
+        );
     }
 
     fn trust_storage_root() -> PathBuf {
@@ -901,6 +1015,46 @@ impl ClientState {
         }))
     }
 
+    pub fn send_plugin_list(&self) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "plugin",
+            "sub": "list",
+        }))
+    }
+
+    pub fn send_plugin_install(&self, plugin: &str) -> Result<(), String> {
+        let plugin = plugin.trim();
+        if plugin.is_empty() {
+            return Err("plugin install target cannot be empty".to_string());
+        }
+
+        self.send_json(serde_json::json!({
+            "t": "plugin",
+            "sub": "install",
+            "plugin": plugin,
+        }))
+    }
+
+    pub fn send_plugin_disable(&self, plugin: &str) -> Result<(), String> {
+        let plugin = plugin.trim();
+        if plugin.is_empty() {
+            return Err("plugin disable target cannot be empty".to_string());
+        }
+
+        self.send_json(serde_json::json!({
+            "t": "plugin",
+            "sub": "disable",
+            "plugin": plugin,
+        }))
+    }
+
+    #[cfg(feature = "bridge-client")]
+    pub fn send_bridge_status(&self) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "bridge_status",
+        }))
+    }
+
     pub fn send_typing(&self, scope: &str, typing: bool) -> Result<(), String> {
         let scope = scope.trim();
         if let Some(target) = scope.strip_prefix("dm:") {
@@ -1017,18 +1171,23 @@ impl ClientState {
     }
 
     pub fn save_draft(&mut self) {
-        if !self.input_buffer.is_empty() {
-            self.draft = Some((self.ch.clone(), self.input_buffer.clone()));
+        if self.input_buffer.trim().is_empty() {
+            self.drafts.remove(&self.ch);
+        } else {
+            self.drafts
+                .insert(self.ch.clone(), self.input_buffer.clone());
         }
     }
 
     pub fn load_draft(&mut self) -> bool {
-        if let Some((ch, content)) = self.draft.take() {
-            if ch == self.ch {
-                self.input_buffer = content;
-                return true;
-            }
+        if let Some(content) = self.drafts.get(&self.ch).cloned() {
+            self.input_buffer = content;
+            self.input_cursor = self.input_buffer.chars().count();
+            return true;
         }
+
+        self.input_buffer.clear();
+        self.input_cursor = 0;
         false
     }
 }
@@ -1256,6 +1415,75 @@ mod tests {
     }
 
     #[test]
+    fn send_plugin_list_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_plugin_list()
+            .expect("send_plugin_list should serialize");
+
+        let frame = rx.try_recv().expect("plugin list frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("plugin"));
+        assert_eq!(parsed.get("sub").and_then(|v| v.as_str()), Some("list"));
+        assert!(parsed.get("plugin").is_none());
+    }
+
+    #[test]
+    fn send_plugin_install_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_plugin_install("builtin:poll")
+            .expect("send_plugin_install should serialize");
+
+        let frame = rx
+            .try_recv()
+            .expect("plugin install frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("plugin"));
+        assert_eq!(parsed.get("sub").and_then(|v| v.as_str()), Some("install"));
+        assert_eq!(
+            parsed.get("plugin").and_then(|v| v.as_str()),
+            Some("builtin:poll")
+        );
+    }
+
+    #[test]
+    fn send_plugin_disable_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_plugin_disable("poll")
+            .expect("send_plugin_disable should serialize");
+
+        let frame = rx
+            .try_recv()
+            .expect("plugin disable frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("plugin"));
+        assert_eq!(parsed.get("sub").and_then(|v| v.as_str()), Some("disable"));
+        assert_eq!(parsed.get("plugin").and_then(|v| v.as_str()), Some("poll"));
+    }
+
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn send_bridge_status_serializes_protocol_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_bridge_status()
+            .expect("send_bridge_status should serialize");
+
+        let frame = rx.try_recv().expect("bridge status frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(
+            parsed.get("t").and_then(|v| v.as_str()),
+            Some("bridge_status")
+        );
+    }
+
+    #[test]
     fn send_typing_channel_serializes_protocol_frame() {
         let (state, mut rx) = make_test_state_with_receiver();
         state
@@ -1325,6 +1553,55 @@ mod tests {
         assert_eq!(parsed.get("to").and_then(|v| v.as_str()), Some("alice"));
         assert_eq!(parsed.get("c").and_then(|v| v.as_str()), Some("hello dm"));
         assert!(parsed.get("p").is_none());
+    }
+
+    #[test]
+    fn switch_scope_persists_per_scope_drafts() {
+        let mut state = make_test_state();
+        state.ch = "general".to_string();
+        state.input_buffer = "hello general".to_string();
+        state.input_cursor = state.input_buffer.chars().count();
+
+        state.switch_scope("dm:alice".to_string());
+        assert_eq!(state.ch, "dm:alice");
+        assert!(state.input_buffer.is_empty());
+
+        state.input_buffer = "hello alice".to_string();
+        state.input_cursor = state.input_buffer.chars().count();
+
+        state.switch_scope("general".to_string());
+        assert_eq!(state.input_buffer, "hello general");
+
+        state.switch_scope("dm:alice".to_string());
+        assert_eq!(state.input_buffer, "hello alice");
+    }
+
+    #[test]
+    fn note_incoming_message_tracks_unread_for_inactive_scope() {
+        let mut state = make_test_state();
+        state.ch = "general".to_string();
+
+        state.note_incoming_message("random", false);
+        assert_eq!(state.unread_counts.get("random"), Some(&1));
+
+        state.note_incoming_message("general", false);
+        assert!(!state.unread_counts.contains_key("general"));
+
+        state.note_incoming_message("random", true);
+        assert!(!state.unread_counts.contains_key("random"));
+    }
+
+    #[test]
+    fn mark_scope_viewed_converts_unread_count_into_timeline_marker() {
+        let mut state = make_test_state();
+        state.unread_counts.insert("general".to_string(), 3);
+        state.unread_separator_scopes.insert("general".to_string());
+
+        state.mark_scope_viewed("general");
+
+        assert!(!state.unread_counts.contains_key("general"));
+        assert_eq!(state.unread_markers.get("general"), Some(&3));
+        assert!(!state.unread_separator_scopes.contains("general"));
     }
 
     #[test]

@@ -8,14 +8,14 @@ Thanks for contributing to Chatify.
 2. Clone the repository.
 3. Build binaries:
 
-   cargo check --bins
+   cargo check --workspace --bins --locked
 
 ## Quality Gates
 
 Run all checks before opening a pull request:
 
 1. cargo fmt --all --check
-2. cargo clippy --all-targets --all-features --locked -- -D warnings
+2. cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 3. cargo test --locked --test message_contracts auth_contract_returns_expected_fields
 4. cargo test --locked --test message_contracts compatibility_contract_client_bootstrap_flow_stays_stable
 5. cargo test --locked --test message_contracts protocol_contract_advertises_backward_compatible_version
@@ -23,7 +23,8 @@ Run all checks before opening a pull request:
 
 Optional feature check for Discord bridge:
 
-1. cargo check --features discord-bridge --bin discord_bot
+1. cargo check --features discord-bridge --bin discord_bot --locked
+2. cargo check -p clifford-client --features bridge-client --locked
 
 ## Branch and Commit Guidance
 

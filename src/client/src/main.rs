@@ -24,6 +24,18 @@ use clifford_client::{
     voice::{start_voice_session, VoiceEvent},
 };
 
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        clifford_client::ui::emit_output_line(format!($($arg)*), false);
+    }};
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        clifford_client::ui::emit_output_line(format!($($arg)*), true);
+    }};
+}
+
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const MAX_HISTORY_LIMIT: usize = 500;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -42,6 +54,19 @@ struct CommandHelp {
     usage: &'static str,
     summary: &'static str,
     aliases: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PluginCommand {
+    List,
+    Install(String),
+    Disable(String),
+}
+
+#[cfg(feature = "bridge-client")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeCommand {
+    Status,
 }
 
 const COMMANDS: &[CommandHelp] = &[
@@ -127,6 +152,19 @@ const COMMANDS: &[CommandHelp] = &[
         name: "/notify",
         usage: "/notify [target] [on|off] | reset | export [--redact] [path|stdout] | doctor [--json] | test [sound] [level] [message]",
         summary: "Show or update desktop notification preferences",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/plugin",
+        usage: "/plugin [list|install <plugin>|disable <plugin>]",
+        summary: "List, install, or disable server-side plugins",
+        aliases: &[],
+    },
+    #[cfg(feature = "bridge-client")]
+    CommandHelp {
+        name: "/bridge",
+        usage: "/bridge status",
+        summary: "Show connected bridge instances and route health",
         aliases: &[],
     },
     CommandHelp {
@@ -374,6 +412,81 @@ fn parse_notify_test_args(tokens: &[&str]) -> (bool, &'static str, usize) {
     }
 
     (sound_probe, level, message_start)
+}
+
+fn parse_shell_like_argument(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let value = if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[trimmed.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            &trimmed[1..trimmed.len() - 1]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_plugin_command(input: &str) -> Result<PluginCommand, &'static str> {
+    let rest = input
+        .trim()
+        .strip_prefix("/plugin")
+        .map(str::trim)
+        .ok_or("Usage: /plugin [list|install <plugin>|disable <plugin>]")?;
+
+    if rest.is_empty() {
+        return Ok(PluginCommand::List);
+    }
+
+    let subcommand_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let subcommand = &rest[..subcommand_end];
+    let argument = rest[subcommand_end..].trim();
+
+    match subcommand.to_ascii_lowercase().as_str() {
+        "list" => {
+            if argument.is_empty() {
+                Ok(PluginCommand::List)
+            } else {
+                Err("Usage: /plugin [list|install <plugin>|disable <plugin>]")
+            }
+        }
+        "install" => parse_shell_like_argument(argument)
+            .map(PluginCommand::Install)
+            .ok_or("Usage: /plugin install <plugin>"),
+        "disable" => parse_shell_like_argument(argument)
+            .map(PluginCommand::Disable)
+            .ok_or("Usage: /plugin disable <plugin>"),
+        _ => Err("Usage: /plugin [list|install <plugin>|disable <plugin>]"),
+    }
+}
+
+#[cfg(feature = "bridge-client")]
+fn parse_bridge_command(input: &str) -> Result<BridgeCommand, &'static str> {
+    let rest = input
+        .trim()
+        .strip_prefix("/bridge")
+        .map(str::trim)
+        .ok_or("Usage: /bridge status")?;
+
+    if rest.eq_ignore_ascii_case("status") {
+        Ok(BridgeCommand::Status)
+    } else {
+        Err("Usage: /bridge status")
+    }
 }
 
 fn build_notification_export(
@@ -700,6 +813,76 @@ async fn print_recent_messages(state: &SharedState, limit: usize) {
     }
 }
 
+async fn send_input_to_active_scope(state: &SharedState, body: &str) {
+    let mut state_lock = state.lock().await;
+    let scope = state_lock.ch.clone();
+    let username = state_lock.me.clone();
+
+    if let Some(peer_raw) = scope.strip_prefix("dm:") {
+        if state_lock.users.is_empty() {
+            if let Err(err) = state_lock.send_json(serde_json::json!({"t": "users"})) {
+                eprintln!("failed to request users: {}", err);
+            }
+            println!(
+                "No key directory loaded yet; requested /users from server. Retry the DM after refresh."
+            );
+            return;
+        }
+
+        let canonical = match resolve_known_username(&state_lock.users, peer_raw) {
+            Ok(user) => user,
+            Err(err) => {
+                println!("{}", err);
+                return;
+            }
+        };
+
+        let audit_len_before = state_lock.trust_store.audit_log.len();
+        match state_lock.ensure_peer_trusted_for_dm(&canonical) {
+            Ok(fingerprint) => {
+                if let Err(err) = state_lock.send_dm(&canonical, body) {
+                    eprintln!("failed to send dm: {}", err);
+                } else {
+                    state_lock.dismiss_unread_marker(&scope);
+                    println!(
+                        "[sending] {} {} -> {} ({})",
+                        scope,
+                        username,
+                        canonical,
+                        ClientState::format_fingerprint_for_display(&fingerprint)
+                    );
+                }
+            }
+            Err(err) => {
+                println!("dm blocked by trust policy: {}", err);
+                if let Some(pubkey_b64) = state_lock.users.get(&canonical) {
+                    if let Some(observed) = ClientState::fingerprint_for_pubkey(pubkey_b64) {
+                        println!(
+                            "current fingerprint for {}: {}",
+                            canonical,
+                            ClientState::format_fingerprint_for_display(&observed)
+                        );
+                    }
+                }
+            }
+        }
+
+        if state_lock.trust_store.audit_log.len() != audit_len_before {
+            if let Err(err) = state_lock.save_trust_store() {
+                eprintln!("failed to persist trust store: {}", err);
+            }
+        }
+        return;
+    }
+
+    if let Err(err) = state_lock.send_message(&scope, body) {
+        eprintln!("failed to send message: {}", err);
+    } else {
+        state_lock.dismiss_unread_marker(&scope);
+        println!("[sending] {} {}: {}", scope, username, body);
+    }
+}
+
 async fn handle_user_input(state: &SharedState, input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -707,14 +890,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
     }
 
     if !trimmed.starts_with('/') {
-        let state_lock = state.lock().await;
-        let channel = state_lock.ch.clone();
-        let username = state_lock.me.clone();
-        if let Err(err) = state_lock.send_message(&channel, trimmed) {
-            eprintln!("failed to send message: {}", err);
-        } else {
-            println!("[sending] {} {}: {}", channel, username, trimmed);
-        }
+        send_input_to_active_scope(state, trimmed).await;
         return true;
     }
 
@@ -763,7 +939,8 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 clifford::normalize_channel(channel_raw).unwrap_or_else(|| "general".to_string());
 
             let mut state_lock = state.lock().await;
-            state_lock.ch = channel.clone();
+            state_lock.chs.insert(channel.clone(), true);
+            state_lock.switch_scope(channel.clone());
             if let Err(err) = state_lock.send_join(&channel) {
                 eprintln!("failed to join channel: {}", err);
             }
@@ -786,9 +963,14 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 current
             };
 
-            let state_lock = state.lock().await;
+            let mut state_lock = state.lock().await;
             if let Err(err) = state_lock.send_leave(&channel) {
                 eprintln!("failed to leave channel: {}", err);
+            } else {
+                state_lock.chs.remove(&channel);
+                if state_lock.ch == channel {
+                    state_lock.switch_scope("general".to_string());
+                }
             }
         }
         "/history" => {
@@ -1591,6 +1773,49 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
             );
             print_notification_settings(&new_config.notifications);
         }
+        "/plugin" => match parse_plugin_command(trimmed) {
+            Ok(PluginCommand::List) => {
+                let state_lock = state.lock().await;
+                if let Err(err) = state_lock.send_plugin_list() {
+                    eprintln!("failed to request plugin inventory: {}", err);
+                } else {
+                    println!("plugin inventory request sent");
+                }
+            }
+            Ok(PluginCommand::Install(spec)) => {
+                let state_lock = state.lock().await;
+                if let Err(err) = state_lock.send_plugin_install(&spec) {
+                    eprintln!("failed to install plugin: {}", err);
+                } else {
+                    println!("plugin install request sent for {}", spec);
+                }
+            }
+            Ok(PluginCommand::Disable(plugin_id)) => {
+                let state_lock = state.lock().await;
+                if let Err(err) = state_lock.send_plugin_disable(&plugin_id) {
+                    eprintln!("failed to disable plugin: {}", err);
+                } else {
+                    println!("plugin disable request sent for {}", plugin_id);
+                }
+            }
+            Err(usage) => {
+                println!("{}", usage);
+            }
+        },
+        #[cfg(feature = "bridge-client")]
+        "/bridge" => match parse_bridge_command(trimmed) {
+            Ok(BridgeCommand::Status) => {
+                let state_lock = state.lock().await;
+                if let Err(err) = state_lock.send_bridge_status() {
+                    eprintln!("failed to request bridge status: {}", err);
+                } else {
+                    println!("bridge status request sent");
+                }
+            }
+            Err(usage) => {
+                println!("{}", usage);
+            }
+        },
         "/dm" => {
             let Some(raw_user) = parts.next() else {
                 println!("Usage: /dm <user> <message>");
@@ -2116,7 +2341,22 @@ async fn main() -> ChatifyResult<()> {
             .map_err(ChatifyError::Message)?;
     }
 
-    let mut input_task = tokio::spawn(run_input_loop(state.clone()));
+    let mut input_task = tokio::spawn({
+        let state = state.clone();
+        async move {
+            match clifford_client::ui::run_tui_loop(state.clone(), |state, line| async move {
+                handle_user_input(&state, &line).await
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(err) => {
+                    std::eprintln!("tui unavailable ({}); falling back to line mode", err);
+                    run_input_loop(state).await;
+                }
+            }
+        }
+    });
 
     tokio::select! {
         _ = &mut input_task => {}
@@ -2136,9 +2376,11 @@ mod tests {
     use super::{
         build_notification_export, build_notify_diagnostics_json, notification_key_for_token,
         notification_value_for_key, notify_export_default_path, parse_notify_probe_level,
-        parse_notify_test_args, parse_toggle_bool, redact_notification_export,
-        sanitize_notify_component,
+        parse_notify_test_args, parse_plugin_command, parse_toggle_bool,
+        redact_notification_export, sanitize_notify_component, PluginCommand,
     };
+    #[cfg(feature = "bridge-client")]
+    use super::{parse_bridge_command, BridgeCommand};
 
     #[test]
     fn parse_toggle_bool_accepts_truthy_and_falsey_values() {
@@ -2188,6 +2430,62 @@ mod tests {
             Some("notifications.sound_enabled")
         );
         assert_eq!(notification_key_for_token("unknown"), None);
+    }
+
+    #[test]
+    fn parse_plugin_command_defaults_to_list() {
+        assert_eq!(parse_plugin_command("/plugin"), Ok(PluginCommand::List));
+        assert_eq!(
+            parse_plugin_command("/plugin list"),
+            Ok(PluginCommand::List)
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_preserves_quoted_install_spec() {
+        assert_eq!(
+            parse_plugin_command(r#"/plugin install "C:\Program Files\Chatify\plugins\poll.exe""#),
+            Ok(PluginCommand::Install(
+                r#"C:\Program Files\Chatify\plugins\poll.exe"#.to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_requires_install_and_disable_arguments() {
+        assert_eq!(
+            parse_plugin_command("/plugin install"),
+            Err("Usage: /plugin install <plugin>")
+        );
+        assert_eq!(
+            parse_plugin_command("/plugin disable"),
+            Err("Usage: /plugin disable <plugin>")
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_rejects_extra_list_args() {
+        assert_eq!(
+            parse_plugin_command("/plugin list extra"),
+            Err("Usage: /plugin [list|install <plugin>|disable <plugin>]")
+        );
+    }
+
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn parse_bridge_command_accepts_status_only() {
+        assert_eq!(
+            parse_bridge_command("/bridge status"),
+            Ok(BridgeCommand::Status)
+        );
+        assert_eq!(
+            parse_bridge_command("/bridge"),
+            Err("Usage: /bridge status")
+        );
+        assert_eq!(
+            parse_bridge_command("/bridge metrics"),
+            Err("Usage: /bridge status")
+        );
     }
 
     #[test]

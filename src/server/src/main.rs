@@ -630,6 +630,16 @@ struct EventStore {
     write_queue: Option<StdArc<WriteQueue>>,
 }
 
+struct MediaObjectUpsert<'a> {
+    channel: &'a str,
+    file_id: &'a str,
+    sender: &'a str,
+    filename: &'a str,
+    media_kind: &'a str,
+    mime: Option<&'a str>,
+    declared_size: u64,
+}
+
 type RoleRow = (i64, String, i32, bool, bool, bool, bool, bool);
 type BanMuteRow = (String, String, String, Option<String>, f64, Option<f64>);
 
@@ -1370,7 +1380,6 @@ impl EventStore {
                 ts: now(),
             });
             self.record_db_observation("persist_enqueue", started, false);
-            return;
         }
 
         #[cfg(not(feature = "batch-writes"))]
@@ -1426,16 +1435,7 @@ impl EventStore {
         }
     }
 
-    fn upsert_media_object(
-        &self,
-        channel: &str,
-        file_id: &str,
-        sender: &str,
-        filename: &str,
-        media_kind: &str,
-        mime: Option<&str>,
-        declared_size: u64,
-    ) {
+    fn upsert_media_object(&self, media: MediaObjectUpsert<'_>) {
         let started = Instant::now();
         let Some(conn) = self.get_connection() else {
             self.record_db_observation("media_upsert_object", started, true);
@@ -1455,19 +1455,19 @@ impl EventStore {
                  mime = excluded.mime,
                  declared_size = excluded.declared_size",
             params![
-                channel,
-                file_id,
-                sender,
-                filename,
-                media_kind,
-                mime,
-                clamp_u64_to_i64(declared_size),
+                media.channel,
+                media.file_id,
+                media.sender,
+                media.filename,
+                media.media_kind,
+                media.mime,
+                clamp_u64_to_i64(media.declared_size),
                 now()
             ],
         ) {
             warn!(
                 "media object upsert failed channel={} file_id={}: {}",
-                channel, file_id, e
+                media.channel, media.file_id, e
             );
             self.record_db_observation("media_upsert_object", started, true);
             return;
@@ -4283,18 +4283,32 @@ async fn handle_self_registration<S>(
         .await;
 }
 
+struct ConnectionSession {
+    out_tx: OutboundTx,
+    voice_room: Option<String>,
+    active_voice_room: Arc<RwLock<Option<String>>>,
+    voice_audio_forwarder: Option<JoinHandle<()>>,
+    voice_relay_subscribed: bool,
+    screen_room: Option<String>,
+    joined_channels: Arc<DashSet<String>>,
+}
+
 async fn handle_event(
     d: &Value,
     state: &Arc<State>,
     username: &str,
-    out_tx: &OutboundTx,
-    voice_room: &mut Option<String>,
-    active_voice_room: &Arc<RwLock<Option<String>>>,
-    voice_audio_forwarder: &mut Option<JoinHandle<()>>,
-    voice_relay_subscribed: &mut bool,
-    screen_room: &mut Option<String>,
-    joined_channels: &Arc<DashSet<String>>,
+    session: &mut ConnectionSession,
 ) {
+    let ConnectionSession {
+        out_tx,
+        voice_room,
+        active_voice_room,
+        voice_audio_forwarder,
+        voice_relay_subscribed,
+        screen_room,
+        joined_channels,
+    } = session;
+
     let t = d["t"].as_str().unwrap_or("");
     let event_channel = d
         .get("ch")
@@ -5583,15 +5597,15 @@ async fn handle_event(
                 &file_announce,
                 &format!("{} {}", media_kind, filename),
             );
-            state.store.upsert_media_object(
-                &ch,
-                &file_id,
-                username,
-                &filename,
+            state.store.upsert_media_object(MediaObjectUpsert {
+                channel: &ch,
+                file_id: &file_id,
+                sender: username,
+                filename: &filename,
                 media_kind,
-                mime.as_deref(),
-                size,
-            );
+                mime: mime.as_deref(),
+                declared_size: size,
+            });
             let _ = state.chan(&ch).tx.send(file_announce.to_string());
         }
         "file_chunk" => {
@@ -7587,16 +7601,15 @@ where
 
     // ---- Phase 4: main event loop -------------------------------------------
 
-    // Tracks the current voice room so vleave / vdata know which room to act on.
-    let mut voice_room: Option<String> = None;
-    // Shared room selector used to filter relay events for this connection.
-    let active_voice_room: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-    // Single room-audio forwarder per connection; replaced on room switches.
-    let mut voice_audio_forwarder: Option<JoinHandle<()>> = None;
-    // Relay events are connection-scoped and should only subscribe once.
-    let mut voice_relay_subscribed = false;
-    // Tracks the current screen-share room for ss_meta / ss_frame relay.
-    let mut screen_room: Option<String> = None;
+    let mut session = ConnectionSession {
+        out_tx: out_tx.clone(),
+        voice_room: None,
+        active_voice_room: Arc::new(RwLock::new(None)),
+        voice_audio_forwarder: None,
+        voice_relay_subscribed: false,
+        screen_room: None,
+        joined_channels: joined_channels.clone(),
+    };
 
     loop {
         let msg = tokio::select! {
@@ -7662,34 +7675,22 @@ where
         state.metrics.inc_received(1);
         state.metrics.inc_bytes_received(raw.len());
 
-        handle_event(
-            &d,
-            &state,
-            &username,
-            &out_tx,
-            &mut voice_room,
-            &active_voice_room,
-            &mut voice_audio_forwarder,
-            &mut voice_relay_subscribed,
-            &mut screen_room,
-            &joined_channels,
-        )
-        .await;
+        handle_event(&d, &state, &username, &mut session).await;
     }
 
     // ---- Phase 5: cleanup ---------------------------------------------------
-    if let Some(handle) = voice_audio_forwarder.take() {
+    if let Some(handle) = session.voice_audio_forwarder.take() {
         handle.abort();
     }
-    if let Some(room) = voice_room.take() {
+    if let Some(room) = session.voice_room.take() {
         state.voice_relay.leave_room(&room, &username);
     }
     {
-        let mut room_guard = active_voice_room.write().await;
+        let mut room_guard = session.active_voice_room.write().await;
         *room_guard = None;
     }
 
-    if let Some(room) = screen_room.take() {
+    if let Some(room) = session.screen_room.take() {
         if let Some(stx) = state.screen.get(&room) {
             let _ = stx.send(
                 serde_json::json!({
@@ -8965,28 +8966,28 @@ mod tests {
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
 
-        state.store.upsert_media_object(
-            "general",
-            "old-complete",
-            "alice",
-            "old.bin",
-            "file",
-            Some("application/octet-stream"),
-            10,
-        );
+        state.store.upsert_media_object(MediaObjectUpsert {
+            channel: "general",
+            file_id: "old-complete",
+            sender: "alice",
+            filename: "old.bin",
+            media_kind: "file",
+            mime: Some("application/octet-stream"),
+            declared_size: 10,
+        });
         state
             .store
             .append_media_chunk("general", "old-complete", "alice", 0, b"0123456789");
 
-        state.store.upsert_media_object(
-            "general",
-            "recent-complete",
-            "alice",
-            "recent.bin",
-            "file",
-            Some("application/octet-stream"),
-            20,
-        );
+        state.store.upsert_media_object(MediaObjectUpsert {
+            channel: "general",
+            file_id: "recent-complete",
+            sender: "alice",
+            filename: "recent.bin",
+            media_kind: "file",
+            mime: Some("application/octet-stream"),
+            declared_size: 20,
+        });
         state.store.append_media_chunk(
             "general",
             "recent-complete",
@@ -8995,15 +8996,15 @@ mod tests {
             b"01234567890123456789",
         );
 
-        state.store.upsert_media_object(
-            "general",
-            "partial",
-            "alice",
-            "partial.bin",
-            "file",
-            Some("application/octet-stream"),
-            30,
-        );
+        state.store.upsert_media_object(MediaObjectUpsert {
+            channel: "general",
+            file_id: "partial",
+            sender: "alice",
+            filename: "partial.bin",
+            media_kind: "file",
+            mime: Some("application/octet-stream"),
+            declared_size: 30,
+        });
         state
             .store
             .append_media_chunk("general", "partial", "alice", 0, b"0123456789");

@@ -15,7 +15,7 @@ Expected: only intentional release-doc changes.
 ```bash
 cargo check --workspace --bins --locked
 cargo fmt --all --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 
 # Protocol contract tests
@@ -26,7 +26,7 @@ cargo test --locked --test message_contracts file_contract_relays_media_metadata
 
 # Feature-gated checks
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check --features bridge-client --locked
+cargo check -p clifford-client --features bridge-client --locked
 ```
 
 ## 3. Build Release Binaries
@@ -114,10 +114,10 @@ If a major version upgrade is required, update `Cargo.toml` intentionally and do
 ```bash
 cargo check --workspace --bins --locked
 cargo fmt --all --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check --features bridge-client --locked
+cargo check -p clifford-client --features bridge-client --locked
 ```
 
 ### 10.5 Record and Communicate

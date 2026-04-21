@@ -13,6 +13,12 @@ use rodio::{OutputStream, Sink};
 use clifford::error::{ChatifyError, ChatifyResult};
 use clifford::voice::AudioProcessor;
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::ui::emit_output_line(format!($($arg)*), true);
+    }};
+}
+
 const SPEAKING_RMS_THRESHOLD: f32 = 0.010;
 const SPEAKING_SIGNAL_COOLDOWN_MS: u64 = 150;
 const SPEAKING_SIGNAL_SILENCE_MS: u64 = 450;
@@ -575,7 +581,7 @@ fn decode_voice_frame_legacy_raw(raw: &[u8]) -> Option<VoiceFrame> {
         return None;
     }
     let samples_raw = &raw[6..];
-    if samples_raw.len() % 2 != 0 {
+    if !samples_raw.len().is_multiple_of(2) {
         return None;
     }
     let sample_count = samples_raw.len() / 2;
