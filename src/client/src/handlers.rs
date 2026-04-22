@@ -19,8 +19,13 @@
 //! manually verify via `/trust` and `/fingerprint` commands. Session tokens don't survive
 //! restarts, so key re-verification is expected after server restarts.
 
+use crate::media::{
+    build_inline_image_preview, media_timeline_id, render_message_plain_lines, MediaKind,
+    MediaRenderStatus, PendingMediaTransfer, TimelineMedia, TimelinePayload,
+};
 use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState, TypingPresence};
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
+use base64::Engine as _;
 use clifford::notifications::NotificationService;
 
 /// Emit a line of output to the UI (with newline).
@@ -102,7 +107,82 @@ fn plugin_commands_summary(value: Option<&serde_json::Value>) -> String {
     }
 }
 
-fn print_live_message(message: &DisplayedMessage, reaction_summary: &str) {
+fn make_text_message(
+    id: String,
+    ts: f64,
+    channel: String,
+    sender: String,
+    content: String,
+    encrypted: bool,
+) -> DisplayedMessage {
+    DisplayedMessage {
+        id,
+        ts,
+        channel,
+        sender,
+        content,
+        payload: None,
+        encrypted,
+        edited: false,
+    }
+}
+
+fn timeline_media_from_file_meta(
+    data: &serde_json::Value,
+    metadata_only: bool,
+    media_enabled: bool,
+) -> Option<TimelineMedia> {
+    let file_id = data.get("file_id").and_then(|v| v.as_str())?.trim();
+    if file_id.is_empty() {
+        return None;
+    }
+
+    let filename = data
+        .get("filename")
+        .or_else(|| data.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .trim();
+    let media_kind = MediaKind::from_wire(
+        data.get("media_kind")
+            .or_else(|| data.get("type"))
+            .and_then(|v| v.as_str()),
+    );
+    let size = data.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let duration_ms = data.get("duration_ms").and_then(|v| v.as_u64());
+
+    Some(TimelineMedia {
+        file_id: file_id.to_string(),
+        filename: filename.to_string(),
+        media_kind,
+        mime: data
+            .get("mime")
+            .and_then(|v| v.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        size,
+        duration_ms,
+        received_bytes: 0,
+        local_path: None,
+        preview: Vec::new(),
+        render_status: if !media_enabled {
+            MediaRenderStatus::Disabled
+        } else if metadata_only {
+            MediaRenderStatus::MetadataOnly
+        } else {
+            MediaRenderStatus::Pending
+        },
+    })
+}
+
+fn message_display_id(message: &DisplayedMessage) -> String {
+    match message.payload.as_ref() {
+        Some(TimelinePayload::Media(media)) => short_id(&media.file_id),
+        None => short_id(&message.id),
+    }
+}
+
+fn print_live_message(message: &DisplayedMessage, reaction_summary: &str, media_enabled: bool) {
     if crate::ui::is_tui_active() {
         return;
     }
@@ -112,15 +192,43 @@ fn print_live_message(message: &DisplayedMessage, reaction_summary: &str) {
         return;
     }
 
-    let id = short_id(&message.id);
+    let id = message_display_id(message);
     let scope = format_scope_label(&message.channel);
-    if reaction_summary.is_empty() {
-        println!("[{}] {} {}: {}", id, scope, message.sender, message.content);
-    } else {
-        println!(
-            "[{}] {} {}: {} {}",
-            id, scope, message.sender, message.content, reaction_summary
-        );
+    let lines =
+        render_message_plain_lines(&message.content, message.payload.as_ref(), media_enabled);
+    let mut primary = lines
+        .first()
+        .cloned()
+        .unwrap_or_else(|| message.content.clone());
+    if !reaction_summary.is_empty() {
+        primary.push(' ');
+        primary.push_str(reaction_summary);
+    }
+    println!("[{}] {} {}: {}", id, scope, message.sender, primary);
+    for line in lines.iter().skip(1) {
+        println!("    [{}] {} {}", id, message.sender, line);
+    }
+}
+
+fn print_media_completion_update(message: &DisplayedMessage, media_enabled: bool) {
+    if crate::ui::is_tui_active() {
+        return;
+    }
+
+    let lines =
+        render_message_plain_lines(&message.content, message.payload.as_ref(), media_enabled);
+    if lines.len() <= 1 {
+        return;
+    }
+
+    let id = message_display_id(message);
+    let scope = format_scope_label(&message.channel);
+    println!(
+        "[media] [{}] {} {}: {}",
+        id, scope, message.sender, lines[0]
+    );
+    for line in lines.iter().skip(1) {
+        println!("    [{}] {}", id, line);
     }
 }
 
@@ -397,28 +505,26 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
     let current_user = state_lock.me.clone();
     let from_self = !current_user.is_empty() && u.eq_ignore_ascii_case(&current_user);
     let notification_config = state_lock.config.notifications.clone();
-    let message = DisplayedMessage {
-        id: msg_id.clone(),
-        ts: event_ts,
-        channel: ch.to_string(),
-        sender: u.to_string(),
-        content: c.to_string(),
-        encrypted: true,
-        edited: false,
-    };
+    let message = make_text_message(
+        msg_id.clone(),
+        event_ts,
+        ch.to_string(),
+        u.to_string(),
+        c.to_string(),
+        true,
+    );
     state_lock.add_message(message.clone());
     state_lock.note_incoming_message(ch, from_self);
     let trust_warning = state_lock.observe_user_key(u, pk);
     if let Some(warning) = trust_warning.as_ref() {
-        state_lock.add_message(DisplayedMessage {
-            id: String::new(),
-            ts: event_ts,
-            channel: String::new(),
-            sender: "system".to_string(),
-            content: trust_warning_summary(warning),
-            encrypted: false,
-            edited: false,
-        });
+        state_lock.add_message(make_text_message(
+            String::new(),
+            event_ts,
+            String::new(),
+            "system".to_string(),
+            trust_warning_summary(warning),
+            false,
+        ));
     }
     if state_lock.trust_store.audit_log.len() != trust_audit_len_before {
         if let Err(err) = state_lock.save_trust_store() {
@@ -426,13 +532,14 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
         }
     }
     let reaction_summary = state_lock.reaction_summary(&msg_id);
+    let media_enabled = state_lock.media_enabled;
     drop(state_lock);
 
     let (rendered_content, mentioned_me) =
         format_content_for_mentions(&message.content, &current_user);
     let mut rendered_message = message.clone();
     rendered_message.content = rendered_content;
-    print_live_message(&rendered_message, &reaction_summary);
+    print_live_message(&rendered_message, &reaction_summary, media_enabled);
 
     if !from_self {
         if mentioned_me && notification_config.on_mention {
@@ -472,15 +579,14 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
     let peer = if from_is_me { to } else { from };
     let scope = format!("dm:{}", peer.to_ascii_lowercase());
 
-    let message = DisplayedMessage {
-        id: msg_id.clone(),
-        ts: event_ts,
-        channel: scope,
-        sender: from.to_string(),
-        content: content.to_string(),
-        encrypted: true,
-        edited: false,
-    };
+    let message = make_text_message(
+        msg_id.clone(),
+        event_ts,
+        scope,
+        from.to_string(),
+        content.to_string(),
+        true,
+    );
     state_lock.add_message(message.clone());
     state_lock.note_incoming_message(&message.channel, from_is_me);
 
@@ -491,15 +597,14 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
     };
 
     if let Some(warning) = trust_warning.as_ref() {
-        state_lock.add_message(DisplayedMessage {
-            id: String::new(),
-            ts: event_ts,
-            channel: String::new(),
-            sender: "system".to_string(),
-            content: trust_warning_summary(warning),
-            encrypted: false,
-            edited: false,
-        });
+        state_lock.add_message(make_text_message(
+            String::new(),
+            event_ts,
+            String::new(),
+            "system".to_string(),
+            trust_warning_summary(warning),
+            false,
+        ));
     }
 
     if state_lock.trust_store.audit_log.len() != trust_audit_len_before {
@@ -509,12 +614,13 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
     }
 
     let reaction_summary = state_lock.reaction_summary(&msg_id);
+    let media_enabled = state_lock.media_enabled;
     drop(state_lock);
 
     let (rendered_content, mentioned_me) = format_content_for_mentions(&message.content, &my_user);
     let mut rendered_message = message.clone();
     rendered_message.content = rendered_content;
-    print_live_message(&rendered_message, &reaction_summary);
+    print_live_message(&rendered_message, &reaction_summary, media_enabled);
 
     if !from_is_me {
         if notification_config.on_dm {
@@ -543,21 +649,162 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
     }
 }
 
+pub async fn handle_file_meta_event(state: &SharedState, data: &serde_json::Value, ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let sender = data
+        .get("from")
+        .or_else(|| data.get("u"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let event_ts = extract_ts(data, ts);
+
+    let mut state_lock = state.lock().await;
+    let media_enabled = state_lock.media_enabled;
+    let current_user = state_lock.me.clone();
+    let from_self = !current_user.is_empty() && sender.eq_ignore_ascii_case(&current_user);
+    let Some(media) = timeline_media_from_file_meta(data, false, media_enabled) else {
+        return;
+    };
+    let timeline_id = media_timeline_id(ch, &media.file_id);
+    let message = DisplayedMessage {
+        id: timeline_id.clone(),
+        ts: event_ts,
+        channel: ch.to_string(),
+        sender: sender.to_string(),
+        content: media.summary_line(),
+        payload: Some(TimelinePayload::Media(media.clone())),
+        encrypted: false,
+        edited: false,
+    };
+    state_lock.upsert_message(message.clone());
+    state_lock.note_incoming_message(ch, from_self);
+    if media_enabled {
+        state_lock.pending_media_transfers.insert(
+            timeline_id,
+            PendingMediaTransfer::new(
+                message.id.clone(),
+                ch.to_string(),
+                sender.to_string(),
+                event_ts,
+                media,
+            ),
+        );
+    }
+    drop(state_lock);
+
+    print_live_message(&message, "", media_enabled);
+}
+
+pub async fn handle_file_chunk_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
+    let file_id = data
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let index = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+    let chunk_b64 = data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    if file_id.is_empty() || chunk_b64.is_empty() {
+        return;
+    }
+
+    let chunk_bytes = match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("failed to decode media chunk {}: {}", file_id, err);
+            return;
+        }
+    };
+
+    let timeline_id = media_timeline_id(ch, file_id);
+    let mut finalized_message = None;
+    let media_enabled;
+
+    {
+        let mut state_lock = state.lock().await;
+        media_enabled = state_lock.media_enabled;
+        if !media_enabled {
+            return;
+        }
+
+        let (latest_media, should_finalize) =
+            if let Some(transfer) = state_lock.pending_media_transfers.get_mut(&timeline_id) {
+                transfer.insert_chunk(index, chunk_bytes);
+                (transfer.media.clone(), transfer.is_complete())
+            } else {
+                return;
+            };
+
+        state_lock.update_message(&timeline_id, |message| {
+            message.content = latest_media.summary_line();
+            message.payload = Some(TimelinePayload::Media(latest_media.clone()));
+        });
+
+        if should_finalize {
+            let Some(transfer) = state_lock.pending_media_transfers.remove(&timeline_id) else {
+                return;
+            };
+            let timeline_id = transfer.timeline_id.clone();
+            let scope = transfer.scope.clone();
+            let sender = transfer.sender.clone();
+            let announced_at = transfer.announced_at;
+            let mut media = transfer.media.clone();
+            let combined = transfer.into_bytes();
+            match state_lock.save_media_bytes(&sender, &media.file_id, &media.filename, &combined) {
+                Ok(path) => {
+                    media.local_path = Some(path.display().to_string());
+                }
+                Err(err) => {
+                    eprintln!("failed to save media '{}': {}", media.filename, err);
+                }
+            }
+
+            media.render_status = MediaRenderStatus::Complete;
+            if media.media_kind == MediaKind::Image {
+                match build_inline_image_preview(&combined) {
+                    Ok(preview) => {
+                        media.preview = preview;
+                    }
+                    Err(status) => {
+                        media.render_status = status;
+                    }
+                }
+            }
+
+            let message = DisplayedMessage {
+                id: timeline_id,
+                ts: announced_at,
+                channel: scope,
+                sender,
+                content: media.summary_line(),
+                payload: Some(TimelinePayload::Media(media)),
+                encrypted: false,
+                edited: false,
+            };
+            state_lock.upsert_message(message.clone());
+            finalized_message = Some(message);
+        }
+    }
+
+    if let Some(message) = finalized_message {
+        print_media_completion_update(&message, media_enabled);
+    }
+}
+
 pub async fn handle_err_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
     let msg = data
         .get("m")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown error");
     let mut state_lock = state.lock().await;
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: format!("Error: {}", msg),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        format!("Error: {}", msg),
+        false,
+    ));
     drop(state_lock);
     eprintln!("[server-error] {}", msg);
 }
@@ -596,15 +843,14 @@ pub async fn handle_ok_event(state: &SharedState, data: &serde_json::Value, _ts:
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: "Connected successfully".to_string(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        "Connected successfully".to_string(),
+        false,
+    ));
     if let Err(err) = state_lock.send_json(serde_json::json!({"t": "users"})) {
         eprintln!("failed to request users directory: {}", err);
     }
@@ -638,15 +884,14 @@ async fn ingest_timeline_events(
                 let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
                 let sender = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
                 let event_ts = extract_ts(event, 0);
-                state_lock.add_message(DisplayedMessage {
-                    id: extract_msg_id(event),
-                    ts: event_ts,
-                    channel: scope.to_string(),
-                    sender: sender.to_string(),
-                    content: content.to_string(),
-                    encrypted: true,
-                    edited: false,
-                });
+                state_lock.add_message(make_text_message(
+                    extract_msg_id(event),
+                    event_ts,
+                    scope.to_string(),
+                    sender.to_string(),
+                    content.to_string(),
+                    true,
+                ));
             }
             "dm" => {
                 let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
@@ -656,15 +901,35 @@ async fn ingest_timeline_events(
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let event_ts = extract_ts(event, 0);
-                state_lock.add_message(DisplayedMessage {
-                    id: extract_msg_id(event),
-                    ts: event_ts,
-                    channel: scope.to_string(),
-                    sender: sender.to_string(),
-                    content: content.to_string(),
-                    encrypted: true,
-                    edited: false,
-                });
+                state_lock.add_message(make_text_message(
+                    extract_msg_id(event),
+                    event_ts,
+                    scope.to_string(),
+                    sender.to_string(),
+                    content.to_string(),
+                    true,
+                ));
+            }
+            "file_meta" => {
+                if let Some(media) =
+                    timeline_media_from_file_meta(event, true, state_lock.media_enabled)
+                {
+                    state_lock.add_message(DisplayedMessage {
+                        id: media_timeline_id(scope, &media.file_id),
+                        ts: extract_ts(event, 0),
+                        channel: scope.to_string(),
+                        sender: event
+                            .get("from")
+                            .or_else(|| event.get("u"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string(),
+                        content: media.summary_line(),
+                        payload: Some(TimelinePayload::Media(media)),
+                        encrypted: false,
+                        edited: false,
+                    });
+                }
             }
             "reaction" => {
                 let msg_id = event.get("msg_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -693,15 +958,14 @@ async fn ingest_timeline_events(
             "sys" => {
                 let content = event.get("m").and_then(|v| v.as_str()).unwrap_or("");
                 let event_ts = extract_ts(event, 0);
-                state_lock.add_message(DisplayedMessage {
-                    id: String::new(),
-                    ts: event_ts,
-                    channel: scope.to_string(),
-                    sender: "system".to_string(),
-                    content: content.to_string(),
-                    encrypted: false,
-                    edited: false,
-                });
+                state_lock.add_message(make_text_message(
+                    String::new(),
+                    event_ts,
+                    scope.to_string(),
+                    "system".to_string(),
+                    content.to_string(),
+                    false,
+                ));
             }
             _ => {}
         }
@@ -719,14 +983,14 @@ async fn ingest_timeline_events(
             if summary.is_empty() {
                 format!(
                     "  [{}] {}: {}",
-                    short_id(&msg.id),
+                    message_display_id(msg),
                     msg.sender,
                     display_content
                 )
             } else {
                 format!(
                     "  [{}] {}: {} {}",
-                    short_id(&msg.id),
+                    message_display_id(msg),
                     msg.sender,
                     display_content,
                     summary
@@ -818,15 +1082,14 @@ pub async fn handle_plugins_event(state: &SharedState, data: &serde_json::Value,
     let summary = format!("Plugin inventory refreshed ({} installed).", plugins.len());
 
     let mut state_lock = state.lock().await;
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: summary.clone(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        summary.clone(),
+        false,
+    ));
     drop(state_lock);
 
     println!("{}", summary);
@@ -898,15 +1161,14 @@ pub async fn handle_plugin_installed_event(
     );
 
     let mut state_lock = state.lock().await;
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: summary.clone(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        summary.clone(),
+        false,
+    ));
     drop(state_lock);
 
     println!("{}", summary);
@@ -921,15 +1183,14 @@ pub async fn handle_plugin_disabled_event(state: &SharedState, data: &serde_json
     let summary = format!("Plugin disabled: {}.", plugin);
 
     let mut state_lock = state.lock().await;
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: summary.clone(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        summary.clone(),
+        false,
+    ));
     drop(state_lock);
 
     println!("{}", summary);
@@ -948,15 +1209,14 @@ pub async fn handle_bridge_status_event(state: &SharedState, data: &serde_json::
     let summary = format!("Bridge status: {} connected instance(s).", count);
 
     let mut state_lock = state.lock().await;
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: summary.clone(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        summary.clone(),
+        false,
+    ));
     drop(state_lock);
 
     println!("{}", summary);
@@ -1020,15 +1280,14 @@ pub async fn handle_users_event(state: &SharedState, data: &serde_json::Value, _
 
             if let Some(warning) = state_lock.observe_user_key(u, pk) {
                 let summary = trust_warning_summary(&warning);
-                state_lock.add_message(DisplayedMessage {
-                    id: String::new(),
-                    ts: 0.0,
-                    channel: String::new(),
-                    sender: "system".to_string(),
-                    content: summary.clone(),
-                    encrypted: false,
-                    edited: false,
-                });
+                state_lock.add_message(make_text_message(
+                    String::new(),
+                    0.0,
+                    String::new(),
+                    "system".to_string(),
+                    summary.clone(),
+                    false,
+                ));
                 warnings.push(summary);
             }
         }
@@ -1058,15 +1317,14 @@ pub async fn handle_joined_event(state: &SharedState, data: &serde_json::Value, 
         let mut state_lock = state.lock().await;
         state_lock.chs.insert(ch.clone(), true);
         state_lock.switch_scope(ch.clone());
-        state_lock.add_message(DisplayedMessage {
-            id: String::new(),
-            ts: 0.0,
-            channel: ch.clone(),
-            sender: "system".to_string(),
-            content: format!("Joined #{}", ch),
-            encrypted: false,
-            edited: false,
-        });
+        state_lock.add_message(make_text_message(
+            String::new(),
+            0.0,
+            ch.clone(),
+            "system".to_string(),
+            format!("Joined #{}", ch),
+            false,
+        ));
         state_lock.ws_tx.clone()
     };
 
@@ -1110,15 +1368,14 @@ pub async fn handle_left_event(state: &SharedState, data: &serde_json::Value, _t
         format!("Left #{}", ch)
     };
 
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: ch.clone(),
-        sender: "system".to_string(),
-        content: summary.clone(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        ch.clone(),
+        "system".to_string(),
+        summary.clone(),
+        false,
+    ));
     drop(state_lock);
 
     println!("{}", summary);
@@ -1131,15 +1388,14 @@ pub async fn handle_sys_event(state: &SharedState, data: &serde_json::Value, ts:
         .unwrap_or("system event");
     let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("");
     let mut state_lock = state.lock().await;
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: extract_ts(data, ts),
-        channel: ch.to_string(),
-        sender: "system".to_string(),
-        content: message.to_string(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        extract_ts(data, ts),
+        ch.to_string(),
+        "system".to_string(),
+        message.to_string(),
+        false,
+    ));
     drop(state_lock);
     println!("[system] {}", message);
 }
@@ -1166,15 +1422,14 @@ pub async fn handle_status_update_event(state: &SharedState, data: &serde_json::
             state_lock.online_users.insert(user.to_string());
         }
     }
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: format!("{} is now {}", user, summary),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        format!("{} is now {}", user, summary),
+        false,
+    ));
     drop(state_lock);
     println!("[status] {} -> {}", user, summary);
 }
@@ -1408,15 +1663,14 @@ pub async fn handle_ss_meta_event(state: &SharedState, data: &serde_json::Value,
     let mut state_lock = state.lock().await;
     state_lock.screen_share = Some(());
     state_lock.screen_viewing = true;
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: content.clone(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        content.clone(),
+        false,
+    ));
     drop(state_lock);
 
     println!("{}", content);
@@ -1517,15 +1771,14 @@ pub async fn handle_ss_state_event(state: &SharedState, data: &serde_json::Value
         )
     };
 
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: content.clone(),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        content.clone(),
+        false,
+    ));
     drop(state_lock);
 
     println!("{}", content);
@@ -1601,15 +1854,14 @@ pub async fn handle_vjoin_event(state: &SharedState, data: &serde_json::Value, _
     {
         state_lock.voice_members.push(user.to_string());
     }
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: format!("🎙 {} joined voice", user),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        format!("🎙 {} joined voice", user),
+        false,
+    ));
 }
 
 pub async fn handle_vleave_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
@@ -1623,15 +1875,14 @@ pub async fn handle_vleave_event(state: &SharedState, data: &serde_json::Value, 
     state_lock
         .voice_members
         .retain(|member| !member.eq_ignore_ascii_case(user));
-    state_lock.add_message(DisplayedMessage {
-        id: String::new(),
-        ts: 0.0,
-        channel: String::new(),
-        sender: "system".to_string(),
-        content: format!("🎙 {} left voice", user),
-        encrypted: false,
-        edited: false,
-    });
+    state_lock.add_message(make_text_message(
+        String::new(),
+        0.0,
+        String::new(),
+        "system".to_string(),
+        format!("🎙 {} left voice", user),
+        false,
+    ));
 }
 
 pub async fn dispatch_event(
@@ -1647,6 +1898,12 @@ pub async fn dispatch_event(
         }
         "dm" => {
             handle_dm_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "file_meta" => {
+            handle_file_meta_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "file_chunk" => {
+            handle_file_chunk_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
         "err" => {
             handle_err_event(state, &serde_json::Value::Object(data.clone()), ts).await;

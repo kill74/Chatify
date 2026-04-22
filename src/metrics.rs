@@ -519,23 +519,26 @@ impl PrometheusMetrics {
         let mut error_map: HashMap<String, u64> = HashMap::new();
 
         for family in self.registry.gather() {
-            match family.get_name() {
+            match family.name() {
                 "chatify_db_query_duration_seconds" => {
-                    for metric in family.get_metric() {
+                    for metric in &family.metric {
                         let operation = metric
-                            .get_label()
+                            .label
                             .iter()
-                            .find(|label| label.get_name() == "operation")
-                            .map(|label| label.get_value().to_string())
+                            .find(|label| label.name() == "operation")
+                            .map(|label| label.value().to_string())
                             .unwrap_or_else(|| "unknown".to_string());
 
-                        let histogram = metric.get_histogram();
-                        let samples = histogram.get_sample_count();
+                        let Some(histogram) = metric.histogram.as_ref() else {
+                            continue;
+                        };
+
+                        let samples = histogram.sample_count();
                         if samples == 0 {
                             continue;
                         }
 
-                        let sum_seconds = histogram.get_sample_sum();
+                        let sum_seconds = histogram.sample_sum();
                         let p50_ms = estimate_histogram_percentile_ms(histogram, 0.50)
                             .unwrap_or_else(|| (sum_seconds / samples as f64) * 1000.0);
                         let p95_ms = estimate_histogram_percentile_ms(histogram, 0.95)
@@ -548,15 +551,19 @@ impl PrometheusMetrics {
                     }
                 }
                 "chatify_db_query_errors_total" => {
-                    for metric in family.get_metric() {
+                    for metric in &family.metric {
                         let operation = metric
-                            .get_label()
+                            .label
                             .iter()
-                            .find(|label| label.get_name() == "operation")
-                            .map(|label| label.get_value().to_string())
+                            .find(|label| label.name() == "operation")
+                            .map(|label| label.value().to_string())
                             .unwrap_or_else(|| "unknown".to_string());
 
-                        let errors = metric.get_counter().get_value() as u64;
+                        let errors = metric
+                            .counter
+                            .as_ref()
+                            .map(|counter| counter.value() as u64)
+                            .unwrap_or_default();
                         error_map.insert(operation, errors);
                     }
                 }
@@ -672,17 +679,17 @@ fn estimate_histogram_percentile_ms(
     histogram: &prometheus::proto::Histogram,
     percentile: f64,
 ) -> Option<f64> {
-    let samples = histogram.get_sample_count();
+    let samples = histogram.sample_count();
     if samples == 0 {
         return None;
     }
 
     let target = ((samples as f64) * percentile).ceil() as u64;
-    let average_ms = (histogram.get_sample_sum() / samples as f64) * 1000.0;
+    let average_ms = (histogram.sample_sum() / samples as f64) * 1000.0;
 
-    for bucket in histogram.get_bucket() {
-        if bucket.get_cumulative_count() >= target {
-            let upper = bucket.get_upper_bound();
+    for bucket in &histogram.bucket {
+        if bucket.cumulative_count() >= target {
+            let upper = bucket.upper_bound();
             if upper.is_finite() {
                 return Some(upper * 1000.0);
             }

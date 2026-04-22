@@ -1909,6 +1909,46 @@ async fn file_contract_persists_media_metadata_and_chunks_in_database() {
     assert_eq!(chunk_rows, 1, "expected one persisted media chunk");
 }
 
+#[tokio::test]
+async fn file_contract_relays_audio_note_duration_metadata() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"file_meta",
+                "ch":"general",
+                "filename":"voice-note.ogg",
+                "size": 11_u64,
+                "file_id":"audio-duration-1",
+                "media_kind":"audio",
+                "mime":"audio/ogg",
+                "duration_ms": 4_250_u64
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send audio note metadata");
+
+    let meta = recv_by_type(&mut bob, "file_meta").await;
+    assert_eq!(meta.get("from").and_then(|v| v.as_str()), Some("alice"));
+    assert_eq!(
+        meta.get("file_id").and_then(|v| v.as_str()),
+        Some("audio-duration-1")
+    );
+    assert_eq!(
+        meta.get("media_kind").and_then(|v| v.as_str()),
+        Some("audio")
+    );
+    assert_eq!(meta.get("mime").and_then(|v| v.as_str()), Some("audio/ogg"));
+    assert_eq!(
+        meta.get("duration_ms").and_then(|v| v.as_u64()),
+        Some(4_250_u64)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Voice contract tests
 // ---------------------------------------------------------------------------

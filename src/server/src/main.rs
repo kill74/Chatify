@@ -6431,6 +6431,10 @@ async fn handle_event(
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(|v| v.chars().take(MAX_MEDIA_MIME_LEN).collect::<String>());
+            let duration_ms = d
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .filter(|value| *value > 0);
 
             let mut file_announce = serde_json::json!({
                 "t":"file_meta","from":username,"filename":filename,
@@ -6439,6 +6443,9 @@ async fn handle_event(
             });
             if let Some(ref mime_value) = mime {
                 file_announce["mime"] = Value::String(mime_value.clone());
+            }
+            if let Some(duration_ms) = duration_ms {
+                file_announce["duration_ms"] = Value::from(duration_ms);
             }
             state.store.persist(
                 "file_meta",

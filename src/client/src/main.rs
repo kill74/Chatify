@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -36,6 +36,7 @@ use clifford::notifications::NotificationService;
 use futures_util::{SinkExt, StreamExt};
 #[allow(unused_imports)]
 use log::info;
+use rodio::{Decoder, Source};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -46,7 +47,8 @@ use clifford::error::{ChatifyError, ChatifyResult};
 use clifford_client::{
     args::Args,
     handlers,
-    state::{ClientState, SharedState},
+    media::{guess_mime_from_path, MediaKind},
+    state::{ClientState, OutgoingMediaMeta, SharedState},
     voice::{start_voice_session, VoiceEvent},
 };
 
@@ -258,6 +260,12 @@ const COMMANDS: &[CommandHelp] = &[
         name: "/video",
         usage: "/video \"<path>\"",
         summary: "Send a video file to the current channel",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/audio",
+        usage: "/audio \"<path>\"",
+        summary: "Send a short audio note to the current channel",
         aliases: &[],
     },
     CommandHelp {
@@ -505,6 +513,23 @@ fn parse_plugin_command(input: &str) -> Result<PluginCommand, &'static str> {
             .ok_or("Usage: /plugin disable <plugin>"),
         _ => Err("Usage: /plugin [list|install <plugin>|disable <plugin>]"),
     }
+}
+
+fn media_kind_for_command(command: &str) -> Option<MediaKind> {
+    match command {
+        "/image" => Some(MediaKind::Image),
+        "/video" => Some(MediaKind::Video),
+        "/audio" => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
+fn detect_audio_duration_ms(path: &Path) -> Option<u64> {
+    let file = fs::File::open(path).ok()?;
+    let decoder = Decoder::new(std::io::BufReader::new(file)).ok()?;
+    decoder
+        .total_duration()
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
 }
 
 #[cfg(feature = "bridge-client")]
@@ -1230,7 +1255,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
 
                     if !media_enabled {
                         println!(
-                            "Voice is disabled by client media settings (--no_media or config)."
+                            "Voice is disabled by client media settings (--no-media or config)."
                         );
                         return true;
                     }
@@ -2128,18 +2153,25 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 eprintln!("failed to sync reactions: {}", err);
             }
         }
-        "/image" | "/video" => {
-            let Some(path_str) = parts.next() else {
+        "/image" | "/video" | "/audio" => {
+            let Some(path_str) = trimmed
+                .strip_prefix(cmd)
+                .and_then(parse_shell_like_argument)
+            else {
                 println!("Usage: {} \"<path>\"", cmd);
                 return true;
             };
-            let path_str = path_str.trim().trim_matches('"');
-            let path = std::path::Path::new(path_str);
+            let Some(media_kind) = media_kind_for_command(cmd) else {
+                println!("Usage: {} \"<path>\"", cmd);
+                return true;
+            };
+
+            let path = Path::new(&path_str);
             if !path.exists() {
                 eprintln!("file not found: {}", path_str);
                 return true;
             }
-            let metadata = match std::fs::metadata(path) {
+            let metadata = match fs::metadata(path) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("cannot read file {}: {}", path_str, e);
@@ -2159,31 +2191,69 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
-            let file_type = if cmd == "/image" { "image" } else { "video" };
+            let mime = guess_mime_from_path(path, media_kind);
+            let duration_ms = if media_kind == MediaKind::Audio {
+                detect_audio_duration_ms(path)
+            } else {
+                None
+            };
+            let data = match fs::read(path) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("failed to read file: {}", e);
+                    return true;
+                }
+            };
 
-            let state_lock = state.lock().await;
-            let channel = state_lock.ch.clone();
-            if let Err(e) = state_lock.send_file_meta(&channel, filename, file_type, file_size) {
-                eprintln!("failed to send file metadata: {}", e);
+            let (channel, media_enabled) = {
+                let state_lock = state.lock().await;
+                (state_lock.ch.clone(), state_lock.media_enabled)
+            };
+            if !media_enabled {
+                println!("Media is disabled by client media settings (--no-media or config).");
+                return true;
+            }
+            if channel.starts_with("dm:") {
+                println!("Media attachments are only supported in channels right now.");
                 return true;
             }
 
-            match std::fs::read(path) {
-                Ok(data) => {
-                    const CHUNK_SIZE: usize = 16 * 1024;
-                    for chunk in data.chunks(CHUNK_SIZE) {
-                        if let Err(e) = state_lock.send_file_chunk(&channel, chunk) {
-                            eprintln!("failed to send file chunk: {}", e);
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("failed to read file: {}", e);
+            let file_id = clifford::fresh_nonce_hex();
+            {
+                let state_lock = state.lock().await;
+                if let Err(e) = state_lock.send_file_meta(OutgoingMediaMeta {
+                    channel: &channel,
+                    file_id: &file_id,
+                    filename,
+                    media_kind: media_kind.wire_name(),
+                    size: file_size,
+                    mime: mime.as_deref(),
+                    duration_ms,
+                }) {
+                    eprintln!("failed to send file metadata: {}", e);
+                    return true;
                 }
             }
-            println!("[sent] {} {} to #{}", file_type, filename, channel);
+
+            let mut chunk_send_failed = false;
+            const CHUNK_SIZE: usize = 16 * 1024;
+            for (index, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+                let state_lock = state.lock().await;
+                if let Err(e) = state_lock.send_file_chunk(&channel, &file_id, index as u64, chunk)
+                {
+                    eprintln!("failed to send file chunk: {}", e);
+                    chunk_send_failed = true;
+                    break;
+                }
+                drop(state_lock);
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+
+            if chunk_send_failed {
+                return true;
+            }
+
+            println!("[sent] {} {} to #{}", media_kind.label(), filename, channel);
         }
         "/react" => {
             let Some(msg_ref) = parts.next() else {

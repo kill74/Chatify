@@ -24,6 +24,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 
 use crate::handlers;
+use crate::media::{render_message_lines, RgbColor, StyledFragment, StyledLine};
 use crate::state::{ActivityEntry, ClientState, SharedState};
 use clifford::error::{ChatifyError, ChatifyResult};
 
@@ -183,7 +184,7 @@ struct ScopeRow {
 struct TimelineEntry {
     when: String,
     sender: String,
-    content: String,
+    body_lines: Vec<StyledLine>,
     reaction_summary: String,
     show_sender: bool,
     is_system: bool,
@@ -310,6 +311,8 @@ impl UiSnapshot {
                 state.reaction_summary(&message.id)
             };
             let (content, _) = handlers::format_content_for_mentions(&message.content, &state.me);
+            let body_lines =
+                render_message_lines(&content, message.payload.as_ref(), state.media_enabled);
             let when = format_timestamp(message.ts);
             let is_system = message.sender == "system";
             let is_self = !state.me.is_empty() && message.sender.eq_ignore_ascii_case(&state.me);
@@ -323,7 +326,7 @@ impl UiSnapshot {
             timeline.push(TimelineEntry {
                 when,
                 sender: message.sender.clone(),
-                content,
+                body_lines,
                 reaction_summary,
                 show_sender,
                 is_system,
@@ -980,7 +983,7 @@ fn render(frame: &mut ratatui::Frame<'_>, snapshot: &UiSnapshot) {
             Constraint::Length(3),
             Constraint::Length(1),
         ])
-        .split(frame.size());
+        .split(frame.area());
 
     render_header(frame, root[0], snapshot);
 
@@ -1188,15 +1191,29 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
         } else {
             Style::default().fg(Color::White)
         };
-        let mut text = item.content.clone();
-        if !item.reaction_summary.is_empty() {
-            text.push(' ');
-            text.push_str(&item.reaction_summary);
+        let mut body_lines = item.body_lines.clone();
+        if body_lines.is_empty() {
+            body_lines.push(vec![StyledFragment {
+                text: String::new(),
+                fg: None,
+                bg: None,
+                bold: false,
+                dim: false,
+            }]);
         }
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(text, content_style),
-        ]));
+
+        for (index, body_line) in body_lines.iter().enumerate() {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(styled_line_to_spans(body_line, content_style));
+            if index == 0 && !item.reaction_summary.is_empty() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    item.reaction_summary.clone(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
         lines.push(Line::default());
     }
 
@@ -1226,6 +1243,34 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
         .wrap(Wrap { trim: false })
         .scroll((scroll_top as u16, 0));
     frame.render_widget(timeline, area);
+}
+
+fn styled_line_to_spans(line: &StyledLine, base_style: Style) -> Vec<Span<'static>> {
+    line.iter()
+        .map(|fragment| styled_fragment_to_span(fragment, base_style))
+        .collect()
+}
+
+fn styled_fragment_to_span(fragment: &StyledFragment, base_style: Style) -> Span<'static> {
+    let mut style = base_style;
+    if let Some(color) = fragment.fg {
+        style = style.fg(rgb_to_color(color));
+    }
+    if let Some(color) = fragment.bg {
+        style = style.bg(rgb_to_color(color));
+    }
+    if fragment.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if fragment.dim {
+        style = style.add_modifier(Modifier::DIM);
+    }
+
+    Span::styled(fragment.text.clone(), style)
+}
+
+fn rgb_to_color(color: RgbColor) -> Color {
+    Color::Rgb(color.r, color.g, color.b)
 }
 
 fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnapshot) {
@@ -1441,7 +1486,7 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
 
     let cursor_x = area.x + 1 + cursor_column as u16;
     let cursor_y = area.y + 1;
-    frame.set_cursor(cursor_x, cursor_y);
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _snapshot: &UiSnapshot) {

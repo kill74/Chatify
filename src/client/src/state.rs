@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::args::ClientConfig;
+use crate::media::{PendingMediaTransfer, TimelinePayload};
 
 const MAX_MESSAGE_HISTORY: usize = 1000;
 const MAX_REACTION_EVENT_DEDUP: usize = 10_000;
@@ -84,6 +85,7 @@ pub struct ClientState {
     pub theme: (),
     /// In-progress file transfers (id → metadata).
     pub file_transfers: HashMap<String, FileTransfer>,
+    pub pending_media_transfers: HashMap<String, PendingMediaTransfer>,
     /// Displayed message history (newest last, up to MAX_MESSAGE_HISTORY).
     pub message_history: VecDeque<DisplayedMessage>,
     /// Message IDs we've already seen (deduplication).
@@ -240,6 +242,16 @@ pub enum FileTransferDirection {
     Download,
 }
 
+pub struct OutgoingMediaMeta<'a> {
+    pub channel: &'a str,
+    pub file_id: &'a str,
+    pub filename: &'a str,
+    pub media_kind: &'a str,
+    pub size: u64,
+    pub mime: Option<&'a str>,
+    pub duration_ms: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct DisplayedMessage {
     pub id: String,
@@ -247,6 +259,7 @@ pub struct DisplayedMessage {
     pub channel: String,
     pub sender: String,
     pub content: String,
+    pub payload: Option<TimelinePayload>,
     pub encrypted: bool,
     pub edited: bool,
 }
@@ -307,6 +320,7 @@ impl ClientState {
             voice_session: None,
             theme: (),
             file_transfers: HashMap::new(),
+            pending_media_transfers: HashMap::new(),
             message_history: VecDeque::new(),
             message_ids_seen: HashSet::new(),
             status: Status {
@@ -367,6 +381,40 @@ impl ClientState {
                 }
             }
         }
+    }
+
+    pub fn upsert_message(&mut self, msg: DisplayedMessage) {
+        if msg.id.is_empty() {
+            self.add_message(msg);
+            return;
+        }
+
+        if let Some(existing) = self
+            .message_history
+            .iter_mut()
+            .find(|entry| entry.id == msg.id)
+        {
+            *existing = msg;
+            return;
+        }
+
+        self.add_message(msg);
+    }
+
+    pub fn update_message<F>(&mut self, id: &str, mut update: F) -> bool
+    where
+        F: FnMut(&mut DisplayedMessage),
+    {
+        if id.is_empty() {
+            return false;
+        }
+
+        if let Some(message) = self.message_history.iter_mut().find(|entry| entry.id == id) {
+            update(message);
+            return true;
+        }
+
+        false
     }
 
     pub fn add_activity(&mut self, text: impl Into<String>, is_error: bool) {
@@ -624,6 +672,21 @@ impl ClientState {
         Self::trust_storage_root().join("trust").join(file_name)
     }
 
+    pub fn media_storage_root(&self) -> PathBuf {
+        let (user, host, port, mode) = self.storage_profile_components();
+        Self::trust_storage_root()
+            .join("media")
+            .join(format!("{}-{}-{}-{}", user, host, port, mode))
+    }
+
+    pub fn media_download_path(&self, sender: &str, file_id: &str, filename: &str) -> PathBuf {
+        let sender = Self::sanitize_storage_component(sender);
+        let file_id = Self::sanitize_storage_component(file_id);
+        let filename = Self::sanitize_storage_component(filename);
+        self.media_storage_root()
+            .join(format!("{}-{}-{}", sender, file_id, filename))
+    }
+
     fn clamp_audit_log(entries: &mut Vec<AuditEntry>) {
         if entries.len() > MAX_TRUST_AUDIT_ENTRIES {
             let overflow = entries.len() - MAX_TRUST_AUDIT_ENTRIES;
@@ -688,6 +751,18 @@ impl ClientState {
         }
 
         Ok(())
+    }
+
+    pub fn save_media_bytes(
+        &self,
+        sender: &str,
+        file_id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, String> {
+        let destination = self.media_download_path(sender, file_id, filename);
+        Self::write_atomically(&destination, bytes, "media file")?;
+        Ok(destination)
     }
 
     pub fn save_trust_store_to_path(&self, path: &Path) -> Result<(), String> {
@@ -1244,29 +1319,39 @@ impl ClientState {
         }))
     }
 
-    pub fn send_file_meta(
-        &self,
-        channel: &str,
-        filename: &str,
-        file_type: &str,
-        size: u64,
-    ) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+    pub fn send_file_meta(&self, meta: OutgoingMediaMeta<'_>) -> Result<(), String> {
+        let mut payload = serde_json::json!({
             "t": "file_meta",
-            "ch": channel,
-            "name": filename,
-            "type": file_type,
-            "size": size,
+            "ch": meta.channel,
+            "file_id": meta.file_id,
+            "filename": meta.filename,
+            "media_kind": meta.media_kind,
+            "size": meta.size,
             "ts": clifford::now(),
             "n": clifford::fresh_nonce_hex(),
-        }))
+        });
+        if let Some(mime) = meta.mime {
+            payload["mime"] = serde_json::Value::String(mime.to_string());
+        }
+        if let Some(duration_ms) = meta.duration_ms {
+            payload["duration_ms"] = serde_json::Value::from(duration_ms);
+        }
+        self.send_json(payload)
     }
 
-    pub fn send_file_chunk(&self, channel: &str, data: &[u8]) -> Result<(), String> {
+    pub fn send_file_chunk(
+        &self,
+        channel: &str,
+        file_id: &str,
+        index: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
         let chunk_b64 = base64::engine::general_purpose::STANDARD.encode(data);
         self.send_json(serde_json::json!({
             "t": "file_chunk",
             "ch": channel,
+            "file_id": file_id,
+            "index": index,
             "data": chunk_b64,
             "ts": clifford::now(),
             "n": clifford::fresh_nonce_hex(),
@@ -1355,6 +1440,7 @@ mod tests {
             channel: channel.to_string(),
             sender: sender.to_string(),
             content: content.to_string(),
+            payload: None,
             encrypted: true,
             edited: false,
         }
@@ -1515,6 +1601,72 @@ mod tests {
             .and_then(|v| v.as_f64())
             .expect("from_ts should be f64");
         assert!((from_ts - 1_711_234_567.125).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn send_file_meta_serializes_media_metadata_frame() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_file_meta(OutgoingMediaMeta {
+                channel: "general",
+                file_id: "audio-1",
+                filename: "voice-note.ogg",
+                media_kind: "audio",
+                size: 1_024,
+                mime: Some("audio/ogg"),
+                duration_ms: Some(4_250),
+            })
+            .expect("send_file_meta should serialize");
+
+        let frame = rx.try_recv().expect("file metadata frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("file_meta"));
+        assert_eq!(parsed.get("ch").and_then(|v| v.as_str()), Some("general"));
+        assert_eq!(
+            parsed.get("file_id").and_then(|v| v.as_str()),
+            Some("audio-1")
+        );
+        assert_eq!(
+            parsed.get("filename").and_then(|v| v.as_str()),
+            Some("voice-note.ogg")
+        );
+        assert_eq!(
+            parsed.get("media_kind").and_then(|v| v.as_str()),
+            Some("audio")
+        );
+        assert_eq!(parsed.get("size").and_then(|v| v.as_u64()), Some(1_024));
+        assert_eq!(
+            parsed.get("mime").and_then(|v| v.as_str()),
+            Some("audio/ogg")
+        );
+        assert_eq!(
+            parsed.get("duration_ms").and_then(|v| v.as_u64()),
+            Some(4_250)
+        );
+    }
+
+    #[test]
+    fn send_file_chunk_serializes_chunk_index_and_payload() {
+        let (state, mut rx) = make_test_state_with_receiver();
+        state
+            .send_file_chunk("general", "image-1", 3, b"hello")
+            .expect("send_file_chunk should serialize");
+
+        let frame = rx.try_recv().expect("file chunk frame should be queued");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+
+        assert_eq!(parsed.get("t").and_then(|v| v.as_str()), Some("file_chunk"));
+        assert_eq!(parsed.get("ch").and_then(|v| v.as_str()), Some("general"));
+        assert_eq!(
+            parsed.get("file_id").and_then(|v| v.as_str()),
+            Some("image-1")
+        );
+        assert_eq!(parsed.get("index").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            parsed.get("data").and_then(|v| v.as_str()),
+            Some("aGVsbG8=")
+        );
     }
 
     #[test]
