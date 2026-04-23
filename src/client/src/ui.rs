@@ -1789,6 +1789,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 8765,
                 tls: false,
+                auto_reconnect: true,
                 log_enabled: false,
                 markdown_enabled: true,
                 media_enabled: true,

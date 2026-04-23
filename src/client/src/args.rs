@@ -27,6 +27,9 @@ pub struct Args {
 
     #[arg(long)]
     pub no_animation: bool,
+
+    #[arg(long)]
+    pub no_reconnect: bool,
 }
 
 impl Args {
@@ -38,6 +41,7 @@ impl Args {
             .to_string();
         let port = self.port.unwrap_or(config.connection.default_port);
         let tls = self.tls || config.connection.use_tls;
+        let auto_reconnect = !self.no_reconnect && config.connection.auto_reconnect;
         let markdown_enabled = !self.no_markdown && config.ui.enable_markdown;
         let media_enabled = !self.no_media && config.ui.enable_media;
         let animations_enabled = !self.no_animation && !config.ui.disable_animations;
@@ -46,6 +50,7 @@ impl Args {
             host: host.to_string(),
             port,
             tls,
+            auto_reconnect,
             log_enabled: self.log,
             markdown_enabled,
             media_enabled,
@@ -59,6 +64,7 @@ pub struct ClientConfig {
     pub host: String,
     pub port: u16,
     pub tls: bool,
+    pub auto_reconnect: bool,
     pub log_enabled: bool,
     pub markdown_enabled: bool,
     pub media_enabled: bool,

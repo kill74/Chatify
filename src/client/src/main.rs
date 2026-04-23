@@ -24,11 +24,12 @@
 //! Session tokens are ephemeral—they don't survive server restarts, so all clients
 //! must re-authenticate. See AGENTS.md for protocol constraints.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use clifford::crypto::{new_keypair, pub_b64, pw_hash_client};
@@ -38,8 +39,13 @@ use futures_util::{SinkExt, StreamExt};
 use log::info;
 use rodio::{Decoder, Source};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::net::{lookup_host, TcpStream};
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::timeout;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{self, Message},
+};
 
 use clifford::config::Config;
 use clifford::error::{ChatifyError, ChatifyResult};
@@ -82,6 +88,16 @@ const MAX_RECENT_LIMIT: usize = 50;
 const DEFAULT_REACTION_SYNC_LIMIT: usize = 500;
 const DEFAULT_TRUST_AUDIT_LIMIT: usize = 20;
 const MAX_TRUST_AUDIT_LIMIT: usize = 200;
+const MAX_OFFLINE_OUTBOUND_QUEUE: usize = 256;
+const RECONNECT_BASE_DELAY_SECS: u64 = 1;
+const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+
+#[derive(Clone)]
+struct ConnectionAuth {
+    username: String,
+    password_hash: String,
+    public_key: String,
+}
 
 #[derive(Clone, Copy)]
 struct CommandHelp {
@@ -164,6 +180,12 @@ const COMMANDS: &[CommandHelp] = &[
         usage: "/db-profile",
         summary: "Show focused database latency profile",
         aliases: &["/dbprofile"],
+    },
+    CommandHelp {
+        name: "/doctor",
+        usage: "/doctor [--json]",
+        summary: "Run connection diagnostics (network, TLS, auth readiness, latency)",
+        aliases: &[],
     },
     CommandHelp {
         name: "/typing",
@@ -728,6 +750,361 @@ fn print_notify_usage() {
     println!("       /notify test [sound] [info|warning|critical] [message]");
 }
 
+fn print_doctor_usage() {
+    println!("Usage: /doctor [--json]");
+}
+
+fn millis_u64(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn connection_doctor_recommendations(
+    auth_ready: bool,
+    dns_ok: bool,
+    tcp_ok: bool,
+    websocket_ok: bool,
+    tls: bool,
+    auto_reconnect: bool,
+) -> Vec<String> {
+    let mut recommendations = Vec::new();
+
+    if !auth_ready {
+        recommendations.push(
+            "auth profile is incomplete; reconnect with valid username/password before troubleshooting"
+                .to_string(),
+        );
+    }
+
+    if !dns_ok {
+        recommendations.push(
+            "DNS resolution failed; verify --host value and local resolver settings".to_string(),
+        );
+    }
+
+    if dns_ok && !tcp_ok {
+        recommendations.push(
+            "TCP connect failed; confirm server process is running and firewall allows the target port"
+                .to_string(),
+        );
+    }
+
+    if tcp_ok && !websocket_ok {
+        if tls {
+            recommendations.push(
+                "WebSocket TLS handshake failed; verify certificate chain and server TLS settings"
+                    .to_string(),
+            );
+        } else {
+            recommendations.push(
+                "WebSocket upgrade failed on plain mode; confirm server protocol and TLS mode match"
+                    .to_string(),
+            );
+        }
+    }
+
+    if !auto_reconnect {
+        recommendations.push(
+            "auto reconnect is disabled; remove --no-reconnect for smoother recovery".to_string(),
+        );
+    }
+
+    if recommendations.is_empty() {
+        recommendations.push("no issues detected by doctor checks".to_string());
+    }
+
+    recommendations
+}
+
+async fn run_connection_doctor(state: &SharedState) -> serde_json::Value {
+    let (username, host, port, tls, auto_reconnect, current_scope, password_hash_present, key_ok) = {
+        let state_lock = state.lock().await;
+        (
+            state_lock.me.trim().to_string(),
+            state_lock.client_config.host.trim().to_string(),
+            state_lock.client_config.port,
+            state_lock.client_config.tls,
+            state_lock.client_config.auto_reconnect,
+            state_lock.ch.clone(),
+            !state_lock.pw.trim().is_empty(),
+            pub_b64(&state_lock.priv_key).is_ok(),
+        )
+    };
+
+    let normalized_user = if username.is_empty() {
+        "anonymous".to_string()
+    } else {
+        username
+    };
+    let normalized_host = if host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+    let uri = format!(
+        "{}://{}:{}",
+        if tls { "wss" } else { "ws" },
+        normalized_host,
+        port
+    );
+
+    let username_format_ok = sanitize_username(&normalized_user) == normalized_user;
+    let auth_ready = username_format_ok && password_hash_present && key_ok;
+
+    let dns_started = Instant::now();
+    let (dns_ok, dns_addresses, dns_error) = match timeout(
+        Duration::from_secs(4),
+        lookup_host((normalized_host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(addresses)) => {
+            let dedup: BTreeSet<String> = addresses.map(|addr| addr.ip().to_string()).collect();
+            let list: Vec<String> = dedup.into_iter().collect();
+            if list.is_empty() {
+                (
+                    false,
+                    list,
+                    Some("resolver returned no addresses".to_string()),
+                )
+            } else {
+                (true, list, None)
+            }
+        }
+        Ok(Err(err)) => (false, Vec::new(), Some(err.to_string())),
+        Err(_) => (
+            false,
+            Vec::new(),
+            Some("dns resolution timed out after 4s".to_string()),
+        ),
+    };
+    let dns_latency_ms = millis_u64(dns_started.elapsed());
+
+    let tcp_started = Instant::now();
+    let (tcp_ok, tcp_latency_ms, tcp_error) = match timeout(
+        Duration::from_secs(5),
+        TcpStream::connect((normalized_host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            (true, Some(millis_u64(tcp_started.elapsed())), None)
+        }
+        Ok(Err(err)) => (false, None, Some(err.to_string())),
+        Err(_) => (
+            false,
+            None,
+            Some("tcp connect timed out after 5s".to_string()),
+        ),
+    };
+
+    let ws_started = Instant::now();
+    let (websocket_ok, websocket_latency_ms, websocket_error) = if !tcp_ok {
+        (
+            false,
+            None,
+            Some("skipped because tcp probe failed".to_string()),
+        )
+    } else {
+        match timeout(Duration::from_secs(8), connect_async(&uri)).await {
+            Ok(Ok((mut ws_stream, _))) => {
+                let _ = ws_stream.close(None).await;
+                (true, Some(millis_u64(ws_started.elapsed())), None)
+            }
+            Ok(Err(err)) => (false, None, Some(friendly_ws_error(&err, tls))),
+            Err(_) => (
+                false,
+                None,
+                Some("websocket handshake timed out after 8s".to_string()),
+            ),
+        }
+    };
+
+    let recommendations = connection_doctor_recommendations(
+        auth_ready,
+        dns_ok,
+        tcp_ok,
+        websocket_ok,
+        tls,
+        auto_reconnect,
+    );
+
+    serde_json::json!({
+        "schema_version": 1,
+        "profile": {
+            "user": normalized_user,
+            "scope": current_scope,
+            "host": normalized_host,
+            "port": port,
+            "tls": tls,
+            "auto_reconnect": auto_reconnect,
+            "uri": uri,
+        },
+        "auth": {
+            "ready": auth_ready,
+            "username_format_ok": username_format_ok,
+            "password_hash_present": password_hash_present,
+            "local_keypair_ready": key_ok,
+        },
+        "dns": {
+            "ok": dns_ok,
+            "latency_ms": dns_latency_ms,
+            "addresses": dns_addresses,
+            "error": dns_error,
+        },
+        "tcp": {
+            "ok": tcp_ok,
+            "latency_ms": tcp_latency_ms,
+            "error": tcp_error,
+        },
+        "websocket": {
+            "ok": websocket_ok,
+            "latency_ms": websocket_latency_ms,
+            "error": websocket_error,
+        },
+        "overall": {
+            "healthy": auth_ready && dns_ok && tcp_ok && websocket_ok,
+        },
+        "recommendations": recommendations,
+    })
+}
+
+fn print_connection_doctor_report(diagnostics: &serde_json::Value) {
+    let profile = diagnostics
+        .get("profile")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let auth = diagnostics
+        .get("auth")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let dns = diagnostics
+        .get("dns")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let tcp = diagnostics
+        .get("tcp")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let websocket = diagnostics
+        .get("websocket")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let dns_addresses = dns
+        .get("addresses")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            let values: Vec<&str> = entries.iter().filter_map(|v| v.as_str()).collect();
+            if values.is_empty() {
+                "none".to_string()
+            } else {
+                values.join(",")
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let dns_error = dns.get("error").and_then(|v| v.as_str()).unwrap_or("-");
+    let tcp_error = tcp.get("error").and_then(|v| v.as_str()).unwrap_or("-");
+    let websocket_error = websocket
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+
+    println!("Connection doctor:");
+    println!(
+        "  profile: user={} scope={} server={}:{} tls={} auto_reconnect={}",
+        profile
+            .get("user")
+            .and_then(|v| v.as_str())
+            .unwrap_or("anonymous"),
+        profile
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general"),
+        profile
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1"),
+        profile.get("port").and_then(|v| v.as_u64()).unwrap_or(0),
+        profile
+            .get("tls")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        profile
+            .get("auto_reconnect")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    );
+    println!(
+        "  auth: ready={} username_format={} password_hash={} keypair={}",
+        auth.get("ready").and_then(|v| v.as_bool()).unwrap_or(false),
+        auth.get("username_format_ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        auth.get("password_hash_present")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        auth.get("local_keypair_ready")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    );
+    println!(
+        "  dns: ok={} latency_ms={} addresses={} detail={}",
+        dns.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        dns.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        dns_addresses,
+        dns_error
+    );
+    println!(
+        "  tcp: ok={} latency_ms={} detail={}",
+        tcp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        tcp.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        tcp_error
+    );
+    println!(
+        "  websocket: ok={} latency_ms={} detail={}",
+        websocket
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        websocket
+            .get("latency_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        websocket_error
+    );
+
+    let overall_healthy = diagnostics
+        .get("overall")
+        .and_then(|v| v.get("healthy"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    println!(
+        "  overall: {}",
+        if overall_healthy {
+            "healthy"
+        } else {
+            "degraded"
+        }
+    );
+
+    if let Some(recommendations) = diagnostics
+        .get("recommendations")
+        .and_then(|v| v.as_array())
+    {
+        for recommendation in recommendations {
+            if let Some(text) = recommendation.as_str() {
+                println!("  recommendation: {}", text);
+            }
+        }
+    }
+}
+
 fn send_notification_test(
     cfg: &clifford::config::NotificationConfig,
     level: &str,
@@ -1179,6 +1556,27 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
             let state_lock = state.lock().await;
             if let Err(err) = state_lock.send_db_profile() {
                 eprintln!("failed to request db profile: {}", err);
+            }
+        }
+        "/doctor" => {
+            let tokens: Vec<&str> = parts.collect();
+            let json_output = if tokens.is_empty() {
+                false
+            } else if tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("--json") {
+                true
+            } else {
+                print_doctor_usage();
+                return true;
+            };
+
+            let diagnostics = run_connection_doctor(state).await;
+            if json_output {
+                match serde_json::to_string_pretty(&diagnostics) {
+                    Ok(rendered) => println!("{}", rendered),
+                    Err(err) => eprintln!("failed to serialize doctor diagnostics: {}", err),
+                }
+            } else {
+                print_connection_doctor_report(&diagnostics);
             }
         }
         "/typing" => {
@@ -2311,6 +2709,383 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
     true
 }
 
+fn reconnect_backoff_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    let seconds = (RECONNECT_BASE_DELAY_SECS << shift).min(RECONNECT_MAX_DELAY_SECS);
+    Duration::from_secs(seconds)
+}
+
+fn enqueue_pending_frame(queue: &mut VecDeque<String>, frame: String) {
+    if queue.len() >= MAX_OFFLINE_OUTBOUND_QUEUE {
+        let _ = queue.pop_front();
+        eprintln!(
+            "[offline-queue] pending queue reached {} frames; dropped oldest message.",
+            MAX_OFFLINE_OUTBOUND_QUEUE
+        );
+    }
+    queue.push_back(frame);
+}
+
+fn enqueue_pending_frame_front(queue: &mut VecDeque<String>, frame: String) {
+    if queue.len() >= MAX_OFFLINE_OUTBOUND_QUEUE {
+        let _ = queue.pop_back();
+        eprintln!(
+            "[offline-queue] pending queue reached {} frames; dropped newest message.",
+            MAX_OFFLINE_OUTBOUND_QUEUE
+        );
+    }
+    queue.push_front(frame);
+}
+
+fn friendly_ws_error(error: &tungstenite::Error, tls: bool) -> String {
+    if let tungstenite::Error::Io(io_error) = error {
+        return match io_error.kind() {
+            io::ErrorKind::ConnectionRefused => {
+                "Server refused the connection. Verify host/port and that chatify-server is running."
+                    .to_string()
+            }
+            io::ErrorKind::TimedOut => {
+                "Connection timed out. Check network reachability and firewall rules.".to_string()
+            }
+            io::ErrorKind::NotFound | io::ErrorKind::AddrNotAvailable => {
+                "Destination host or port is unavailable. Validate the connection profile."
+                    .to_string()
+            }
+            io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof => {
+                "Connection dropped by peer. The client will attempt to reconnect.".to_string()
+            }
+            io::ErrorKind::PermissionDenied => {
+                "Connection blocked by local OS policy or firewall.".to_string()
+            }
+            _ => format!("Network I/O error: {}", io_error),
+        };
+    }
+
+    let raw = error.to_string();
+    let lower = raw.to_ascii_lowercase();
+
+    if lower.contains("certificate") || lower.contains("tls") || lower.contains("handshake") {
+        return if tls {
+            "TLS handshake failed. Verify cert/key configuration and trust chain.".to_string()
+        } else {
+            "Handshake failed. Server may require TLS; try enabling --tls.".to_string()
+        };
+    }
+
+    if lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
+        return "Authentication rejected by server. Check username/password and access policy."
+            .to_string();
+    }
+
+    format!("WebSocket error: {}", raw)
+}
+
+fn is_auth_rejection_frame(data: &serde_json::Value) -> bool {
+    if data.get("t").and_then(|v| v.as_str()) != Some("err") {
+        return false;
+    }
+
+    let message = data
+        .get("m")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    [
+        "auth",
+        "credential",
+        "password",
+        "unauthorized",
+        "forbidden",
+        "invalid token",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+async fn channels_to_rejoin(state: &SharedState) -> Vec<String> {
+    let state_lock = state.lock().await;
+    let mut channels = BTreeSet::new();
+    channels.insert("general".to_string());
+
+    if !state_lock.ch.starts_with("dm:") {
+        let normalized =
+            clifford::normalize_channel(&state_lock.ch).unwrap_or_else(|| "general".to_string());
+        channels.insert(normalized);
+    }
+
+    for (channel, joined) in &state_lock.chs {
+        if !joined {
+            continue;
+        }
+
+        if let Some(normalized) = clifford::normalize_channel(channel) {
+            channels.insert(normalized);
+        }
+    }
+
+    channels.into_iter().collect()
+}
+
+async fn wait_backoff_with_buffer(
+    outbound_rx: &mut mpsc::UnboundedReceiver<String>,
+    pending_frames: &mut VecDeque<String>,
+    delay: Duration,
+) -> bool {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return true,
+            maybe_frame = outbound_rx.recv() => {
+                match maybe_frame {
+                    Some(frame) => enqueue_pending_frame(pending_frames, frame),
+                    None => return false,
+                }
+            }
+        }
+    }
+}
+
+async fn run_connection_supervisor(
+    state: SharedState,
+    mut outbound_rx: mpsc::UnboundedReceiver<String>,
+    uri: String,
+    auth: ConnectionAuth,
+    reconnect_enabled: bool,
+    tls: bool,
+) {
+    let mut reconnect_attempt = 0u32;
+    let mut pending_frames = VecDeque::new();
+
+    loop {
+        let connect_result = connect_async(&uri).await;
+        let (ws_stream, _) = match connect_result {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("[connect] {}", friendly_ws_error(&error, tls));
+
+                if !reconnect_enabled {
+                    eprintln!(
+                        "[connect] auto-reconnect is off; exiting after failed connection attempt."
+                    );
+                    break;
+                }
+
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                let delay = reconnect_backoff_delay(reconnect_attempt);
+                eprintln!(
+                    "[reconnect] Attempt #{} in {}s. Outbound messages are queued.",
+                    reconnect_attempt,
+                    delay.as_secs()
+                );
+
+                if !wait_backoff_with_buffer(&mut outbound_rx, &mut pending_frames, delay).await {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        reconnect_attempt = 0;
+        println!("[connection] Connected to {}", uri);
+
+        let (mut write, mut read) = ws_stream.split();
+
+        let auth_frame = serde_json::json!({
+            "t": "auth",
+            "u": auth.username,
+            "pw": auth.password_hash,
+            "pk": auth.public_key,
+            "status": {"text": "Online", "emoji": ""}
+        })
+        .to_string();
+
+        if let Err(error) = write.send(Message::Text(auth_frame)).await {
+            eprintln!(
+                "[connect] failed to send auth frame: {}",
+                friendly_ws_error(&error, tls)
+            );
+
+            if !reconnect_enabled {
+                eprintln!("[connect] auto-reconnect is off; exiting after failed auth frame send.");
+                break;
+            }
+
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            let delay = reconnect_backoff_delay(reconnect_attempt);
+            eprintln!(
+                "[reconnect] Attempt #{} in {}s. Outbound messages are queued.",
+                reconnect_attempt,
+                delay.as_secs()
+            );
+
+            if !wait_backoff_with_buffer(&mut outbound_rx, &mut pending_frames, delay).await {
+                break;
+            }
+            continue;
+        }
+
+        let channels = channels_to_rejoin(&state).await;
+        let mut reconnect_reason = String::new();
+        for channel in channels {
+            let join_frame = serde_json::json!({"t": "join", "ch": channel}).to_string();
+            if let Err(error) = write.send(Message::Text(join_frame)).await {
+                reconnect_reason = format!(
+                    "failed to restore joined channels: {}",
+                    friendly_ws_error(&error, tls)
+                );
+                break;
+            }
+        }
+
+        if !reconnect_reason.is_empty() {
+            eprintln!("[connection] {}", reconnect_reason);
+            if !reconnect_enabled {
+                eprintln!("[connection] auto-reconnect is off; exiting after restore failure.");
+                break;
+            }
+
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            let delay = reconnect_backoff_delay(reconnect_attempt);
+            eprintln!(
+                "[reconnect] Attempt #{} in {}s. Outbound messages are queued.",
+                reconnect_attempt,
+                delay.as_secs()
+            );
+
+            if !wait_backoff_with_buffer(&mut outbound_rx, &mut pending_frames, delay).await {
+                break;
+            }
+            continue;
+        }
+
+        while let Some(frame) = pending_frames.pop_front() {
+            if let Err(error) = write.send(Message::Text(frame.clone())).await {
+                enqueue_pending_frame_front(&mut pending_frames, frame);
+                reconnect_reason = format!(
+                    "connection dropped while flushing queued messages: {}",
+                    friendly_ws_error(&error, tls)
+                );
+                break;
+            }
+        }
+
+        if !reconnect_reason.is_empty() {
+            eprintln!("[connection] {}", reconnect_reason);
+            if !reconnect_enabled {
+                eprintln!("[connection] auto-reconnect is off; exiting after queue flush failure.");
+                break;
+            }
+
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            let delay = reconnect_backoff_delay(reconnect_attempt);
+            eprintln!(
+                "[reconnect] Attempt #{} in {}s. Outbound messages are queued.",
+                reconnect_attempt,
+                delay.as_secs()
+            );
+
+            if !wait_backoff_with_buffer(&mut outbound_rx, &mut pending_frames, delay).await {
+                break;
+            }
+            continue;
+        }
+
+        let mut authenticated = false;
+        loop {
+            tokio::select! {
+                maybe_outbound = outbound_rx.recv() => {
+                    let Some(frame) = maybe_outbound else {
+                        return;
+                    };
+
+                    if let Err(error) = write.send(Message::Text(frame.clone())).await {
+                        enqueue_pending_frame_front(&mut pending_frames, frame);
+                        reconnect_reason = format!("outbound stream failed: {}", friendly_ws_error(&error, tls));
+                        break;
+                    }
+                }
+                inbound = read.next() => {
+                    match inbound {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if data.get("t").and_then(|v| v.as_str()) == Some("ok") {
+                                    authenticated = true;
+                                }
+
+                                if !authenticated && is_auth_rejection_frame(&data) {
+                                    let msg = data
+                                        .get("m")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("authentication rejected");
+                                    eprintln!(
+                                        "[auth] {}. Check username/password and server auth policy.",
+                                        msg
+                                    );
+                                    return;
+                                }
+
+                                if let Some(map) = data.as_object() {
+                                    handlers::dispatch_event(&state, map).await;
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            reconnect_reason = frame
+                                .map(|close| format!(
+                                    "server closed connection (code={} reason='{}')",
+                                    close.code,
+                                    close.reason
+                                ))
+                                .unwrap_or_else(|| "server closed connection".to_string());
+                            break;
+                        }
+                        Some(Err(error)) => {
+                            reconnect_reason = friendly_ws_error(&error, tls);
+                            break;
+                        }
+                        Some(_) => {}
+                        None => {
+                            reconnect_reason =
+                                "websocket stream ended unexpectedly; server may have restarted"
+                                    .to_string();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("[connection] {}", reconnect_reason);
+
+        if !reconnect_enabled {
+            eprintln!("[connection] auto-reconnect is off; exiting client network loop.");
+            break;
+        }
+
+        reconnect_attempt = reconnect_attempt.saturating_add(1);
+        let delay = reconnect_backoff_delay(reconnect_attempt);
+        eprintln!(
+            "[reconnect] Attempt #{} in {}s. Outbound messages are queued.",
+            reconnect_attempt,
+            delay.as_secs()
+        );
+
+        if !wait_backoff_with_buffer(&mut outbound_rx, &mut pending_frames, delay).await {
+            break;
+        }
+    }
+}
+
 async fn run_input_loop(state: SharedState) {
     print_help();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -2332,7 +3107,7 @@ async fn run_input_loop(state: SharedState) {
 #[tokio::main]
 async fn main() -> ChatifyResult<()> {
     let args = Args::parse();
-    let config = Config::load();
+    let mut config = Config::load();
     NotificationService::init();
     let client_config = args.merge_with_config(&config);
 
@@ -2343,13 +3118,32 @@ async fn main() -> ChatifyResult<()> {
     }
 
     let uri = client_config.uri();
-    info!("Connecting to {}", uri);
+    info!("Prepared connection target {}", uri);
 
-    let default_username = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "user".to_string());
+    let default_username = if config.session.remember_username {
+        let remembered = config.session.last_username.trim();
+        if remembered.is_empty() {
+            std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_else(|_| "user".to_string())
+        } else {
+            remembered.to_string()
+        }
+    } else {
+        std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "user".to_string())
+    };
+
     let input_username = prompt_input("Username", Some(&default_username))?;
     let username = sanitize_username(&input_username);
+
+    if config.session.remember_username && config.session.last_username != username {
+        config.session.last_username = username.clone();
+        if let Err(err) = config.save() {
+            eprintln!("failed to persist remembered username: {}", err);
+        }
+    }
 
     let mut password = String::new();
     while password.is_empty() {
@@ -2360,11 +3154,7 @@ async fn main() -> ChatifyResult<()> {
     }
     let pw_hash = pw_hash_client(&password).map_err(ChatifyError::Validation)?;
 
-    let (ws_stream, _) = connect_async(&uri).await?;
-    let (mut write, mut read) = ws_stream.split();
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
     let state: SharedState = Arc::new(Mutex::new(ClientState::new(
         tx,
         client_config.clone(),
@@ -2380,6 +3170,15 @@ async fn main() -> ChatifyResult<()> {
         state_lock.pw = pw_hash.clone();
         state_lock.priv_key = priv_key;
 
+        if state_lock.config.session.remember_channel {
+            if let Some(saved_channel) =
+                clifford::normalize_channel(&state_lock.config.session.last_channel)
+            {
+                state_lock.ch = saved_channel.clone();
+                state_lock.chs.insert(saved_channel, true);
+            }
+        }
+
         match state_lock.load_trust_store() {
             Ok(true) => {
                 println!(
@@ -2394,55 +3193,31 @@ async fn main() -> ChatifyResult<()> {
         }
     }
 
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write.send(Message::Text(msg)).await.is_err() {
-                break;
-            }
+    println!(
+        "Connecting to {} (auto-reconnect: {}).",
+        uri,
+        if client_config.auto_reconnect {
+            "on"
+        } else {
+            "off"
         }
-    });
+    );
+    println!("Tip: use /commands for discoverability and /help <command> for details.");
 
-    let recv_state = state.clone();
-    let _uri = uri.clone();
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(map) = data.as_object() {
-                            handlers::dispatch_event(&recv_state, map).await;
-                        }
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    eprintln!("\n[disconnected] Connection closed. Please restart the client.");
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("\n[error] Connection error: {}. Please restart.", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
+    let auth = ConnectionAuth {
+        username,
+        password_hash: pw_hash,
+        public_key: pub_key,
+    };
 
-    {
-        let state_lock = state.lock().await;
-        state_lock
-            .send_json(serde_json::json!({
-                "t": "auth",
-                "u": username,
-                "pw": pw_hash,
-                "pk": pub_key,
-                "status": {"text": "Online", "emoji": ""}
-            }))
-            .map_err(ChatifyError::Message)?;
-
-        state_lock
-            .send_join("general")
-            .map_err(ChatifyError::Message)?;
-    }
+    let mut connection_task = tokio::spawn(run_connection_supervisor(
+        state.clone(),
+        rx,
+        uri,
+        auth,
+        client_config.auto_reconnect,
+        client_config.tls,
+    ));
 
     let mut input_task = tokio::spawn({
         let state = state.clone();
@@ -2463,12 +3238,27 @@ async fn main() -> ChatifyResult<()> {
 
     tokio::select! {
         _ = &mut input_task => {}
-        _ = &mut recv_task => {}
+        _ = &mut connection_task => {}
     }
 
-    send_task.abort();
-    recv_task.abort();
+    connection_task.abort();
     input_task.abort();
+
+    {
+        let state_lock = state.lock().await;
+        let mut persisted = state_lock.config.clone();
+        if persisted.session.remember_username {
+            persisted.session.last_username = state_lock.me.clone();
+        }
+        if persisted.session.remember_channel {
+            persisted.session.last_channel = state_lock.ch.clone();
+        }
+        drop(state_lock);
+
+        if let Err(err) = persisted.save() {
+            eprintln!("failed to persist session defaults: {}", err);
+        }
+    }
 
     println!("Disconnected");
     Ok(())
@@ -2477,9 +3267,10 @@ async fn main() -> ChatifyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_notification_export, build_notify_diagnostics_json, notification_key_for_token,
+        build_notification_export, build_notify_diagnostics_json,
+        connection_doctor_recommendations, is_auth_rejection_frame, notification_key_for_token,
         notification_value_for_key, notify_export_default_path, parse_notify_probe_level,
-        parse_notify_test_args, parse_plugin_command, parse_toggle_bool,
+        parse_notify_test_args, parse_plugin_command, parse_toggle_bool, reconnect_backoff_delay,
         redact_notification_export, sanitize_notify_component, PluginCommand,
     };
     #[cfg(feature = "bridge-client")]
@@ -2500,6 +3291,50 @@ mod tests {
     fn parse_toggle_bool_rejects_unknown_values() {
         assert_eq!(parse_toggle_bool("maybe"), None);
         assert_eq!(parse_toggle_bool(""), None);
+    }
+
+    #[test]
+    fn reconnect_backoff_delay_caps_at_maximum() {
+        assert_eq!(reconnect_backoff_delay(1).as_secs(), 1);
+        assert_eq!(reconnect_backoff_delay(2).as_secs(), 2);
+        assert_eq!(reconnect_backoff_delay(3).as_secs(), 4);
+        assert_eq!(reconnect_backoff_delay(6).as_secs(), 30);
+        assert_eq!(reconnect_backoff_delay(12).as_secs(), 30);
+    }
+
+    #[test]
+    fn auth_rejection_detection_is_specific_to_auth_errors() {
+        assert!(is_auth_rejection_frame(
+            &serde_json::json!({"t": "err", "m": "invalid credentials"})
+        ));
+        assert!(is_auth_rejection_frame(
+            &serde_json::json!({"t": "err", "m": "unauthorized user"})
+        ));
+        assert!(!is_auth_rejection_frame(
+            &serde_json::json!({"t": "err", "m": "rate limit exceeded"})
+        ));
+        assert!(!is_auth_rejection_frame(&serde_json::json!({"t": "ok"})));
+    }
+
+    #[test]
+    fn doctor_recommendations_include_actionable_failures() {
+        let recommendations =
+            connection_doctor_recommendations(false, false, false, false, true, false);
+
+        let joined = recommendations.join(" | ");
+        assert!(joined.contains("auth profile is incomplete"));
+        assert!(joined.contains("DNS resolution failed"));
+        assert!(joined.contains("auto reconnect is disabled"));
+    }
+
+    #[test]
+    fn doctor_recommendations_report_healthy_path() {
+        let recommendations =
+            connection_doctor_recommendations(true, true, true, true, false, true);
+        assert_eq!(
+            recommendations,
+            vec!["no issues detected by doctor checks".to_string()]
+        );
     }
 
     #[test]
