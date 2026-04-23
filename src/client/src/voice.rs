@@ -10,8 +10,8 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 
-use clifford::error::{ChatifyError, ChatifyResult};
-use clifford::voice::AudioProcessor;
+use chatify::error::{ChatifyError, ChatifyResult};
+use chatify::voice::AudioProcessor;
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{

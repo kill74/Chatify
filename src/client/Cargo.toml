@@ -1,5 +1,5 @@
 [package]
-name = "clifford-client"
+name = "chatify-client"
 version = "0.3.0"
 edition = "2021"
 
@@ -8,7 +8,7 @@ default = []
 bridge-client = []
 
 [lib]
-name = "clifford_client"
+name = "chatify_client"
 path = "src/lib.rs"
 
 [[bin]]
@@ -16,7 +16,7 @@ name = "chatify-client"
 path = "src/main.rs"
 
 [dependencies]
-clifford = { path = "../../" }
+chatify = { path = "../../" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
 tungstenite = "0.21"

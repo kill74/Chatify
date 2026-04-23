@@ -17,8 +17,8 @@ function ConvertFrom-JsonCompat {
 
 function Get-ChatifyReleaseTargets {
   return @(
-    [pscustomobject]@{ Package = "clifford-server"; Binary = "chatify-server" },
-    [pscustomobject]@{ Package = "clifford-client"; Binary = "chatify-client" }
+    [pscustomobject]@{ Package = "chatify-server"; Binary = "chatify-server" },
+    [pscustomobject]@{ Package = "chatify-client"; Binary = "chatify-client" }
   )
 }
 

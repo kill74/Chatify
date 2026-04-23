@@ -1,5 +1,5 @@
 [package]
-name = "clifford"
+name = "chatify"
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
@@ -18,7 +18,7 @@ path = "src/discord_bot.rs"
 required-features = ["discord-bridge"]
 
 [lib]
-name = "clifford"
+name = "chatify"
 path = "src/lib.rs"
 
 [dependencies]

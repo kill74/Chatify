@@ -1,6 +1,7 @@
 # Chatify
 
 [![CI](https://github.com/kill74/Chatify/actions/workflows/ci.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/kill74/Chatify/actions/workflows/codeql.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/codeql.yml)
 [![Windows Release Package](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/windows-release-package.yml)
 [![Release Security Report](https://github.com/kill74/Chatify/actions/workflows/release-security-report.yml/badge.svg)](https://github.com/kill74/Chatify/actions/workflows/release-security-report.yml)
 [![Release](https://img.shields.io/github/v/release/kill74/Chatify)](https://github.com/kill74/Chatify/releases)
@@ -8,15 +9,34 @@
 
 Self-hosted, terminal-native chat server written in Rust. Ships a WebSocket server, a terminal dashboard client, and an optional Discord relay bridge. Designed for controlled deployments where operational transparency and protocol correctness matter more than UI polish.
 
+## 30-Second Engineering Signal
+
+![Chatify terminal dashboard](docs/assets/chatify-dashboard.png)
+
+**Quick demo:** [Run the two-terminal local walkthrough](docs/DEMO.md), or skim the recorded terminal flow below.
+
+![Chatify local terminal demo](docs/assets/chatify-demo.gif)
+
+| Signal | Evidence |
+| ------ | -------- |
+| Async Rust system | WebSocket server, terminal client, and feature-gated Discord bridge |
+| Protocol correctness | [Contract tests](tests/message_contracts.rs) for auth, bootstrap compatibility, versioning, and media transfer |
+| Persistence discipline | Append-only SQLite event store with schema no-downgrade policy |
+| Performance evidence | [100k-event history/search baseline](docs/BENCHMARKS.md) backed by a contract test |
+| Engineering judgment | [Case study](docs/ENGINEERING_CASE_STUDY.md) and [v0.3.0 release notes](https://github.com/kill74/Chatify/releases/tag/v0.3.0) show tradeoffs and shipped increments |
+| Operational maturity | [CI gates](.github/workflows/ci.yml), [CodeQL scanning](.github/workflows/codeql.yml), [Windows packaging](.github/workflows/windows-release-package.yml), checksums, and [release security reports](.github/workflows/release-security-report.yml) |
+| Honest security posture | [Security entry point](SECURITY.md), documented limits, and no unaudited production-security overclaiming |
+
 ---
 
 ## Table of Contents
 
+- [30-Second Engineering Signal](#30-second-engineering-signal)
 - [Design Rationale](#design-rationale)
 - [System Overview](#system-overview)
 - [Quick Start](#quick-start)
 - [Configuration Reference](#configuration-reference)
-- [Client Command Reference](#client-command-reference)
+- [Client Commands](#client-commands)
 - [Persistence Model](#persistence-model)
 - [Trust & Identity Model](#trust--identity-model)
 - [Security Posture](#security-posture)
@@ -72,23 +92,6 @@ Most self-hosted chat systems are web-first and treat the protocol as a second-c
 | `chatify-client` | Terminal dashboard: channels, DMs, media, search, trust  |
 | `discord_bot`    | Discord ↔ Chatify relay bridge (feature-gated)           |
 
-**Terminal dashboard layout:**
-
-```text
-// CHATIFY // [ONLINE:3] [CHANNELS:2] [EVENTS:18] [UNREAD:1] [TYPING:0] [THEME:retro-grid]
-[ROOM:#general] [VOICE:OFF] [TRUST:T2/U1/C0] [STATUS:Online] [CLIENT:CID-ABCD-1234-EF90]
-
-┌GLOBAL_FEED───────────────────────────────────────────────┐  ┌PROFILE──────────────────────────┐
-│ [14:31] alice  #general                                  │  │ alice [CID-ABCD-1234-EF90]      │
-│   > testing media upload                                 │  │ status:  Online                 │
-│ [14:32] [VIDEO] alice shared 'demo.mp4' (12.40 MiB)      │  │ channel: #general               │
-│        saved: ~/.chatify/media/alice-...-demo.mp4        │  │ voice:   OFF                    │
-│ [14:33] IMG alice inline image (ASCII preview below)     │  └QUICK ACTIONS────────────────────┘
-│ @@@@%%%###**++==--::..                                   │  ┌LIVE ROSTER──────────────────────┐
-│                                                          │  │ ● alice  ● bob  ○ carol         │
-└──────────────────────────────────────────────────────────┘  └─────────────────────────────────┘
-```
-
 ---
 
 ## Quick Start
@@ -121,10 +124,10 @@ cargo build --release
 
 ```bash
 # Terminal 1
-cargo run --bin chatify-server
+cargo run -p chatify-server --bin chatify-server
 
 # Terminal 2
-cargo run --bin chatify-client -- --host 127.0.0.1 --port 8765
+cargo run -p chatify-client --bin chatify-client -- --host 127.0.0.1 --port 8765
 ```
 
 **Windows dev scripts with automatic artifact cleanup:**
@@ -186,100 +189,14 @@ cargo run --bin chatify-client -- --host 127.0.0.1 --port 8765
 
 ---
 
-## Client Command Reference
+## Client Commands
 
-| Command                                                           | Description                                                        |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `/commands [filter]`                                              | List commands, optionally filtered by keyword                      |
-| `/help [command]`                                                 | Show command help (general or per-command detail)                  |
-| `/join <channel>`                                                 | Join or switch to a channel                                        |
-| `/switch <channel>`                                               | Alias for `/join`                                                  |
-| `/leave [channel]`                                                | Leave a channel (defaults to current channel)                      |
-| `/part [channel]`                                                 | Alias for `/leave`                                                 |
-| `/history [ch\|dm:user] [limit]`                                  | Load channel or DM history                                         |
-| `/search [#ch\|dm:user] <query> [limit=N]`                        | Search timeline events                                             |
-| `/replay <from_ts> [#ch\|dm:user] [limit=N]`                      | Replay events from a unix timestamp                                |
-| `/users`                                                          | Refresh online users and key directory                             |
-| `/metrics`                                                        | Show runtime counters plus DB pool and DB latency summaries        |
-| `/db-profile` or `/dbprofile`                                     | Show focused DB latency profile and alerts                         |
-| `/doctor [--json]`                                                | Run connection diagnostics (DNS, TCP, WebSocket, auth readiness)   |
-| `/typing [on\|off] [#ch\|dm:user]`                                | Broadcast ephemeral typing state                                   |
-| `/voice <on\|off\|mute\|unmute\|deafen\|undeafen\|status> [room]` | Control voice session and signaling                                |
-| `/screen <start\|stop\|status> [room]`                            | Control screen-share signaling                                     |
-| `/notify [target] [on\|off]`                                      | Manage notification settings, exports, diagnostics, and probes     |
-| `/plugin [list\|install <plugin>\|disable <plugin>]`              | List, install, or disable server-side plugins                      |
-| `/bridge status`                                                  | Show connected bridge instances and route health (`bridge-client`) |
-| `/dm <user> <message>`                                            | Send encrypted direct message (trust-verified)                     |
-| `/fingerprint [user]`                                             | Show peer key fingerprint(s) and trust status                      |
-| `/trust <user> <fingerprint>`                                     | Mark a peer fingerprint as trusted after out-of-band verification  |
-| `/trust-audit [n]`                                                | Show recent trust audit entries                                    |
-| `/trust-export [path]`                                            | Export deterministic trust audit JSON                              |
-| `/recent [n]`                                                     | Show recent message IDs for quick reaction targeting               |
-| `/react <msg_id\|#index> <emoji>`                                 | React to a message by stable `msg_id` or recent index              |
-| `/sync`                                                           | Request reaction sync for the active channel                       |
-| `/image "<path>"`                                                 | Send an image file to the active channel                           |
-| `/video "<path>"`                                                 | Send a video file to the active channel                            |
-| `/audio "<path>"`                                                 | Send a short audio note to the active channel                      |
-| `/quit` `/exit` `/q`                                              | Disconnect and exit                                                |
+The terminal client is command-driven. The full command reference lives in [docs/COMMANDS.md](docs/COMMANDS.md); the high-signal workflows are:
 
-Any non-command text is sent as a channel message to the active scope.
-
-### Mentions and Notifications
-
-- Mention users with `@username` inside message text.
-- The client highlights mentions addressed to the current user.
-- Desktop notifications are controlled by `notifications.*` config flags:
-  - `notifications.on_mention` for mention alerts.
-  - `notifications.on_dm` for incoming DM alerts.
-  - `notifications.on_all_messages` for broad message alerts.
-- `/notify` lets you inspect and toggle these settings from the client runtime.
-- Valid `/notify` targets: `enabled`, `dm`, `mention`, `all`, `sound`.
-- Use `/notify <target>` to inspect a single notification setting.
-- Use `/notify reset` to restore notification settings to defaults.
-- Use `/notify export [--redact] [path|stdout]` to write a settings snapshot, optionally masking profile identifiers.
-- Use `/notify doctor [--json]` to print a quick diagnostics report in text or JSON format.
-- Use `/notify test [sound] [info|warning|critical] [message]` to trigger a one-time desktop notification probe.
-- Use `/doctor [--json]` for connection diagnostics (DNS, TCP, WebSocket, auth readiness).
-
-### Reactions and Message IDs
-
-- Every channel message now includes a stable `msg_id` in the protocol payload.
-- Reactions are sent as `reaction` events and aggregated per `(msg_id, emoji)`.
-- Clients can bootstrap reaction state with `reaction_sync` after join/reconnect.
-- For terminal UX, `/react #1 +1` targets the most recent visible message ID.
-
-### Runtime and Database Profiling
-
-- `/metrics` returns runtime traffic counters, cache hit-rate, DB pool stats, DB top operations (p50/p95/p99/avg), and DB alerts.
-- `/db-profile` (or `/dbprofile`) returns a DB-focused view with top operations, pool pressure, and latency alerts.
-- Current default DB latency budget thresholds are `warning_p95=50ms`, `critical_p95=200ms`, with `min_samples=5`.
-
-### Connection Diagnostics and Recovery
-
-- Automatic reconnect is enabled by default and uses bounded exponential backoff (`1s` to `30s`).
-- Use `--no-reconnect` to disable reconnect retries for deterministic failure behavior.
-- Use `/doctor` to run an on-demand diagnostics pass (auth readiness, DNS, TCP reachability, WebSocket handshake).
-- Use `/doctor --json` for structured diagnostics output suitable for scripts and support bundles.
-- Outbound messages are buffered while reconnecting; the queue is bounded to avoid unbounded memory growth.
-
-### Media Transfer
-
-Media transfer uses `file_meta` + `file_chunk` framing over the existing WebSocket connection — no separate HTTP endpoint and no second auth context.
-
-```text
-/image "/path/to/screenshot.png"
-/video "/path/to/demo.mp4"
-/audio "/path/to/voice-note.ogg"
-```
-
-Received files are written to:
-
-- **Windows:** `%APPDATA%\Chatify\media\`
-- **Linux/macOS:** `$HOME/.chatify/media/`
-
-Image transfers render an ASCII preview inline in the terminal feed. Video transfers produce a metadata card (sender, filename, size, local path). The 100 MB cap is enforced at the application layer on the sender side.
-
-The client exposes `/image`, `/video`, and `/audio` directly. Each upload is chunked over WebSocket and bounded by the 100 MB sender-side cap.
+- Timeline: `/history`, `/search`, `/replay`
+- Trust: `/fingerprint`, `/trust`, `/trust-audit`, `/trust-export`
+- Operations: `/metrics`, `/db-profile`, `/doctor`
+- Rich messages: `/image`, `/video`, `/audio`, `/react`
 
 ---
 
@@ -492,7 +409,7 @@ cargo test --locked --test message_contracts file_contract_relays_media_metadata
 
 ```bash
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check -p clifford-client --features bridge-client --locked
+cargo check -p chatify-client --features bridge-client --locked
 ```
 
 All checks above are enforced in CI on every push to `main`. A failing check blocks merge.
@@ -514,6 +431,11 @@ Tracked explicitly rather than omitted:
 
 ## Project Docs
 
+- [docs/COMMANDS.md](docs/COMMANDS.md) - full terminal client command reference
+- [docs/DEMO.md](docs/DEMO.md) - two-terminal local demo walkthrough
+- [docs/RECRUITER_REVIEW_GUIDE.md](docs/RECRUITER_REVIEW_GUIDE.md) - 5-minute reviewer path and proof commands
+- [examples/plugins/README.md](examples/plugins/README.md) - tiny v1 plugin reference implementation
+- [SECURITY.md](SECURITY.md) - vulnerability reporting and supported security scope
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — component design, message flow, data model
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — benchmark methodology and baseline results
 - [docs/ENGINEERING_CASE_STUDY.md](docs/ENGINEERING_CASE_STUDY.md) — design decisions and tradeoff analysis

@@ -790,7 +790,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
 
 [[package]]
-name = "clifford"
+name = "chatify"
 version = "0.3.0"
 dependencies = [
  "base64 0.21.7",
@@ -850,13 +850,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "clifford-server"
+name = "chatify-server"
 version = "0.3.0"
 dependencies = [
  "base64 0.21.7",
  "bitflags 2.11.0",
  "clap",
- "clifford",
+ "chatify",
  "dashmap",
  "env_logger",
  "futures-util",

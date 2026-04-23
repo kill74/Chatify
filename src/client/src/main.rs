@@ -16,9 +16,9 @@
 //! # Architecture
 //!
 //! The client uses a decoupled actor-like pattern:
-//! - **UI layer** (`clifford_client::ui`): Terminal rendering, theme, markdown
+//! - **UI layer** (`chatify_client::ui`): Terminal rendering, theme, markdown
 //! - **State layer** (`ClientState`): Ephemeral session, message history, presence
-//! - **Handlers** (`clifford_client::handlers`): Business logic for commands and protocol events
+//! - **Handlers** (`chatify_client::handlers`): Business logic for commands and protocol events
 //! - **Protocol**: WebSocket communication with first-frame auth guarantee
 //!
 //! Session tokens are ephemeral—they don't survive server restarts, so all clients
@@ -31,9 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chatify::crypto::{new_keypair, pub_b64, pw_hash_client};
+use chatify::notifications::NotificationService;
 use clap::Parser;
-use clifford::crypto::{new_keypair, pub_b64, pw_hash_client};
-use clifford::notifications::NotificationService;
 use futures_util::{SinkExt, StreamExt};
 #[allow(unused_imports)]
 use log::info;
@@ -47,10 +47,10 @@ use tokio_tungstenite::{
     tungstenite::{self, Message},
 };
 
-use clifford::config::Config;
-use clifford::error::{ChatifyError, ChatifyResult};
+use chatify::config::Config;
+use chatify::error::{ChatifyError, ChatifyResult};
 
-use clifford_client::{
+use chatify_client::{
     args::Args,
     handlers,
     media::{guess_mime_from_path, MediaKind},
@@ -64,7 +64,7 @@ use clifford_client::{
 /// integrates with the terminal dashboard. Avoids stdout contention.
 macro_rules! println {
     ($($arg:tt)*) => {{
-        clifford_client::ui::emit_output_line(format!($($arg)*), false);
+        chatify_client::ui::emit_output_line(format!($($arg)*), false);
     }};
 }
 
@@ -73,7 +73,7 @@ macro_rules! println {
 /// Same as println! but semantically marked as an error stream for styling.
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
-        clifford_client::ui::emit_output_line(format!($($arg)*), true);
+        chatify_client::ui::emit_output_line(format!($($arg)*), true);
     }};
 }
 
@@ -391,7 +391,7 @@ fn normalize_scope_token(raw: &str, fallback_channel: &str, allow_plain_channel:
 
     if trimmed.starts_with('#') || allow_plain_channel {
         let channel_raw = trimmed.trim_start_matches('#');
-        return clifford::normalize_channel(channel_raw)
+        return chatify::normalize_channel(channel_raw)
             .unwrap_or_else(|| fallback_channel.to_string());
     }
 
@@ -433,7 +433,7 @@ fn notification_key_for_token(raw: &str) -> Option<&'static str> {
 }
 
 fn notification_value_for_key(
-    cfg: &clifford::config::NotificationConfig,
+    cfg: &chatify::config::NotificationConfig,
     key: &str,
 ) -> Option<bool> {
     match key {
@@ -570,7 +570,7 @@ fn parse_bridge_command(input: &str) -> Result<BridgeCommand, &'static str> {
 }
 
 fn build_notification_export(
-    cfg: &clifford::config::NotificationConfig,
+    cfg: &chatify::config::NotificationConfig,
     profile_user: &str,
     host: &str,
     port: u16,
@@ -655,7 +655,7 @@ fn notify_export_default_path(profile_user: &str, host: &str, port: u16, tls: bo
     base.join("exports").join(file_name)
 }
 
-fn notify_recommendations(cfg: &clifford::config::NotificationConfig) -> Vec<String> {
+fn notify_recommendations(cfg: &chatify::config::NotificationConfig) -> Vec<String> {
     let mut recommendations = Vec::new();
     if !cfg.enabled {
         recommendations.push(
@@ -678,7 +678,7 @@ fn notify_recommendations(cfg: &clifford::config::NotificationConfig) -> Vec<Str
 }
 
 fn build_notify_diagnostics_json(
-    cfg: &clifford::config::NotificationConfig,
+    cfg: &chatify::config::NotificationConfig,
     profile_user: &str,
     host: &str,
     port: u16,
@@ -733,7 +733,7 @@ fn build_notify_diagnostics_json(
     })
 }
 
-fn print_notification_settings(cfg: &clifford::config::NotificationConfig) {
+fn print_notification_settings(cfg: &chatify::config::NotificationConfig) {
     println!(
         "Notifications: enabled={} dm={} mention={} all={} sound={}",
         cfg.enabled, cfg.on_dm, cfg.on_mention, cfg.on_all_messages, cfg.sound_enabled
@@ -1106,7 +1106,7 @@ fn print_connection_doctor_report(diagnostics: &serde_json::Value) {
 }
 
 fn send_notification_test(
-    cfg: &clifford::config::NotificationConfig,
+    cfg: &chatify::config::NotificationConfig,
     level: &str,
     message: &str,
     sound_probe: bool,
@@ -1371,7 +1371,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 return true;
             };
             let channel =
-                clifford::normalize_channel(channel_raw).unwrap_or_else(|| "general".to_string());
+                chatify::normalize_channel(channel_raw).unwrap_or_else(|| "general".to_string());
 
             let mut state_lock = state.lock().await;
             state_lock.chs.insert(channel.clone(), true);
@@ -1388,7 +1388,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
             }
 
             let channel = if let Some(channel_raw) = maybe_channel_raw {
-                clifford::normalize_channel(channel_raw).unwrap_or_else(|| "general".to_string())
+                chatify::normalize_channel(channel_raw).unwrap_or_else(|| "general".to_string())
             } else {
                 let current = state.lock().await.ch.clone();
                 if current.starts_with("dm:") {
@@ -1631,7 +1631,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                     }
 
                     let requested_room = room_arg
-                        .and_then(clifford::normalize_channel)
+                        .and_then(chatify::normalize_channel)
                         .unwrap_or_default();
 
                     let (media_enabled, already_active, ws_tx, default_room) = {
@@ -1639,7 +1639,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                         let default_room = if state_lock.ch.starts_with("dm:") {
                             "general".to_string()
                         } else {
-                            clifford::normalize_channel(&state_lock.ch)
+                            chatify::normalize_channel(&state_lock.ch)
                                 .unwrap_or_else(|| "general".to_string())
                         };
 
@@ -1691,7 +1691,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                         return true;
                     }
 
-                    state_lock.voice_session = Some(clifford_client::state::VoiceSession {
+                    state_lock.voice_session = Some(chatify_client::state::VoiceSession {
                         room: room.clone(),
                         event_tx,
                     });
@@ -1840,14 +1840,14 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                     }
 
                     let room = if let Some(raw_room) = room_arg {
-                        clifford::normalize_channel(raw_room)
+                        chatify::normalize_channel(raw_room)
                             .unwrap_or_else(|| "general".to_string())
                     } else {
                         let current = state.lock().await.ch.clone();
                         if current.starts_with("dm:") {
                             "general".to_string()
                         } else {
-                            clifford::normalize_channel(&current)
+                            chatify::normalize_channel(&current)
                                 .unwrap_or_else(|| "general".to_string())
                         }
                     };
@@ -1867,14 +1867,14 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                     }
 
                     let room = if let Some(raw_room) = room_arg {
-                        clifford::normalize_channel(raw_room)
+                        chatify::normalize_channel(raw_room)
                             .unwrap_or_else(|| "general".to_string())
                     } else {
                         let current = state.lock().await.ch.clone();
                         if current.starts_with("dm:") {
                             "general".to_string()
                         } else {
-                            clifford::normalize_channel(&current)
+                            chatify::normalize_channel(&current)
                                 .unwrap_or_else(|| "general".to_string())
                         }
                     };
@@ -1935,7 +1935,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                     let mut state_lock = state.lock().await;
                     let old_config = state_lock.config.clone();
                     state_lock.config.notifications =
-                        clifford::config::NotificationConfig::default();
+                        chatify::config::NotificationConfig::default();
                     let new_config = state_lock.config.clone();
                     (old_config, new_config)
                 };
@@ -2616,7 +2616,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 return true;
             }
 
-            let file_id = clifford::fresh_nonce_hex();
+            let file_id = chatify::fresh_nonce_hex();
             {
                 let state_lock = state.lock().await;
                 if let Err(e) = state_lock.send_file_meta(OutgoingMediaMeta {
@@ -2817,7 +2817,7 @@ async fn channels_to_rejoin(state: &SharedState) -> Vec<String> {
 
     if !state_lock.ch.starts_with("dm:") {
         let normalized =
-            clifford::normalize_channel(&state_lock.ch).unwrap_or_else(|| "general".to_string());
+            chatify::normalize_channel(&state_lock.ch).unwrap_or_else(|| "general".to_string());
         channels.insert(normalized);
     }
 
@@ -2826,7 +2826,7 @@ async fn channels_to_rejoin(state: &SharedState) -> Vec<String> {
             continue;
         }
 
-        if let Some(normalized) = clifford::normalize_channel(channel) {
+        if let Some(normalized) = chatify::normalize_channel(channel) {
             channels.insert(normalized);
         }
     }
@@ -3172,7 +3172,7 @@ async fn main() -> ChatifyResult<()> {
 
         if state_lock.config.session.remember_channel {
             if let Some(saved_channel) =
-                clifford::normalize_channel(&state_lock.config.session.last_channel)
+                chatify::normalize_channel(&state_lock.config.session.last_channel)
             {
                 state_lock.ch = saved_channel.clone();
                 state_lock.chs.insert(saved_channel, true);
@@ -3222,7 +3222,7 @@ async fn main() -> ChatifyResult<()> {
     let mut input_task = tokio::spawn({
         let state = state.clone();
         async move {
-            match clifford_client::ui::run_tui_loop(state.clone(), |state, line| async move {
+            match chatify_client::ui::run_tui_loop(state.clone(), |state, line| async move {
                 handle_user_input(&state, &line).await
             })
             .await
@@ -3457,7 +3457,7 @@ mod tests {
 
     #[test]
     fn build_notification_export_contains_expected_fields() {
-        let cfg = clifford::config::NotificationConfig {
+        let cfg = chatify::config::NotificationConfig {
             enabled: true,
             on_dm: false,
             on_mention: true,
@@ -3495,7 +3495,7 @@ mod tests {
 
     #[test]
     fn redact_notification_export_masks_profile_identifiers() {
-        let cfg = clifford::config::NotificationConfig::default();
+        let cfg = chatify::config::NotificationConfig::default();
         let export = build_notification_export(&cfg, "alice", "chatify.local", 8765, false);
         let redacted = redact_notification_export(&export);
 
@@ -3531,7 +3531,7 @@ mod tests {
 
     #[test]
     fn build_notify_diagnostics_json_contains_recommendations() {
-        let cfg = clifford::config::NotificationConfig {
+        let cfg = chatify::config::NotificationConfig {
             enabled: false,
             on_dm: false,
             on_mention: false,
@@ -3550,7 +3550,7 @@ mod tests {
 
     #[test]
     fn notification_value_for_key_reads_expected_flags() {
-        let cfg = clifford::config::NotificationConfig {
+        let cfg = chatify::config::NotificationConfig {
             enabled: true,
             on_dm: false,
             on_mention: true,

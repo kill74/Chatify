@@ -63,9 +63,9 @@ impl DbDurabilityMode {
     }
 }
 
-/// Command-line arguments for `clifford-server`.
+/// Command-line arguments for `chatify-server`.
 #[derive(Parser)]
-#[command(name = "clifford-server")]
+#[command(name = "chatify-server")]
 pub struct Args {
     /// IP address the server will bind to.
     #[arg(long, default_value = "0.0.0.0")]

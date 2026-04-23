@@ -44,7 +44,7 @@ Chatify should feel differentiated by default in three ways:
 | Phase 2 Identity and Trust UX         | Complete                | High       | CLI trust workflow, key-change protection, and audit export are now shipped       | Monitor UX friction and tune defaults          |
 | Phase 3 Discord Bridge Re-Enable      | In progress (alpha)     | Medium     | Bridge runtime, route mapping, and status visibility exist                        | Stabilize and decide default-off vs default-on |
 | Phase 4 Terminal-Native Rich Messages | In progress             | Medium     | Markdown and ANSI are good; media UX is incomplete                                | Ship one media milestone cleanly               |
-| Phase 5 Plugin Runtime                | In progress (ecosystem enablement) | High       | API v1, built-ins, runtime management, and client plugin command UX are shipped    | Freeze examples and widen third-party validation |
+| Phase 5 Plugin Runtime                | In progress (ecosystem enablement) | High       | API v1, built-ins, runtime management, client plugin UX, and a reference example are shipped | Widen third-party validation |
 
 ## Program Health Metrics
 
@@ -171,10 +171,11 @@ Completed:
 - Runtime management supports install, list, and disable without restart (protocol-level).
 - Default client now exposes `/plugin list`, `/plugin install`, and `/plugin disable` for operator workflows.
 - Hardening delivered: strict response parsing, bounded I/O, process timeout, stronger termination behavior.
+- A tiny external reference plugin is available under `examples/plugins/`.
 
 Remaining:
 
-- Publish API v1 examples and reference plugin templates.
+- Broaden API v1 examples beyond the Windows-friendly reference plugin.
 - Add wider ecosystem validation for third-party plugin ergonomics.
 
 Exit Criteria:
@@ -191,7 +192,7 @@ Cycle goal: complete plugin operator follow-through and de-risk the next promoti
 | Workstream              | Deliverable                                                                  | Acceptance Criteria                                                     |
 | ----------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | Query UX follow-through | Publish usage examples for `/history`, `/search`, and `/replay`              | Operator docs match implemented CLI grammar and protocol scope behavior |
-| Plugin UX               | Publish API v1 examples and reference plugin templates                       | Third-party authors can follow documented install and command flows     |
+| Plugin UX               | Broaden API v1 examples and reference plugin templates                       | Third-party authors can follow documented install and command flows     |
 | Trust follow-through    | Publish operator guidance for `/fingerprint`, `/trust`, and `/trust-export`  | Docs match implemented trust UX and incident-export workflow            |
 | Bridge hardening        | Execute targeted reconnect/loop-prevention stress pass                       | No loop regressions in scripted stress test scenarios                   |
 | Rich media increment    | Ship one media milestone (`image preview` or `audio notes`)                  | Feature works with explicit fallback and can be disabled globally       |

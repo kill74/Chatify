@@ -1,6 +1,6 @@
-//! # `clifford-server` Integration Test Suite
+//! # `chatify-server` Integration Test Suite
 //!
-//! End-to-end contract tests for the `clifford-server` WebSocket binary.
+//! End-to-end contract tests for the `chatify-server` WebSocket binary.
 //!
 //! ## Architecture
 //!
@@ -19,7 +19,7 @@
 //! cargo test --test integration
 //! ```
 //!
-//! The binary path is resolved at compile time via the `CARGO_BIN_EXE_clifford-server`
+//! The binary path is resolved at compile time via the `CARGO_BIN_EXE_chatify-server`
 //! env var injected by Cargo, so no manual `PATH` setup is needed.
 //!
 //! ## Coverage Areas
@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use clifford::crypto::{new_keypair, pub_b64};
+use chatify::crypto::{new_keypair, pub_b64};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ fn temp_db_path(port: u16) -> PathBuf {
         "chatify-test-{}-{}-{}.db",
         std::process::id(),
         port,
-        clifford::fresh_nonce_hex()
+        chatify::fresh_nonce_hex()
     ))
 }
 
@@ -315,13 +315,9 @@ fn read_schema_version(db_path: &PathBuf) -> String {
 /// Preferred order:
 /// 1) Cargo-provided env vars (`CARGO_BIN_EXE_*`)
 /// 2) Sibling binary next to the compiled test in `target/debug`
-/// 3) One-time `cargo build -p clifford-server --bin chatify-server`
+/// 3) One-time `cargo build -p chatify-server --bin chatify-server`
 fn resolve_server_binary() -> PathBuf {
-    for var in [
-        "CARGO_BIN_EXE_chatify-server",
-        "CARGO_BIN_EXE_clifford-server",
-        "CARGO_BIN_EXE_clicord-server",
-    ] {
+    for var in ["CARGO_BIN_EXE_chatify-server"] {
         if let Ok(path) = std::env::var(var) {
             let candidate = PathBuf::from(path);
             if candidate.is_file() {
@@ -336,8 +332,6 @@ fn resolve_server_binary() -> PathBuf {
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(debug_dir) = current_exe.parent().and_then(|p| p.parent()) {
             candidates.push(debug_dir.join(format!("chatify-server{}", exe_suffix)));
-            candidates.push(debug_dir.join(format!("clifford-server{}", exe_suffix)));
-            candidates.push(debug_dir.join(format!("clicord-server{}", exe_suffix)));
         }
     }
 
@@ -351,16 +345,6 @@ fn resolve_server_binary() -> PathBuf {
             .join("debug")
             .join(format!("chatify-server{}", exe_suffix)),
     );
-    candidates.push(
-        target_dir
-            .join("debug")
-            .join(format!("clifford-server{}", exe_suffix)),
-    );
-    candidates.push(
-        target_dir
-            .join("debug")
-            .join(format!("clicord-server{}", exe_suffix)),
-    );
 
     // When Cargo does not inject CARGO_BIN_EXE_*, force a one-time build so
     // fallback binaries are guaranteed to match current sources.
@@ -368,7 +352,7 @@ fn resolve_server_binary() -> PathBuf {
         let status = Command::new("cargo")
             .arg("build")
             .arg("-p")
-            .arg("clifford-server")
+            .arg("chatify-server")
             .arg("--bin")
             .arg("chatify-server")
             .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
@@ -377,7 +361,7 @@ fn resolve_server_binary() -> PathBuf {
 
         assert!(
             status.success(),
-            "cargo build -p clifford-server --bin chatify-server failed"
+            "cargo build -p chatify-server --bin chatify-server failed"
         );
     });
 
@@ -1732,8 +1716,8 @@ async fn reaction_contract_broadcasts_and_syncs_aggregated_counts() {
                 "ch":"reaction-room",
                 "msg_id":msg_id,
                 "emoji":"+1",
-                "ts": clifford::now(),
-                "n": clifford::fresh_nonce_hex()
+                "ts": chatify::now(),
+                "n": chatify::fresh_nonce_hex()
             })
             .to_string(),
         ))
@@ -1791,8 +1775,8 @@ async fn reaction_contract_rejects_invalid_msg_id() {
                 "ch":"general",
                 "msg_id":"bad id with spaces",
                 "emoji":"+1",
-                "ts": clifford::now(),
-                "n": clifford::fresh_nonce_hex()
+                "ts": chatify::now(),
+                "n": chatify::fresh_nonce_hex()
             })
             .to_string(),
         ))

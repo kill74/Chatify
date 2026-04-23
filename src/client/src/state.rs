@@ -113,7 +113,7 @@ pub struct ClientState {
     /// Whether message logging is enabled.
     pub log_enabled: bool,
     /// Persistent user configuration (connection host, UI theme, etc.).
-    pub config: clifford::config::Config,
+    pub config: chatify::config::Config,
     /// Screen share session state (reserved).
     pub screen_share: Option<()>,
     /// Whether currently viewing another user's screen.
@@ -298,7 +298,7 @@ impl ClientState {
     pub fn new(
         ws_tx: mpsc::UnboundedSender<String>,
         client_config: ClientConfig,
-        config: clifford::config::Config,
+        config: chatify::config::Config,
     ) -> Self {
         Self {
             ws_tx,
@@ -424,7 +424,7 @@ impl ClientState {
         }
 
         self.activity_log.push_back(ActivityEntry {
-            ts: clifford::now() as u64,
+            ts: chatify::now() as u64,
             text,
             is_error,
         });
@@ -909,7 +909,7 @@ impl ClientState {
         self.trust_store.audit_log.push(AuditEntry {
             action: action.to_string(),
             peer: peer.to_string(),
-            timestamp: clifford::now() as u64,
+            timestamp: chatify::now() as u64,
             details: details.to_string(),
         });
 
@@ -979,7 +979,7 @@ impl ClientState {
             );
         };
 
-        if !clifford::crypto::secure_string_eq(&observed_fingerprint, &normalized_supplied) {
+        if !chatify::crypto::secure_string_eq(&observed_fingerprint, &normalized_supplied) {
             self.append_trust_audit(
                 "trust_failed",
                 user,
@@ -995,7 +995,7 @@ impl ClientState {
             user.to_string(),
             PeerTrust {
                 fingerprint: observed_fingerprint.clone(),
-                trusted_at: clifford::now() as u64,
+                trusted_at: chatify::now() as u64,
                 verified: true,
             },
         );
@@ -1043,7 +1043,7 @@ impl ClientState {
 
         match trusted_state {
             Some((trusted_fingerprint, true))
-                if clifford::crypto::secure_string_eq(
+                if chatify::crypto::secure_string_eq(
                     &trusted_fingerprint,
                     &observed_fingerprint,
                 ) =>
@@ -1051,7 +1051,7 @@ impl ClientState {
                 Ok(observed_fingerprint)
             }
             Some((trusted_fingerprint, false))
-                if clifford::crypto::secure_string_eq(
+                if chatify::crypto::secure_string_eq(
                     &trusted_fingerprint,
                     &observed_fingerprint,
                 ) =>
@@ -1285,8 +1285,8 @@ impl ClientState {
             "t": "dm",
             "to": to,
             "c": body,
-            "ts": clifford::now(),
-            "n": clifford::fresh_nonce_hex(),
+            "ts": chatify::now(),
+            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
@@ -1295,8 +1295,8 @@ impl ClientState {
             "t": "msg",
             "ch": channel,
             "c": content,
-            "ts": clifford::now(),
-            "n": clifford::fresh_nonce_hex(),
+            "ts": chatify::now(),
+            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
@@ -1306,8 +1306,8 @@ impl ClientState {
             "ch": channel,
             "msg_id": msg_id,
             "emoji": emoji,
-            "ts": clifford::now(),
-            "n": clifford::fresh_nonce_hex(),
+            "ts": chatify::now(),
+            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
@@ -1327,8 +1327,8 @@ impl ClientState {
             "filename": meta.filename,
             "media_kind": meta.media_kind,
             "size": meta.size,
-            "ts": clifford::now(),
-            "n": clifford::fresh_nonce_hex(),
+            "ts": chatify::now(),
+            "n": chatify::fresh_nonce_hex(),
         });
         if let Some(mime) = meta.mime {
             payload["mime"] = serde_json::Value::String(mime.to_string());
@@ -1353,8 +1353,8 @@ impl ClientState {
             "file_id": file_id,
             "index": index,
             "data": chunk_b64,
-            "ts": clifford::now(),
-            "n": clifford::fresh_nonce_hex(),
+            "ts": chatify::now(),
+            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
@@ -1393,7 +1393,7 @@ mod tests {
             "chatify-trust-{}-{}-{}.json",
             name,
             std::process::id(),
-            clifford::fresh_nonce_hex()
+            chatify::fresh_nonce_hex()
         ))
     }
 
@@ -1411,7 +1411,7 @@ mod tests {
                 media_enabled: true,
                 animations_enabled: true,
             },
-            clifford::config::Config::default(),
+            chatify::config::Config::default(),
         )
     }
 
@@ -1429,7 +1429,7 @@ mod tests {
                 media_enabled: true,
                 animations_enabled: true,
             },
-            clifford::config::Config::default(),
+            chatify::config::Config::default(),
         );
 
         (state, rx)
@@ -1880,8 +1880,8 @@ mod tests {
     #[test]
     fn trust_peer_validates_fingerprint_and_records_audit() {
         let mut state = make_test_state();
-        let priv_key = clifford::crypto::new_keypair();
-        let pub_key = clifford::crypto::pub_b64(&priv_key).expect("pubkey should encode");
+        let priv_key = chatify::crypto::new_keypair();
+        let pub_key = chatify::crypto::pub_b64(&priv_key).expect("pubkey should encode");
         state.users.insert("alice".to_string(), pub_key);
 
         let fingerprint = ClientState::fingerprint_for_pubkey(
@@ -1924,12 +1924,12 @@ mod tests {
     fn observe_user_key_marks_verified_peer_unverified_on_change() {
         let mut state = make_test_state();
 
-        let old_key = clifford::crypto::pub_b64(&clifford::crypto::new_keypair())
+        let old_key = chatify::crypto::pub_b64(&chatify::crypto::new_keypair())
             .expect("old key should encode");
-        let mut new_key = clifford::crypto::pub_b64(&clifford::crypto::new_keypair())
+        let mut new_key = chatify::crypto::pub_b64(&chatify::crypto::new_keypair())
             .expect("new key should encode");
         if old_key == new_key {
-            new_key = clifford::crypto::pub_b64(&clifford::crypto::new_keypair())
+            new_key = chatify::crypto::pub_b64(&chatify::crypto::new_keypair())
                 .expect("replacement key should encode");
         }
 
@@ -2031,8 +2031,8 @@ mod tests {
     #[test]
     fn ensure_peer_trusted_for_dm_blocks_untrusted_peer() {
         let mut state = make_test_state();
-        let priv_key = clifford::crypto::new_keypair();
-        let pub_key = clifford::crypto::pub_b64(&priv_key).expect("pubkey should encode");
+        let priv_key = chatify::crypto::new_keypair();
+        let pub_key = chatify::crypto::pub_b64(&priv_key).expect("pubkey should encode");
         state.users.insert("bob".to_string(), pub_key);
 
         let err = state

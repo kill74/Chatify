@@ -118,7 +118,7 @@ jobs:
             run_bridge_regressions: true
             run_bridge_client_tests: false
           - gate_name: Bridge client compile gate
-            cargo_command: cargo check -p clifford-client --features bridge-client --locked
+            cargo_command: cargo check -p chatify-client --features bridge-client --locked
             run_bridge_regressions: false
             run_bridge_client_tests: true
 
@@ -161,4 +161,4 @@ jobs:
 
       - name: Bridge client feature tests
         if: ${{ matrix.run_bridge_client_tests }}
-        run: cargo test -p clifford-client --features bridge-client --locked
+        run: cargo test -p chatify-client --features bridge-client --locked

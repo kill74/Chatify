@@ -58,7 +58,7 @@ impl DbPool {
 #[derive(Clone)]
 pub struct EventStore {
     pool: DbPool,
-    prometheus: Option<std::sync::Arc<std::sync::Mutex<clifford::metrics::PrometheusMetrics>>>,
+    prometheus: Option<std::sync::Arc<std::sync::Mutex<chatify::metrics::PrometheusMetrics>>>,
 }
 
 impl EventStore {
@@ -67,7 +67,7 @@ impl EventStore {
         path: String,
         encryption_key: Option<Vec<u8>>,
         durability_mode: DbDurabilityMode,
-        prometheus: Option<std::sync::Arc<std::sync::Mutex<clifford::metrics::PrometheusMetrics>>>,
+        prometheus: Option<std::sync::Arc<std::sync::Mutex<chatify::metrics::PrometheusMetrics>>>,
     ) -> Self {
         let pool = DbPool::new(path, encryption_key, durability_mode)
             .expect("failed to create database pool");
@@ -471,7 +471,7 @@ impl EventStore {
     }
 
     /// Loads 2FA data for a user.
-    pub fn load_user_2fa(&self, username: &str) -> Option<clifford::totp::User2FA> {
+    pub fn load_user_2fa(&self, username: &str) -> Option<chatify::totp::User2FA> {
         let started = Instant::now();
         let conn = match self.get_connection() {
             Ok(c) => c,
@@ -506,14 +506,14 @@ impl EventStore {
                     .and_then(|v| serde_json::from_str(v).ok())
                     .unwrap_or_default();
 
-                let totp_config = secret.map(|s| clifford::totp::TotpConfig {
+                let totp_config = secret.map(|s| chatify::totp::TotpConfig {
                     secret: s,
                     digits: 6,
                     step: 30,
                     algorithm: "SHA256".to_string(),
                 });
 
-                clifford::totp::User2FA {
+                chatify::totp::User2FA {
                     username: username.to_string(),
                     enabled,
                     totp_config,
@@ -526,7 +526,7 @@ impl EventStore {
     }
 
     /// Stores 2FA data for a user.
-    pub fn upsert_user_2fa(&self, user: &clifford::totp::User2FA) {
+    pub fn upsert_user_2fa(&self, user: &chatify::totp::User2FA) {
         let started = Instant::now();
         let conn = match self.get_connection() {
             Ok(c) => c,

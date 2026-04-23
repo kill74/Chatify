@@ -13,7 +13,7 @@ cargo test --locked --test message_contracts file_contract_relays_media_metadata
 
 # Feature-gated builds
 cargo check --features discord-bridge --bin discord_bot --locked
-cargo check -p clifford-client --features bridge-client --locked
+cargo check -p chatify-client --features bridge-client --locked
 ```
 
 **Always use `--locked`** — CI enforces this for reproducible builds.

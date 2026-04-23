@@ -34,7 +34,7 @@ use crate::media::{
     render_message_lines, MediaKind, RgbColor, StyledFragment, StyledLine, TimelinePayload,
 };
 use crate::state::{ActivityEntry, ClientState, SharedState};
-use clifford::error::{ChatifyError, ChatifyResult};
+use chatify::error::{ChatifyError, ChatifyResult};
 
 #[derive(Clone, Debug)]
 pub struct OutputLine {
@@ -454,7 +454,7 @@ impl UiSnapshot {
             previous_scope = message.channel.clone();
         }
 
-        let cutoff = (clifford::now() as u64).saturating_sub(30);
+        let cutoff = (chatify::now() as u64).saturating_sub(30);
         let scope_prefix = format!("{}|", current_scope);
         let mut typing_users: Vec<String> = state
             .typing_presence
@@ -1795,7 +1795,7 @@ mod tests {
                 media_enabled: true,
                 animations_enabled: true,
             },
-            clifford::config::Config::default(),
+            chatify::config::Config::default(),
         )
     }
 

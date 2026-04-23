@@ -11,6 +11,9 @@ chatify.db.key
 cert.pem
 key.pem
 build.log
+*.log
+clicord-server
+COMMENTS.md
 dist/security-reports/*.log
 dist/security-reports/*.tmp
 dist/security-reports/chatify-security-report-*.json
@@ -33,9 +36,13 @@ Thumbs.db
 .DS_Store
 
 # Backup files
+backup-original/
 *.bak
 *.backup
 *.rs.bk
+
+# Local agent/tooling scratch space
+.opencode/
 
 # Python leftovers
 __pycache__/

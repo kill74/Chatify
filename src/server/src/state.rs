@@ -121,9 +121,9 @@ pub struct State {
     /// Connected bridge instances, keyed by username.
     pub bridges: DashMap<String, BridgeInfo>,
     /// Internal metrics for runtime stats.
-    pub metrics: clifford::performance::Metrics,
+    pub metrics: chatify::performance::Metrics,
     /// Prometheus metrics for export.
-    pub prometheus: Option<Arc<std::sync::Mutex<clifford::metrics::PrometheusMetrics>>>,
+    pub prometheus: Option<Arc<std::sync::Mutex<chatify::metrics::PrometheusMetrics>>>,
     /// Flag to signal graceful shutdown in progress.
     pub shutdown_in_progress: AtomicBool,
     /// Shutdown trigger for external signaling.
@@ -147,7 +147,7 @@ impl State {
         db_path: String,
         db_key: Option<Vec<u8>>,
         db_durability: crate::args::DbDurabilityMode,
-        prometheus: Option<Arc<std::sync::Mutex<clifford::metrics::PrometheusMetrics>>>,
+        prometheus: Option<Arc<std::sync::Mutex<chatify::metrics::PrometheusMetrics>>>,
         plugin_runtime: crate::plugin_runtime::PluginRuntime,
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
@@ -169,7 +169,7 @@ impl State {
             ip_last_auth: DashMap::new(),
             session_tokens: DashMap::new(),
             bridges: DashMap::new(),
-            metrics: clifford::performance::Metrics::new(),
+            metrics: chatify::performance::Metrics::new(),
             prometheus,
             shutdown_in_progress: AtomicBool::new(false),
             shutdown_notify: Notify::new(),

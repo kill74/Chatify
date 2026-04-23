@@ -28,7 +28,7 @@ use crate::media::{
 use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState, TypingPresence};
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
 use base64::Engine as _;
-use clifford::notifications::NotificationService;
+use chatify::notifications::NotificationService;
 
 /// Emit a line of output to the UI (with newline).
 macro_rules! println {
@@ -371,11 +371,7 @@ pub fn format_content_for_mentions(content: &str, username: &str) -> (String, bo
     (out, mentioned)
 }
 
-fn notify_message(
-    notifications: &clifford::config::NotificationConfig,
-    title: &str,
-    message: &str,
-) {
+fn notify_message(notifications: &chatify::config::NotificationConfig, title: &str, message: &str) {
     let body = message.trim();
     if body.is_empty() {
         return;
@@ -1480,7 +1476,7 @@ pub async fn handle_typing_event(state: &SharedState, data: &serde_json::Value, 
     }
 
     let typing = data.get("typing").and_then(|v| v.as_bool()).unwrap_or(true);
-    let now_ts = clifford::now() as u64;
+    let now_ts = chatify::now() as u64;
     let event_ts = extract_ts(data, now_ts) as u64;
 
     let mut state_lock = state.lock().await;
@@ -1516,7 +1512,7 @@ pub async fn handle_typing_event(state: &SharedState, data: &serde_json::Value, 
             format!("dm:{}", peer)
         }
     } else {
-        clifford::normalize_channel(raw_scope.trim_start_matches('#')).unwrap_or(fallback_scope)
+        chatify::normalize_channel(raw_scope.trim_start_matches('#')).unwrap_or(fallback_scope)
     };
 
     let key = format!("{}|{}", scope, user.to_ascii_lowercase());
@@ -2056,7 +2052,7 @@ mod tests {
                 media_enabled,
                 animations_enabled: true,
             },
-            clifford::config::Config::default(),
+            chatify::config::Config::default(),
         )))
     }
 

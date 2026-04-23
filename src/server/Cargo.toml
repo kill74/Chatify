@@ -1,5 +1,5 @@
 [package]
-name = "clifford-server"
+name = "chatify-server"
 version = "0.3.0"
 edition = "2021"
 
@@ -8,7 +8,7 @@ default = []
 batch-writes = []
 
 [lib]
-name = "clifford_server"
+name = "chatify_server"
 path = "src/lib.rs"
 
 [[bin]]
@@ -16,7 +16,7 @@ name = "chatify-server"
 path = "src/main.rs"
 
 [dependencies]
-clifford = { path = "../../" }
+chatify = { path = "../../" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
 tungstenite = "0.21"

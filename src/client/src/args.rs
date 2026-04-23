@@ -3,7 +3,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "clifford-client")]
+#[command(name = "chatify-client")]
 #[command(version = "1.0")]
 #[command(about = "WebSocket chat client with encryption")]
 pub struct Args {
@@ -33,7 +33,7 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn merge_with_config(&self, config: &clifford::config::Config) -> ClientConfig {
+    pub fn merge_with_config(&self, config: &chatify::config::Config) -> ClientConfig {
         let host = self
             .host
             .as_deref()

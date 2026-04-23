@@ -1,4 +1,4 @@
-//! # `clicord-server` ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â WebSocket Chat Server
+//! # `chatify-server` ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â WebSocket Chat Server
 //!
 //! A single-binary, async WebSocket server built on [Tokio] and
 //! [tokio-tungstenite]. It provides:
@@ -81,13 +81,13 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose, Engine as _};
+use chatify::crypto;
+use chatify::error::{ChatifyError, ChatifyResult};
+use chatify::metrics::PrometheusMetrics;
+use chatify::performance::{Metrics as PerfMetrics, VecCache};
+use chatify::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
+use chatify::voice::{relay::VoiceBroadcast, VoiceRelay};
 use clap::Parser;
-use clifford::crypto;
-use clifford::error::{ChatifyError, ChatifyResult};
-use clifford::metrics::PrometheusMetrics;
-use clifford::performance::{Metrics as PerfMetrics, VecCache};
-use clifford::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
-use clifford::voice::{relay::VoiceBroadcast, VoiceRelay};
 use dashmap::{DashMap, DashSet};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -124,7 +124,7 @@ use tokio_tungstenite::{
 
 // Protocol constants (imported from library)
 // ---------------------------------------------------------------------------
-use clifford_server::protocol::*;
+use chatify_server::protocol::*;
 
 // Data structures
 // ---------------------------------------------------------------------------
@@ -1220,8 +1220,8 @@ impl EventStore {
         self.pool.pool.get().ok()
     }
 
-    fn get_pool_stats(&self) -> clifford::performance::PoolStats {
-        use clifford::performance::PoolStats;
+    fn get_pool_stats(&self) -> chatify::performance::PoolStats {
+        use chatify::performance::PoolStats;
         let state = self.pool.pool.state();
         PoolStats {
             active_connections: (state.connections - state.idle_connections) as usize,
@@ -5433,7 +5433,7 @@ async fn handle_event(
                 }
             }
 
-            let msg_id = clifford::fresh_nonce_hex();
+            let msg_id = chatify::fresh_nonce_hex();
             let mut entry = serde_json::json!({
                 "t":"msg",
                 "msg_id":msg_id,
@@ -7291,7 +7291,7 @@ async fn handle_event(
 
 /// Returns the current Unix timestamp as a floating-point number of seconds.
 fn now() -> f64 {
-    clifford::now()
+    chatify::now()
 }
 
 /// Normalises a raw channel name to a safe, consistent format.
@@ -7307,7 +7307,7 @@ fn now() -> f64 {
 /// is used as a `DashMap` key or SQLite parameter, preventing channel-name
 /// injection and collisions between logically identical names.
 fn safe_ch(raw: &str) -> String {
-    clifford::normalize_channel(raw).unwrap_or_else(|| "general".into())
+    chatify::normalize_channel(raw).unwrap_or_else(|| "general".into())
 }
 
 fn is_default_online_status(status: &Value) -> bool {
@@ -8739,10 +8739,10 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
     }
 
     if let Some(username) = &args.enable_2fa_for {
-        let secret = clifford::totp::generate_secret();
-        let qr_url = clifford::totp::generate_qr_url(username, "Chatify", &secret);
+        let secret = chatify::totp::generate_secret();
+        let qr_url = chatify::totp::generate_qr_url(username, "Chatify", &secret);
 
-        let mut user_2fa = clifford::totp::User2FA::new(username.clone());
+        let mut user_2fa = chatify::totp::User2FA::new(username.clone());
         user_2fa.enable(secret);
 
         state.store.upsert_user_2fa(&user_2fa);

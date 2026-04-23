@@ -68,6 +68,24 @@ Run server:
 
 Run client workloads from separate terminals or benchmark harnesses.
 
+## Current Baseline Results
+
+The first published baseline uses the existing protocol contract test for Scenario D. This is a focused event-store latency check, not a full throughput benchmark.
+
+```bash
+cargo test --locked --test message_contracts history_and_search_latency_stays_low_with_100k_local_events -- --nocapture
+```
+
+Observed output:
+
+```text
+benchmark latencies on 100000 events: history=3ms (limit 600ms), search=254ms (limit 2500ms)
+```
+
+| Date       | Commit  | Scenario | Events  | Query limits | History latency | Search latency | Environment |
+| :--------- | :------ | :------- | ------: | :----------- | --------------: | -------------: | :---------- |
+| 2026-04-23 | 9a59a49 | D        | 100,000 | 100 / 100    |            3 ms |         254 ms | Windows 11 Pro 10.0.26200, AMD Ryzen 5 7600, rustc 1.94.0 |
+
 ## Reporting Template
 
 Use this table format in PRs and release notes.

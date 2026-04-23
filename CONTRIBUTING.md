@@ -24,7 +24,7 @@ Run all checks before opening a pull request:
 Optional feature check for Discord bridge:
 
 1. cargo check --features discord-bridge --bin discord_bot --locked
-2. cargo check -p clifford-client --features bridge-client --locked
+2. cargo check -p chatify-client --features bridge-client --locked
 
 ## Branch and Commit Guidance
 
