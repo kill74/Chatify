@@ -290,11 +290,18 @@ pub fn render_message_plain_lines(
 }
 
 pub fn build_inline_image_preview(bytes: &[u8]) -> Result<Vec<StyledLine>, MediaRenderStatus> {
+    build_inline_image_preview_with_support(bytes, terminal_supports_inline_media())
+}
+
+fn build_inline_image_preview_with_support(
+    bytes: &[u8],
+    supports_inline_media: bool,
+) -> Result<Vec<StyledLine>, MediaRenderStatus> {
     if bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
         return Err(MediaRenderStatus::TooLarge);
     }
 
-    if !terminal_supports_inline_media() {
+    if !supports_inline_media {
         return Err(MediaRenderStatus::Unsupported);
     }
 
@@ -476,8 +483,8 @@ fn composite_pixel(pixel: image::Rgba<u8>) -> RgbColor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_inline_image_preview, format_byte_size, format_duration, render_message_plain_lines,
-        terminal_supports_inline_media, MediaKind, MediaRenderStatus, StyledFragment,
+        build_inline_image_preview, build_inline_image_preview_with_support, format_byte_size,
+        format_duration, render_message_plain_lines, MediaKind, MediaRenderStatus, StyledFragment,
         TimelineMedia, TimelinePayload,
     };
 
@@ -516,7 +523,6 @@ mod tests {
 
     #[test]
     fn tiny_png_generates_preview_when_forced() {
-        std::env::set_var("CHATIFY_FORCE_INLINE_MEDIA", "1");
         let mut cursor = std::io::Cursor::new(Vec::new());
         let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             1,
@@ -528,11 +534,11 @@ mod tests {
             .expect("encode 1x1 png");
         let png = cursor.into_inner();
 
-        let preview = build_inline_image_preview(&png).expect("build inline preview");
+        // Keep this deterministic under parallel test execution by avoiding
+        // process-wide environment mutation.
+        let preview =
+            build_inline_image_preview_with_support(&png, true).expect("build inline preview");
         assert!(!preview.is_empty());
-
-        std::env::remove_var("CHATIFY_FORCE_INLINE_MEDIA");
-        let _ = terminal_supports_inline_media();
     }
 
     #[test]
