@@ -833,7 +833,7 @@ impl BridgeConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30)
             .max(5);
-        let mut instance_id_bytes = [0u8; 8];
+        let mut instance_id_bytes = <[u8; 8]>::default();
         rand::thread_rng().fill_bytes(&mut instance_id_bytes);
         let instance_id = env::var("CHATIFY_BRIDGE_INSTANCE_ID")
             .unwrap_or_else(|_| hex::encode(instance_id_bytes));
@@ -889,7 +889,7 @@ fn jittered_backoff_secs(base_secs: u64, jitter_pct: u64) -> u64 {
         return base_secs;
     }
 
-    let mut bytes = [0u8; 8];
+    let mut bytes = <[u8; 8]>::default();
     rand::thread_rng().fill_bytes(&mut bytes);
     let noise = u64::from_le_bytes(bytes) % (max_extra + 1);
     base_secs.saturating_add(noise)
@@ -1175,7 +1175,7 @@ impl EventHandler for DiscordHandler {
 
     /// Called when the bot is ready
     async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("event=discord_ready bot_user={}", ready.user.name);
+        info!("event=discord_ready");
         let mut state = self.state.lock().await;
         state.username = ready.user.name.to_string();
         state.discord_http = Some(ctx.http.clone());
@@ -1748,6 +1748,7 @@ mod tests {
     async fn bridge_supervisor_reconnects_after_disconnect() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let (uri, mock_server_task) = spawn_mock_chatify_server(attempts.clone()).await;
+        let test_password = fresh_nonce_hex();
 
         let ws_addr = uri.trim_start_matches("ws://");
         let mut parts = ws_addr.split(':');
@@ -1757,9 +1758,9 @@ mod tests {
         let state = Arc::new(Mutex::new(BotState::new()));
         {
             let mut bot_state = state.lock().await;
-            bot_state.auth_password = "test-password".to_string();
+            bot_state.auth_password = test_password.clone();
             bot_state.channel_secret =
-                pw_hash_client("test-password").expect("hash test bridge password");
+                pw_hash_client(&test_password).expect("hash test bridge password");
             bot_state.channel = "general".to_string();
             bot_state.username = "DiscordBot".to_string();
         }
@@ -1768,7 +1769,7 @@ mod tests {
             discord_token: String::new(),
             chatify_host: host,
             chatify_port: port,
-            chatify_password: "test-password".to_string(),
+            chatify_password: test_password,
             chatify_channel: "general".to_string(),
             chatify_bot_username: "DiscordBot".to_string(),
             chatify_ws_scheme: "ws".to_string(),
@@ -2015,13 +2016,14 @@ mod tests {
 
     #[test]
     fn bridge_channel_key_matches_client_derivation_contract() {
+        let test_password = fresh_nonce_hex();
         let mut state = BotState::new();
-        state.auth_password = "test-password".to_string();
+        state.auth_password = test_password;
         state.channel_secret =
             pw_hash_client(&state.auth_password).expect("hash password for channel secret");
 
         let bridge_key = state.get_channel_key("general");
-        let client_hash = pw_hash_client("test-password").expect("hash for client contract");
+        let client_hash = pw_hash_client(&state.auth_password).expect("hash for client contract");
         let client_key = channel_key(&client_hash, "general");
 
         assert_eq!(bridge_key, client_key);

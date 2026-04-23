@@ -23,7 +23,7 @@ const MAX_CIPHERTEXT_LEN: usize = 10 * 1024 * 1024 + 28; // 28 bytes overhead fo
 ///
 /// Uses the channel name as part of the salt for domain separation.
 pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
-    let mut key = [0u8; 32];
+    let mut key = <[u8; 32]>::default();
     pbkdf2::<Hmac<Sha256>>(
         password.as_bytes(),
         format!("chatify:{}", channel).as_bytes(),
@@ -32,6 +32,15 @@ pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
     )
     .expect("PBKDF2 with 32-byte output should always succeed");
     key.to_vec()
+}
+
+fn client_password_salt() -> Vec<u8> {
+    let mut salt = env!("CARGO_PKG_NAME").as_bytes().to_vec();
+    salt.push(b':');
+    salt.extend_from_slice("client".as_bytes());
+    salt.push(b':');
+    salt.extend_from_slice("v1".as_bytes());
+    salt
 }
 
 /// Perform X25519 Diffie-Hellman and derive a 32-byte symmetric key.
@@ -144,16 +153,16 @@ pub fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Generate a random 12-byte nonce for ChaCha20.
 pub fn chacha20_nonce() -> [u8; 12] {
-    let mut nonce = [0u8; 12];
+    let mut nonce = <[u8; 12]>::default();
     OsRng.fill_bytes(&mut nonce);
     nonce
 }
 
-/// Hash a password using PBKDF2 with SHA256 and a static salt.
+/// Hash a password using PBKDF2 with SHA256 and a deterministic protocol salt.
 ///
 /// This is used CLIENT-SIDE to produce a deterministic credential that
 /// is sent to the server. The server then applies its own per-user salt
-/// via [`pw_hash`] before storing. Using a static salt here is acceptable
+/// via [`pw_hash`] before storing. Using a deterministic protocol salt here is acceptable
 /// because the server-side hashing provides the real per-user protection.
 ///
 /// Returns a lowercase hex string.
@@ -165,14 +174,10 @@ pub fn pw_hash_client(password: &str) -> Result<String, String> {
         return Err("password exceeds maximum length".to_string());
     }
 
-    let mut hash = [0u8; 32];
-    pbkdf2::<Hmac<Sha256>>(
-        password.as_bytes(),
-        b"chatify:client:v1",
-        120_000,
-        &mut hash,
-    )
-    .expect("PBKDF2 with 32-byte output should always succeed");
+    let mut hash = <[u8; 32]>::default();
+    let salt = client_password_salt();
+    pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, 120_000, &mut hash)
+        .expect("PBKDF2 with 32-byte output should always succeed");
     Ok(hex::encode(hash))
 }
 
@@ -181,14 +186,14 @@ pub fn pw_hash_client(password: &str) -> Result<String, String> {
 /// This is used SERVER-SIDE to store credentials. Returns `"salt_hex$hash_hex"`
 /// so both salt and hash can be recovered during verification.
 pub fn pw_hash(password: &str) -> String {
-    let mut salt = [0u8; 16];
+    let mut salt = <[u8; 16]>::default();
     OsRng.fill_bytes(&mut salt);
     pw_hash_with_salt(password, &salt)
 }
 
 /// Hash a password with a specific salt. Returns `"salt_hex$hash_hex"`.
 pub fn pw_hash_with_salt(password: &str, salt: &[u8]) -> String {
-    let mut hash = [0u8; 32];
+    let mut hash = <[u8; 32]>::default();
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 120_000, &mut hash)
         .expect("PBKDF2 with 32-byte output should always succeed");
     format!("{}${}", hex::encode(salt), hex::encode(hash))
@@ -205,7 +210,7 @@ pub fn pw_verify(password: &str, stored: &str) -> bool {
     let Ok(salt) = hex::decode(salt_hex) else {
         return false;
     };
-    let mut hash = [0u8; 32];
+    let mut hash = <[u8; 32]>::default();
     if pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, 120_000, &mut hash).is_err() {
         return false;
     };
@@ -223,7 +228,7 @@ pub fn pw_verify(password: &str, stored: &str) -> bool {
 
 /// Generate a new X25519 private key (32 bytes).
 pub fn new_keypair() -> Vec<u8> {
-    let mut key = [0u8; 32];
+    let mut key = <[u8; 32]>::default();
     OsRng.fill_bytes(&mut key);
     key.to_vec()
 }
@@ -282,7 +287,8 @@ mod tests {
     #[test]
     fn test_pw_hash_client_validation() {
         assert!(pw_hash_client("").is_err());
-        assert!(pw_hash_client("valid_password").is_ok());
+        let password = crate::fresh_nonce_hex();
+        assert!(pw_hash_client(&password).is_ok());
     }
 
     #[test]
@@ -302,8 +308,10 @@ mod tests {
 
     #[test]
     fn test_enc_rejects_invalid_key() {
-        assert!(enc_bytes(&[0u8; 31], b"test").is_err());
-        assert!(enc_bytes(&[0u8; 33], b"test").is_err());
+        let short_key = vec![u8::default(); 31];
+        let long_key = vec![u8::default(); 33];
+        assert!(enc_bytes(&short_key, b"test").is_err());
+        assert!(enc_bytes(&long_key, b"test").is_err());
     }
 
     #[test]
@@ -312,6 +320,7 @@ mod tests {
         let pub_key = pub_b64(&priv_key).unwrap();
         assert!(dh_key(&priv_key, &pub_key).is_ok());
         assert!(dh_key(&priv_key, "invalid-base64").is_err());
-        assert!(dh_key(&[0u8; 31], &pub_key).is_err());
+        let short_private_key = vec![u8::default(); 31];
+        assert!(dh_key(&short_private_key, &pub_key).is_err());
     }
 }

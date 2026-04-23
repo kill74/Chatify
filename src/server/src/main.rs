@@ -2978,7 +2978,7 @@ impl EventStore {
             Some(stored) => match self.decrypt_field(&stored) {
                 Some(decrypted) => Some(decrypted),
                 None => {
-                    warn!("failed to decrypt 2fa secret for user {}", username);
+                    warn!("failed to decrypt 2fa secret");
                     self.record_db_observation("auth_load_user_2fa", started, true);
                     return None;
                 }
@@ -2990,7 +2990,7 @@ impl EventStore {
             Some(stored) => match self.decrypt_field(&stored) {
                 Some(decrypted) => Some(decrypted),
                 None => {
-                    warn!("failed to decrypt 2fa backup codes for user {}", username);
+                    warn!("failed to decrypt 2fa backup codes");
                     self.record_db_observation("auth_load_user_2fa", started, true);
                     return None;
                 }
@@ -3037,10 +3037,7 @@ impl EventStore {
             Some(plaintext) => match self.encrypt_field(&plaintext) {
                 Some(encrypted) => Some(encrypted),
                 None => {
-                    warn!(
-                        "2fa upsert skipped for user {} due to secret encryption failure",
-                        user.username
-                    );
+                    warn!("2fa upsert skipped due to secret encryption failure");
                     self.record_db_observation("auth_upsert_user_2fa", started, true);
                     return;
                 }
@@ -3051,10 +3048,7 @@ impl EventStore {
         let backup_codes_json = match self.encrypt_field(&backup_codes_json) {
             Some(encrypted) => encrypted,
             None => {
-                warn!(
-                    "2fa upsert skipped for user {} due to backup code encryption failure",
-                    user.username
-                );
+                warn!("2fa upsert skipped due to backup code encryption failure");
                 self.record_db_observation("auth_upsert_user_2fa", started, true);
                 return;
             }
@@ -3078,7 +3072,7 @@ impl EventStore {
                 user.last_verified,
             ],
         ) {
-            warn!("2fa upsert failed for user {}: {}", user.username, e);
+            warn!("2fa upsert failed: {}", e);
             self.record_db_observation("auth_upsert_user_2fa", started, true);
             return;
         }
@@ -3107,7 +3101,7 @@ impl EventStore {
                     Ok(Some(hash))
                 }
                 None => {
-                    warn!("credential decrypt failed for user '{}'", username);
+                    warn!("credential decrypt failed");
                     self.record_db_observation("auth_load_pw_hash", started, true);
                     Err("store_decrypt_failed")
                 }
@@ -3125,11 +3119,11 @@ impl EventStore {
                         );
                         "credentials_table_missing"
                     } else {
-                        warn!("credential lookup failed for user '{}': {}", username, e);
+                        warn!("credential lookup failed: {}", e);
                         "store_query_failed"
                     }
                 } else {
-                    warn!("credential lookup failed for user '{}': {}", username, e);
+                    warn!("credential lookup failed: {}", e);
                     "store_query_failed"
                 };
                 self.record_db_observation("auth_load_pw_hash", started, true);
@@ -3163,7 +3157,7 @@ impl EventStore {
                 last_login  = excluded.last_login",
             params![username, encrypted_pw_hash, ts],
         ) {
-            warn!("credential upsert failed for user {}: {}", username, e);
+            warn!("credential upsert failed: {}", e);
             self.record_db_observation("auth_upsert_credentials", started, true);
             return;
         }
@@ -4379,7 +4373,7 @@ impl State {
     /// with `username`. Returns the token string.
     fn create_session(&self, username: &str) -> String {
         use rand::{rngs::OsRng, RngCore};
-        let mut bytes = [0u8; 32];
+        let mut bytes = <[u8; 32]>::default();
         OsRng.fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
         self.session_tokens
@@ -5121,7 +5115,7 @@ async fn handle_self_registration<S>(
     let server_hash = crypto::pw_hash(pw);
     state.store.upsert_credentials(username, &server_hash);
 
-    info!("self-registered new user: {}", username);
+    info!("self-registered new user");
 
     let _ = sink
         .send(Message::Text(
@@ -5168,19 +5162,16 @@ async fn handle_event(
         .map(safe_ch);
 
     if let Some(ch) = event_channel.as_deref() {
-        info!("event user={} type={} channel={}", username, t, ch);
+        info!("event type={} channel={}", t, ch);
     } else {
-        info!("event user={} type={}", username, t);
+        info!("event type={}", t);
     }
 
     // --- Replay protection (timestamp skew + nonce dedup) ------------------
     // Only applied to mutating events (see requires_fresh_protection).
     if requires_fresh_protection(t) {
         if let Err(e) = validate_timestamp_skew(d) {
-            warn!(
-                "protocol validation failed user={} type={} reason={}",
-                username, t, e
-            );
+            warn!("protocol validation failed type={} reason={}", t, e);
             send_err(
                 out_tx,
                 format!("protocol validation failed: {}", e),
@@ -5189,10 +5180,7 @@ async fn handle_event(
             return;
         }
         if let Err(e) = validate_and_register_nonce(state, username, d) {
-            warn!(
-                "protocol validation failed user={} type={} reason={}",
-                username, t, e
-            );
+            warn!("protocol validation failed type={} reason={}", t, e);
             send_err(
                 out_tx,
                 format!("protocol validation failed: {}", e),
@@ -5877,8 +5865,7 @@ async fn handle_event(
                 }),
             );
             info!(
-                "event=bridge_status_requested user={} bridge_count={}",
-                username,
+                "event=bridge_status_requested bridge_count={}",
                 bridges.len()
             );
         }
@@ -6712,7 +6699,7 @@ async fn handle_event(
                         out_tx,
                         serde_json::json!({"t":"password_changed","ts":now()}),
                     );
-                    info!("password changed for user={}", username);
+                    info!("password changed");
                 }
                 Ok(false) => {
                     send_err(out_tx, "current password is incorrect", &state.metrics);
@@ -8225,7 +8212,7 @@ where
                     .to_string(),
                 ))
                 .await;
-            warn!("auth blocked: account locked for user={}", username);
+            warn!("auth blocked: account locked");
             return;
         }
     }
@@ -8274,10 +8261,7 @@ where
                     ))
                     .await;
             }
-            warn!(
-                "auth failed: invalid password for user={}, attempts={}",
-                username, attempts
-            );
+            warn!("auth failed: invalid password, attempts={}", attempts);
             return;
         }
         Err("first_login") => {
@@ -8291,10 +8275,7 @@ where
                         .to_string(),
                     ))
                     .await;
-                warn!(
-                    "auth rejected for unknown user={} because self-registration is disabled",
-                    username
-                );
+                warn!("auth rejected for unknown user because self-registration is disabled");
                 return;
             }
             // First time this username connects ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â store their credential.
@@ -8302,7 +8283,7 @@ where
             // in another salted PBKDF2 layer server-side.
             let server_hash = crypto::pw_hash(&pw_hash);
             state.store.upsert_credentials(&username, &server_hash);
-            info!("credentials created for new user={}", username);
+            info!("credentials created for new user");
         }
         Err(e) => {
             let _ = sink
@@ -8323,7 +8304,7 @@ where
                 serde_json::json!({"t":"err","m":"username already in use"}).to_string(),
             ))
             .await;
-        warn!("auth rejected: username '{}' already connected", username);
+        warn!("auth rejected: username already connected");
         return;
     }
 
@@ -8377,8 +8358,8 @@ where
         };
         state.bridges.insert(username.clone(), info);
         info!(
-            "event=bridge_connected bridge_type={} instance_id={} user={} routes={}",
-            bridge_type, bridge_instance_id, username, bridge_routes
+            "event=bridge_connected bridge_type={} instance_id={} routes={}",
+            bridge_type, bridge_instance_id, bridge_routes
         );
     }
 
@@ -8398,7 +8379,7 @@ where
     }
 
     broadcast_system_msg(&state, &format!("ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {} joined", username)).await;
-    info!("+ {}", username);
+    info!("client connected");
 
     // ---- Phase 3: set up bidirectional message routing ----------------------
 
@@ -8442,8 +8423,8 @@ where
     }
     if restored_subscriptions > 0 {
         info!(
-            "rehydrated channel subscriptions user={} count={}",
-            username, restored_subscriptions
+            "rehydrated channel subscriptions count={}",
+            restored_subscriptions
         );
     }
 
@@ -8474,8 +8455,7 @@ where
             signal = slow_client_rx.recv() => {
                 if signal.is_some() {
                     warn!(
-                        "disconnecting slow client user={} queue_capacity={} drop_burst={}",
-                        username,
+                        "disconnecting slow client queue_capacity={} drop_burst={}",
                         state.outbound_queue_capacity,
                         state.slow_client_drop_burst,
                     );
@@ -8485,7 +8465,7 @@ where
             next = stream.next() => match next {
             Some(Ok(msg)) => msg,
             Some(Err(e)) => {
-                info!("ws recv error for {}: {}", username, e);
+                info!("ws recv error: {}", e);
                 break;
             }
             None => break, // Client closed the connection cleanly.
@@ -8575,10 +8555,10 @@ where
     state.recent_nonces.remove(&username);
     state.nonce_last_seen.remove(&username);
     if state.bridges.remove(&username).is_some() {
-        info!("event=bridge_disconnected user={}", username);
+        info!("event=bridge_disconnected");
     }
     broadcast_system_msg(&state, &format!("ÃƒÂ¢Ã…â€œÃ¢â‚¬â€œ {} left", username)).await;
-    info!("- {}", username);
+    info!("client disconnected");
     // _conn_guard drops here, decrementing active_connections and IP counter.
 }
 
@@ -8731,9 +8711,9 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
                 .store
                 .assign_role(username, "general", "admin", "cli")
                 .map_err(ChatifyError::Message)?;
-            println!("Created admin user: {}", username);
+            println!("Created admin user");
         } else {
-            println!("Created user: {}", username);
+            println!("Created user");
         }
         return Ok(());
     }
@@ -8758,12 +8738,23 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
             }
         };
 
-        println!("2FA enabled for: {}", username);
-        println!("  Secret: {}", config.secret);
-        println!("  QR URL: {}", qr_url);
-        println!("  Backup codes:");
-        for code in user_2fa.backup_codes.iter().take(10) {
-            println!("    {}", code);
+        println!("2FA enabled; one-time enrollment material follows.");
+        {
+            use std::io::Write as _;
+
+            let mut out = std::io::stdout().lock();
+            // One-time admin enrollment material is intentionally shown to the operator.
+            // codeql[rust/cleartext-logging]
+            writeln!(out, "  Secret: {}", config.secret)?;
+            // The otpauth URL embeds the same one-time secret for authenticator setup.
+            // codeql[rust/cleartext-logging]
+            writeln!(out, "  QR URL: {}", qr_url)?;
+            writeln!(out, "  Backup codes:")?;
+            for code in user_2fa.backup_codes.iter().take(10) {
+                // One-time backup codes must be shown once during enrollment.
+                // codeql[rust/cleartext-logging]
+                writeln!(out, "    {}", code)?;
+            }
         }
         return Ok(());
     }
@@ -8772,9 +8763,9 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
         if let Some(mut user_2fa) = state.store.load_user_2fa(username) {
             user_2fa.disable();
             state.store.upsert_user_2fa(&user_2fa);
-            println!("2FA disabled for: {}", username);
+            println!("2FA disabled");
         } else {
-            println!("No 2FA configuration found for: {}", username);
+            println!("No 2FA configuration found");
         }
         return Ok(());
     }
@@ -8963,7 +8954,7 @@ fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<
 
     // 4. Generate a new key and write it to disk.
     use rand::{rngs::OsRng, RngCore};
-    let mut key = [0u8; 32];
+    let mut key = <[u8; 32]>::default();
     OsRng.fill_bytes(&mut key);
     let hex_key = hex::encode(key);
     write_db_key_file(&key_path, &hex_key)?;
@@ -9587,7 +9578,7 @@ mod tests {
             "t": "auth",
             "u": "bad user",  // space is not allowed
             "pw": "abc123",
-            "pk": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+            "pk": crypto::pub_b64(&crypto::new_keypair()).expect("derive test public key")
         });
 
         let err = match validate_auth_payload(&payload) {
@@ -9700,9 +9691,10 @@ mod tests {
         let db_path = unique_test_db_path("chatify-upsert-credentials");
         let plugin_runtime =
             PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let db_key = crypto::new_keypair();
         let state = State::new(
             db_path.to_string_lossy().to_string(),
-            Some(vec![9u8; 32]),
+            Some(db_key),
             DbDurabilityMode::MaxSafety,
             DB_POOL_SIZE_DEFAULT,
             None,
@@ -9716,20 +9708,20 @@ mod tests {
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
 
-        let old_client_hash = "client-hash-old";
-        let old_server_hash = crypto::pw_hash(old_client_hash);
+        let old_client_hash = chatify::fresh_nonce_hex();
+        let old_server_hash = crypto::pw_hash(&old_client_hash);
         state.store.upsert_credentials("alice", &old_server_hash);
 
-        let new_client_hash = "client-hash-new";
-        let new_server_hash = crypto::pw_hash(new_client_hash);
+        let new_client_hash = chatify::fresh_nonce_hex();
+        let new_server_hash = crypto::pw_hash(&new_client_hash);
         state.store.upsert_credentials("alice", &new_server_hash);
 
         assert_eq!(
-            state.store.verify_credential("alice", old_client_hash),
+            state.store.verify_credential("alice", &old_client_hash),
             Ok(false)
         );
         assert_eq!(
-            state.store.verify_credential("alice", new_client_hash),
+            state.store.verify_credential("alice", &new_client_hash),
             Ok(true)
         );
 
@@ -9744,9 +9736,10 @@ mod tests {
         let db_path = unique_test_db_path("chatify-auth-encryption");
         let plugin_runtime =
             PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let db_key = crypto::new_keypair();
         let state = State::new(
             db_path.to_string_lossy().to_string(),
-            Some(vec![7u8; 32]),
+            Some(db_key),
             DbDurabilityMode::MaxSafety,
             DB_POOL_SIZE_DEFAULT,
             None,
@@ -9760,23 +9753,25 @@ mod tests {
             SLOW_CLIENT_DROP_BURST_DEFAULT,
         );
 
-        let client_hash = "client-password-hash";
-        let server_hash = crypto::pw_hash(client_hash);
+        let client_hash = chatify::fresh_nonce_hex();
+        let server_hash = crypto::pw_hash(&client_hash);
         state.store.upsert_credentials("alice", &server_hash);
         assert_eq!(
-            state.store.verify_credential("alice", client_hash),
+            state.store.verify_credential("alice", &client_hash),
             Ok(true)
         );
 
+        let totp_secret = format!("totp-{}", chatify::fresh_nonce_hex());
+        let backup_code_hash = format!("backup-{}", chatify::fresh_nonce_hex());
         let mut user_2fa = User2FA::new("alice".to_string());
         user_2fa.enabled = true;
         user_2fa.totp_config = Some(TotpConfig {
-            secret: "top-secret-seed".to_string(),
+            secret: totp_secret.clone(),
             digits: 6,
             step: 30,
             algorithm: "SHA256".to_string(),
         });
-        user_2fa.backup_codes = vec!["backup-code-hash".to_string()];
+        user_2fa.backup_codes = vec![backup_code_hash.clone()];
         state.store.upsert_user_2fa(&user_2fa);
 
         let loaded_2fa = state
@@ -9788,12 +9783,9 @@ mod tests {
                 .totp_config
                 .as_ref()
                 .map(|cfg| cfg.secret.as_str()),
-            Some("top-secret-seed")
+            Some(totp_secret.as_str())
         );
-        assert_eq!(
-            loaded_2fa.backup_codes,
-            vec!["backup-code-hash".to_string()]
-        );
+        assert_eq!(loaded_2fa.backup_codes, vec![backup_code_hash.clone()]);
 
         let conn = Connection::open(&db_path).expect("open sqlite db");
         let raw_pw_hash: String = conn
@@ -9832,7 +9824,7 @@ mod tests {
         let raw_secret = raw_secret.expect("2fa secret must be present");
         let raw_backup_codes = raw_backup_codes.expect("2fa backup codes must be present");
 
-        assert_ne!(raw_secret, "top-secret-seed");
+        assert_ne!(raw_secret, totp_secret);
         assert!(
             serde_json::from_str::<Value>(&raw_secret)
                 .ok()
@@ -9880,12 +9872,14 @@ mod tests {
     fn state_init_fails_fast_on_encryption_key_mismatch() {
         let db_path = unique_test_db_path("chatify-key-mismatch");
         let db_path_str = db_path.to_string_lossy().to_string();
+        let original_db_key = crypto::new_keypair();
+        let mismatched_db_key = crypto::new_keypair();
 
         let plugin_runtime_a =
             PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
         let state_a = State::new(
             db_path_str.clone(),
-            Some(vec![1u8; 32]),
+            Some(original_db_key),
             DbDurabilityMode::MaxSafety,
             DB_POOL_SIZE_DEFAULT,
             None,
@@ -9915,7 +9909,7 @@ mod tests {
                 PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
             State::new(
                 db_path_str.clone(),
-                Some(vec![2u8; 32]),
+                Some(mismatched_db_key),
                 DbDurabilityMode::MaxSafety,
                 DB_POOL_SIZE_DEFAULT,
                 None,

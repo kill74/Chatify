@@ -304,8 +304,8 @@ fn is_valid_reaction_emoji(emoji: &str) -> bool {
 }
 
 fn prompt_input(label: &str, default: Option<&str>) -> ChatifyResult<String> {
-    if let Some(default_value) = default {
-        print!("{} [{}]: ", label, default_value);
+    if default.is_some() {
+        print!("{} [saved]: ", label);
     } else {
         print!("{}: ", label);
     }
@@ -1314,7 +1314,7 @@ async fn send_input_to_active_scope(state: &SharedState, body: &str) {
         eprintln!("failed to send message: {}", err);
     } else {
         state_lock.dismiss_unread_marker(&scope);
-        println!("[sending] {} {}: {}", scope, username, body);
+        println!("[sending] {}", scope);
     }
 }
 

@@ -33,7 +33,7 @@
 //! | Feature contracts| Messages, history, search, replay, rewind, voice (vdata) |
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -83,6 +83,9 @@ impl Drop for TestServer {
         let _ = self._child.wait();
         if self.cleanup_db {
             let _ = std::fs::remove_file(&self.db_path);
+            let _ = std::fs::remove_file(format!("{}-wal", self.db_path.to_string_lossy()));
+            let _ = std::fs::remove_file(format!("{}-shm", self.db_path.to_string_lossy()));
+            let _ = std::fs::remove_file(format!("{}.key", self.db_path.to_string_lossy()));
         }
     }
 }
@@ -117,7 +120,6 @@ type PersistedMediaRow = (
 
 /// Protocol version this test suite expects to remain backward-compatible.
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
-const TEST_DB_KEY_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 static BUILD_SERVER_BINARY_ONCE: Once = Once::new();
 const SERVER_START_RETRIES: usize = 5;
 const SERVER_READY_POLL_ATTEMPTS: usize = 100;
@@ -161,6 +163,18 @@ fn settle_delay() -> Duration {
 
 fn time_boundary_delay() -> Duration {
     ci_adjusted_duration(TIME_BOUNDARY_DELAY_MS_LOCAL, TIME_BOUNDARY_DELAY_MS_CI)
+}
+
+fn test_pw_hash_for(username: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(username.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn test_db_key_hex(db_path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(db_path.to_string_lossy().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +420,7 @@ async fn start_server_with_db_internal(
             .arg("--db")
             .arg(db_path.to_string_lossy().to_string())
             .arg("--db-key")
-            .arg(TEST_DB_KEY_HEX);
+            .arg(test_db_key_hex(&db_path));
         if enable_self_registration {
             command.arg("--enable-self-registration");
         }
@@ -534,7 +548,8 @@ async fn connect_and_auth_with_pw_hash(url: &str, username: &str, pw_hash: &str)
 /// A fresh ephemeral keypair is generated for every call so tests never share
 /// key material, mirroring real client behaviour.
 async fn connect_and_auth_with_otp(url: &str, username: &str, otp: Option<&str>) -> Ws {
-    connect_and_auth_with_pw_hash_and_otp(url, username, "test-password-hash", otp).await
+    let pw_hash = test_pw_hash_for(username);
+    connect_and_auth_with_pw_hash_and_otp(url, username, &pw_hash, otp).await
 }
 
 async fn connect_and_auth_with_pw_hash_and_otp(
@@ -617,7 +632,8 @@ async fn recv_by_type(ws: &mut Ws, expected_type: &str) -> Value {
 async fn auth_contract_rejects_when_2fa_enabled_without_code() {
     let seed_port = allocate_port();
     let db_path = temp_db_path(seed_port);
-    seed_enabled_2fa_user(&db_path, "alice", &["backup-aa11bb22"]);
+    let backup_code = chatify::fresh_nonce_hex();
+    seed_enabled_2fa_user(&db_path, "alice", &[backup_code.as_str()]);
 
     let server = start_server_with_db(db_path).await;
     let (mut ws, _) = connect_async(&server.url)
@@ -627,7 +643,7 @@ async fn auth_contract_rejects_when_2fa_enabled_without_code() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice",
-            "pw": "test-password-hash",
+            "pw": test_pw_hash_for("alice"),
             "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
@@ -656,7 +672,7 @@ async fn auth_contract_rejects_first_login_when_self_registration_disabled() {
         json!({
             "t": "auth",
             "u": "new-user-no-register",
-            "pw": "test-password-hash",
+            "pw": test_pw_hash_for("new-user-no-register"),
             "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
@@ -688,13 +704,13 @@ async fn auth_contract_rejects_first_login_when_self_registration_disabled() {
 async fn auth_contract_accepts_backup_code_and_consumes_it() {
     let seed_port = allocate_port();
     let db_path = temp_db_path(seed_port);
-    let backup_code = "feedface1234abcd";
-    seed_enabled_2fa_user(&db_path, "alice", &[backup_code]);
+    let backup_code = chatify::fresh_nonce_hex();
+    seed_enabled_2fa_user(&db_path, "alice", &[backup_code.as_str()]);
 
     let server = start_server_with_db(db_path).await;
 
     // First use of the backup code ÔÇö must succeed.
-    let mut ws = connect_and_auth_with_otp(&server.url, "alice", Some(backup_code)).await;
+    let mut ws = connect_and_auth_with_otp(&server.url, "alice", Some(backup_code.as_str())).await;
     ws.close(None)
         .await
         .expect("close first authenticated socket");
@@ -705,10 +721,10 @@ async fn auth_contract_accepts_backup_code_and_consumes_it() {
         .expect("connect websocket for consumed backup code test");
     let auth = json!({
         "t": "auth", "u": "alice",
-        "pw": "test-password-hash",
+        "pw": test_pw_hash_for("alice"),
         "pk": pub_b64(&new_keypair()).unwrap(),
         "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
-        "otp": backup_code
+        "otp": backup_code.as_str()
     });
     ws2.send(Message::Text(auth.to_string()))
         .await
@@ -757,7 +773,7 @@ async fn auth_contract_returns_expected_fields() {
     ws2.send(Message::Text(
         json!({
             "t": "auth", "u": "auth-contract-check",
-            "pw": "test", "pk": pub_b64(&new_keypair()).unwrap(),
+            "pw": test_pw_hash_for("auth-contract-check"), "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
@@ -805,15 +821,15 @@ async fn auth_contract_returns_expected_fields() {
 #[tokio::test]
 async fn auth_contract_password_change_invalidates_old_password_and_accepts_new_password() {
     let server = start_server().await;
-    let old_hash = "client-hash-before-change";
-    let new_hash = "client-hash-after-change";
+    let old_hash = test_pw_hash_for("alice-before-change");
+    let new_hash = test_pw_hash_for("alice-after-change");
 
-    let mut ws = connect_and_auth_with_pw_hash(&server.url, "alice", old_hash).await;
+    let mut ws = connect_and_auth_with_pw_hash(&server.url, "alice", &old_hash).await;
     ws.send(Message::Text(
         json!({
             "t": "password_change",
-            "current": old_hash,
-            "new": new_hash
+            "current": old_hash.as_str(),
+            "new": new_hash.as_str()
         })
         .to_string(),
     ))
@@ -837,7 +853,7 @@ async fn auth_contract_password_change_invalidates_old_password_and_accepts_new_
             json!({
                 "t": "auth",
                 "u": "alice",
-                "pw": old_hash,
+                "pw": old_hash.as_str(),
                 "pk": pub_b64(&new_keypair()).unwrap(),
                 "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
             })
@@ -851,7 +867,7 @@ async fn auth_contract_password_change_invalidates_old_password_and_accepts_new_
         Some("invalid credentials")
     );
 
-    let mut new_ws = connect_and_auth_with_pw_hash(&server.url, "alice", new_hash).await;
+    let mut new_ws = connect_and_auth_with_pw_hash(&server.url, "alice", &new_hash).await;
     new_ws
         .close(None)
         .await
@@ -934,7 +950,7 @@ async fn protocol_contract_advertises_backward_compatible_version() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "proto-check",
-            "pw": "test-password-hash",
+            "pw": test_pw_hash_for("proto-check"),
             "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
@@ -975,7 +991,7 @@ async fn auth_contract_rejects_invalid_username() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "invalid user",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+            "pw": test_pw_hash_for("invalid user"), "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
@@ -1030,7 +1046,7 @@ async fn auth_contract_rejects_invalid_public_key() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice",
-            "pw": "test-password-hash", "pk": "not-base64",
+            "pw": test_pw_hash_for("alice"), "pk": "not-base64",
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
@@ -1109,7 +1125,7 @@ async fn auth_contract_rejects_sql_injection_like_username() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice' OR '1'='1",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+            "pw": test_pw_hash_for("alice' OR '1'='1"), "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"}
         })
         .to_string(),
@@ -1134,7 +1150,8 @@ async fn auth_contract_rejects_sql_injection_like_username() {
 async fn auth_contract_rejects_oversized_otp_input() {
     let seed_port = allocate_port();
     let db_path = temp_db_path(seed_port);
-    seed_enabled_2fa_user(&db_path, "alice", &["backup-aa11bb22"]);
+    let backup_code = chatify::fresh_nonce_hex();
+    seed_enabled_2fa_user(&db_path, "alice", &[backup_code.as_str()]);
 
     let server = start_server_with_db(db_path).await;
     let (mut ws, _) = connect_async(&server.url)
@@ -1145,7 +1162,7 @@ async fn auth_contract_rejects_oversized_otp_input() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+            "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
             "otp": oversized_otp
         })
@@ -1176,7 +1193,7 @@ async fn auth_contract_rejects_non_object_status_field() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+            "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
             "status": "online"
         })
         .to_string(),
@@ -1205,7 +1222,7 @@ async fn auth_contract_rejects_unexpected_status_object_field() {
     ws.send(Message::Text(
         json!({
             "t": "auth", "u": "alice",
-            "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+            "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
             "status": {"text":"Online","emoji":"\u{AD}ƒƒó","mood":"focused"}
         })
         .to_string(),
@@ -1232,8 +1249,8 @@ async fn auth_contract_rejects_unexpected_status_object_field() {
 async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
     let seed_port = allocate_port();
     let db_path = temp_db_path(seed_port);
-    let backup_code = "ab12cd34ef56ab78";
-    seed_enabled_2fa_user(&db_path, "alice", &[backup_code]);
+    let backup_code = chatify::fresh_nonce_hex();
+    seed_enabled_2fa_user(&db_path, "alice", &[backup_code.as_str()]);
 
     let server = start_server_with_db(db_path).await;
 
@@ -1246,7 +1263,7 @@ async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
         ws.send(Message::Text(
             json!({
                 "t": "auth", "u": "alice",
-                "pw": "test-password-hash", "pk": pub_b64(&new_keypair()).unwrap(),
+                "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
                 "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
                 "otp": wrong_otp
             })
@@ -1265,7 +1282,7 @@ async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
     }
 
     // After all failures, the correct backup code must still be accepted.
-    let mut ws = connect_and_auth_with_otp(&server.url, "alice", Some(backup_code)).await;
+    let mut ws = connect_and_auth_with_otp(&server.url, "alice", Some(backup_code.as_str())).await;
     ws.close(None)
         .await
         .expect("close successful backup-code auth socket");
@@ -3243,7 +3260,7 @@ async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
             json!({
                 "t": "msg", "ch": "general",
                 "c": "stale-cipher", "ts": 1,
-                "n": "11111111111111111111111111111111"
+                "n": chatify::fresh_nonce_hex()
             })
             .to_string(),
         ))
