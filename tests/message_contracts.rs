@@ -39,7 +39,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
@@ -102,6 +102,18 @@ impl TestServer {
 
 /// Convenience type alias for an authenticated, ready-to-use WebSocket stream.
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+type PersistedMediaRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    bool,
+);
 
 /// Protocol version this test suite expects to remain backward-compatible.
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
@@ -110,6 +122,46 @@ static BUILD_SERVER_BINARY_ONCE: Once = Once::new();
 const SERVER_START_RETRIES: usize = 5;
 const SERVER_READY_POLL_ATTEMPTS: usize = 100;
 const SERVER_READY_POLL_INTERVAL_MS: u64 = 100;
+const WS_FRAME_TIMEOUT_SECS_LOCAL: u64 = 3;
+const WS_FRAME_TIMEOUT_SECS_CI: u64 = 8;
+const SETTLE_DELAY_MS_LOCAL: u64 = 150;
+const SETTLE_DELAY_MS_CI: u64 = 400;
+const TIME_BOUNDARY_DELAY_MS_LOCAL: u64 = 1200;
+const TIME_BOUNDARY_DELAY_MS_CI: u64 = 1800;
+const MEDIA_DB_POLL_ATTEMPTS: usize = 20;
+const MEDIA_DB_POLL_INTERVAL_MS: u64 = 100;
+
+fn running_in_ci() -> bool {
+    std::env::var("CI")
+        .map(|value| {
+            let trimmed = value.trim();
+            !trimmed.is_empty()
+                && trimmed != "0"
+                && !trimmed.eq_ignore_ascii_case("false")
+                && !trimmed.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(false)
+}
+
+fn ci_adjusted_duration(local_ms: u64, ci_ms: u64) -> Duration {
+    Duration::from_millis(if running_in_ci() { ci_ms } else { local_ms })
+}
+
+fn websocket_frame_timeout() -> Duration {
+    Duration::from_secs(if running_in_ci() {
+        WS_FRAME_TIMEOUT_SECS_CI
+    } else {
+        WS_FRAME_TIMEOUT_SECS_LOCAL
+    })
+}
+
+fn settle_delay() -> Duration {
+    ci_adjusted_duration(SETTLE_DELAY_MS_LOCAL, SETTLE_DELAY_MS_CI)
+}
+
+fn time_boundary_delay() -> Duration {
+    ci_adjusted_duration(TIME_BOUNDARY_DELAY_MS_LOCAL, TIME_BOUNDARY_DELAY_MS_CI)
+}
 
 // ---------------------------------------------------------------------------
 // Server / database helpers
@@ -128,18 +180,16 @@ fn allocate_port() -> u16 {
 }
 
 /// Returns a unique temporary database path of the form
-/// `$TMPDIR/chatify-test-<port>-<nanoseconds>.db`.
+/// `$TMPDIR/chatify-test-<pid>-<port>-<nonce>.db`.
 ///
-/// The port and nanosecond timestamp together make collisions between
-/// concurrent test runs vanishingly unlikely.
+/// Including the process id and a cryptographically random nonce avoids rare
+/// collisions between concurrent test workers on fast CI runners.
 fn temp_db_path(port: u16) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "chatify-test-{}-{}.db",
+        "chatify-test-{}-{}-{}.db",
+        std::process::id(),
         port,
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
+        clifford::fresh_nonce_hex()
     ))
 }
 
@@ -551,7 +601,7 @@ async fn connect_and_auth_with_pw_hash_and_otp(
 /// - No matching frame is seen within 50 attempts.
 async fn recv_by_type(ws: &mut Ws, expected_type: &str) -> Value {
     for _ in 0..50 {
-        let msg = timeout(Duration::from_secs(3), ws.next())
+        let msg = timeout(websocket_frame_timeout(), ws.next())
             .await
             .expect("timeout waiting for websocket frame");
         let msg = msg.expect("websocket closed unexpectedly");
@@ -1897,32 +1947,60 @@ async fn file_contract_persists_media_metadata_and_chunks_in_database() {
         .await
         .expect("send media chunk for db persistence contract");
 
-    sleep(Duration::from_millis(150)).await;
+    let row: PersistedMediaRow = {
+        let mut last_row = None;
+        let mut completed_row = None;
 
-    let conn =
-        Connection::open(&server.db_path).expect("open sqlite db for media persistence checks");
-    let row: (i64, String, String, String, String, Option<String>, i64, i64, i64, bool) = conn
-        .query_row(
-            "SELECT id, channel, sender, filename, media_kind, mime, declared_size, received_size, chunk_count, completed
-             FROM media_objects
-             WHERE channel = ?1 AND file_id = ?2",
-            params!["general", file_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                ))
-            },
-        )
-        .expect("media_objects row should be persisted");
+        for attempt in 1..=MEDIA_DB_POLL_ATTEMPTS {
+            let conn = Connection::open(&server.db_path)
+                .expect("open sqlite db for media persistence checks");
+            let candidate: Option<PersistedMediaRow> = conn
+                .query_row(
+                    "SELECT id, channel, sender, filename, media_kind, mime, declared_size, received_size, chunk_count, completed
+                     FROM media_objects
+                     WHERE channel = ?1 AND file_id = ?2",
+                    params!["general", file_id],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                        ))
+                    },
+                )
+                .optional()
+                .expect("query media_objects row");
+
+            if let Some(row) = candidate {
+                let received_size = row.7;
+                let chunk_count = row.8;
+                let completed = row.9;
+                if received_size == 11 && chunk_count == 1 && completed {
+                    completed_row = Some(row);
+                    break;
+                }
+                last_row = Some(row);
+            }
+
+            if attempt < MEDIA_DB_POLL_ATTEMPTS {
+                sleep(Duration::from_millis(MEDIA_DB_POLL_INTERVAL_MS)).await;
+            }
+        }
+
+        completed_row.unwrap_or_else(|| {
+            panic!(
+                "media_objects row did not reach completed state in time for {}: {:?}",
+                file_id, last_row
+            )
+        })
+    };
 
     let (
         media_id,
@@ -1946,6 +2024,8 @@ async fn file_contract_persists_media_metadata_and_chunks_in_database() {
     assert_eq!(chunk_count, 1);
     assert!(completed, "media object should be marked completed");
 
+    let conn =
+        Connection::open(&server.db_path).expect("open sqlite db for media persistence checks");
     let chunk_rows: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM media_chunks WHERE media_id = ?1",
@@ -2028,7 +2108,7 @@ async fn voice_contract_forwards_vdata_between_room_members() {
         .expect("bob joins voice room");
 
     // Allow both join events to be processed server-side before sending audio.
-    sleep(Duration::from_millis(150)).await;
+    sleep(settle_delay()).await;
 
     alice
         .send(Message::Text(
@@ -2082,7 +2162,7 @@ async fn screen_share_contract_relays_meta_and_frames_between_room_members() {
     );
 
     // Allow subscriptions to settle before relaying metadata/frames.
-    sleep(Duration::from_millis(150)).await;
+    sleep(settle_delay()).await;
 
     alice
         .send(Message::Text(
@@ -2429,7 +2509,7 @@ async fn history_contract_respects_seconds_window_filter() {
         .expect("send older message");
 
     // Ensure the first message is outside a 1-second history window.
-    sleep(Duration::from_millis(1200)).await;
+    sleep(time_boundary_delay()).await;
 
     alice
         .send(Message::Text(
@@ -2734,7 +2814,7 @@ async fn replay_contract_returns_events_from_timestamp() {
         })
         .expect("first replay message should exist in history with ts");
 
-    sleep(Duration::from_millis(1200)).await;
+    sleep(time_boundary_delay()).await;
 
     alice
         .send(Message::Text(
