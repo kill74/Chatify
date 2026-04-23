@@ -16,15 +16,23 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use image::ImageReader;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+use ratatui_image::{
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+    StatefulImage,
+};
 
 use crate::handlers;
-use crate::media::{render_message_lines, RgbColor, StyledFragment, StyledLine};
+use crate::media::{
+    render_message_lines, MediaKind, RgbColor, StyledFragment, StyledLine, TimelinePayload,
+};
 use crate::state::{ActivityEntry, ClientState, SharedState};
 use clifford::error::{ChatifyError, ChatifyResult};
 
@@ -216,6 +224,23 @@ struct PresenceRow {
 }
 
 #[derive(Clone)]
+struct MediaPreviewCandidate {
+    key: String,
+    title: String,
+    summary: String,
+    path: String,
+}
+
+struct MediaPreviewRuntime {
+    picker: Option<Picker>,
+    protocol_label: Option<String>,
+    unsupported_reason: Option<String>,
+    active_key: Option<String>,
+    image: Option<StatefulProtocol>,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
 struct UiSnapshot {
     title: String,
     subtitle: String,
@@ -231,9 +256,97 @@ struct UiSnapshot {
     input_cursor: usize,
     scroll_offset: usize,
     media_enabled: bool,
+    media_preview: Option<MediaPreviewCandidate>,
     known_users: usize,
     dm_trust_label: Option<String>,
     voice: VoiceSnapshot,
+}
+
+impl MediaPreviewRuntime {
+    fn from_terminal() -> Self {
+        match Picker::from_query_stdio() {
+            Ok(picker) => match picker.protocol_type() {
+                ProtocolType::Halfblocks => Self {
+                    picker: None,
+                    protocol_label: None,
+                    unsupported_reason: Some(
+                        "Terminal bitmap image preview is unavailable here.".to_string(),
+                    ),
+                    active_key: None,
+                    image: None,
+                    last_error: None,
+                },
+                protocol_type => Self {
+                    picker: Some(picker),
+                    protocol_label: Some(protocol_type_label(protocol_type).to_string()),
+                    unsupported_reason: None,
+                    active_key: None,
+                    image: None,
+                    last_error: None,
+                },
+            },
+            Err(err) => Self {
+                picker: None,
+                protocol_label: None,
+                unsupported_reason: Some(format!("Image preview detection failed: {}", err)),
+                active_key: None,
+                image: None,
+                last_error: None,
+            },
+        }
+    }
+
+    fn sync(&mut self, candidate: Option<&MediaPreviewCandidate>) {
+        let Some(candidate) = candidate else {
+            self.active_key = None;
+            self.image = None;
+            self.last_error = None;
+            return;
+        };
+
+        if self.active_key.as_deref() == Some(candidate.key.as_str()) {
+            return;
+        }
+
+        self.active_key = Some(candidate.key.clone());
+        self.image = None;
+        self.last_error = None;
+
+        let Some(picker) = &self.picker else {
+            return;
+        };
+
+        match ImageReader::open(&candidate.path) {
+            Ok(reader) => match reader.decode() {
+                Ok(image) => {
+                    self.image = Some(picker.new_resize_protocol(image));
+                }
+                Err(err) => {
+                    self.last_error = Some(format!("Failed to decode image: {}", err));
+                }
+            },
+            Err(err) => {
+                self.last_error = Some(format!("Failed to open image: {}", err));
+            }
+        }
+    }
+
+    fn record_render_result(&mut self) {
+        let Some(image) = self.image.as_mut() else {
+            return;
+        };
+
+        if let Some(result) = image.last_encoding_result() {
+            match result {
+                Ok(()) => {
+                    self.last_error = None;
+                }
+                Err(err) => {
+                    self.last_error = Some(format!("Failed to render image: {}", err));
+                }
+            }
+        }
+    }
 }
 
 impl UiSnapshot {
@@ -304,7 +417,7 @@ impl UiSnapshot {
         let mut previous_sender = String::new();
         let mut previous_scope = String::new();
         let mut seen_unreadable = 0usize;
-        for message in visible_messages {
+        for message in &visible_messages {
             let reaction_summary = if message.id.is_empty() {
                 String::new()
             } else {
@@ -387,6 +500,22 @@ impl UiSnapshot {
             .collect();
         online_people.sort_by_key(|row| (!row.online, row.user.to_ascii_lowercase()));
 
+        let media_preview = visible_messages.iter().rev().find_map(|message| {
+            let Some(TimelinePayload::Media(media)) = message.payload.as_ref() else {
+                return None;
+            };
+            if media.media_kind != MediaKind::Image {
+                return None;
+            }
+
+            Some(MediaPreviewCandidate {
+                key: message.id.clone(),
+                title: media.filename.clone(),
+                summary: media.summary_line(),
+                path: media.local_path.as_ref()?.clone(),
+            })
+        });
+
         let composer_suggestions = mention_query(&state.input_buffer, state.input_cursor)
             .map(|query| mention_suggestions(state, &query.query))
             .unwrap_or_default();
@@ -406,6 +535,7 @@ impl UiSnapshot {
             input_cursor: state.input_cursor,
             scroll_offset: state.scroll_offset,
             media_enabled: state.media_enabled,
+            media_preview,
             known_users: state.users.len(),
             dm_trust_label,
             voice: VoiceSnapshot {
@@ -431,6 +561,7 @@ where
     let (output_tx, output_rx) = mpsc::channel::<OutputLine>();
     let _output_guard = OutputSinkGuard::install(output_tx);
     let mut terminal = TerminalSession::enter()?;
+    let mut media_preview = MediaPreviewRuntime::from_terminal();
     let input_thread = InputThread::start();
 
     {
@@ -456,11 +587,13 @@ where
             let state_lock = state.lock().await;
             UiSnapshot::from_state(&state_lock)
         };
+        media_preview.sync(snapshot.media_preview.as_ref());
 
         terminal
             .terminal
-            .draw(|frame| render(frame, &snapshot))
+            .draw(|frame| render(frame, &snapshot, &mut media_preview))
             .map_err(ChatifyError::from)?;
+        media_preview.record_render_result();
 
         let mut actions = Vec::new();
         while let Ok(event) = input_thread.try_recv() {
@@ -974,7 +1107,11 @@ fn format_timestamp(ts: f64) -> String {
         .unwrap_or_default()
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, snapshot: &UiSnapshot) {
+fn render(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &UiSnapshot,
+    media_preview: &mut MediaPreviewRuntime,
+) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -992,13 +1129,17 @@ fn render(frame: &mut ratatui::Frame<'_>, snapshot: &UiSnapshot) {
         .constraints([
             Constraint::Length(24),
             Constraint::Min(40),
-            Constraint::Length(30),
+            Constraint::Length(if snapshot.media_preview.is_some() {
+                36
+            } else {
+                30
+            }),
         ])
         .split(root[1]);
 
     render_sidebar(frame, body[0], snapshot);
     render_timeline(frame, body[1], snapshot);
-    render_right_panel(frame, body[2], snapshot);
+    render_right_panel(frame, body[2], snapshot, media_preview);
     render_composer(frame, root[2], snapshot);
     render_footer(frame, root[3], snapshot);
 }
@@ -1273,13 +1414,18 @@ fn rgb_to_color(color: RgbColor) -> Color {
     Color::Rgb(color.r, color.g, color.b)
 }
 
-fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnapshot) {
+fn render_right_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    media_preview: &mut MediaPreviewRuntime,
+) {
     let columns = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(10),
+            Constraint::Min(10),
             Constraint::Length(8),
-            Constraint::Min(6),
         ])
         .split(area);
 
@@ -1357,11 +1503,38 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiS
         .wrap(Wrap { trim: true });
     frame.render_widget(status, columns[0]);
 
+    render_media_or_people_panel(frame, columns[1], snapshot, media_preview);
+
+    let activity_lines: Vec<Line<'_>> = snapshot
+        .activity
+        .iter()
+        .rev()
+        .take(columns[2].height.saturating_sub(2) as usize)
+        .map(render_activity_line)
+        .collect();
+
+    let activity = Paragraph::new(Text::from(activity_lines))
+        .block(Block::default().borders(Borders::ALL).title("Activity"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(activity, columns[2]);
+}
+
+fn render_media_or_people_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    media_preview: &mut MediaPreviewRuntime,
+) {
+    if let Some(candidate) = &snapshot.media_preview {
+        render_media_preview_panel(frame, area, snapshot, candidate, media_preview);
+        return;
+    }
+
     if !snapshot.composer_suggestions.is_empty() {
         let suggestion_lines: Vec<Line<'_>> = snapshot
             .composer_suggestions
             .iter()
-            .take(columns[1].height.saturating_sub(2) as usize)
+            .take(area.height.saturating_sub(2) as usize)
             .map(|suggestion| {
                 Line::from(vec![
                     Span::styled(
@@ -1382,12 +1555,12 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiS
         let suggestions = Paragraph::new(Text::from(suggestion_lines))
             .block(Block::default().borders(Borders::ALL).title("Suggestions"))
             .wrap(Wrap { trim: true });
-        frame.render_widget(suggestions, columns[1]);
+        frame.render_widget(suggestions, area);
     } else {
         let people_lines: Vec<Line<'_>> = snapshot
             .online_people
             .iter()
-            .take(columns[1].height.saturating_sub(2) as usize)
+            .take(area.height.saturating_sub(2) as usize)
             .map(|person| {
                 Line::from(vec![
                     Span::styled(
@@ -1418,21 +1591,91 @@ fn render_right_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiS
         let people = Paragraph::new(Text::from(people_lines))
             .block(Block::default().borders(Borders::ALL).title("People"))
             .wrap(Wrap { trim: true });
-        frame.render_widget(people, columns[1]);
+        frame.render_widget(people, area);
+    }
+}
+
+fn render_media_preview_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    candidate: &MediaPreviewCandidate,
+    media_preview: &mut MediaPreviewRuntime,
+) {
+    let protocol_suffix = media_preview
+        .protocol_label
+        .as_deref()
+        .map(|label| format!(" [{}]", label))
+        .unwrap_or_default();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Image Preview{}", protocol_suffix));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 4 || inner.height < 4 {
+        return;
     }
 
-    let activity_lines: Vec<Line<'_>> = snapshot
-        .activity
-        .iter()
-        .rev()
-        .take(columns[2].height.saturating_sub(2) as usize)
-        .map(render_activity_line)
-        .collect();
-
-    let activity = Paragraph::new(Text::from(activity_lines))
-        .block(Block::default().borders(Borders::ALL).title("Activity"))
+    if !snapshot.media_enabled {
+        let disabled = Paragraph::new(Text::from(vec![
+            Line::from(candidate.summary.clone()),
+            Line::default(),
+            Line::from(Span::styled(
+                "Media rendering is disabled.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]))
         .wrap(Wrap { trim: true });
-    frame.render_widget(activity, columns[2]);
+        frame.render_widget(disabled, inner);
+        return;
+    }
+
+    if let Some(reason) = media_preview.unsupported_reason.as_deref() {
+        let fallback = Paragraph::new(Text::from(vec![
+            Line::from(candidate.summary.clone()),
+            Line::default(),
+            Line::from(Span::styled(reason, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                format!("saved: {}", candidate.path),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(fallback, inner);
+        return;
+    }
+
+    if let Some(error) = media_preview.last_error.as_deref() {
+        let fallback = Paragraph::new(Text::from(vec![
+            Line::from(candidate.summary.clone()),
+            Line::default(),
+            Line::from(Span::styled(error, Style::default().fg(Color::Red))),
+            Line::from(Span::styled(
+                format!("saved: {}", candidate.path),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(fallback, inner);
+        return;
+    }
+
+    if let Some(image) = media_preview.image.as_mut() {
+        frame.render_stateful_widget(StatefulImage::default(), inner, image);
+        return;
+    }
+
+    let loading = Paragraph::new(Text::from(vec![
+        Line::from(candidate.title.clone()),
+        Line::default(),
+        Line::from(Span::styled(
+            "Loading image preview...",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(loading, inner);
 }
 
 fn render_activity_line(entry: &ActivityEntry) -> Line<'static> {
@@ -1519,11 +1762,23 @@ fn on_off(enabled: bool) -> &'static str {
     }
 }
 
+fn protocol_type_label(protocol_type: ProtocolType) -> &'static str {
+    match protocol_type {
+        ProtocolType::Halfblocks => "Halfblocks",
+        ProtocolType::Sixel => "Sixel",
+        ProtocolType::Kitty => "Kitty",
+        ProtocolType::Iterm2 => "iTerm2",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_mention_completion, mention_query, mention_suggestions};
+    use super::{apply_mention_completion, mention_query, mention_suggestions, UiSnapshot};
     use crate::args::ClientConfig;
-    use crate::state::ClientState;
+    use crate::{
+        media::{MediaKind, MediaRenderStatus, TimelineMedia, TimelinePayload},
+        state::{ClientState, DisplayedMessage},
+    };
     use tokio::sync::mpsc;
 
     fn make_test_state() -> ClientState {
@@ -1584,5 +1839,38 @@ mod tests {
             suggestions.first().map(|item| item.value.as_str()),
             Some("alice")
         );
+    }
+
+    #[test]
+    fn ui_snapshot_prefers_latest_image_with_local_path_for_preview_panel() {
+        let mut state = make_test_state();
+        state.message_history.push_back(DisplayedMessage {
+            id: "media:general:img-1".to_string(),
+            ts: 1.0,
+            channel: "general".to_string(),
+            sender: "alice".to_string(),
+            content: "[image] preview.png".to_string(),
+            payload: Some(TimelinePayload::Media(TimelineMedia {
+                file_id: "img-1".to_string(),
+                filename: "preview.png".to_string(),
+                media_kind: MediaKind::Image,
+                mime: Some("image/png".to_string()),
+                size: 64,
+                duration_ms: None,
+                received_bytes: 64,
+                local_path: Some("C:/tmp/preview.png".to_string()),
+                preview: Vec::new(),
+                render_status: MediaRenderStatus::Complete,
+            })),
+            encrypted: false,
+            edited: false,
+        });
+
+        let snapshot = UiSnapshot::from_state(&state);
+        let preview = snapshot
+            .media_preview
+            .expect("latest image should be promoted to the preview panel");
+        assert_eq!(preview.title, "preview.png");
+        assert_eq!(preview.path, "C:/tmp/preview.png");
     }
 }

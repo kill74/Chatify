@@ -46,7 +46,7 @@ log = "0.4"
 rpassword = "7"
 cpal = "0.14"
 rodio = "0.18"
-image = "0.24"
+image = "0.25.10"
 serenity = { version = "=0.11.7", default-features = false, features = ["default_no_backend", "native_tls_backend"], optional = true }
 base64 = "0.21"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::io::IsTerminal;
 
 use image::imageops::FilterType;
 
@@ -195,6 +196,10 @@ pub fn media_timeline_id(scope: &str, file_id: &str) -> String {
 pub fn terminal_supports_inline_media() -> bool {
     if env::var_os("CHATIFY_FORCE_INLINE_MEDIA").is_some() {
         return true;
+    }
+
+    if !std::io::stdout().is_terminal() {
+        return false;
     }
 
     if env::var_os("NO_COLOR").is_some() || env::var("CLICOLOR").ok().as_deref() == Some("0") {
@@ -530,7 +535,7 @@ mod tests {
             image::Rgba([255, 0, 0, 255]),
         ));
         image
-            .write_to(&mut cursor, image::ImageOutputFormat::Png)
+            .write_to(&mut cursor, image::ImageFormat::Png)
             .expect("encode 1x1 png");
         let png = cursor.into_inner();
 

@@ -19,9 +19,11 @@
 //! manually verify via `/trust` and `/fingerprint` commands. Session tokens don't survive
 //! restarts, so key re-verification is expected after server restarts.
 
+use std::fs;
+
 use crate::media::{
-    build_inline_image_preview, media_timeline_id, render_message_plain_lines, MediaKind,
-    MediaRenderStatus, PendingMediaTransfer, TimelineMedia, TimelinePayload,
+    media_timeline_id, render_message_plain_lines, MediaKind, MediaRenderStatus,
+    PendingMediaTransfer, TimelineMedia, TimelinePayload,
 };
 use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState, TypingPresence};
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
@@ -230,6 +232,62 @@ fn print_media_completion_update(message: &DisplayedMessage, media_enabled: bool
     for line in lines.iter().skip(1) {
         println!("    [{}] {}", id, line);
     }
+}
+
+fn restore_cached_timeline_media(state: &ClientState, sender: &str, media: &mut TimelineMedia) {
+    if !state.media_enabled || media.render_status == MediaRenderStatus::Disabled {
+        media.render_status = MediaRenderStatus::Disabled;
+        return;
+    }
+
+    let cached_path = state.media_download_path(sender, &media.file_id, &media.filename);
+    let Ok(metadata) = fs::metadata(&cached_path) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+
+    let cached_len = metadata.len();
+    if media.size > 0 && cached_len < media.size {
+        return;
+    }
+
+    media.local_path = Some(cached_path.display().to_string());
+    media.received_bytes = if media.size == 0 {
+        cached_len
+    } else {
+        media.size
+    };
+    media.render_status = MediaRenderStatus::Complete;
+}
+
+fn history_preview_lines(
+    message: &DisplayedMessage,
+    current_user: &str,
+    reaction_summary: &str,
+    media_enabled: bool,
+) -> Vec<String> {
+    let (display_content, _) = format_content_for_mentions(&message.content, current_user);
+    let mut lines =
+        render_message_plain_lines(&display_content, message.payload.as_ref(), media_enabled);
+    let mut primary = lines
+        .first()
+        .cloned()
+        .unwrap_or_else(|| display_content.clone());
+    if !reaction_summary.is_empty() {
+        primary.push(' ');
+        primary.push_str(reaction_summary);
+    }
+
+    let mut preview = vec![format!(
+        "  [{}] {}: {}",
+        message_display_id(message),
+        message.sender,
+        primary
+    )];
+    preview.extend(lines.drain(1..).map(|line| format!("      {}", line)));
+    preview
 }
 
 fn is_mention_char(ch: char) -> bool {
@@ -760,16 +818,6 @@ pub async fn handle_file_chunk_event(state: &SharedState, data: &serde_json::Val
             }
 
             media.render_status = MediaRenderStatus::Complete;
-            if media.media_kind == MediaKind::Image {
-                match build_inline_image_preview(&combined) {
-                    Ok(preview) => {
-                        media.preview = preview;
-                    }
-                    Err(status) => {
-                        media.render_status = status;
-                    }
-                }
-            }
 
             let message = DisplayedMessage {
                 id: timeline_id,
@@ -911,19 +959,21 @@ async fn ingest_timeline_events(
                 ));
             }
             "file_meta" => {
-                if let Some(media) =
+                if let Some(mut media) =
                     timeline_media_from_file_meta(event, true, state_lock.media_enabled)
                 {
+                    let sender = event
+                        .get("from")
+                        .or_else(|| event.get("u"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    restore_cached_timeline_media(&state_lock, &sender, &mut media);
                     state_lock.add_message(DisplayedMessage {
                         id: media_timeline_id(scope, &media.file_id),
                         ts: extract_ts(event, 0),
                         channel: scope.to_string(),
-                        sender: event
-                            .get("from")
-                            .or_else(|| event.get("u"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?")
-                            .to_string(),
+                        sender,
                         content: media.summary_line(),
                         payload: Some(TimelinePayload::Media(media)),
                         encrypted: false,
@@ -977,25 +1027,9 @@ async fn ingest_timeline_events(
         .rev()
         .filter(|msg| msg.channel == scope && !msg.id.is_empty())
         .take(5)
-        .map(|msg| {
-            let (display_content, _) = format_content_for_mentions(&msg.content, &current_user);
+        .flat_map(|msg| {
             let summary = state_lock.reaction_summary(&msg.id);
-            if summary.is_empty() {
-                format!(
-                    "  [{}] {}: {}",
-                    message_display_id(msg),
-                    msg.sender,
-                    display_content
-                )
-            } else {
-                format!(
-                    "  [{}] {}: {} {}",
-                    message_display_id(msg),
-                    msg.sender,
-                    display_content,
-                    summary
-                )
-            }
+            history_preview_lines(msg, &current_user, &summary, state_lock.media_enabled)
         })
         .collect();
 
@@ -1999,12 +2033,16 @@ pub async fn dispatch_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch_event, format_content_for_mentions};
-    use crate::{args::ClientConfig, state::ClientState};
+    use super::{dispatch_event, format_content_for_mentions, ingest_timeline_events};
+    use crate::{
+        args::ClientConfig,
+        media::{MediaRenderStatus, TimelinePayload},
+        state::ClientState,
+    };
     use std::sync::Arc;
     use tokio::sync::{mpsc, Mutex};
 
-    fn make_test_state() -> crate::state::SharedState {
+    fn make_test_state_with_media_enabled(media_enabled: bool) -> crate::state::SharedState {
         let (tx, _rx) = mpsc::unbounded_channel();
         Arc::new(Mutex::new(ClientState::new(
             tx,
@@ -2014,11 +2052,15 @@ mod tests {
                 tls: false,
                 log_enabled: false,
                 markdown_enabled: true,
-                media_enabled: true,
+                media_enabled,
                 animations_enabled: true,
             },
             clifford::config::Config::default(),
         )))
+    }
+
+    fn make_test_state() -> crate::state::SharedState {
+        make_test_state_with_media_enabled(true)
     }
 
     #[test]
@@ -2128,5 +2170,85 @@ mod tests {
             .back()
             .expect("bridge status summary should be recorded");
         assert_eq!(latest.content, "Bridge status: 1 connected instance(s).");
+    }
+
+    #[tokio::test]
+    async fn history_preview_rehydrates_cached_audio_note_media() {
+        let state = make_test_state();
+        let saved_path = {
+            let state_lock = state.lock().await;
+            state_lock
+                .save_media_bytes("alice", "audio-1", "voice-note.ogg", b"note")
+                .expect("save cached audio note")
+        };
+        let saved_path_text = saved_path.display().to_string();
+
+        let events = vec![serde_json::json!({
+            "t": "file_meta",
+            "from": "alice",
+            "ch": "general",
+            "filename": "voice-note.ogg",
+            "size": 4,
+            "file_id": "audio-1",
+            "media_kind": "audio",
+            "mime": "audio/ogg",
+            "duration_ms": 4_250_u64,
+            "ts": 1_u64
+        })];
+
+        let (_reaction_events, preview) = ingest_timeline_events(&state, "general", &events).await;
+
+        assert!(preview
+            .iter()
+            .any(|line| line.contains("[audio note] voice-note.ogg (4 B, 0:04, audio/ogg)")));
+        assert!(preview
+            .iter()
+            .any(|line| line.contains(&format!("saved: {}", saved_path_text))));
+
+        let state_lock = state.lock().await;
+        let message = state_lock
+            .message_history
+            .back()
+            .expect("audio note message should be recorded");
+        let Some(TimelinePayload::Media(media)) = message.payload.as_ref() else {
+            panic!("audio note payload should be present");
+        };
+        assert_eq!(media.duration_ms, Some(4_250));
+        assert_eq!(media.local_path.as_deref(), Some(saved_path_text.as_str()));
+        assert_eq!(media.render_status, MediaRenderStatus::Complete);
+        drop(state_lock);
+
+        let _ = std::fs::remove_file(saved_path);
+    }
+
+    #[tokio::test]
+    async fn history_preview_reports_disabled_media_when_media_is_off() {
+        let state = make_test_state_with_media_enabled(false);
+        let events = vec![serde_json::json!({
+            "t": "file_meta",
+            "from": "alice",
+            "ch": "general",
+            "filename": "voice-note.ogg",
+            "size": 4,
+            "file_id": "audio-disabled-1",
+            "media_kind": "audio",
+            "mime": "audio/ogg",
+            "duration_ms": 4_250_u64,
+            "ts": 1_u64
+        })];
+
+        let (_reaction_events, preview) = ingest_timeline_events(&state, "general", &events).await;
+
+        assert!(preview.iter().any(|line| line.contains("disabled")));
+
+        let state_lock = state.lock().await;
+        let message = state_lock
+            .message_history
+            .back()
+            .expect("disabled media message should be recorded");
+        let Some(TimelinePayload::Media(media)) = message.payload.as_ref() else {
+            panic!("disabled media payload should be present");
+        };
+        assert_eq!(media.render_status, MediaRenderStatus::Disabled);
     }
 }
