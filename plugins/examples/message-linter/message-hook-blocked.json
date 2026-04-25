@@ -1,0 +1,12 @@
+{
+  "api_version": "1",
+  "replacement": null,
+  "blocked": true,
+  "messages": [
+    {
+      "target": "ephemeral",
+      "content": "message blocked by plugin policy"
+    }
+  ]
+}
+

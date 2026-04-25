@@ -1284,6 +1284,113 @@ pub async fn handle_bridge_status_event(state: &SharedState, data: &serde_json::
     }
 }
 
+async fn record_system_summary(state: &SharedState, summary: String) {
+    let mut state_lock = state.lock().await;
+    state_lock.add_message(DisplayedMessage {
+        id: String::new(),
+        ts: 0.0,
+        channel: String::new(),
+        sender: "system".to_string(),
+        content: summary.clone(),
+        encrypted: false,
+        edited: false,
+    });
+    drop(state_lock);
+
+    println!("{}", summary);
+}
+
+pub async fn handle_admin_users_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let users = data
+        .get("users")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    record_system_summary(state, format!("Admin users: {} account(s).", users.len())).await;
+
+    for user in users {
+        let username = user
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let role = user
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("member");
+        let channel = user
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general");
+        println!("  {} role={} channel=#{}", username, role, channel);
+    }
+}
+
+pub async fn handle_admin_registered_event(
+    state: &SharedState,
+    data: &serde_json::Value,
+    _ts: u64,
+) {
+    let target = data
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let role = data
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("member");
+    record_system_summary(
+        state,
+        format!("Admin registered user {} as {}.", target, role),
+    )
+    .await;
+}
+
+pub async fn handle_admin_role_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let target = data
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let role = data
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("member");
+    let channel = data
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("general");
+    record_system_summary(
+        state,
+        format!("Admin set {} to {} in #{}.", target, role, channel),
+    )
+    .await;
+}
+
+pub async fn handle_admin_audit_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
+    let logs = data
+        .get("logs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    record_system_summary(state, format!("Admin audit: {} entries.", logs.len())).await;
+
+    for log in logs {
+        let action = log
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let actor = log
+            .get("actor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let target = log.get("target").and_then(|v| v.as_str()).unwrap_or("-");
+        let channel = log.get("channel").and_then(|v| v.as_str()).unwrap_or("-");
+        println!(
+            "  {} actor={} target={} channel={}",
+            action, actor, target, channel
+        );
+    }
+}
+
 pub async fn handle_users_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
     let users = data.get("users").and_then(|v| v.as_array());
 
@@ -1962,6 +2069,19 @@ pub async fn dispatch_event(
         }
         "bridge_status" => {
             handle_bridge_status_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "admin_users" => {
+            handle_admin_users_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "admin_registered" => {
+            handle_admin_registered_event(state, &serde_json::Value::Object(data.clone()), ts)
+                .await;
+        }
+        "admin_role" => {
+            handle_admin_role_event(state, &serde_json::Value::Object(data.clone()), ts).await;
+        }
+        "admin_audit" | "audit_logs" => {
+            handle_admin_audit_event(state, &serde_json::Value::Object(data.clone()), ts).await;
         }
         "users" => {
             handle_users_event(state, &serde_json::Value::Object(data.clone()), ts).await;

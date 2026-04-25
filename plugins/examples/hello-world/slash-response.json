@@ -1,0 +1,10 @@
+{
+  "api_version": "1",
+  "messages": [
+    {
+      "target": "channel",
+      "content": "hello from Chatify plugin API v1"
+    }
+  ]
+}
+

@@ -1,0 +1,12 @@
+{
+  "api_version": "1",
+  "name": "hello-world",
+  "commands": [
+    {
+      "name": "hello",
+      "description": "Send a greeting from the plugin runtime"
+    }
+  ],
+  "message_hook": false
+}
+

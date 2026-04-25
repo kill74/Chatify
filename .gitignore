@@ -27,6 +27,9 @@ dist/security-reports/chatify-security-report-*.md
 *.swo
 *~
 
+# Codex local artifacts
+.codex
+
 # Environment and local overrides
 .env
 .env.local
