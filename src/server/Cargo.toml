@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 chatify = { path = "../../" }
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.21"
+tokio-tungstenite = "0.29"
 tungstenite = "0.21"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
