@@ -35,7 +35,7 @@ prometheus = "0.14"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pki-types = "1"
-base64 = "0.21"
+base64 = "0.22"
 bitflags = "2"
 parking_lot = "0.12"
 rand = "0.8.6"
