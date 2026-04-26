@@ -59,7 +59,7 @@ zeroize = { version = "1.7", features = ["derive"] }
 ring = "0.17"
 toml = "0.8"
 dirs = "5.0"
-rustyline = "13.0"
+rustyline = "18.0"
 pulldown-cmark = "0.9"
 syntect = "5.1"
 notify-rust = "4.10"
