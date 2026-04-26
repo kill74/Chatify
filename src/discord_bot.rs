@@ -42,6 +42,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use serenity::{
     async_trait,
+    builder::{CreateAllowedMentions, CreateMessage},
     http::Http,
     model::{
         channel::Message,
@@ -135,7 +136,7 @@ fn extract_discord_attachments(msg: &Message) -> Vec<RelayAttachmentMeta> {
         .map(|attachment| RelayAttachmentMeta {
             url: truncate_chars(&attachment.url, MAX_RELAY_ATTACHMENT_URL_LEN),
             filename: sanitize_single_line(&attachment.filename, MAX_RELAY_ATTACHMENT_NAME_LEN),
-            size_bytes: attachment.size,
+            size_bytes: u64::from(attachment.size),
             content_type: attachment
                 .content_type
                 .as_ref()
@@ -534,7 +535,8 @@ async fn send_to_discord_channel(
     content: &str,
     reply: Option<&RelayReplyMeta>,
 ) -> Result<(), serenity::Error> {
-    let channel_id = ChannelId(channel_id_num);
+    let channel_id = ChannelId::new(channel_id_num);
+    let allowed_mentions = CreateAllowedMentions::new().replied_user(false);
 
     let maybe_reply_message_id = reply
         .and_then(|r| {
@@ -548,24 +550,18 @@ async fn send_to_discord_channel(
         .and_then(|id| id.parse::<u64>().ok());
 
     if let Some(reply_message_id) = maybe_reply_message_id {
-        channel_id
-            .send_message(http.as_ref(), |message| {
-                message
-                    .content(content)
-                    .reference_message((channel_id, MessageId(reply_message_id)))
-                    .allowed_mentions(|mentions| mentions.empty_parse())
-            })
-            .await?;
+        let message = CreateMessage::new()
+            .content(content)
+            .reference_message((channel_id, MessageId::new(reply_message_id)))
+            .allowed_mentions(allowed_mentions);
+        channel_id.send_message(http.as_ref(), message).await?;
         return Ok(());
     }
 
-    channel_id
-        .send_message(http.as_ref(), |message| {
-            message
-                .content(content)
-                .allowed_mentions(|mentions| mentions.empty_parse())
-        })
-        .await?;
+    let message = CreateMessage::new()
+        .content(content)
+        .allowed_mentions(allowed_mentions);
+    channel_id.send_message(http.as_ref(), message).await?;
     Ok(())
 }
 
@@ -1019,7 +1015,7 @@ impl EventHandler for DiscordHandler {
     /// Handle incoming Discord messages and forward to Chatify
     async fn message(&self, ctx: Context, msg: Message) {
         // Ignore bridge's own messages and messages from any bot account.
-        if msg.author.id == ctx.cache.current_user_id() || msg.author.bot {
+        if msg.author.id == ctx.cache.current_user().id || msg.author.bot {
             return;
         }
 
