@@ -57,7 +57,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 subtle = "2.6"
 zeroize = { version = "1.7", features = ["derive"] }
 ring = "0.17"
-toml = "0.8"
+toml = "1.1"
 dirs = "5.0"
 rustyline = "13.0"
 pulldown-cmark = "0.9"
