@@ -25,7 +25,9 @@ use crate::media::{
     media_timeline_id, render_message_plain_lines, MediaKind, MediaRenderStatus,
     PendingMediaTransfer, TimelineMedia, TimelinePayload,
 };
-use crate::state::{ClientState, DisplayedMessage, KeyChangeWarning, SharedState, TypingPresence};
+use crate::state::{
+    ClientState, DisplayedMessage, KeyChangeWarning, ReplyPreview, SharedState, TypingPresence,
+};
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
 use base64::Engine as _;
 use chatify::notifications::NotificationService;
@@ -58,6 +60,33 @@ fn extract_ts(data: &serde_json::Value, fallback: u64) -> f64 {
     data.get("ts")
         .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
         .unwrap_or(fallback as f64)
+}
+
+fn reply_preview_from_event(data: &serde_json::Value) -> Option<ReplyPreview> {
+    let reply_to = data
+        .get("reply_to")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let reply = data.get("reply").filter(|v| v.is_object());
+    Some(ReplyPreview {
+        msg_id: reply_to.to_string(),
+        sender: reply
+            .and_then(|v| {
+                v.get("sender")
+                    .or_else(|| v.get("u"))
+                    .and_then(|field| field.as_str())
+            })
+            .map(str::to_string),
+        preview: reply
+            .and_then(|v| {
+                v.get("preview")
+                    .or_else(|| v.get("c"))
+                    .and_then(|field| field.as_str())
+            })
+            .map(str::to_string),
+    })
 }
 
 fn short_id(id: &str) -> String {
@@ -123,6 +152,7 @@ fn make_text_message(
         channel,
         sender,
         content,
+        reply: None,
         payload: None,
         encrypted,
         edited: false,
@@ -559,7 +589,7 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
     let current_user = state_lock.me.clone();
     let from_self = !current_user.is_empty() && u.eq_ignore_ascii_case(&current_user);
     let notification_config = state_lock.config.notifications.clone();
-    let message = make_text_message(
+    let mut message = make_text_message(
         msg_id.clone(),
         event_ts,
         ch.to_string(),
@@ -567,6 +597,7 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
         c.to_string(),
         true,
     );
+    message.reply = reply_preview_from_event(data);
     state_lock.add_message(message.clone());
     state_lock.note_incoming_message(ch, from_self);
     let trust_warning = state_lock.observe_user_key(u, pk);
@@ -726,6 +757,7 @@ pub async fn handle_file_meta_event(state: &SharedState, data: &serde_json::Valu
         channel: ch.to_string(),
         sender: sender.to_string(),
         content: media.summary_line(),
+        reply: None,
         payload: Some(TimelinePayload::Media(media.clone())),
         encrypted: false,
         edited: false,
@@ -821,6 +853,7 @@ pub async fn handle_file_chunk_event(state: &SharedState, data: &serde_json::Val
                 channel: scope,
                 sender,
                 content: media.summary_line(),
+                reply: None,
                 payload: Some(TimelinePayload::Media(media)),
                 encrypted: false,
                 edited: false,
@@ -928,14 +961,16 @@ async fn ingest_timeline_events(
                 let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
                 let sender = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
                 let event_ts = extract_ts(event, 0);
-                state_lock.add_message(make_text_message(
+                let mut message = make_text_message(
                     extract_msg_id(event),
                     event_ts,
                     scope.to_string(),
                     sender.to_string(),
                     content.to_string(),
                     true,
-                ));
+                );
+                message.reply = reply_preview_from_event(event);
+                state_lock.add_message(message);
             }
             "dm" => {
                 let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
@@ -971,6 +1006,7 @@ async fn ingest_timeline_events(
                         channel: scope.to_string(),
                         sender,
                         content: media.summary_line(),
+                        reply: None,
                         payload: Some(TimelinePayload::Media(media)),
                         encrypted: false,
                         edited: false,
@@ -1292,6 +1328,8 @@ async fn record_system_summary(state: &SharedState, summary: String) {
         channel: String::new(),
         sender: "system".to_string(),
         content: summary.clone(),
+        reply: None,
+        payload: None,
         encrypted: false,
         edited: false,
     });
@@ -2149,7 +2187,10 @@ pub async fn dispatch_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch_event, format_content_for_mentions, ingest_timeline_events};
+    use super::{
+        dispatch_event, format_content_for_mentions, ingest_timeline_events,
+        reply_preview_from_event,
+    };
     use crate::{
         args::ClientConfig,
         media::{MediaRenderStatus, TimelinePayload},
@@ -2193,6 +2234,24 @@ mod tests {
             format_content_for_mentions("mail alice@example.com then @carol", "alice");
         assert!(!mentioned);
         assert_eq!(rendered, "mail alice@example.com then @carol");
+    }
+
+    #[test]
+    fn reply_preview_parses_first_class_reply_context() {
+        let payload = serde_json::json!({
+            "t": "msg",
+            "reply_to": "msg-1",
+            "reply": {
+                "msg_id": "msg-1",
+                "sender": "alice",
+                "preview": "seed message"
+            }
+        });
+
+        let reply = reply_preview_from_event(&payload).expect("reply context should parse");
+        assert_eq!(reply.msg_id, "msg-1");
+        assert_eq!(reply.sender.as_deref(), Some("alice"));
+        assert_eq!(reply.preview.as_deref(), Some("seed message"));
     }
 
     #[tokio::test]

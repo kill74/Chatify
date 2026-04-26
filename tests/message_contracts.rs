@@ -1689,6 +1689,170 @@ async fn msg_contract_preserves_bridge_source_and_relay_markers() {
     );
 }
 
+/// Verifies first-class channel replies echo `reply_to`, include best-effort
+/// context for resolvable targets, and persist that metadata in history.
+#[tokio::test]
+async fn reply_contract_roundtrips_and_persists_context() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let mut bob = connect_and_auth(&server.url, "bob").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"join","ch":"reply-room"}).to_string(),
+        ))
+        .await
+        .expect("alice joins reply-room");
+    let _ = recv_by_type(&mut alice, "joined").await;
+
+    bob.send(Message::Text(
+        json!({"t":"join","ch":"reply-room"}).to_string(),
+    ))
+    .await
+    .expect("bob joins reply-room");
+    let _ = recv_by_type(&mut bob, "joined").await;
+
+    alice
+        .send(Message::Text(
+            json!({"t":"msg","ch":"reply-room","c":"seed message"}).to_string(),
+        ))
+        .await
+        .expect("alice sends seed message");
+    let seed = recv_by_type(&mut alice, "msg").await;
+    let _ = recv_by_type(&mut bob, "msg").await;
+    let seed_id = seed
+        .get("msg_id")
+        .and_then(|v| v.as_str())
+        .expect("seed message should include msg_id")
+        .to_string();
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"msg",
+                "ch":"reply-room",
+                "c":"reply body",
+                "reply_to": seed_id,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("alice sends reply");
+
+    let reply = recv_by_type(&mut bob, "msg").await;
+    assert_eq!(reply.get("c").and_then(|v| v.as_str()), Some("reply body"));
+    assert_eq!(
+        reply.get("reply_to").and_then(|v| v.as_str()),
+        Some(seed_id.as_str())
+    );
+    assert_eq!(
+        reply
+            .get("reply")
+            .and_then(|v| v.get("msg_id"))
+            .and_then(|v| v.as_str()),
+        Some(seed_id.as_str())
+    );
+    assert_eq!(
+        reply
+            .get("reply")
+            .and_then(|v| v.get("sender"))
+            .and_then(|v| v.as_str()),
+        Some("alice")
+    );
+    assert_eq!(
+        reply
+            .get("reply")
+            .and_then(|v| v.get("preview"))
+            .and_then(|v| v.as_str()),
+        Some("seed message")
+    );
+
+    bob.send(Message::Text(
+        json!({"t":"history","ch":"reply-room","limit":10}).to_string(),
+    ))
+    .await
+    .expect("request reply history");
+
+    let history = recv_by_type(&mut bob, "history").await;
+    let events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history should include events");
+    let persisted = events
+        .iter()
+        .find(|event| event.get("c").and_then(|v| v.as_str()) == Some("reply body"))
+        .expect("reply should be persisted in history");
+    assert_eq!(
+        persisted.get("reply_to").and_then(|v| v.as_str()),
+        Some(seed_id.as_str())
+    );
+    assert_eq!(
+        persisted
+            .get("reply")
+            .and_then(|v| v.get("preview"))
+            .and_then(|v| v.as_str()),
+        Some("seed message")
+    );
+}
+
+/// Verifies malformed reply targets are rejected before broadcast.
+#[tokio::test]
+async fn reply_contract_rejects_invalid_msg_id() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"msg",
+                "ch":"general",
+                "c":"bad reply",
+                "reply_to":"bad id with spaces",
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send invalid reply payload");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("reply requires valid msg_id")
+    );
+}
+
+/// Verifies a syntactically valid but unresolved reply target still delivers
+/// as a message with `reply_to` and without fabricated context.
+#[tokio::test]
+async fn reply_contract_delivers_unresolved_reply_to_without_context() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::Text(
+            json!({
+                "t":"msg",
+                "ch":"general",
+                "c":"orphan reply",
+                "reply_to":"missing_msg_1",
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send unresolved reply payload");
+
+    let msg = recv_by_type(&mut alice, "msg").await;
+    assert_eq!(msg.get("c").and_then(|v| v.as_str()), Some("orphan reply"));
+    assert_eq!(
+        msg.get("reply_to").and_then(|v| v.as_str()),
+        Some("missing_msg_1")
+    );
+    assert!(
+        msg.get("reply").is_none(),
+        "unresolved replies should not fabricate reply context"
+    );
+}
+
 /// Verifies that reaction events are broadcast and can be re-synced as
 /// aggregated counters for reconnect/bootstrap flows.
 #[tokio::test]

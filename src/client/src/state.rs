@@ -252,6 +252,13 @@ pub struct OutgoingMediaMeta<'a> {
     pub duration_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplyPreview {
+    pub msg_id: String,
+    pub sender: Option<String>,
+    pub preview: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct DisplayedMessage {
     pub id: String,
@@ -259,6 +266,7 @@ pub struct DisplayedMessage {
     pub channel: String,
     pub sender: String,
     pub content: String,
+    pub reply: Option<ReplyPreview>,
     pub payload: Option<TimelinePayload>,
     pub encrypted: bool,
     pub edited: bool,
@@ -1226,6 +1234,71 @@ impl ClientState {
         }))
     }
 
+    pub fn send_admin_users(&self, limit: usize) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "admin",
+            "sub": "users",
+            "ch": self.ch,
+            "limit": limit,
+        }))
+    }
+
+    pub fn send_admin_register(
+        &self,
+        username: &str,
+        password: &str,
+        role: &str,
+    ) -> Result<(), String> {
+        let target = username.trim().to_ascii_lowercase();
+        let password = password.trim();
+        let role = role.trim();
+        if target.is_empty() {
+            return Err("admin register target cannot be empty".to_string());
+        }
+        if password.is_empty() {
+            return Err("admin register password cannot be empty".to_string());
+        }
+        if role.is_empty() {
+            return Err("admin register role cannot be empty".to_string());
+        }
+
+        self.send_json(serde_json::json!({
+            "t": "admin",
+            "sub": "register",
+            "ch": self.ch,
+            "target": target,
+            "password": password,
+            "role": role,
+        }))
+    }
+
+    pub fn send_admin_role(&self, username: &str, role: &str) -> Result<(), String> {
+        let target = username.trim().to_ascii_lowercase();
+        let role = role.trim();
+        if target.is_empty() {
+            return Err("admin role target cannot be empty".to_string());
+        }
+        if role.is_empty() {
+            return Err("admin role cannot be empty".to_string());
+        }
+
+        self.send_json(serde_json::json!({
+            "t": "admin",
+            "sub": "role",
+            "ch": self.ch,
+            "target": target,
+            "role": role,
+        }))
+    }
+
+    pub fn send_admin_audit(&self, limit: usize) -> Result<(), String> {
+        self.send_json(serde_json::json!({
+            "t": "admin",
+            "sub": "audit",
+            "limit": limit,
+        }))
+    }
+
     #[cfg(feature = "bridge-client")]
     pub fn send_bridge_status(&self) -> Result<(), String> {
         self.send_json(serde_json::json!({
@@ -1295,6 +1368,26 @@ impl ClientState {
             "t": "msg",
             "ch": channel,
             "c": content,
+            "ts": chatify::now(),
+            "n": chatify::fresh_nonce_hex(),
+        }))
+    }
+
+    pub fn send_reply(&self, channel: &str, reply_to: &str, content: &str) -> Result<(), String> {
+        let target = reply_to.trim();
+        let body = content.trim();
+        if target.is_empty() {
+            return Err("reply target cannot be empty".to_string());
+        }
+        if body.is_empty() {
+            return Err("reply content cannot be empty".to_string());
+        }
+
+        self.send_json(serde_json::json!({
+            "t": "msg",
+            "ch": channel,
+            "c": body,
+            "reply_to": target,
             "ts": chatify::now(),
             "n": chatify::fresh_nonce_hex(),
         }))
@@ -1442,6 +1535,7 @@ mod tests {
             channel: channel.to_string(),
             sender: sender.to_string(),
             content: content.to_string(),
+            reply: None,
             payload: None,
             encrypted: true,
             edited: false,
@@ -1470,6 +1564,29 @@ mod tests {
         assert_eq!(
             state.resolve_recent_message_id_in_channel("random", 1),
             Some("r-1".to_string())
+        );
+    }
+
+    #[test]
+    fn send_reply_serializes_reply_to_channel_message() {
+        let (state, mut rx) = make_test_state_with_receiver();
+
+        state
+            .send_reply("general", "msg-123", "reply body")
+            .expect("reply frame should serialize");
+
+        let frame = rx.try_recv().expect("reply frame should be sent");
+        let payload: serde_json::Value =
+            serde_json::from_str(&frame).expect("reply frame should be JSON");
+        assert_eq!(payload.get("t").and_then(|v| v.as_str()), Some("msg"));
+        assert_eq!(payload.get("ch").and_then(|v| v.as_str()), Some("general"));
+        assert_eq!(
+            payload.get("c").and_then(|v| v.as_str()),
+            Some("reply body")
+        );
+        assert_eq!(
+            payload.get("reply_to").and_then(|v| v.as_str()),
+            Some("msg-123")
         );
     }
 

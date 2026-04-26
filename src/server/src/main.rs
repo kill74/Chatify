@@ -80,13 +80,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
+use chatify::crypto;
+use chatify::error::{ChatifyError, ChatifyResult};
+use chatify::metrics::PrometheusMetrics;
+use chatify::performance::{Metrics as PerfMetrics, VecCache};
+use chatify::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
+use chatify::voice::{relay::VoiceBroadcast, VoiceRelay};
 use clap::Parser;
-use clifford::crypto;
-use clifford::error::{ChatifyError, ChatifyResult};
-use clifford::metrics::PrometheusMetrics;
-use clifford::performance::{Metrics as PerfMetrics, VecCache};
-use clifford::totp::{generate_qr_url, generate_secret, TotpConfig, User2FA};
-use clifford::voice::{relay::VoiceBroadcast, VoiceRelay};
 use dashmap::{DashMap, DashSet};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -119,7 +119,7 @@ use tokio_tungstenite::{
 
 // Protocol constants (imported from library)
 // ---------------------------------------------------------------------------
-use clifford_server::protocol::*;
+use chatify_server::protocol::*;
 
 // Data structures
 // ---------------------------------------------------------------------------
@@ -890,8 +890,8 @@ impl EventStore {
         self.pool.pool.get().ok()
     }
 
-    fn get_pool_stats(&self) -> clifford::performance::PoolStats {
-        use clifford::performance::PoolStats;
+    fn get_pool_stats(&self) -> chatify::performance::PoolStats {
+        use chatify::performance::PoolStats;
         let state = self.pool.pool.state();
         PoolStats {
             active_connections: (state.connections - state.idle_connections) as usize,
@@ -1231,6 +1231,34 @@ impl EventStore {
             )?;
 
             version = 8;
+            Self::set_schema_version(conn, version)?;
+        }
+
+        if version < 9 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS event_search_terms (
+                    event_id INTEGER NOT NULL,
+                    term     TEXT NOT NULL,
+                    weight   INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(event_id, term),
+                    FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_search_terms_term_event
+                    ON event_search_terms(term, event_id);
+                ",
+            )?;
+
+            conn.execute(
+                "ALTER TABLE media_chunks ADD COLUMN storage_backend TEXT NOT NULL DEFAULT 'sqlite'",
+                [],
+            )
+            .ok();
+            conn.execute("ALTER TABLE media_chunks ADD COLUMN storage_path TEXT", [])
+                .ok();
+
+            version = 9;
             Self::set_schema_version(conn, version)?;
         }
 
@@ -4678,7 +4706,40 @@ async fn handle_event(
                 }
             }
 
-            let msg_id = clifford::fresh_nonce_hex();
+            let reply_to = d
+                .get("reply_to")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(reply_to) = reply_to.as_deref() {
+                if !is_valid_msg_id(reply_to) {
+                    send_err(out_tx, "reply requires valid msg_id", &state.metrics);
+                    return;
+                }
+            }
+
+            let chan = state.chan(&ch);
+            let reply_context = if let Some(reply_to) = reply_to.as_deref() {
+                let mut context = chan
+                    .hist()
+                    .await
+                    .iter()
+                    .rev()
+                    .find_map(|event| reply_context_from_event(event, reply_to));
+                if context.is_none() {
+                    context = state
+                        .store
+                        .history(&ch, HISTORY_CAP)
+                        .iter()
+                        .find_map(|event| reply_context_from_event(event, reply_to));
+                }
+                context
+            } else {
+                None
+            };
+
+            let msg_id = chatify::fresh_nonce_hex();
             let mut entry = serde_json::json!({
                 "t":"msg",
                 "msg_id":msg_id,
@@ -4693,8 +4754,15 @@ async fn handle_event(
             if let Some(relay) = d.get("relay").filter(|v| v.is_object()) {
                 entry["relay"] = relay.clone();
             }
+            if let Some(reply_to) = reply_to.as_deref() {
+                entry["reply_to"] = Value::String(reply_to.to_string());
+                if let Some(reply_context) = reply_context {
+                    entry["reply"] = reply_context;
+                }
+            } else if let Some(reply) = d.get("reply").filter(|v| v.is_object()) {
+                entry["reply"] = reply.clone();
+            }
             let serialized = entry.to_string();
-            let chan = state.chan(&ch);
             chan.push(entry.clone()).await;
             let searchable = if p.is_empty() { c.as_str() } else { p.as_str() };
             state
@@ -5676,6 +5744,7 @@ async fn handle_event(
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(|v| v.chars().take(MAX_MEDIA_MIME_LEN).collect::<String>());
+            let duration_ms = d.get("duration_ms").and_then(|v| v.as_u64());
 
             let mut file_announce = serde_json::json!({
                 "t":"file_meta","from":username,"filename":filename,
@@ -5684,6 +5753,9 @@ async fn handle_event(
             });
             if let Some(ref mime_value) = mime {
                 file_announce["mime"] = Value::String(mime_value.clone());
+            }
+            if let Some(duration_ms) = duration_ms {
+                file_announce["duration_ms"] = Value::from(duration_ms);
             }
             state.store.persist(
                 "file_meta",
@@ -6703,7 +6775,7 @@ async fn handle_event(
 
 /// Returns the current Unix timestamp as a floating-point number of seconds.
 fn now() -> f64 {
-    clifford::now()
+    chatify::now()
 }
 
 /// Normalises a raw channel name to a safe, consistent format.
@@ -6719,7 +6791,7 @@ fn now() -> f64 {
 /// is used as a `DashMap` key or SQLite parameter, preventing channel-name
 /// injection and collisions between logically identical names.
 fn safe_ch(raw: &str) -> String {
-    clifford::normalize_channel(raw).unwrap_or_else(|| "general".into())
+    chatify::normalize_channel(raw).unwrap_or_else(|| "general".into())
 }
 
 fn is_default_online_status(status: &Value) -> bool {
@@ -7082,6 +7154,55 @@ fn is_valid_msg_id(msg_id: &str) -> bool {
     msg_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn reply_context_from_event(event: &Value, reply_to: &str) -> Option<Value> {
+    if event.get("t").and_then(|v| v.as_str()) != Some("msg") {
+        return None;
+    }
+    if event
+        .get("msg_id")
+        .or_else(|| event.get("id"))
+        .and_then(|v| v.as_str())
+        != Some(reply_to)
+    {
+        return None;
+    }
+
+    let mut reply = serde_json::json!({ "msg_id": reply_to });
+    if let Some(sender) = event
+        .get("u")
+        .or_else(|| event.get("from"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        reply["sender"] = Value::String(sender.to_string());
+    }
+    if let Some(preview) = event
+        .get("c")
+        .and_then(|v| v.as_str())
+        .map(reply_preview_text)
+        .filter(|value| !value.is_empty())
+    {
+        reply["preview"] = Value::String(preview);
+    }
+
+    Some(reply)
+}
+
+fn reply_preview_text(raw: &str) -> String {
+    const MAX_REPLY_PREVIEW_CHARS: usize = 120;
+    let single_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= MAX_REPLY_PREVIEW_CHARS {
+        return single_line;
+    }
+
+    single_line
+        .chars()
+        .take(MAX_REPLY_PREVIEW_CHARS.saturating_sub(3))
+        .chain("...".chars())
+        .collect()
 }
 
 /// Returns `true` if `emoji` is a non-empty, bounded reaction token.
@@ -8114,10 +8235,10 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
     }
 
     if let Some(username) = &args.enable_2fa_for {
-        let secret = clifford::totp::generate_secret();
-        let qr_url = clifford::totp::generate_qr_url(username, "Chatify", &secret);
+        let secret = chatify::totp::generate_secret();
+        let qr_url = chatify::totp::generate_qr_url(username, "Chatify", &secret);
 
-        let mut user_2fa = clifford::totp::User2FA::new(username.clone());
+        let mut user_2fa = chatify::totp::User2FA::new(username.clone());
         user_2fa.enable(secret);
 
         state.store.upsert_user_2fa(&user_2fa);

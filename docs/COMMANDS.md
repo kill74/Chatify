@@ -27,6 +27,7 @@
 | `/trust-audit [n]`                                                | Show recent trust audit entries                                    |
 | `/trust-export [path]`                                            | Export deterministic trust audit JSON                              |
 | `/recent [n]`                                                     | Show recent message IDs for quick reaction targeting               |
+| `/reply <msg_id\|#index> <message>`                               | Reply to a channel message by stable `msg_id` or recent index      |
 | `/react <msg_id\|#index> <emoji>`                                 | React to a message by stable `msg_id` or recent index              |
 | `/sync`                                                           | Request reaction sync for the active channel                       |
 | `/image "<path>"`                                                 | Send an image file to the active channel                           |
@@ -35,6 +36,21 @@
 | `/quit` `/exit` `/q`                                              | Disconnect and exit                                                |
 
 Any non-command text is sent as a channel message to the active scope.
+
+## TUI Shortcuts
+
+| Shortcut       | Description                                      |
+| -------------- | ------------------------------------------------ |
+| `Ctrl+K`       | Open searchable actions for common tasks         |
+| `Enter`        | Send the composer text or run selected action    |
+| `Tab`          | Complete the current `@mention` suggestion       |
+| `PageUp/Down`  | Scroll the timeline                              |
+| `Alt+Up/Down`  | Switch rooms quickly                             |
+| `Ctrl+C`       | Quit                                             |
+
+The TUI adapts to terminal width: narrow windows prioritize the chat list,
+timeline, and composer; wider windows show a compact contextual panel for media,
+mentions, people, voice state, and recent activity.
 
 ### Mentions and Notifications
 
@@ -56,8 +72,10 @@ Any non-command text is sent as a channel message to the active scope.
 ### Reactions and Message IDs
 
 - Every channel message now includes a stable `msg_id` in the protocol payload.
+- Replies are sent on channel messages with `reply_to` and may include compact quoted context.
 - Reactions are sent as `reaction` events and aggregated per `(msg_id, emoji)`.
 - Clients can bootstrap reaction state with `reaction_sync` after join/reconnect.
+- For terminal UX, `/reply #1 thanks` targets the most recent visible message ID.
 - For terminal UX, `/react #1 +1` targets the most recent visible message ID.
 
 ### Runtime and Database Profiling
