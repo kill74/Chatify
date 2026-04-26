@@ -141,12 +141,17 @@ cd /d "%~dp0"
 
 set HOST=0.0.0.0
 set PORT=8765
+set DATA_DIR=%LOCALAPPDATA%\Chatify
+set DB_PATH=%DATA_DIR%\chatify.db
 
 if not "%~1"=="" set HOST=%~1
 if not "%~2"=="" set PORT=%~2
 
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+
 echo Starting Chatify server on %HOST%:%PORT%
-chatify-server.exe --host %HOST% --port %PORT%
+echo Server data: %DATA_DIR%
+chatify-server.exe --host %HOST% --port %PORT% --db "%DB_PATH%"
 "@
 
 $ClientBat = @"
@@ -173,12 +178,15 @@ cd /d "%~dp0"
 
 set HOST=127.0.0.1
 set PORT=8765
+set DATA_DIR=%LOCALAPPDATA%\Chatify
+set DB_PATH=%DATA_DIR%\chatify.db
 
 if not "%~1"=="" set HOST=%~1
 if not "%~2"=="" set PORT=%~2
 
 echo Launching Chatify server and client...
-start "Chatify Server" cmd /k "cd /d %~dp0 && chatify-server.exe --host 0.0.0.0 --port %PORT%"
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+start "Chatify Server" cmd /k call "%~dp0start-server.bat" 0.0.0.0 %PORT%
 timeout /t 1 /nobreak >nul
 start "Chatify Client" cmd /k "cd /d %~dp0 && chatify-client.exe --host %HOST% --port %PORT%"
 "@
@@ -191,6 +199,8 @@ cd /d "%~dp0"
 
 set DEFAULT_HOST=127.0.0.1
 set DEFAULT_PORT=8765
+set DATA_DIR=%LOCALAPPDATA%\Chatify
+set DB_PATH=%DATA_DIR%\chatify.db
 
 :menu
 cls
@@ -217,7 +227,8 @@ set /p PORT=Server port [%DEFAULT_PORT%]:
 if "%PORT%"=="" set PORT=%DEFAULT_PORT%
 
 echo Starting server on 0.0.0.0:%PORT%
-start "Chatify Server" cmd /k "cd /d %~dp0 && chatify-server.exe --host 0.0.0.0 --port %PORT%"
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+start "Chatify Server" cmd /k call "%~dp0start-server.bat" 0.0.0.0 %PORT%
 timeout /t 1 /nobreak >nul
 
 echo Connecting local client to 127.0.0.1:%PORT%
@@ -259,6 +270,10 @@ Launcher modes:
 Manual mode:
 1) Run start-server.bat
 2) Run start-client.bat
+
+Server data:
+- The Windows launcher stores server data in %LOCALAPPDATA%\Chatify.
+- The database key is written as %LOCALAPPDATA%\Chatify\chatify.db.key.
 
 Optional parameters:
 - start-server.bat [host] [port]
