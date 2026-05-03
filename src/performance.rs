@@ -434,7 +434,7 @@ impl<V> MessageCache<V> {
 
     pub fn insert(&self, key: String, value: V) {
         let arc_value = Arc::new(value);
-        self.cache.write().push(key, arc_value);
+        self.cache.write().put(key, arc_value);
     }
 
     pub fn invalidate(&self, key: &str) {
@@ -535,7 +535,7 @@ impl<T: Clone> VecCache<T> {
                 vec.drain(0..drain_start);
             }
         } else {
-            cache.push(key.to_string(), Arc::new(vec![item]));
+            cache.put(key.to_string(), Arc::new(vec![item]));
         }
     }
 }

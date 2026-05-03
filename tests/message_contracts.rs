@@ -576,7 +576,7 @@ async fn connect_and_auth_with_pw_hash_and_otp(
         }),
     };
 
-    ws.send(Message::Text(auth.to_string()))
+    ws.send(Message::text(auth.to_string()))
         .await
         .expect("send auth");
 
@@ -640,7 +640,7 @@ async fn auth_contract_rejects_when_2fa_enabled_without_code() {
         .await
         .expect("connect websocket for 2fa missing code test");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "alice",
             "pw": test_pw_hash_for("alice"),
@@ -668,7 +668,7 @@ async fn auth_contract_rejects_first_login_when_self_registration_disabled() {
     let (mut ws, _) = connect_async(&server.url)
         .await
         .expect("connect websocket for self-registration policy test");
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth",
             "u": "new-user-no-register",
@@ -726,7 +726,7 @@ async fn auth_contract_accepts_backup_code_and_consumes_it() {
         "status": {"text":"Online","emoji":"\u{AD}ƒƒó"},
         "otp": backup_code.as_str()
     });
-    ws2.send(Message::Text(auth.to_string()))
+    ws2.send(Message::text(auth.to_string()))
         .await
         .expect("send auth with consumed backup code");
 
@@ -760,7 +760,7 @@ async fn auth_contract_returns_expected_fields() {
     let mut ws = connect_and_auth(&server.url, "alice").await;
 
     // Smoke-test that info RPC works after auth.
-    ws.send(Message::Text(json!({"t":"info"}).to_string()))
+    ws.send(Message::text(json!({"t":"info"}).to_string()))
         .await
         .expect("send info");
     let info = recv_by_type(&mut ws, "info").await;
@@ -770,7 +770,7 @@ async fn auth_contract_returns_expected_fields() {
     let (mut ws2, _) = connect_async(&server.url)
         .await
         .expect("connect second websocket");
-    ws2.send(Message::Text(
+    ws2.send(Message::text(
         json!({
             "t": "auth", "u": "auth-contract-check",
             "pw": test_pw_hash_for("auth-contract-check"), "pk": pub_b64(&new_keypair()).unwrap(),
@@ -825,7 +825,7 @@ async fn auth_contract_password_change_invalidates_old_password_and_accepts_new_
     let new_hash = test_pw_hash_for("alice-after-change");
 
     let mut ws = connect_and_auth_with_pw_hash(&server.url, "alice", &old_hash).await;
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "password_change",
             "current": old_hash.as_str(),
@@ -849,7 +849,7 @@ async fn auth_contract_password_change_invalidates_old_password_and_accepts_new_
         .await
         .expect("connect websocket with old password");
     old_ws
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "auth",
                 "u": "alice",
@@ -885,7 +885,7 @@ async fn compatibility_contract_client_bootstrap_flow_stays_stable() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(json!({"t":"users"}).to_string()))
+        .send(Message::text(json!({"t":"users"}).to_string()))
         .await
         .expect("send users rpc");
     let users_msg = recv_by_type(&mut alice, "users").await;
@@ -900,7 +900,7 @@ async fn compatibility_contract_client_bootstrap_flow_stays_stable() {
     }
 
     alice
-        .send(Message::Text(json!({"t":"info"}).to_string()))
+        .send(Message::text(json!({"t":"info"}).to_string()))
         .await
         .expect("send info rpc");
     let info_msg = recv_by_type(&mut alice, "info").await;
@@ -914,7 +914,7 @@ async fn compatibility_contract_client_bootstrap_flow_stays_stable() {
     );
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"join","ch":"compat-room"}).to_string(),
         ))
         .await
@@ -927,7 +927,7 @@ async fn compatibility_contract_client_bootstrap_flow_stays_stable() {
     assert!(joined.get("hist").and_then(|v| v.as_array()).is_some());
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"msg","ch":"compat-room","c":"compat-cipher"}).to_string(),
         ))
         .await
@@ -947,7 +947,7 @@ async fn protocol_contract_advertises_backward_compatible_version() {
         .await
         .expect("connect websocket for protocol version test");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "proto-check",
             "pw": test_pw_hash_for("proto-check"),
@@ -988,7 +988,7 @@ async fn auth_contract_rejects_invalid_username() {
     let server = start_server().await;
     let (mut ws, _) = connect_async(&server.url).await.expect("connect websocket");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "invalid user",
             "pw": test_pw_hash_for("invalid user"), "pk": pub_b64(&new_keypair()).unwrap(),
@@ -1018,7 +1018,7 @@ async fn auth_contract_rejects_non_auth_first_frame() {
         .await
         .expect("connect websocket for invalid auth test");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({"t": "ping", "u": "alice"}).to_string(),
     ))
     .await
@@ -1043,7 +1043,7 @@ async fn auth_contract_rejects_invalid_public_key() {
         .await
         .expect("connect websocket for invalid key test");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "alice",
             "pw": test_pw_hash_for("alice"), "pk": "not-base64",
@@ -1075,7 +1075,7 @@ async fn auth_contract_rejects_oversized_auth_frame() {
         .expect("connect websocket for oversized auth frame test");
 
     let oversized_payload = "x".repeat(4_097);
-    ws.send(Message::Text(oversized_payload))
+    ws.send(Message::text(oversized_payload))
         .await
         .expect("send oversized auth frame");
 
@@ -1097,7 +1097,7 @@ async fn auth_contract_rejects_malformed_json() {
         .await
         .expect("connect websocket for malformed auth json test");
 
-    ws.send(Message::Text("{bad-json".to_string()))
+    ws.send(Message::text("{bad-json".to_string()))
         .await
         .expect("send malformed auth json");
 
@@ -1122,7 +1122,7 @@ async fn auth_contract_rejects_sql_injection_like_username() {
         .await
         .expect("connect websocket for sql-injection username test");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "alice' OR '1'='1",
             "pw": test_pw_hash_for("alice' OR '1'='1"), "pk": pub_b64(&new_keypair()).unwrap(),
@@ -1159,7 +1159,7 @@ async fn auth_contract_rejects_oversized_otp_input() {
         .expect("connect websocket for oversized otp test");
 
     let oversized_otp = "1".repeat(65); // one byte over the 64-char limit
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "alice",
             "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
@@ -1190,7 +1190,7 @@ async fn auth_contract_rejects_non_object_status_field() {
         .await
         .expect("connect websocket for non-object status test");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "alice",
             "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
@@ -1219,7 +1219,7 @@ async fn auth_contract_rejects_unexpected_status_object_field() {
         .await
         .expect("connect websocket for unexpected status field test");
 
-    ws.send(Message::Text(
+    ws.send(Message::text(
         json!({
             "t": "auth", "u": "alice",
             "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
@@ -1260,7 +1260,7 @@ async fn auth_contract_blocks_repeated_wrong_otp_attempts() {
             .await
             .expect("connect websocket for wrong otp attempt");
 
-        ws.send(Message::Text(
+        ws.send(Message::text(
             json!({
                 "t": "auth", "u": "alice",
                 "pw": test_pw_hash_for("alice"), "pk": pub_b64(&new_keypair()).unwrap(),
@@ -1306,7 +1306,7 @@ async fn users_contract_returns_user_objects_with_public_keys() {
     let _bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(json!({"t":"users","ts":1}).to_string()))
+        .send(Message::text(json!({"t":"users","ts":1}).to_string()))
         .await
         .expect("send users command");
 
@@ -1339,7 +1339,7 @@ async fn join_contract_normalizes_channel_name() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"join","ch":"#Dev Ops!!!_X"}).to_string(),
         ))
         .await
@@ -1360,7 +1360,7 @@ async fn leave_contract_rejects_general_channel() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"leave","ch":"general"}).to_string(),
         ))
         .await
@@ -1380,7 +1380,7 @@ async fn leave_contract_acknowledges_and_persists_event() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"join","ch":"leave-room"}).to_string(),
         ))
         .await
@@ -1388,7 +1388,7 @@ async fn leave_contract_acknowledges_and_persists_event() {
     let _ = recv_by_type(&mut alice, "joined").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"leave","ch":"leave-room"}).to_string(),
         ))
         .await
@@ -1402,7 +1402,7 @@ async fn leave_contract_acknowledges_and_persists_event() {
 
     // Second leave should be idempotent and not create another persisted leave event.
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"leave","ch":"leave-room"}).to_string(),
         ))
         .await
@@ -1414,7 +1414,7 @@ async fn leave_contract_acknowledges_and_persists_event() {
     );
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "history", "ch": "leave-room", "limit": 100}).to_string(),
         ))
         .await
@@ -1450,7 +1450,7 @@ async fn status_contract_broadcasts_status_update_to_other_clients() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"status",
                 "status": {"text":"In focus","emoji":"Ô£à"}
@@ -1486,14 +1486,14 @@ async fn typing_contract_broadcasts_channel_scope_updates() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"join","ch":"typing-room"}).to_string(),
         ))
         .await
         .expect("alice joins typing-room");
     let _ = recv_by_type(&mut alice, "joined").await;
 
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t":"join","ch":"typing-room"}).to_string(),
     ))
     .await
@@ -1501,7 +1501,7 @@ async fn typing_contract_broadcasts_channel_scope_updates() {
     let _ = recv_by_type(&mut bob, "joined").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"typing","ch":"typing-room","typing":true}).to_string(),
         ))
         .await
@@ -1519,7 +1519,7 @@ async fn typing_contract_broadcasts_channel_scope_updates() {
     );
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"typing","ch":"typing-room","typing":false}).to_string(),
         ))
         .await
@@ -1540,7 +1540,7 @@ async fn typing_contract_routes_dm_scope_updates() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     // Subscribe Bob to his DM route so DM typing relay can be observed.
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t":"join","ch":"__dm__bob"}).to_string(),
     ))
     .await
@@ -1548,7 +1548,7 @@ async fn typing_contract_routes_dm_scope_updates() {
     let _ = recv_by_type(&mut bob, "joined").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"typing","to":"bob","typing":true}).to_string(),
         ))
         .await
@@ -1584,7 +1584,7 @@ async fn msg_contract_roundtrips_channel_payload() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "ciphertext-blob", "ts": 123
@@ -1621,7 +1621,7 @@ async fn msg_contract_preserves_bridge_source_and_relay_markers() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg",
                 "ch": "general",
@@ -1698,14 +1698,14 @@ async fn reply_contract_roundtrips_and_persists_context() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"join","ch":"reply-room"}).to_string(),
         ))
         .await
         .expect("alice joins reply-room");
     let _ = recv_by_type(&mut alice, "joined").await;
 
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t":"join","ch":"reply-room"}).to_string(),
     ))
     .await
@@ -1713,7 +1713,7 @@ async fn reply_contract_roundtrips_and_persists_context() {
     let _ = recv_by_type(&mut bob, "joined").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"msg","ch":"reply-room","c":"seed message"}).to_string(),
         ))
         .await
@@ -1727,7 +1727,7 @@ async fn reply_contract_roundtrips_and_persists_context() {
         .to_string();
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"msg",
                 "ch":"reply-room",
@@ -1767,7 +1767,7 @@ async fn reply_contract_roundtrips_and_persists_context() {
         Some("seed message")
     );
 
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t":"history","ch":"reply-room","limit":10}).to_string(),
     ))
     .await
@@ -1802,7 +1802,7 @@ async fn reply_contract_rejects_invalid_msg_id() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"msg",
                 "ch":"general",
@@ -1829,7 +1829,7 @@ async fn reply_contract_delivers_unresolved_reply_to_without_context() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"msg",
                 "ch":"general",
@@ -1862,14 +1862,14 @@ async fn reaction_contract_broadcasts_and_syncs_aggregated_counts() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"join","ch":"reaction-room"}).to_string(),
         ))
         .await
         .expect("alice joins reaction-room");
     let _ = recv_by_type(&mut alice, "joined").await;
 
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t":"join","ch":"reaction-room"}).to_string(),
     ))
     .await
@@ -1877,7 +1877,7 @@ async fn reaction_contract_broadcasts_and_syncs_aggregated_counts() {
     let _ = recv_by_type(&mut bob, "joined").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"msg","ch":"reaction-room","c":"reaction-seed"}).to_string(),
         ))
         .await
@@ -1891,7 +1891,7 @@ async fn reaction_contract_broadcasts_and_syncs_aggregated_counts() {
         .to_string();
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"reaction",
                 "ch":"reaction-room",
@@ -1918,7 +1918,7 @@ async fn reaction_contract_broadcasts_and_syncs_aggregated_counts() {
         .expect("reaction should carry msg_id")
         .to_string();
 
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t":"reaction_sync","ch":"reaction-room","limit":200}).to_string(),
     ))
     .await
@@ -1950,7 +1950,7 @@ async fn reaction_contract_rejects_invalid_msg_id() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"reaction",
                 "ch":"general",
@@ -1985,7 +1985,7 @@ async fn file_contract_rejects_oversized_file_metadata() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"file_meta",
                 "ch":"general",
@@ -2022,7 +2022,7 @@ async fn file_contract_relays_media_metadata_and_chunks() {
 
     let file_id = "media-contract-1";
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"file_meta",
                 "ch":"general",
@@ -2054,7 +2054,7 @@ async fn file_contract_relays_media_metadata_and_chunks() {
 
     let chunk_data = "aGVsbG8td29ybGQ=";
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"file_chunk",
                 "ch":"general",
@@ -2083,7 +2083,7 @@ async fn file_contract_persists_media_metadata_and_chunks_in_database() {
     let file_id = "media-db-contract-1";
     let chunk_data = "aGVsbG8td29ybGQ=";
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"file_meta",
                 "ch":"general",
@@ -2099,7 +2099,7 @@ async fn file_contract_persists_media_metadata_and_chunks_in_database() {
         .expect("send media metadata for db persistence contract");
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"file_chunk",
                 "ch":"general",
@@ -2208,7 +2208,7 @@ async fn file_contract_relays_audio_note_duration_metadata() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"file_meta",
                 "ch":"general",
@@ -2265,10 +2265,10 @@ async fn voice_contract_forwards_vdata_between_room_members() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(json!({"t":"vjoin","r":"room-a"}).to_string()))
+        .send(Message::text(json!({"t":"vjoin","r":"room-a"}).to_string()))
         .await
         .expect("alice joins voice room");
-    bob.send(Message::Text(json!({"t":"vjoin","r":"room-a"}).to_string()))
+    bob.send(Message::text(json!({"t":"vjoin","r":"room-a"}).to_string()))
         .await
         .expect("bob joins voice room");
 
@@ -2276,7 +2276,7 @@ async fn voice_contract_forwards_vdata_between_room_members() {
     sleep(settle_delay()).await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"vdata","r":"room-a","a":"ZmFrZS1hdWRpby1wYXlsb2Fk"}).to_string(),
         ))
         .await
@@ -2299,12 +2299,12 @@ async fn screen_share_contract_relays_meta_and_frames_between_room_members() {
     let mut bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t":"ss_start","r":"room-screen"}).to_string(),
         ))
         .await
         .expect("alice starts screen room");
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t":"ss_start","r":"room-screen"}).to_string(),
     ))
     .await
@@ -2330,7 +2330,7 @@ async fn screen_share_contract_relays_meta_and_frames_between_room_members() {
     sleep(settle_delay()).await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"ss_meta",
                 "r":"room-screen",
@@ -2364,7 +2364,7 @@ async fn screen_share_contract_relays_meta_and_frames_between_room_members() {
     assert_eq!(meta.get("fps").and_then(|v| v.as_u64()), Some(24));
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t":"ss_frame",
                 "r":"room-screen",
@@ -2418,7 +2418,7 @@ async fn history_contract_returns_persisted_events() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "history-cipher",
@@ -2433,7 +2433,7 @@ async fn history_contract_returns_persisted_events() {
     let _ = recv_by_type(&mut alice, "msg").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "history", "ch": "general", "limit": 25}).to_string(),
         ))
         .await
@@ -2465,7 +2465,7 @@ async fn history_contract_survives_server_restart() {
     let mut alice = connect_and_auth(&server_before.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "restart-history-cipher",
@@ -2481,7 +2481,7 @@ async fn history_contract_survives_server_restart() {
 
     let server_after = start_server_with_db(preserved_db).await;
     let mut bob = connect_and_auth(&server_after.url, "bob").await;
-    bob.send(Message::Text(
+    bob.send(Message::text(
         json!({"t": "history", "ch": "general", "limit": 50}).to_string(),
     ))
     .await
@@ -2593,7 +2593,7 @@ async fn history_and_search_latency_stays_low_with_100k_local_events() {
 
     let history_start = Instant::now();
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "history", "ch": "benchroom", "limit": HISTORY_LIMIT}).to_string(),
         ))
         .await
@@ -2618,7 +2618,7 @@ async fn history_and_search_latency_stays_low_with_100k_local_events() {
 
     let search_start = Instant::now();
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "search",
                 "ch": "benchroom",
@@ -2662,7 +2662,7 @@ async fn history_contract_respects_seconds_window_filter() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "window-room",
                 "c": "history-window-old",
@@ -2677,7 +2677,7 @@ async fn history_contract_respects_seconds_window_filter() {
     sleep(time_boundary_delay()).await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "window-room",
                 "c": "history-window-new",
@@ -2689,7 +2689,7 @@ async fn history_contract_respects_seconds_window_filter() {
         .expect("send newer message");
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "history", "ch": "window-room", "seconds": 1, "limit": 50}).to_string(),
         ))
         .await
@@ -2726,7 +2726,7 @@ async fn history_contract_supports_dm_scope() {
     let _bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "dm", "to": "bob",
                 "c": "dm-history-cipher",
@@ -2738,7 +2738,7 @@ async fn history_contract_supports_dm_scope() {
         .expect("send dm for history scope");
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "history", "ch": "dm:bob", "limit": 50}).to_string(),
         ))
         .await
@@ -2765,7 +2765,7 @@ async fn history_contract_persists_join_events() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "join", "ch": "join-contract-room"}).to_string(),
         ))
         .await
@@ -2778,7 +2778,7 @@ async fn history_contract_persists_join_events() {
     );
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "history", "ch": "join-contract-room", "limit": 100}).to_string(),
         ))
         .await
@@ -2814,7 +2814,7 @@ async fn search_contract_filters_by_plaintext_index() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "search-cipher-hit",
@@ -2828,7 +2828,7 @@ async fn search_contract_filters_by_plaintext_index() {
     let _ = recv_by_type(&mut alice, "msg").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "search", "ch": "general", "q": "deploy", "limit": 25}).to_string(),
         ))
         .await
@@ -2855,7 +2855,7 @@ async fn search_contract_supports_dm_scope() {
     let _bob = connect_and_auth(&server.url, "bob").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "dm", "to": "bob",
                 "c": "dm-search-cipher",
@@ -2867,7 +2867,7 @@ async fn search_contract_supports_dm_scope() {
         .expect("send dm for search scope");
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "search", "ch": "dm:bob", "q": "planning", "limit": 50}).to_string(),
         ))
         .await
@@ -2902,7 +2902,7 @@ async fn rewind_contract_returns_recent_events() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "rewind-cipher-hit",
@@ -2916,7 +2916,7 @@ async fn rewind_contract_returns_recent_events() {
     let _ = recv_by_type(&mut alice, "msg").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "rewind", "ch": "general", "seconds": 300, "limit": 25}).to_string(),
         ))
         .await
@@ -2942,7 +2942,7 @@ async fn replay_contract_returns_events_from_timestamp() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "replay-room",
                 "c": "replay-old-cipher",
@@ -2954,7 +2954,7 @@ async fn replay_contract_returns_events_from_timestamp() {
         .expect("send old replay message");
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "history", "ch": "replay-room", "limit": 50}).to_string(),
         ))
         .await
@@ -2982,7 +2982,7 @@ async fn replay_contract_returns_events_from_timestamp() {
     sleep(time_boundary_delay()).await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "replay-room",
                 "c": "replay-new-cipher",
@@ -2994,7 +2994,7 @@ async fn replay_contract_returns_events_from_timestamp() {
         .expect("send new replay message");
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({"t": "replay", "ch": "replay-room", "from_ts": first_ts + 0.5, "limit": 100})
                 .to_string(),
         ))
@@ -3385,7 +3385,7 @@ async fn schema_newer_version_is_not_downgraded_and_server_auth_still_works() {
 
     // Server must remain fully functional, not crash or refuse connections.
     alice
-        .send(Message::Text(json!({"t":"info"}).to_string()))
+        .send(Message::text(json!({"t":"info"}).to_string()))
         .await
         .expect("send info request");
     let info = recv_by_type(&mut alice, "info").await;
@@ -3420,7 +3420,7 @@ async fn protocol_contract_rejects_stale_timestamp_on_mutating_event() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "stale-cipher", "ts": 1,
@@ -3450,7 +3450,7 @@ async fn protocol_contract_rejects_missing_timestamp_when_nonce_present() {
     let mut alice = connect_and_auth(&server.url, "alice").await;
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "missing-ts", "n": "cccccccccccccccccccccccccccccccc"
@@ -3493,14 +3493,14 @@ async fn protocol_contract_rejects_replayed_nonce() {
 
     // First send ÔÇö must succeed.
     alice
-        .send(Message::Text(payload.to_string()))
+        .send(Message::text(payload.to_string()))
         .await
         .expect("send first message with nonce");
     let _ = recv_by_type(&mut alice, "msg").await;
 
     // Identical replay ÔÇö must be rejected.
     alice
-        .send(Message::Text(payload.to_string()))
+        .send(Message::text(payload.to_string()))
         .await
         .expect("send replayed nonce message");
     let err = recv_by_type(&mut alice, "err").await;
@@ -3528,7 +3528,7 @@ async fn protocol_contract_rejects_invalid_nonce_format() {
         .as_secs_f64();
 
     alice
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
                 "c": "nonce-format-attack", "ts": now,
@@ -3562,7 +3562,7 @@ async fn protocol_contract_rejects_oversized_runtime_payload() {
 
     let oversized_payload = "x".repeat(16_001);
     alice
-        .send(Message::Text(oversized_payload))
+        .send(Message::text(oversized_payload))
         .await
         .expect("send oversized runtime payload");
 
@@ -3594,7 +3594,7 @@ async fn protocol_contract_fuzz_corpus_rejects_malformed_and_non_object_frames()
     let malformed_frames = vec!["{", "{\"t\":\"msg\"", "not-json", "\\u0000"];
     for frame in malformed_frames {
         alice
-            .send(Message::Text(frame.to_string()))
+            .send(Message::text(frame.to_string()))
             .await
             .expect("send malformed fuzz frame");
         let err = recv_by_type(&mut alice, "err").await;
@@ -3609,7 +3609,7 @@ async fn protocol_contract_fuzz_corpus_rejects_malformed_and_non_object_frames()
     let non_object_frames = vec!["[]", "null", "123", "\"string\""];
     for frame in non_object_frames {
         alice
-            .send(Message::Text(frame.to_string()))
+            .send(Message::text(frame.to_string()))
             .await
             .expect("send non-object fuzz frame");
         let err = recv_by_type(&mut alice, "err").await;
@@ -3648,7 +3648,7 @@ async fn protocol_contract_rejects_replay_nonce_flood() {
 
     // First send must succeed.
     alice
-        .send(Message::Text(payload.to_string()))
+        .send(Message::text(payload.to_string()))
         .await
         .expect("send first message for nonce flood test");
     let _ = recv_by_type(&mut alice, "msg").await;
@@ -3656,7 +3656,7 @@ async fn protocol_contract_rejects_replay_nonce_flood() {
     // All subsequent replays must be consistently rejected.
     for _ in 0..20 {
         alice
-            .send(Message::Text(payload.to_string()))
+            .send(Message::text(payload.to_string()))
             .await
             .expect("send replayed nonce in flood attempt");
         let err = recv_by_type(&mut alice, "err").await;

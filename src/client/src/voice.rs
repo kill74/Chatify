@@ -225,6 +225,10 @@ pub fn start_voice_session(
                 event_tx.clone(),
                 chunk_samples,
             ),
+            _ => Err(ChatifyError::Audio(format!(
+                "unsupported input sample format: {:?}",
+                format
+            ))),
         };
 
         let input_stream = match result_stream {
@@ -388,6 +392,7 @@ fn build_input_stream(
             |err| {
                 eprintln!("voice input error: {}", err);
             },
+            None,
         )
         .map_err(|e| ChatifyError::Audio(format!("failed to build input stream: {}", e)))
 }
@@ -421,6 +426,7 @@ fn build_input_stream_u16(
             |err| {
                 eprintln!("voice input error: {}", err);
             },
+            None,
         )
         .map_err(|e| ChatifyError::Audio(format!("failed to build u16 input stream: {}", e)))
 }
@@ -454,6 +460,7 @@ fn build_input_stream_f32(
             |err| {
                 eprintln!("voice input error: {}", err);
             },
+            None,
         )
         .map_err(|e| ChatifyError::Audio(format!("failed to build f32 input stream: {}", e)))
 }

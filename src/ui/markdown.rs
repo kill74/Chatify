@@ -3,7 +3,7 @@
 //! Converts markdown text into ANSI-escaped strings for display in the client dashboard.
 //! Uses `pulldown-cmark` for parsing and `syntect` for syntax highlighting of code blocks.
 
-use pulldown_cmark::{Event, Parser, Tag};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -67,7 +67,7 @@ pub fn render_markdown(
                 in_code_block = true;
                 code_lang = String::new();
             }
-            Event::End(Tag::CodeBlock(_)) => {
+            Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
                 if !code_lang.is_empty() {
                     out.push_str("\x1b[35m["); // Magenta for language label
@@ -88,11 +88,11 @@ pub fn render_markdown(
                 code_buffer.clear();
             }
             Event::Start(Tag::Strong) => out.push_str("\x1b[1m"),
-            Event::End(Tag::Strong) => out.push_str("\x1b[22m"),
+            Event::End(TagEnd::Strong) => out.push_str("\x1b[22m"),
             Event::Start(Tag::Emphasis) => out.push_str("\x1b[3m"),
-            Event::End(Tag::Emphasis) => out.push_str("\x1b[23m"),
+            Event::End(TagEnd::Emphasis) => out.push_str("\x1b[23m"),
             Event::Start(Tag::Strikethrough) => out.push_str("\x1b[9m"),
-            Event::End(Tag::Strikethrough) => out.push_str("\x1b[29m"),
+            Event::End(TagEnd::Strikethrough) => out.push_str("\x1b[29m"),
             Event::SoftBreak | Event::HardBreak => out.push('\n'),
             // Basic lists and others can just fall back or be implemented as needed
             Event::Start(Tag::Item) => out.push_str(" • "),

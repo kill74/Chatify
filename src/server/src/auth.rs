@@ -20,7 +20,7 @@ pub struct AuthInfo {
     pub pw_hash: String,
     /// Validated status object (text + emoji), or default.
     pub status: Value,
-    /// Base64-encoded 32-byte Ed25519 public key used for E2E DM encryption.
+    /// Base64-encoded 32-byte X25519 public key used for E2E DM encryption.
     pub pubkey: String,
     /// Optional TOTP or backup code.
     pub otp_code: Option<String>,

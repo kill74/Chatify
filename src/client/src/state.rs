@@ -37,6 +37,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose, Engine as _};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
+use zeroize::Zeroize;
 
 use crate::args::ClientConfig;
 use crate::media::{PendingMediaTransfer, TimelinePayload};
@@ -73,7 +74,7 @@ pub struct ClientState {
     pub chan_keys: HashMap<String, Vec<u8>>,
     /// Per-DM user keys: username → 32-byte key (derived from X25519 ECDH).
     pub dm_keys: HashMap<String, Vec<u8>>,
-    /// Client's Ed25519 private key (32 bytes, used to sign DMs).
+    /// Client's X25519 private key (32 bytes, used to derive DM keys).
     pub priv_key: Vec<u8>,
     /// Whether the connection is active.
     pub running: bool,
@@ -160,6 +161,19 @@ pub struct ClientState {
     pub client_config: ClientConfig,
     /// Activity log for debugging and audit (recent actions).
     pub activity_log: VecDeque<ActivityEntry>,
+}
+
+impl Drop for ClientState {
+    fn drop(&mut self) {
+        self.pw.zeroize();
+        self.priv_key.zeroize();
+        for key in self.chan_keys.values_mut() {
+            key.zeroize();
+        }
+        for key in self.dm_keys.values_mut() {
+            key.zeroize();
+        }
+    }
 }
 
 /// Explicit key trust management.

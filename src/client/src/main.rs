@@ -13,6 +13,7 @@ use log::info;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use zeroize::Zeroize;
 
 use chatify::config::Config;
 use chatify::error::{ChatifyError, ChatifyResult};
@@ -295,6 +296,13 @@ fn prompt_input(label: &str, default: Option<&str>) -> ChatifyResult<String> {
     } else {
         Ok(value.to_string())
     }
+}
+
+fn prompt_secret_input(label: &str) -> ChatifyResult<String> {
+    let mut input = rpassword::prompt_password(format!("{}: ", label))?;
+    let value = input.trim().to_string();
+    input.zeroize();
+    Ok(value)
 }
 
 fn sanitize_username(raw: &str) -> String {
@@ -2473,12 +2481,13 @@ async fn main() -> ChatifyResult<()> {
 
     let mut password = String::new();
     while password.is_empty() {
-        password = prompt_input("Password", None)?;
+        password = prompt_secret_input("Password")?;
         if password.is_empty() {
             println!("Password cannot be empty.");
         }
     }
     let pw_hash = pw_hash_client(&password).map_err(ChatifyError::Validation)?;
+    password.zeroize();
 
     let (ws_stream, _) = connect_async(&uri).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -2516,7 +2525,7 @@ async fn main() -> ChatifyResult<()> {
 
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if write.send(Message::Text(msg)).await.is_err() {
+            if write.send(Message::text(msg)).await.is_err() {
                 break;
             }
         }

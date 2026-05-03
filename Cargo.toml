@@ -23,17 +23,17 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.21"
-tungstenite = "0.21"
+tokio-tungstenite = "0.29"
+tungstenite = "0.29"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 hex = "0.4"
-dashmap = "5"
-clap = { version = "=4.4.18", features = ["derive"] }
+dashmap = "6"
+clap = { version = "4.6", features = ["derive"] }
 rand = "0.8.6"
-chacha20poly1305 = "0.9"
+chacha20poly1305 = "0.10"
 once_cell = "1"
 pbkdf2 = "0.12"
 hmac = "0.12"
@@ -44,29 +44,29 @@ chrono = "0.4"
 env_logger = "0.11"
 log = "0.4"
 rpassword = "7"
-cpal = "0.14"
+cpal = "0.15"
 rodio = "0.18"
 image = "0.25.10"
 serenity = { version = "=0.12.5", default-features = false, features = ["default_no_backend", "native_tls_backend"], optional = true }
-base64 = "0.21"
+base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 r2d2 = "0.8"
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 subtle = "2.6"
 zeroize = { version = "1.7", features = ["derive"] }
 ring = "0.17"
-toml = "0.8"
-dirs = "5.0"
-rustyline = "13.0"
-pulldown-cmark = "0.9"
+toml = "1.1"
+dirs = "6.0"
+rustyline = "18.0"
+pulldown-cmark = "0.13"
 syntect = "5.1"
 notify-rust = "4.10"
 regex = "1.10"
 bytes = "1"
 bitflags = "2"
-lru = "0.8"
+lru = "0.16"
 webrtc = "0.17"
 flate2 = "1.0"
 parking_lot = "0.12"

@@ -897,7 +897,7 @@ fn now_secs() -> u64 {
 }
 
 fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
-    let _ = tx.send(WsMessage::Text(payload.to_string()));
+    let _ = tx.send(WsMessage::text(payload.to_string()));
 }
 
 fn fresh_nonce_hex() -> String {
@@ -1726,7 +1726,7 @@ mod tests {
                                 "u": "DiscordBot",
                                 "users": []
                             });
-                            let _ = ws.send(WsMessage::Text(ok.to_string())).await;
+                            let _ = ws.send(WsMessage::text(ok.to_string())).await;
                         }
                         _ => return,
                     }

@@ -5,7 +5,7 @@
 //! cryptographic failures explicitly.
 
 use base64::{engine::general_purpose, Engine as _};
-use chacha20poly1305::aead::{Aead, NewAead};
+use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
@@ -107,10 +107,8 @@ pub fn enc_bytes(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let nonce_bytes = chacha20_nonce();
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let key_arr: [u8; 32] = key
-        .try_into()
-        .map_err(|_| "key must be 32 bytes".to_string())?;
-    let cipher = ChaCha20Poly1305::new(&key_arr.into());
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| "encryption key must be exactly 32 bytes".to_string())?;
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
@@ -141,10 +139,8 @@ pub fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     let (nonce_bytes, ciphertext_data) = ciphertext.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    let key_arr: [u8; 32] = key
-        .try_into()
-        .map_err(|_| "key must be 32 bytes".to_string())?;
-    let cipher = ChaCha20Poly1305::new(&key_arr.into());
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| "decryption key must be exactly 32 bytes".to_string())?;
 
     cipher
         .decrypt(nonce, ciphertext_data)

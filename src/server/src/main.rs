@@ -4296,7 +4296,7 @@ async fn handle_self_registration<S>(
 {
     if !state.self_registration_enabled {
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({
                     "t": "err",
                     "m": "self-registration is disabled"
@@ -4311,7 +4311,7 @@ async fn handle_self_registration<S>(
         Some(u) => u,
         None => {
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({"t": "err", "m": "missing username"}).to_string(),
                 ))
                 .await;
@@ -4321,7 +4321,7 @@ async fn handle_self_registration<S>(
 
     if !is_valid_username(username) {
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({"t": "err", "m": "invalid username"}).to_string(),
             ))
             .await;
@@ -4332,7 +4332,7 @@ async fn handle_self_registration<S>(
         Some(p) if !p.is_empty() => p,
         _ => {
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({"t": "err", "m": "missing password"}).to_string(),
                 ))
                 .await;
@@ -4342,7 +4342,7 @@ async fn handle_self_registration<S>(
 
     if pw.len() > MAX_PASSWORD_FIELD_LEN {
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({"t": "err", "m": "password too long"}).to_string(),
             ))
             .await;
@@ -4353,7 +4353,7 @@ async fn handle_self_registration<S>(
         Some(pk) if is_valid_pubkey_b64(pk) => pk,
         _ => {
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({"t": "err", "m": "invalid public key"}).to_string(),
                 ))
                 .await;
@@ -4363,7 +4363,7 @@ async fn handle_self_registration<S>(
 
     if state.store.load_pw_hash(username).ok().flatten().is_some() {
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({
                     "t": "err",
                     "m": "username already exists"
@@ -4380,7 +4380,7 @@ async fn handle_self_registration<S>(
     info!("self-registered new user: {}", username);
 
     let _ = sink
-        .send(Message::Text(
+        .send(Message::text(
             serde_json::json!({
                 "t": "registered",
                 "m": "account created successfully"
@@ -7634,7 +7634,7 @@ where
         if let Ok(ws) = accept_async(stream).await {
             let (mut sink, _) = ws.split();
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "t": "err",
                         "m": format!("too many connections from {}", addr.ip())
@@ -7665,7 +7665,7 @@ where
         Some(Ok(Message::Text(r))) => r,
         Some(Ok(_)) => {
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({"t":"err","m":"first frame must be text auth"}).to_string(),
                 ))
                 .await;
@@ -7677,7 +7677,7 @@ where
     // Reject oversized auth frames before JSON parsing.
     if raw.len() > MAX_AUTH_BYTES {
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({"t":"err","m":"auth frame too large"}).to_string(),
             ))
             .await;
@@ -7688,7 +7688,7 @@ where
         Ok(v) => v,
         Err(_) => {
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({"t":"err","m":"invalid auth JSON"}).to_string(),
                 ))
                 .await;
@@ -7707,7 +7707,7 @@ where
         Ok(a) => a,
         Err(err) => {
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({"t":"err","m":err.to_string()}).to_string(),
                 ))
                 .await;
@@ -7719,7 +7719,7 @@ where
     if !state.ip_auth_allowed(&addr) {
         warn!("auth rate limited from {}", addr.ip());
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({
                     "t": "err",
                     "m": "too many auth attempts, please wait"
@@ -7748,7 +7748,7 @@ where
         if locked_until > crate::now() {
             let remaining = (locked_until - crate::now()) as i32;
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "t": "err",
                         "m": format!("account locked, try again in {} seconds", remaining),
@@ -7790,7 +7790,7 @@ where
                     Some(&format!("{} failed login attempts", attempts)),
                 );
                 let _ = sink
-                    .send(Message::Text(
+                    .send(Message::text(
                         serde_json::json!({
                             "t":"err",
                             "m":"account locked due to too many failed attempts",
@@ -7803,7 +7803,7 @@ where
             } else {
                 let remaining = MAX_FAILED_ATTEMPTS - attempts;
                 let _ = sink
-                    .send(Message::Text(
+                    .send(Message::text(
                         serde_json::json!({
                             "t":"err",
                             "m":"invalid credentials",
@@ -7822,7 +7822,7 @@ where
         Err("first_login") => {
             if !state.self_registration_enabled {
                 let _ = sink
-                    .send(Message::Text(
+                    .send(Message::text(
                         serde_json::json!({
                             "t": "err",
                             "m": "self-registration is disabled"
@@ -7858,7 +7858,7 @@ where
         }
         Err(e) => {
             let _ = sink
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({"t":"err","m":format!("credential error: {}", e)})
                         .to_string(),
                 ))
@@ -7871,7 +7871,7 @@ where
     // Reject if this username is already online (prevents session hijacking).
     if state.user_statuses.contains_key(&username) {
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({"t":"err","m":"username already in use"}).to_string(),
             ))
             .await;
@@ -7881,7 +7881,7 @@ where
 
     if let Err(err) = enforce_2fa_on_auth(&state, &username, otp_code.as_deref()) {
         let _ = sink
-            .send(Message::Text(
+            .send(Message::text(
                 serde_json::json!({"t":"err","m":err.to_string()}).to_string(),
             ))
             .await;
@@ -7945,7 +7945,7 @@ where
     }
 
     let ok = create_ok_response(&username, &state, hist, Some(&session_token));
-    if sink.send(Message::Text(ok)).await.is_err() {
+    if sink.send(Message::text(ok)).await.is_err() {
         return;
     }
 
@@ -8003,7 +8003,7 @@ where
     // Runs until out_rx is closed (out_tx is dropped at function exit).
     tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
-            if sink.send(Message::Text(m)).await.is_err() {
+            if sink.send(Message::text(m)).await.is_err() {
                 break;
             }
         }
