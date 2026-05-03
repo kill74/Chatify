@@ -65,7 +65,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Workspace tests
-        run: cargo test --workspace --all-targets --locked
+        # The contract tests spawn many short-lived local server processes. Keep
+        # the CI run deterministic on shared runners by avoiding parallel port
+        # and process scheduling races.
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
 
   protocol-contracts:
     name: Protocol contract gates
