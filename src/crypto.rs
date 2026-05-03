@@ -282,7 +282,8 @@ mod tests {
 
     #[test]
     fn test_pw_hash_client_validation() {
-        assert!(pw_hash_client("").is_err());
+        let empty_password = String::new();
+        assert!(pw_hash_client(empty_password.as_str()).is_err());
         let password = crate::fresh_nonce_hex();
         assert!(pw_hash_client(&password).is_ok());
     }

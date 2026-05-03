@@ -107,9 +107,9 @@ Received files are written to:
 - **Windows:** `%APPDATA%\Chatify\media\`
 - **Linux/macOS:** `$HOME/.chatify/media/`
 
-Image transfers render an ASCII preview inline in the terminal feed. Video transfers produce a metadata card (sender, filename, size, local path). The 100 MB cap is enforced at the application layer on the sender side.
+Image transfers render an ASCII preview inline in the terminal feed. Audio notes show an inline `Play` button in the TUI after the file is received; pending notes show `Receiving...`, and missing local files show `Unavailable`. Video transfers produce a metadata card (sender, filename, size, local path). The 100 MB cap is enforced at the application layer on the sender side.
 
-The client exposes `/image`, `/video`, and `/audio` directly. Each upload is chunked over WebSocket and bounded by the 100 MB sender-side cap.
+The client exposes `/image`, `/video`, and `/audio` directly. Audio playback is click-to-play in the TUI, not a slash command. Each upload is chunked over WebSocket and bounded by the 100 MB sender-side cap.
 
 
 ## Related Docs

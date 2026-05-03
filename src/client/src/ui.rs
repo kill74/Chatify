@@ -1,8 +1,10 @@
 //! Terminal UI runtime and shared output sink for the Chatify client.
 
 use std::collections::HashSet;
+use std::fs::File;
 use std::future::Future;
-use std::io;
+use std::io::{self, BufReader};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,7 +13,10 @@ use std::time::Duration;
 
 use chrono::{Local, TimeZone};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -28,10 +33,12 @@ use ratatui_image::{
     protocol::StatefulProtocol,
     StatefulImage,
 };
+use rodio::{Decoder, OutputStream, Sink};
 
 use crate::handlers;
 use crate::media::{
-    render_message_lines, MediaKind, RgbColor, StyledFragment, StyledLine, TimelinePayload,
+    render_message_lines, MediaKind, MediaRenderStatus, RgbColor, StyledFragment, StyledLine,
+    TimelineMedia, TimelinePayload,
 };
 use crate::state::{ActivityEntry, ClientState, ReplyPreview, SharedState};
 use chatify::error::{ChatifyError, ChatifyResult};
@@ -156,7 +163,8 @@ impl TerminalSession {
     fn enter() -> ChatifyResult<Self> {
         enable_raw_mode().map_err(ChatifyError::from)?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide).map_err(ChatifyError::from)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)
+            .map_err(ChatifyError::from)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).map_err(ChatifyError::from)?;
         terminal.clear().map_err(ChatifyError::from)?;
@@ -167,15 +175,136 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
 
+const AUDIO_PLAY_BUTTON_LABEL: &str = " Play ";
+const AUDIO_RECEIVING_LABEL: &str = " Receiving... ";
+const AUDIO_UNAVAILABLE_LABEL: &str = " Unavailable ";
+
 enum UiAction {
     None,
     Execute(String),
+    PlayAudio(AudioPlaybackTarget),
     Quit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AudioPlaybackTarget {
+    filename: String,
+    local_path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioPlaybackRejection {
+    NotAudio,
+    MediaDisabled,
+    Pending,
+    MissingLocalPath,
+    MissingFile,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AudioControlState {
+    Play(AudioPlaybackTarget),
+    Receiving,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AudioPlayHitbox {
+    area: Rect,
+    target: AudioPlaybackTarget,
+}
+
+#[derive(Default)]
+struct UiHitboxes {
+    audio_play: Vec<AudioPlayHitbox>,
+}
+
+impl UiHitboxes {
+    fn clear(&mut self) {
+        self.audio_play.clear();
+    }
+
+    fn audio_at(&self, column: u16, row: u16) -> Option<AudioPlaybackTarget> {
+        self.audio_play
+            .iter()
+            .find(|hitbox| rect_contains(hitbox.area, column, row))
+            .map(|hitbox| hitbox.target.clone())
+    }
+
+    fn push_audio(&mut self, area: Rect, target: AudioPlaybackTarget) {
+        self.audio_play.push(AudioPlayHitbox { area, target });
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingAudioPlayHitbox {
+    line_index: usize,
+    start_col: usize,
+    width: usize,
+    target: AudioPlaybackTarget,
+}
+
+fn audio_control_for_media(
+    media: &TimelineMedia,
+    media_enabled: bool,
+) -> Option<AudioControlState> {
+    match audio_playback_target_for_media(media, media_enabled) {
+        Ok(target) => Some(AudioControlState::Play(target)),
+        Err(AudioPlaybackRejection::NotAudio) => None,
+        Err(AudioPlaybackRejection::Pending) => Some(AudioControlState::Receiving),
+        Err(
+            AudioPlaybackRejection::MediaDisabled
+            | AudioPlaybackRejection::MissingLocalPath
+            | AudioPlaybackRejection::MissingFile
+            | AudioPlaybackRejection::Unavailable,
+        ) => Some(AudioControlState::Unavailable),
+    }
+}
+
+fn audio_playback_target_for_media(
+    media: &TimelineMedia,
+    media_enabled: bool,
+) -> Result<AudioPlaybackTarget, AudioPlaybackRejection> {
+    if media.media_kind != MediaKind::Audio {
+        return Err(AudioPlaybackRejection::NotAudio);
+    }
+
+    if !media_enabled || media.render_status == MediaRenderStatus::Disabled {
+        return Err(AudioPlaybackRejection::MediaDisabled);
+    }
+
+    match media.render_status {
+        MediaRenderStatus::Pending => Err(AudioPlaybackRejection::Pending),
+        MediaRenderStatus::Complete | MediaRenderStatus::MetadataOnly => {
+            let Some(local_path) = media.local_path.as_deref().filter(|path| !path.is_empty())
+            else {
+                return Err(AudioPlaybackRejection::MissingLocalPath);
+            };
+            if !Path::new(local_path).is_file() {
+                return Err(AudioPlaybackRejection::MissingFile);
+            }
+
+            Ok(AudioPlaybackTarget {
+                filename: media.filename.clone(),
+                local_path: local_path.to_string(),
+            })
+        }
+        MediaRenderStatus::Disabled
+        | MediaRenderStatus::Unsupported
+        | MediaRenderStatus::TooLarge
+        | MediaRenderStatus::DecodeFailed => Err(AudioPlaybackRejection::Unavailable),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +483,7 @@ struct TimelineEntry {
     when: String,
     sender: String,
     body_lines: Vec<StyledLine>,
+    audio_control: Option<AudioControlState>,
     reply: Option<ReplyPreview>,
     reaction_summary: String,
     show_sender: bool,
@@ -582,6 +712,12 @@ impl UiSnapshot {
             let (content, _) = handlers::format_content_for_mentions(&message.content, &state.me);
             let body_lines =
                 render_message_lines(&content, message.payload.as_ref(), state.media_enabled);
+            let audio_control = match message.payload.as_ref() {
+                Some(TimelinePayload::Media(media)) => {
+                    audio_control_for_media(media, state.media_enabled)
+                }
+                None => None,
+            };
             let when = format_timestamp(message.ts);
             let is_system = message.sender == "system";
             let is_self = !state.me.is_empty() && message.sender.eq_ignore_ascii_case(&state.me);
@@ -596,6 +732,7 @@ impl UiSnapshot {
                 when,
                 sender: message.sender.clone(),
                 body_lines,
+                audio_control,
                 reply: message.reply.clone(),
                 reaction_summary,
                 show_sender,
@@ -721,6 +858,7 @@ where
     let mut terminal = TerminalSession::enter()?;
     let mut media_preview = MediaPreviewRuntime::from_terminal();
     let mut palette = PaletteState::default();
+    let mut hitboxes = UiHitboxes::default();
     let input_thread = InputThread::start();
 
     {
@@ -750,13 +888,21 @@ where
 
         terminal
             .terminal
-            .draw(|frame| render(frame, &snapshot, &mut media_preview, &palette))
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &mut hitboxes,
+                )
+            })
             .map_err(ChatifyError::from)?;
         media_preview.record_render_result();
 
         let mut actions = Vec::new();
         while let Ok(event) = input_thread.try_recv() {
-            let action = handle_event(&state, event, &mut palette).await;
+            let action = handle_event(&state, event, &mut palette, &hitboxes).await;
             if !matches!(action, UiAction::None) {
                 actions.push(action);
             }
@@ -771,6 +917,7 @@ where
                         return Ok(());
                     }
                 }
+                UiAction::PlayAudio(target) => start_audio_playback(target),
             }
         }
 
@@ -786,9 +933,49 @@ fn drain_output_lines(output_rx: &Receiver<OutputLine>) -> Vec<OutputLine> {
     lines
 }
 
-async fn handle_event(state: &SharedState, event: Event, palette: &mut PaletteState) -> UiAction {
-    let Event::Key(key) = event else {
-        return UiAction::None;
+fn start_audio_playback(target: AudioPlaybackTarget) {
+    if !Path::new(&target.local_path).is_file() {
+        emit_output_line(
+            format!(
+                "Unable to play {}: saved audio file is unavailable.",
+                target.filename
+            ),
+            true,
+        );
+        return;
+    }
+
+    emit_output_line(format!("Playing {}", target.filename), false);
+    thread::spawn(move || {
+        if let Err(err) = play_audio_file(&target.local_path) {
+            emit_output_line(format!("Unable to play {}: {}", target.filename, err), true);
+        }
+    });
+}
+
+fn play_audio_file(path: &str) -> Result<(), String> {
+    let file = File::open(path).map_err(|err| format!("open failed: {}", err))?;
+    let source =
+        Decoder::new(BufReader::new(file)).map_err(|err| format!("decode failed: {}", err))?;
+    let (_stream, stream_handle) =
+        OutputStream::try_default().map_err(|err| format!("audio output unavailable: {}", err))?;
+    let sink =
+        Sink::try_new(&stream_handle).map_err(|err| format!("audio sink unavailable: {}", err))?;
+    sink.append(source);
+    sink.sleep_until_end();
+    Ok(())
+}
+
+async fn handle_event(
+    state: &SharedState,
+    event: Event,
+    palette: &mut PaletteState,
+    hitboxes: &UiHitboxes,
+) -> UiAction {
+    let key = match event {
+        Event::Key(key) => key,
+        Event::Mouse(mouse) => return handle_mouse_event(mouse, palette, hitboxes),
+        _ => return UiAction::None,
     };
 
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -965,6 +1152,25 @@ async fn handle_event(state: &SharedState, event: Event, palette: &mut PaletteSt
         }
         _ => UiAction::None,
     }
+}
+
+fn handle_mouse_event(
+    mouse: MouseEvent,
+    palette: &PaletteState,
+    hitboxes: &UiHitboxes,
+) -> UiAction {
+    if palette.open {
+        return UiAction::None;
+    }
+
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return UiAction::None;
+    }
+
+    hitboxes
+        .audio_at(mouse.column, mouse.row)
+        .map(UiAction::PlayAudio)
+        .unwrap_or(UiAction::None)
 }
 
 fn open_palette(palette: &mut PaletteState) {
@@ -1553,7 +1759,9 @@ fn render(
     snapshot: &UiSnapshot,
     media_preview: &mut MediaPreviewRuntime,
     palette: &PaletteState,
+    hitboxes: &mut UiHitboxes,
 ) {
+    hitboxes.clear();
     let area = frame.area();
     let mode = layout_mode(area.width);
     let root = Layout::default()
@@ -1584,7 +1792,7 @@ fn render(
                 .split(root[1]);
 
             render_sidebar(frame, body[0], snapshot);
-            render_timeline(frame, body[1], snapshot);
+            render_timeline(frame, body[1], snapshot, hitboxes);
             render_right_panel(frame, body[2], snapshot, media_preview);
         }
         UiLayoutMode::Narrow => {
@@ -1594,7 +1802,7 @@ fn render(
                 .split(root[1]);
 
             render_sidebar(frame, body[0], snapshot);
-            render_timeline(frame, body[1], snapshot);
+            render_timeline(frame, body[1], snapshot, hitboxes);
         }
     }
     render_composer(frame, root[2], snapshot);
@@ -1867,7 +2075,12 @@ fn reply_context_line(reply: &ReplyPreview) -> String {
     format!("reply to {}: {}", target, preview)
 }
 
-fn render_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnapshot) {
+fn render_timeline(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    hitboxes: &mut UiHitboxes,
+) {
     if snapshot.timeline.is_empty() {
         let empty = Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
@@ -1889,6 +2102,7 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
     }
 
     let mut lines = Vec::new();
+    let mut pending_hitboxes = Vec::new();
     for (item_index, item) in snapshot.timeline.iter().enumerate() {
         if item.unread_divider_before {
             lines.push(Line::from(vec![
@@ -1964,6 +2178,20 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
         for (index, body_line) in body_lines.iter().enumerate() {
             let mut spans = vec![Span::raw("  ")];
             spans.extend(styled_line_to_spans(body_line, content_style));
+            if index == 0 {
+                if let Some(control) = item.audio_control.as_ref() {
+                    let button_start_col = 2 + styled_line_width(body_line) + 2;
+                    append_audio_control_spans(&mut spans, control);
+                    if let AudioControlState::Play(target) = control {
+                        pending_hitboxes.push(PendingAudioPlayHitbox {
+                            line_index: lines.len(),
+                            start_col: button_start_col,
+                            width: audio_control_label(control).chars().count(),
+                            target: target.clone(),
+                        });
+                    }
+                }
+            }
             if index == 0 && !item.reaction_summary.is_empty() {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(item.reaction_summary.clone(), warning_style()));
@@ -1989,6 +2217,7 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
     let inner_height = area.height.saturating_sub(2) as usize;
     let total_lines = lines.len();
     let scroll_top = total_lines.saturating_sub(inner_height + snapshot.scroll_offset);
+    record_visible_audio_hitboxes(hitboxes, &pending_hitboxes, area, scroll_top, inner_height);
 
     let timeline = Paragraph::new(Text::from(lines))
         .block(panel_block(format!(
@@ -1998,6 +2227,100 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
         .wrap(Wrap { trim: false })
         .scroll((scroll_top as u16, 0));
     frame.render_widget(timeline, area);
+}
+
+fn append_audio_control_spans(spans: &mut Vec<Span<'static>>, control: &AudioControlState) {
+    spans.push(Span::raw("  "));
+    match control {
+        AudioControlState::Play(_) => {
+            spans.push(Span::styled(
+                AUDIO_PLAY_BUTTON_LABEL,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        AudioControlState::Receiving => {
+            spans.push(Span::styled(AUDIO_RECEIVING_LABEL, muted_style()));
+        }
+        AudioControlState::Unavailable => {
+            spans.push(Span::styled(
+                AUDIO_UNAVAILABLE_LABEL,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+}
+
+fn audio_control_label(control: &AudioControlState) -> &'static str {
+    match control {
+        AudioControlState::Play(_) => AUDIO_PLAY_BUTTON_LABEL,
+        AudioControlState::Receiving => AUDIO_RECEIVING_LABEL,
+        AudioControlState::Unavailable => AUDIO_UNAVAILABLE_LABEL,
+    }
+}
+
+fn styled_line_width(line: &StyledLine) -> usize {
+    line.iter()
+        .map(|fragment| fragment.text.chars().count())
+        .sum()
+}
+
+fn record_visible_audio_hitboxes(
+    hitboxes: &mut UiHitboxes,
+    pending: &[PendingAudioPlayHitbox],
+    area: Rect,
+    scroll_top: usize,
+    inner_height: usize,
+) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    if inner_width == 0 || inner_height == 0 {
+        return;
+    }
+
+    let visible_end = scroll_top.saturating_add(inner_height);
+    for pending_hitbox in pending {
+        if pending_hitbox.line_index < scroll_top || pending_hitbox.line_index >= visible_end {
+            continue;
+        }
+        if pending_hitbox
+            .start_col
+            .saturating_add(pending_hitbox.width)
+            > inner_width
+        {
+            continue;
+        }
+
+        let Ok(x_offset) = u16::try_from(pending_hitbox.start_col) else {
+            continue;
+        };
+        let Ok(y_offset) = u16::try_from(pending_hitbox.line_index - scroll_top) else {
+            continue;
+        };
+        let Ok(width) = u16::try_from(pending_hitbox.width) else {
+            continue;
+        };
+        if width == 0 {
+            continue;
+        }
+
+        hitboxes.push_audio(
+            Rect {
+                x: area.x.saturating_add(1).saturating_add(x_offset),
+                y: area.y.saturating_add(1).saturating_add(y_offset),
+                width,
+                height: 1,
+            },
+            pending_hitbox.target.clone(),
+        );
+    }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    let right = rect.x.saturating_add(rect.width);
+    let bottom = rect.y.saturating_add(rect.height);
+    column >= rect.x && column < right && row >= rect.y && row < bottom
 }
 
 fn styled_line_to_spans(line: &StyledLine, base_style: Style) -> Vec<Span<'static>> {
@@ -2348,16 +2671,20 @@ fn protocol_type_label(protocol_type: ProtocolType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_mention_completion, composer_hint, filtered_palette_actions, layout_mode,
-        mention_query, mention_suggestions, move_palette_selection, resolve_palette_action,
-        right_panel_mode, PaletteActionKind, PaletteResolvedAction, PaletteState, RightPanelMode,
-        UiLayoutMode, UiSnapshot,
+        apply_mention_completion, audio_control_for_media, audio_playback_target_for_media,
+        composer_hint, filtered_palette_actions, layout_mode, mention_query, mention_suggestions,
+        move_palette_selection, resolve_palette_action, right_panel_mode, AudioControlState,
+        AudioPlaybackRejection, AudioPlaybackTarget, PaletteActionKind, PaletteResolvedAction,
+        PaletteState, RightPanelMode, UiHitboxes, UiLayoutMode, UiSnapshot,
     };
     use crate::args::ClientConfig;
     use crate::{
         media::{MediaKind, MediaRenderStatus, TimelineMedia, TimelinePayload},
         state::{ClientState, DisplayedMessage, PeerTrust, ReplyPreview},
     };
+    use ratatui::layout::Rect;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
     fn make_test_state() -> ClientState {
@@ -2376,6 +2703,131 @@ mod tests {
             },
             chatify::config::Config::default(),
         )
+    }
+
+    fn temp_audio_file_path() -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("chatify-ui-audio-{suffix}.ogg"))
+    }
+
+    fn audio_media(
+        render_status: MediaRenderStatus,
+        received_bytes: u64,
+        local_path: Option<String>,
+    ) -> TimelineMedia {
+        TimelineMedia {
+            file_id: "audio-1".to_string(),
+            filename: "voice-note.ogg".to_string(),
+            media_kind: MediaKind::Audio,
+            mime: Some("audio/ogg".to_string()),
+            size: 12,
+            duration_ms: Some(5_000),
+            received_bytes,
+            local_path,
+            preview: Vec::new(),
+            render_status,
+        }
+    }
+
+    #[test]
+    fn audio_control_complete_existing_file_is_playable() {
+        let path = temp_audio_file_path();
+        fs::write(&path, b"placeholder audio bytes").expect("write audio placeholder");
+        let path_text = path.to_string_lossy().to_string();
+        let media = audio_media(MediaRenderStatus::Complete, 12, Some(path_text.clone()));
+
+        assert_eq!(
+            audio_control_for_media(&media, true),
+            Some(AudioControlState::Play(AudioPlaybackTarget {
+                filename: "voice-note.ogg".to_string(),
+                local_path: path_text,
+            }))
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn audio_control_pending_disabled_and_missing_states_are_not_clickable() {
+        let pending = audio_media(MediaRenderStatus::Pending, 4, None);
+        assert_eq!(
+            audio_control_for_media(&pending, true),
+            Some(AudioControlState::Receiving)
+        );
+
+        let disabled = audio_media(MediaRenderStatus::Disabled, 0, None);
+        assert_eq!(
+            audio_control_for_media(&disabled, true),
+            Some(AudioControlState::Unavailable)
+        );
+
+        let missing = audio_media(
+            MediaRenderStatus::Complete,
+            12,
+            Some("C:/chatify/missing/voice-note.ogg".to_string()),
+        );
+        assert_eq!(
+            audio_control_for_media(&missing, true),
+            Some(AudioControlState::Unavailable)
+        );
+    }
+
+    #[test]
+    fn audio_play_hitbox_resolves_inside_click_only() {
+        let target = AudioPlaybackTarget {
+            filename: "voice-note.ogg".to_string(),
+            local_path: "C:/tmp/voice-note.ogg".to_string(),
+        };
+        let mut hitboxes = UiHitboxes::default();
+        hitboxes.push_audio(
+            Rect {
+                x: 10,
+                y: 4,
+                width: 6,
+                height: 1,
+            },
+            target.clone(),
+        );
+
+        assert_eq!(hitboxes.audio_at(10, 4), Some(target.clone()));
+        assert_eq!(hitboxes.audio_at(15, 4), Some(target));
+        assert_eq!(hitboxes.audio_at(16, 4), None);
+        assert_eq!(hitboxes.audio_at(10, 5), None);
+    }
+
+    #[test]
+    fn audio_playback_validation_rejects_non_audio_pending_and_missing_files() {
+        let mut non_audio = audio_media(MediaRenderStatus::Complete, 12, None);
+        non_audio.media_kind = MediaKind::File;
+        assert_eq!(
+            audio_playback_target_for_media(&non_audio, true),
+            Err(AudioPlaybackRejection::NotAudio)
+        );
+
+        let pending = audio_media(MediaRenderStatus::Pending, 4, None);
+        assert_eq!(
+            audio_playback_target_for_media(&pending, true),
+            Err(AudioPlaybackRejection::Pending)
+        );
+
+        let missing_path = audio_media(MediaRenderStatus::Complete, 12, None);
+        assert_eq!(
+            audio_playback_target_for_media(&missing_path, true),
+            Err(AudioPlaybackRejection::MissingLocalPath)
+        );
+
+        let missing_file = audio_media(
+            MediaRenderStatus::Complete,
+            12,
+            Some("C:/chatify/missing/voice-note.ogg".to_string()),
+        );
+        assert_eq!(
+            audio_playback_target_for_media(&missing_file, true),
+            Err(AudioPlaybackRejection::MissingFile)
+        );
     }
 
     #[test]
