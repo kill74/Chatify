@@ -1125,29 +1125,35 @@ impl ClientState {
             .map_err(|_| "failed to send websocket frame".to_string())
     }
 
+    pub fn send_fresh_json(&self, mut payload: serde_json::Value) -> Result<(), String> {
+        payload["ts"] = serde_json::Value::from(chatify::now());
+        payload["n"] = serde_json::Value::String(chatify::fresh_nonce_hex());
+        self.send_json(payload)
+    }
+
     pub fn send_join(&self, channel: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "join",
             "ch": channel,
         }))
     }
 
     pub fn send_leave(&self, channel: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "leave",
             "ch": channel,
         }))
     }
 
     pub fn send_voice_join(&self, room: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "vjoin",
             "r": room,
         }))
     }
 
     pub fn send_voice_leave(&self, room: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "vleave",
             "r": room,
         }))
@@ -1165,25 +1171,25 @@ impl ClientState {
         if let Some(deafened) = deafened {
             payload["deafened"] = serde_json::json!(deafened);
         }
-        self.send_json(payload)
+        self.send_fresh_json(payload)
     }
 
     pub fn send_voice_speaking(&self, speaking: bool) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "vspeaking",
             "speaking": speaking,
         }))
     }
 
     pub fn send_screen_start(&self, room: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "ss_start",
             "r": room,
         }))
     }
 
     pub fn send_screen_stop(&self, room: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "ss_stop",
             "r": room,
         }))
@@ -1228,7 +1234,7 @@ impl ClientState {
             return Err("plugin install target cannot be empty".to_string());
         }
 
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "plugin",
             "sub": "install",
             "plugin": plugin,
@@ -1241,7 +1247,7 @@ impl ClientState {
             return Err("plugin disable target cannot be empty".to_string());
         }
 
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "plugin",
             "sub": "disable",
             "plugin": plugin,
@@ -1276,7 +1282,7 @@ impl ClientState {
             return Err("admin register role cannot be empty".to_string());
         }
 
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "admin",
             "sub": "register",
             "ch": self.ch,
@@ -1296,7 +1302,7 @@ impl ClientState {
             return Err("admin role cannot be empty".to_string());
         }
 
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "admin",
             "sub": "role",
             "ch": self.ch,
@@ -1328,7 +1334,7 @@ impl ClientState {
                 return Err("typing dm target cannot be empty".to_string());
             }
 
-            return self.send_json(serde_json::json!({
+            return self.send_fresh_json(serde_json::json!({
                 "t": "typing",
                 "to": to,
                 "typing": typing,
@@ -1339,7 +1345,7 @@ impl ClientState {
             return Err("typing channel cannot be empty".to_string());
         }
 
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "typing",
             "ch": scope,
             "typing": typing,
@@ -1368,22 +1374,18 @@ impl ClientState {
             return Err("dm content cannot be empty".to_string());
         }
 
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "dm",
             "to": to,
             "c": body,
-            "ts": chatify::now(),
-            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
     pub fn send_message(&self, channel: &str, content: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "msg",
             "ch": channel,
             "c": content,
-            "ts": chatify::now(),
-            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
@@ -1397,24 +1399,20 @@ impl ClientState {
             return Err("reply content cannot be empty".to_string());
         }
 
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "msg",
             "ch": channel,
             "c": body,
             "reply_to": target,
-            "ts": chatify::now(),
-            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
     pub fn send_reaction(&self, channel: &str, msg_id: &str, emoji: &str) -> Result<(), String> {
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "reaction",
             "ch": channel,
             "msg_id": msg_id,
             "emoji": emoji,
-            "ts": chatify::now(),
-            "n": chatify::fresh_nonce_hex(),
         }))
     }
 
@@ -1443,7 +1441,7 @@ impl ClientState {
         if let Some(duration_ms) = meta.duration_ms {
             payload["duration_ms"] = serde_json::Value::from(duration_ms);
         }
-        self.send_json(payload)
+        self.send_fresh_json(payload)
     }
 
     pub fn send_file_chunk(
@@ -1454,14 +1452,12 @@ impl ClientState {
         data: &[u8],
     ) -> Result<(), String> {
         let chunk_b64 = base64::engine::general_purpose::STANDARD.encode(data);
-        self.send_json(serde_json::json!({
+        self.send_fresh_json(serde_json::json!({
             "t": "file_chunk",
             "ch": channel,
             "file_id": file_id,
             "index": index,
             "data": chunk_b64,
-            "ts": chatify::now(),
-            "n": chatify::fresh_nonce_hex(),
         }))
     }
 

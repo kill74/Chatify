@@ -7,7 +7,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
-use hmac::Hmac;
+use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -175,6 +175,35 @@ pub fn pw_hash_client(password: &str) -> Result<String, String> {
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, 120_000, &mut hash)
         .expect("PBKDF2 with 32-byte output should always succeed");
     Ok(hex::encode(hash))
+}
+
+/// Build the proof sent by auth-v2 clients.
+///
+/// The client secret is the deterministic client password hash. It is never
+/// sent for normal v2 logins; instead the client proves possession with an
+/// HMAC over both nonces and the username.
+pub fn auth_proof(
+    client_secret: &str,
+    username: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+) -> Result<String, String> {
+    if client_secret.is_empty() {
+        return Err("auth secret cannot be empty".to_string());
+    }
+    if username.is_empty() || client_nonce.is_empty() || server_nonce.is_empty() {
+        return Err("auth proof inputs cannot be empty".to_string());
+    }
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(client_secret.as_bytes())
+        .map_err(|_| "invalid auth secret".to_string())?;
+    mac.update(b"chatify:auth:v2:");
+    mac.update(username.as_bytes());
+    mac.update(b":");
+    mac.update(client_nonce.as_bytes());
+    mac.update(b":");
+    mac.update(server_nonce.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 /// Hash a password using PBKDF2 with SHA256 and a random per-user salt.

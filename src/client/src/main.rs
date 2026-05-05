@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chatify::crypto::{new_keypair, pub_b64, pw_hash_client};
+use chatify::crypto::{auth_proof, new_keypair, pub_b64, pw_hash_client};
 use chatify::notifications::NotificationService;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -2523,6 +2523,105 @@ async fn main() -> ChatifyResult<()> {
         }
     }
 
+    let client_nonce = chatify::fresh_nonce_hex();
+    write
+        .send(Message::text(
+            serde_json::json!({
+                "t": "auth",
+                "auth_v": 2,
+                "u": username,
+                "cn": client_nonce,
+                "pk": pub_key,
+                "status": {"text": "Online", "emoji": ""}
+            })
+            .to_string(),
+        ))
+        .await?;
+
+    let challenge = match read.next().await {
+        Some(Ok(Message::Text(text))) => serde_json::from_str::<serde_json::Value>(&text)?,
+        Some(Ok(_)) => {
+            return Err(ChatifyError::Message(
+                "auth challenge must be a text frame".to_string(),
+            ));
+        }
+        Some(Err(err)) => return Err(ChatifyError::from(err)),
+        None => {
+            return Err(ChatifyError::Message(
+                "server closed during auth".to_string(),
+            ))
+        }
+    };
+    if challenge.get("t").and_then(|v| v.as_str()) == Some("err") {
+        return Err(ChatifyError::Message(
+            challenge["m"].as_str().unwrap_or("auth failed").to_string(),
+        ));
+    }
+    if challenge.get("t").and_then(|v| v.as_str()) != Some("auth_challenge") {
+        return Err(ChatifyError::Message(
+            "server did not provide auth challenge".to_string(),
+        ));
+    }
+    let server_nonce = challenge
+        .get("sn")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ChatifyError::Message("auth challenge missing nonce".to_string()))?;
+    let proof = auth_proof(&pw_hash, &username, &client_nonce, server_nonce)
+        .map_err(ChatifyError::Crypto)?;
+    let include_enrollment_secret = challenge
+        .get("enroll")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || challenge
+            .get("legacy_migration")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    let mut auth_finish = serde_json::json!({
+        "t": "auth",
+        "auth_v": 2,
+        "u": username,
+        "proof": proof,
+        "cn": client_nonce,
+        "sn": server_nonce,
+        "pk": pub_key,
+        "status": {"text": "Online", "emoji": ""}
+    });
+    if include_enrollment_secret {
+        auth_finish["pw"] = serde_json::Value::String(pw_hash.clone());
+    }
+    write.send(Message::text(auth_finish.to_string())).await?;
+
+    let ok_payload = match read.next().await {
+        Some(Ok(Message::Text(text))) => serde_json::from_str::<serde_json::Value>(&text)?,
+        Some(Ok(_)) => {
+            return Err(ChatifyError::Message(
+                "auth response must be a text frame".to_string(),
+            ));
+        }
+        Some(Err(err)) => return Err(ChatifyError::from(err)),
+        None => {
+            return Err(ChatifyError::Message(
+                "server closed during auth".to_string(),
+            ))
+        }
+    };
+    if ok_payload.get("t").and_then(|v| v.as_str()) == Some("err") {
+        return Err(ChatifyError::Message(
+            ok_payload["m"]
+                .as_str()
+                .unwrap_or("auth failed")
+                .to_string(),
+        ));
+    }
+    if ok_payload.get("t").and_then(|v| v.as_str()) != Some("ok") {
+        return Err(ChatifyError::Message(
+            "server returned unexpected auth response".to_string(),
+        ));
+    }
+    if let Some(map) = ok_payload.as_object() {
+        handlers::dispatch_event(&state, map).await;
+    }
+
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if write.send(Message::text(msg)).await.is_err() {
@@ -2558,16 +2657,6 @@ async fn main() -> ChatifyResult<()> {
 
     {
         let state_lock = state.lock().await;
-        state_lock
-            .send_json(serde_json::json!({
-                "t": "auth",
-                "u": username,
-                "pw": pw_hash,
-                "pk": pub_key,
-                "status": {"text": "Online", "emoji": ""}
-            }))
-            .map_err(ChatifyError::Message)?;
-
         state_lock
             .send_join("general")
             .map_err(ChatifyError::Message)?;

@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use chatify::crypto::{new_keypair, pub_b64};
+use chatify::crypto::{auth_proof, new_keypair, pub_b64};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -585,6 +585,61 @@ async fn connect_and_auth_with_pw_hash_and_otp(
     ws
 }
 
+async fn connect_and_auth_v2_with_pw_hash(url: &str, username: &str, pw_hash: &str) -> Ws {
+    let (mut ws, _) = connect_async(url).await.expect("connect websocket");
+    let client_nonce = chatify::fresh_nonce_hex();
+    let pk = pub_b64(&new_keypair()).unwrap();
+    ws.send(Message::text(
+        json!({
+            "t": "auth",
+            "auth_v": 2,
+            "u": username,
+            "cn": client_nonce,
+            "pk": pk,
+            "status": {"text":"Online","emoji":"test"}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send auth-v2 start");
+
+    let challenge = recv_by_type(&mut ws, "auth_challenge").await;
+    let server_nonce = challenge
+        .get("sn")
+        .and_then(|v| v.as_str())
+        .expect("auth-v2 challenge should include server nonce");
+    let proof =
+        auth_proof(pw_hash, username, &client_nonce, server_nonce).expect("build auth-v2 proof");
+    let include_secret = challenge
+        .get("enroll")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || challenge
+            .get("legacy_migration")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    let mut finish = json!({
+        "t": "auth",
+        "auth_v": 2,
+        "u": username,
+        "proof": proof,
+        "cn": client_nonce,
+        "sn": server_nonce,
+        "pk": pk,
+        "status": {"text":"Online","emoji":"test"}
+    });
+    if include_secret {
+        finish["pw"] = Value::String(pw_hash.to_string());
+    }
+    ws.send(Message::text(finish.to_string()))
+        .await
+        .expect("send auth-v2 proof");
+
+    let ok = recv_by_type(&mut ws, "ok").await;
+    assert_eq!(ok.get("u").and_then(|v| v.as_str()), Some(username));
+    ws
+}
+
 /// Drains incoming WebSocket frames until one whose `"t"` field matches
 /// `expected_type` is found, then returns the parsed [`Value`].
 ///
@@ -872,6 +927,40 @@ async fn auth_contract_password_change_invalidates_old_password_and_accepts_new_
         .close(None)
         .await
         .expect("close socket after new password auth");
+}
+
+#[tokio::test]
+async fn auth_contract_v2_enrollment_rejects_legacy_hash_replay() {
+    let server = start_server().await;
+    let username = "v2alice";
+    let pw_hash = test_pw_hash_for(username);
+    let mut ws = connect_and_auth_v2_with_pw_hash(&server.url, username, &pw_hash).await;
+    ws.close(None)
+        .await
+        .expect("close first auth-v2 socket before replay attempt");
+    sleep(settle_delay()).await;
+
+    let (mut replay_ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for legacy replay attempt");
+    replay_ws
+        .send(Message::text(
+            json!({
+                "t": "auth",
+                "u": username,
+                "pw": pw_hash,
+                "pk": pub_b64(&new_keypair()).unwrap(),
+                "status": {"text":"Online","emoji":"test"}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send legacy auth replay");
+    let err = recv_by_type(&mut replay_ws, "err").await;
+    assert_eq!(
+        err.get("m").and_then(|v| v.as_str()),
+        Some("invalid credentials")
+    );
 }
 
 /// Verifies server/client bootstrap compatibility for the runtime startup flow.
@@ -1587,7 +1676,8 @@ async fn msg_contract_roundtrips_channel_payload() {
         .send(Message::text(
             json!({
                 "t": "msg", "ch": "general",
-                "c": "ciphertext-blob", "ts": 123
+                "c": "ciphertext-blob", "ts": chatify::now(),
+                "n": chatify::fresh_nonce_hex()
             })
             .to_string(),
         ))
@@ -3465,6 +3555,34 @@ async fn protocol_contract_rejects_missing_timestamp_when_nonce_present() {
     assert!(
         msg.contains("missing timestamp"),
         "expected missing timestamp rejection, got: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn protocol_contract_v2_session_rejects_missing_nonce_on_mutation() {
+    let server = start_server().await;
+    let mut alice =
+        connect_and_auth_v2_with_pw_hash(&server.url, "v2nonce", &test_pw_hash_for("v2nonce"))
+            .await;
+
+    alice
+        .send(Message::text(
+            json!({
+                "t": "msg",
+                "ch": "general",
+                "c": "nonce-required"
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send nonce-less auth-v2 mutation");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("missing nonce"),
+        "expected auth-v2 missing nonce rejection, got: {}",
         msg
     );
 }

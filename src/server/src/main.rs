@@ -130,13 +130,23 @@ use chatify_server::protocol::*;
 /// passes. Using a typed struct here ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â rather than passing `&Value` through
 /// downstream functions ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â makes it impossible to accidentally skip validation
 /// or misread a field name.
+enum AuthCredential {
+    LegacyHash(String),
+    V2Proof {
+        proof: String,
+        client_nonce: String,
+        server_nonce: String,
+        enrollment_secret: Option<String>,
+    },
+}
+
 struct AuthInfo {
     /// Validated username (ASCII alphanumeric / `-` / `_`, ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 32 chars).
     username: String,
 
     /// Password hash submitted by the client (non-empty, ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 256 chars).
     /// Used for credential verification against the stored hash.
-    pw_hash: String,
+    credential: AuthCredential,
 
     /// Validated status object (text + emoji), or default.
     status: Value,
@@ -2547,10 +2557,44 @@ impl EventStore {
     ) -> Result<bool, &'static str> {
         match self.load_pw_hash(username) {
             Ok(None) => Err("first_login"),
+            Ok(Some(stored)) if stored.starts_with("v2$") => Ok(false),
             Ok(Some(stored)) => Ok(crypto::pw_verify(submitted_hash, &stored)),
             Err("credentials_table_missing") => Err("first_login"),
             Err(e) => Err(e),
         }
+    }
+
+    fn credential_state(&self, username: &str) -> Result<Option<String>, &'static str> {
+        match self.load_pw_hash(username) {
+            Ok(Some(stored)) => Ok(Some(stored)),
+            Ok(None) => Ok(None),
+            Err("credentials_table_missing") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn verify_auth_v2_proof(
+        &self,
+        username: &str,
+        proof: &str,
+        client_nonce: &str,
+        server_nonce: &str,
+    ) -> Result<bool, &'static str> {
+        let Some(stored) = self.credential_state(username)? else {
+            return Err("first_login");
+        };
+        let Some(secret) = stored.strip_prefix("v2$") else {
+            return Err("legacy_credential");
+        };
+        let expected = match crypto::auth_proof(secret, username, client_nonce, server_nonce) {
+            Ok(value) => value,
+            Err(_) => return Ok(false),
+        };
+        Ok(crypto::secure_string_eq(proof, &expected))
+    }
+
+    fn upsert_auth_v2_secret(&self, username: &str, client_secret: &str) {
+        self.upsert_credentials(username, &format!("v2${client_secret}"));
     }
 
     fn get_user_role(&self, username: &str, channel: &str) -> Option<Role> {
@@ -4377,6 +4421,7 @@ async fn handle_self_registration<S>(
 
 struct ConnectionSession {
     out_tx: OutboundTx,
+    fresh_required: bool,
     voice_room: Option<String>,
     active_voice_room: Arc<RwLock<Option<String>>>,
     voice_audio_forwarder: Option<JoinHandle<()>>,
@@ -4393,6 +4438,7 @@ async fn handle_event(
 ) {
     let ConnectionSession {
         out_tx,
+        fresh_required,
         voice_room,
         active_voice_room,
         voice_audio_forwarder,
@@ -4416,7 +4462,9 @@ async fn handle_event(
 
     // --- Replay protection (timestamp skew + nonce dedup) ------------------
     // Only applied to mutating events (see requires_fresh_protection).
-    if requires_fresh_protection(t) {
+    let should_validate_freshness =
+        *fresh_required || d.get("n").is_some() || d.get("ts").is_some();
+    if requires_fresh_protection(d) && should_validate_freshness {
         if let Err(e) = validate_timestamp_skew(d) {
             warn!("protocol validation failed type={} reason={}", t, e);
             send_err(
@@ -7240,15 +7288,60 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
         return Err(ChatifyError::Validation("invalid username".to_string()));
     }
 
-    let pw = d
-        .get("pw")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ChatifyError::Validation("missing password hash".to_string()))?;
-    if pw.is_empty() || pw.len() > MAX_PASSWORD_FIELD_LEN {
-        return Err(ChatifyError::Validation(
-            "invalid password hash".to_string(),
-        ));
-    }
+    let auth_v = d.get("auth_v").and_then(|v| v.as_u64()).unwrap_or(1);
+    let credential = if auth_v >= 2 || d.get("proof").is_some() {
+        let proof = d
+            .get("proof")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ChatifyError::Validation("missing auth proof".to_string()))?;
+        if proof.len() != 64 || !proof.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ChatifyError::Validation("invalid auth proof".to_string()));
+        }
+
+        let client_nonce = d
+            .get("cn")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ChatifyError::Validation("missing auth client nonce".to_string()))?;
+        let server_nonce = d
+            .get("sn")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ChatifyError::Validation("missing auth server nonce".to_string()))?;
+        for nonce in [client_nonce, server_nonce] {
+            if nonce.is_empty()
+                || nonce.len() > MAX_NONCE_LEN
+                || !nonce.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Err(ChatifyError::Validation("invalid auth nonce".to_string()));
+            }
+        }
+
+        let enrollment_secret = d.get("pw").and_then(|v| v.as_str()).map(str::to_string);
+        if let Some(secret) = enrollment_secret.as_deref() {
+            if secret.is_empty() || secret.len() > MAX_PASSWORD_FIELD_LEN {
+                return Err(ChatifyError::Validation(
+                    "invalid password hash".to_string(),
+                ));
+            }
+        }
+
+        AuthCredential::V2Proof {
+            proof: proof.to_string(),
+            client_nonce: client_nonce.to_string(),
+            server_nonce: server_nonce.to_string(),
+            enrollment_secret,
+        }
+    } else {
+        let pw = d
+            .get("pw")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ChatifyError::Validation("missing password hash".to_string()))?;
+        if pw.is_empty() || pw.len() > MAX_PASSWORD_FIELD_LEN {
+            return Err(ChatifyError::Validation(
+                "invalid password hash".to_string(),
+            ));
+        }
+        AuthCredential::LegacyHash(pw.to_string())
+    };
 
     let pubkey = d
         .get("pk")
@@ -7289,7 +7382,7 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
 
     Ok(AuthInfo {
         username,
-        pw_hash: pw.to_string(),
+        credential,
         status,
         pubkey,
         otp_code,
@@ -7298,6 +7391,45 @@ fn validate_auth_payload(d: &Value) -> ChatifyResult<AuthInfo> {
         bridge_instance_id,
         bridge_routes,
     })
+}
+
+fn auth_v2_start_client_nonce(d: &Value) -> ChatifyResult<Option<String>> {
+    if d.get("t").and_then(|v| v.as_str()) != Some("auth")
+        || d.get("auth_v").and_then(|v| v.as_u64()) != Some(2)
+        || d.get("proof").is_some()
+    {
+        return Ok(None);
+    }
+
+    let username = d
+        .get("u")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ChatifyError::Validation("missing username".to_string()))?;
+    if !is_valid_username(username) {
+        return Err(ChatifyError::Validation("invalid username".to_string()));
+    }
+
+    let pubkey = d
+        .get("pk")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ChatifyError::Validation("missing public key".to_string()))?;
+    if !is_valid_pubkey_b64(pubkey) {
+        return Err(ChatifyError::Message("invalid public key".to_string()));
+    }
+    let _ = validate_status_field(d.get("status"))?;
+
+    let client_nonce = d
+        .get("cn")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ChatifyError::Validation("missing auth client nonce".to_string()))?;
+    if client_nonce.is_empty()
+        || client_nonce.len() > MAX_NONCE_LEN
+        || !client_nonce.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(ChatifyError::Validation("invalid auth nonce".to_string()));
+    }
+
+    Ok(Some(client_nonce.to_string()))
 }
 
 /// Validates the optional `"status"` field in the auth frame.
@@ -7416,21 +7548,31 @@ fn enforce_2fa_on_auth(
 /// are protected. Read-only queries (`"history"`, `"search"`, `"users"`,
 /// `"info"`, `"ping"`) and control events (`"join"`, `"leave"`, `"vjoin"`) are excluded
 /// because replaying them is either idempotent or harmless.
-fn requires_fresh_protection(event_type: &str) -> bool {
-    matches!(
-        event_type,
-        "msg"
-            | "img"
-            | "dm"
-            | "vdata"
-            | "ss_meta"
-            | "ss_frame"
-            | "edit"
-            | "file_meta"
-            | "file_chunk"
-            | "status"
-            | "reaction"
-    )
+fn requires_fresh_protection(d: &Value) -> bool {
+    let event_type = d.get("t").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "msg" | "img" | "dm" | "join" | "leave" | "vjoin" | "vleave" | "vstate" | "vspeaking"
+        | "vdata" | "ss_start" | "ss_stop" | "ss_meta" | "ss_frame" | "edit" | "file_meta"
+        | "file_chunk" | "typing" | "status" | "reaction" | "kick" | "2fa_verify" | "unlock"
+        | "slash" => true,
+        "plugin" => !matches!(
+            d.get("sub").and_then(|v| v.as_str()).unwrap_or("list"),
+            "list" | ""
+        ),
+        "admin" => !matches!(
+            d.get("sub").and_then(|v| v.as_str()).unwrap_or("users"),
+            "users" | "audit" | ""
+        ),
+        "role" => !matches!(
+            d.get("sub").and_then(|v| v.as_str()).unwrap_or("get"),
+            "get" | ""
+        ),
+        "ban" | "mute" => !matches!(
+            d.get("sub").and_then(|v| v.as_str()).unwrap_or("add"),
+            "check"
+        ),
+        _ => false,
+    }
 }
 
 /// Validates that the client-supplied `"ts"` field is within
@@ -7442,8 +7584,7 @@ fn requires_fresh_protection(event_type: &str) -> bool {
 /// rejected to guard against clients that send uninitialised fields.
 fn validate_timestamp_skew(d: &Value) -> ChatifyResult<()> {
     if d.get("n").and_then(|v| v.as_str()).is_none() {
-        // Legacy clients may omit nonce/timestamp on mutating frames.
-        return Ok(());
+        return Err(ChatifyError::Validation("missing nonce".to_string()));
     }
 
     let Some(ts) = d
@@ -7485,8 +7626,7 @@ fn validate_timestamp_skew(d: &Value) -> ChatifyResult<()> {
 /// nonces that could arrive within that window.
 fn validate_and_register_nonce(state: &State, username: &str, d: &Value) -> ChatifyResult<()> {
     let Some(nonce) = d.get("n").and_then(|v| v.as_str()) else {
-        // Legacy clients may omit nonces.
-        return Ok(());
+        return Err(ChatifyError::Validation("missing nonce".to_string()));
     };
 
     if nonce.is_empty() || nonce.len() > MAX_NONCE_LEN {
@@ -7643,7 +7783,7 @@ where
 
     // ---- Phase 1: read and validate the auth frame --------------------------
 
-    let raw = match stream.next().await {
+    let mut raw = match stream.next().await {
         Some(Ok(Message::Text(r))) => r,
         Some(Ok(_)) => {
             let _ = sink
@@ -7666,7 +7806,7 @@ where
         return;
     }
 
-    let d: Value = match serde_json::from_str(&raw) {
+    let mut d: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(_) => {
             let _ = sink
@@ -7683,6 +7823,87 @@ where
     if msg_type == "register" {
         handle_self_registration(&state, &d, &addr, &mut sink).await;
         return;
+    }
+
+    let mut expected_auth_v2_nonce: Option<(String, String)> = None;
+    match auth_v2_start_client_nonce(&d) {
+        Ok(Some(client_nonce)) => {
+            let username = d.get("u").and_then(|v| v.as_str()).unwrap_or("");
+            let credential_state = match state.store.credential_state(username) {
+                Ok(stored) => stored,
+                Err(err) => {
+                    let _ = sink
+                        .send(Message::text(
+                            serde_json::json!({"t":"err","m":format!("credential error: {}", err)})
+                                .to_string(),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+            let enrollment = credential_state.is_none();
+            let legacy_migration = credential_state
+                .as_deref()
+                .is_some_and(|stored| !stored.starts_with("v2$"));
+            let server_nonce = chatify::fresh_nonce_hex();
+            expected_auth_v2_nonce = Some((client_nonce.clone(), server_nonce.clone()));
+            let _ = sink
+                .send(Message::text(
+                    serde_json::json!({
+                        "t":"auth_challenge",
+                        "auth_v":2,
+                        "alg":"hmac-sha256",
+                        "cn":client_nonce,
+                        "sn":server_nonce,
+                        "enroll": enrollment,
+                        "legacy_migration": legacy_migration
+                    })
+                    .to_string(),
+                ))
+                .await;
+
+            raw = match stream.next().await {
+                Some(Ok(Message::Text(r))) => r,
+                Some(Ok(_)) => {
+                    let _ = sink
+                        .send(Message::text(
+                            serde_json::json!({"t":"err","m":"auth proof must be text"})
+                                .to_string(),
+                        ))
+                        .await;
+                    return;
+                }
+                _ => return,
+            };
+            if raw.len() > MAX_AUTH_BYTES {
+                let _ = sink
+                    .send(Message::text(
+                        serde_json::json!({"t":"err","m":"auth frame too large"}).to_string(),
+                    ))
+                    .await;
+                return;
+            }
+            d = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = sink
+                        .send(Message::text(
+                            serde_json::json!({"t":"err","m":"invalid auth JSON"}).to_string(),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(err) => {
+            let _ = sink
+                .send(Message::text(
+                    serde_json::json!({"t":"err","m":err.to_string()}).to_string(),
+                ))
+                .await;
+            return;
+        }
     }
 
     let auth = match validate_auth_payload(&d) {
@@ -7714,7 +7935,7 @@ where
 
     let AuthInfo {
         username,
-        pw_hash,
+        credential,
         mut status,
         pubkey,
         otp_code,
@@ -7746,19 +7967,109 @@ where
     }
 
     // --- Credential verification ---
-    // The client sends a PBKDF2 hash of their password. The server stores
-    // its own PBKDF2 hash of that value (with a random salt). This two-layer
-    // approach means the server never sees the raw password, but also never
-    // trusts a client-provided hash blindly.
-    let credential_result = if let Some(pending) = state.pending_credentials.get(&username) {
-        Ok(crypto::secure_string_eq(&pw_hash, pending.value()))
-    } else {
-        state.store.verify_credential(&username, &pw_hash)
+    // Auth-v2 uses a per-login challenge proof so the reusable client password
+    // hash is not sent over the WebSocket during normal logins. Legacy rows can
+    // be migrated by one v2 login that includes the client secret only when the
+    // challenge explicitly asks for enrollment/migration.
+    let mut legacy_hash_to_persist: Option<String> = None;
+    let mut v2_secret_to_persist: Option<String> = None;
+    let credential_result = match credential {
+        AuthCredential::LegacyHash(pw_hash) => {
+            if state
+                .store
+                .credential_state(&username)
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_some_and(|stored| stored.starts_with("v2$"))
+            {
+                Ok(false)
+            } else if let Some(pending) = state.pending_credentials.get(&username) {
+                Ok(crypto::secure_string_eq(&pw_hash, pending.value()))
+            } else {
+                let result = state.store.verify_credential(&username, &pw_hash);
+                if result == Err("first_login") {
+                    legacy_hash_to_persist = Some(pw_hash);
+                }
+                result
+            }
+        }
+        AuthCredential::V2Proof {
+            proof,
+            client_nonce,
+            server_nonce,
+            enrollment_secret,
+        } => {
+            if let Some((expected_client_nonce, expected_server_nonce)) =
+                expected_auth_v2_nonce.as_ref()
+            {
+                if client_nonce != *expected_client_nonce || server_nonce != *expected_server_nonce
+                {
+                    Ok(false)
+                } else {
+                    match state.store.verify_auth_v2_proof(
+                        &username,
+                        &proof,
+                        &client_nonce,
+                        &server_nonce,
+                    ) {
+                        Ok(result) => Ok(result),
+                        Err("first_login") => {
+                            if let Some(secret) = enrollment_secret {
+                                let expected = crypto::auth_proof(
+                                    &secret,
+                                    &username,
+                                    &client_nonce,
+                                    &server_nonce,
+                                )
+                                .unwrap_or_default();
+                                if crypto::secure_string_eq(&proof, &expected) {
+                                    v2_secret_to_persist = Some(secret);
+                                    Err("first_login")
+                                } else {
+                                    Ok(false)
+                                }
+                            } else {
+                                Ok(false)
+                            }
+                        }
+                        Err("legacy_credential") => {
+                            if let Some(secret) = enrollment_secret {
+                                let expected = crypto::auth_proof(
+                                    &secret,
+                                    &username,
+                                    &client_nonce,
+                                    &server_nonce,
+                                )
+                                .unwrap_or_default();
+                                if crypto::secure_string_eq(&proof, &expected)
+                                    && state.store.verify_credential(&username, &secret) == Ok(true)
+                                {
+                                    v2_secret_to_persist = Some(secret);
+                                    Ok(true)
+                                } else {
+                                    Ok(false)
+                                }
+                            } else {
+                                Ok(false)
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            } else {
+                warn!("auth-v2 proof rejected without matching challenge");
+                Ok(false)
+            }
+        }
     };
 
     match credential_result {
         Ok(true) => {
             state.store.clear_failed_logins(&username);
+            if let Some(secret) = v2_secret_to_persist.take() {
+                state.store.upsert_auth_v2_secret(&username, &secret);
+            }
         } // Hash matches ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â proceed.
         Ok(false) => {
             let (locked, attempts) = state
@@ -7815,17 +8126,37 @@ where
             // First time this username connects ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â store their credential.
             // The submitted hash is itself a PBKDF2 output, so we wrap it
             // in another salted PBKDF2 layer server-side.
+            let credential_secret = if let Some(secret) = v2_secret_to_persist.take() {
+                secret
+            } else if let Some(secret) = legacy_hash_to_persist.take() {
+                secret
+            } else {
+                let _ = sink
+                    .send(Message::text(
+                        serde_json::json!({"t":"err","m":"missing enrollment credential"})
+                            .to_string(),
+                    ))
+                    .await;
+                return;
+            };
+            let store_as_v2 = expected_auth_v2_nonce.is_some();
             state
                 .pending_credentials
-                .insert(username.clone(), pw_hash.clone());
+                .insert(username.clone(), credential_secret.clone());
             let state_for_task = state.clone();
             let username_for_task = username.clone();
-            let pw_hash_for_task = pw_hash.clone();
+            let credential_secret_for_task = credential_secret.clone();
             tokio::task::spawn_blocking(move || {
-                let server_hash = crypto::pw_hash(&pw_hash_for_task);
-                state_for_task
-                    .store
-                    .upsert_credentials(&username_for_task, &server_hash);
+                if store_as_v2 {
+                    state_for_task
+                        .store
+                        .upsert_auth_v2_secret(&username_for_task, &credential_secret_for_task);
+                } else {
+                    let server_hash = crypto::pw_hash(&credential_secret_for_task);
+                    state_for_task
+                        .store
+                        .upsert_credentials(&username_for_task, &server_hash);
+                }
                 state_for_task
                     .pending_credentials
                     .remove(&username_for_task);
@@ -7989,6 +8320,7 @@ where
 
     let mut session = ConnectionSession {
         out_tx: out_tx.clone(),
+        fresh_required: expected_auth_v2_nonce.is_some(),
         voice_room: None,
         active_voice_room: Arc::new(RwLock::new(None)),
         voice_audio_forwarder: None,
