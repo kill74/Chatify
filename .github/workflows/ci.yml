@@ -23,6 +23,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  CHATIFY_CI: 1
 
 defaults:
   run:
@@ -54,6 +55,10 @@ jobs:
 
       - name: Pre-fetch dependencies
         run: cargo fetch --locked
+
+      - name: Validate release target inventory
+        shell: pwsh
+        run: ./scripts/assert-release-targets.ps1
 
       - name: Workspace compile check
         run: cargo check --workspace --bins --locked
@@ -162,3 +167,104 @@ jobs:
       - name: Bridge client feature tests
         if: ${{ matrix.run_bridge_client_tests }}
         run: cargo test -p chatify-client --features bridge-client --locked
+
+  windows-package-smoke:
+    name: Windows package smoke
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs:
+      - workspace-quality
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate release target inventory
+        shell: pwsh
+        run: .\scripts\assert-release-targets.ps1
+
+      - name: Build portable Windows package
+        shell: pwsh
+        run: .\build-windows-package.ps1 -SkipInstaller
+
+      - name: Smoke test packaged executables
+        shell: pwsh
+        run: |
+          $packageDir = "dist/chatify-windows-x64"
+          $launcherExe = Join-Path $packageDir "chatify.exe"
+          $serverExe = Join-Path $packageDir "chatify-server.exe"
+          $clientExe = Join-Path $packageDir "chatify-client.exe"
+
+          foreach ($exe in @($launcherExe, $serverExe, $clientExe)) {
+            if (-not (Test-Path -Path $exe)) {
+              throw "Missing packaged executable: $exe"
+            }
+          }
+
+          $serverHelp = (& $serverExe --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "chatify-server --help failed with exit code $LASTEXITCODE"
+          }
+          if ([string]::IsNullOrWhiteSpace($serverHelp)) {
+            throw "chatify-server --help returned empty output"
+          }
+
+          $clientHelp = (& $clientExe --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "chatify-client --help failed with exit code $LASTEXITCODE"
+          }
+          if ([string]::IsNullOrWhiteSpace($clientHelp)) {
+            throw "chatify-client --help returned empty output"
+          }
+
+          $tmp = Join-Path $env:RUNNER_TEMP ("chatify-launcher-smoke-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $tmp | Out-Null
+          $oldAppData = $env:APPDATA
+          $oldLocalAppData = $env:LOCALAPPDATA
+          $oldChatifyConfigDir = $env:CHATIFY_CONFIG_DIR
+          try {
+            $env:APPDATA = $tmp
+            $env:LOCALAPPDATA = $tmp
+            $env:CHATIFY_CONFIG_DIR = (Join-Path $tmp "config")
+            $launcherOutput = "1`n`n`nq`n" | & $launcherExe 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              throw "chatify.exe first-run smoke failed with exit code $LASTEXITCODE. Output: $launcherOutput"
+            }
+            if ($launcherOutput -notmatch "R\) Reconnect") {
+              throw "chatify.exe first-run smoke did not show saved reconnect mode. Output: $launcherOutput"
+            }
+          }
+          finally {
+            $env:APPDATA = $oldAppData
+            $env:LOCALAPPDATA = $oldLocalAppData
+            $env:CHATIFY_CONFIG_DIR = $oldChatifyConfigDir
+            if (Test-Path -LiteralPath $tmp) {
+              Remove-Item -LiteralPath $tmp -Recurse -Force
+            }
+          }
+
+      - name: Validate package artifacts
+        shell: pwsh
+        run: |
+          $zipPath = "dist/chatify-windows-x64.zip"
+          $shaPath = "dist/chatify-windows-x64.zip.sha256"
+
+          if (-not (Test-Path -Path $zipPath)) {
+            throw "Missing artifact: $zipPath"
+          }
+          if (-not (Test-Path -Path $shaPath)) {
+            throw "Missing checksum: $shaPath"
+          }
+
+          $expectedHash = (Get-Content -Path $shaPath | Select-Object -First 1).Split(' ')[0].Trim().ToLowerInvariant()
+          $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.Trim().ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Checksum mismatch for $zipPath. Expected $expectedHash but got $actualHash"
+          }

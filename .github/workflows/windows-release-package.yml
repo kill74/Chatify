@@ -62,10 +62,11 @@ jobs:
         shell: pwsh
         run: |
           $packageDir = "dist/chatify-windows-x64"
+          $launcherExe = Join-Path $packageDir "chatify.exe"
           $serverExe = Join-Path $packageDir "chatify-server.exe"
           $clientExe = Join-Path $packageDir "chatify-client.exe"
 
-          foreach ($exe in @($serverExe, $clientExe)) {
+          foreach ($exe in @($launcherExe, $serverExe, $clientExe)) {
             if (-not (Test-Path -Path $exe)) {
               throw "Missing packaged executable: $exe"
             }
@@ -85,6 +86,32 @@ jobs:
           }
           if ([string]::IsNullOrWhiteSpace($clientHelp)) {
             throw "chatify-client --help returned empty output"
+          }
+
+          $tmp = Join-Path $env:RUNNER_TEMP ("chatify-launcher-smoke-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $tmp | Out-Null
+          $oldAppData = $env:APPDATA
+          $oldLocalAppData = $env:LOCALAPPDATA
+          $oldChatifyConfigDir = $env:CHATIFY_CONFIG_DIR
+          try {
+            $env:APPDATA = $tmp
+            $env:LOCALAPPDATA = $tmp
+            $env:CHATIFY_CONFIG_DIR = (Join-Path $tmp "config")
+            $launcherOutput = "1`n`n`nq`n" | & $launcherExe 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              throw "chatify.exe first-run smoke failed with exit code $LASTEXITCODE. Output: $launcherOutput"
+            }
+            if ($launcherOutput -notmatch "R\) Reconnect") {
+              throw "chatify.exe first-run smoke did not show saved reconnect mode. Output: $launcherOutput"
+            }
+          }
+          finally {
+            $env:APPDATA = $oldAppData
+            $env:LOCALAPPDATA = $oldLocalAppData
+            $env:CHATIFY_CONFIG_DIR = $oldChatifyConfigDir
+            if (Test-Path -LiteralPath $tmp) {
+              Remove-Item -LiteralPath $tmp -Recurse -Force
+            }
           }
 
       - name: Validate release artifacts

@@ -4,6 +4,7 @@
 
 use crate::ui::theme::{CustomTheme, OwnedTheme};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 
@@ -272,6 +273,10 @@ impl Config {
     /// Windows: %APPDATA%\Chatify
     /// Unix: ~/.chatify
     pub fn config_dir() -> Option<PathBuf> {
+        if let Some(path) = env::var_os("CHATIFY_CONFIG_DIR").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(path));
+        }
+
         if cfg!(windows) {
             dirs::data_dir().map(|p| p.join("Chatify"))
         } else {
