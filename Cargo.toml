@@ -17,6 +17,10 @@ name = "discord_bot"
 path = "src/discord_bot.rs"
 required-features = ["discord-bridge"]
 
+[[bin]]
+name = "chatify"
+path = "src/launcher.rs"
+
 [lib]
 name = "chatify"
 path = "src/lib.rs"

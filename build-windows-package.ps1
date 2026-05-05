@@ -128,7 +128,9 @@ New-Item -ItemType Directory -Path $PackageDir -Force | Out-Null
 
 $serverBinaryPath = Get-ReleaseBinaryPath -Binary "chatify-server"
 $clientBinaryPath = Get-ReleaseBinaryPath -Binary "chatify-client"
+$launcherBinaryPath = Get-ReleaseBinaryPath -Binary "chatify"
 
+Copy-Item $launcherBinaryPath (Join-Path $PackageDir "chatify.exe")
 Copy-Item $serverBinaryPath (Join-Path $PackageDir "chatify-server.exe")
 Copy-Item $clientBinaryPath (Join-Path $PackageDir "chatify-client.exe")
 Copy-Item (Join-Path $RepoRoot "LICENSE") (Join-Path $PackageDir "LICENSE")
@@ -151,7 +153,7 @@ if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 
 echo Starting Chatify server on %HOST%:%PORT%
 echo Server data: %DATA_DIR%
-chatify-server.exe --host %HOST% --port %PORT% --db "%DB_PATH%"
+chatify-server.exe --host %HOST% --port %PORT% --db "%DB_PATH%" --enable-self-registration
 "@
 
 $ClientBat = @"
@@ -201,6 +203,11 @@ set DEFAULT_HOST=127.0.0.1
 set DEFAULT_PORT=8765
 set DATA_DIR=%LOCALAPPDATA%\Chatify
 set DB_PATH=%DATA_DIR%\chatify.db
+
+if exist "%~dp0chatify.exe" (
+  "%~dp0chatify.exe"
+  exit /b %ERRORLEVEL%
+)
 
 :menu
 cls
@@ -253,6 +260,7 @@ Chatify Windows Package
 =======================
 
 Files:
+- chatify.exe
 - chatify-server.exe
 - chatify-client.exe
 - chatify-launcher.cmd
@@ -261,11 +269,18 @@ Files:
 - start-client.bat
 
 Quick Start:
-1) Run chatify-launcher.cmd
+1) Run chatify.exe
 
 Launcher modes:
-- [1] Host on this machine (starts server + local client)
-- [2] Join existing server (client only)
+- [1] Start here (starts a local server + local client)
+- [2] Host for others (starts a LAN server + local client)
+- [3] Join a server (choose a saved server or enter host/port)
+- [4] Server only
+- [5] Manage saved servers
+- [6] Open README
+
+After first setup:
+- Press Enter in chatify.exe to reconnect with the last saved mode, host, and port.
 
 Manual mode:
 1) Run start-server.bat

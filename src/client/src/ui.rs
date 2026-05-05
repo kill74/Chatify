@@ -192,9 +192,71 @@ const AUDIO_UNAVAILABLE_LABEL: &str = " Unavailable ";
 enum UiAction {
     None,
     Execute(String),
+    OpenSettings,
+    ToggleSetting(SettingToggle),
+    SwitchScope(String),
+    PrefillInput {
+        value: String,
+        cursor_back: usize,
+        activity: &'static str,
+    },
+    AddActivity {
+        message: String,
+        is_error: bool,
+    },
     PlayAudio(AudioPlaybackTarget),
     Quit,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingToggle {
+    Media,
+    Markdown,
+    Notifications,
+    NotificationSound,
+    AutoReconnect,
+    Animations,
+}
+
+#[derive(Clone, Copy)]
+struct SettingRow {
+    label: &'static str,
+    detail: &'static str,
+    toggle: SettingToggle,
+}
+
+const SETTINGS_ROWS: &[SettingRow] = &[
+    SettingRow {
+        label: "Media",
+        detail: "Uploads, previews, audio playback, voice, and screen sharing",
+        toggle: SettingToggle::Media,
+    },
+    SettingRow {
+        label: "Markdown",
+        detail: "Render markdown formatting in messages",
+        toggle: SettingToggle::Markdown,
+    },
+    SettingRow {
+        label: "Notifications",
+        detail: "Desktop alerts for DMs and mentions",
+        toggle: SettingToggle::Notifications,
+    },
+    SettingRow {
+        label: "Sound",
+        detail: "Notification sound probes and local sound setting",
+        toggle: SettingToggle::NotificationSound,
+    },
+    SettingRow {
+        label: "Reconnect",
+        detail: "Automatically reconnect after connection drops",
+        toggle: SettingToggle::AutoReconnect,
+    },
+    SettingRow {
+        label: "Animations",
+        detail: "Startup and terminal motion effects",
+        toggle: SettingToggle::Animations,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AudioPlaybackTarget {
@@ -225,14 +287,49 @@ struct AudioPlayHitbox {
     target: AudioPlaybackTarget,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClickAction {
+    Execute(String),
+    OpenSettings,
+    ToggleSetting(SettingToggle),
+    SwitchScope(String),
+    Prefill {
+        value: String,
+        cursor_back: usize,
+        activity: &'static str,
+    },
+    AddActivity {
+        message: String,
+        is_error: bool,
+    },
+    PlayAudio(AudioPlaybackTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClickHitbox {
+    area: Rect,
+    action: ClickAction,
+}
+
 #[derive(Default)]
 struct UiHitboxes {
     audio_play: Vec<AudioPlayHitbox>,
+    controls: Vec<ClickHitbox>,
 }
 
 impl UiHitboxes {
     fn clear(&mut self) {
         self.audio_play.clear();
+        self.controls.clear();
+    }
+
+    fn action_at(&self, column: u16, row: u16) -> Option<ClickAction> {
+        self.controls
+            .iter()
+            .rev()
+            .find(|hitbox| rect_contains(hitbox.area, column, row))
+            .map(|hitbox| hitbox.action.clone())
+            .or_else(|| self.audio_at(column, row).map(ClickAction::PlayAudio))
     }
 
     fn audio_at(&self, column: u16, row: u16) -> Option<AudioPlaybackTarget> {
@@ -245,6 +342,10 @@ impl UiHitboxes {
     fn push_audio(&mut self, area: Rect, target: AudioPlaybackTarget) {
         self.audio_play.push(AudioPlayHitbox { area, target });
     }
+
+    fn push_control(&mut self, area: Rect, action: ClickAction) {
+        self.controls.push(ClickHitbox { area, action });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +354,14 @@ struct PendingAudioPlayHitbox {
     start_col: usize,
     width: usize,
     target: AudioPlaybackTarget,
+}
+
+#[derive(Clone, Debug)]
+struct PendingControlHitbox {
+    line_index: usize,
+    start_col: usize,
+    width: usize,
+    action: ClickAction,
 }
 
 fn audio_control_for_media(
@@ -327,6 +436,12 @@ struct PaletteState {
     selected: usize,
 }
 
+#[derive(Clone, Default)]
+struct SettingsState {
+    open: bool,
+    selected: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaletteActionKind {
     Prefill {
@@ -337,6 +452,7 @@ enum PaletteActionKind {
     ToggleVoice,
     ToggleMute,
     ToggleDeafen,
+    OpenSettings,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -351,6 +467,7 @@ struct PaletteAction {
 enum PaletteResolvedAction {
     Prefill { value: String, cursor_back: usize },
     Execute(String),
+    OpenSettings,
     Disabled(String),
 }
 
@@ -461,6 +578,12 @@ const PALETTE_ACTIONS: &[PaletteAction] = &[
         kind: PaletteActionKind::ToggleDeafen,
     },
     PaletteAction {
+        label: "Open settings",
+        detail: "Change media, markdown, notifications, and reconnect",
+        keywords: &["settings", "preferences", "config", "options"],
+        kind: PaletteActionKind::OpenSettings,
+    },
+    PaletteAction {
         label: "Show help",
         detail: "List available commands",
         keywords: &["commands", "shortcuts"],
@@ -470,6 +593,7 @@ const PALETTE_ACTIONS: &[PaletteAction] = &[
 
 #[derive(Clone)]
 struct ScopeRow {
+    scope: String,
     label: String,
     unread: usize,
     is_current: bool,
@@ -480,6 +604,8 @@ struct ScopeRow {
 
 #[derive(Clone)]
 struct TimelineEntry {
+    msg_id: String,
+    channel: String,
     when: String,
     sender: String,
     body_lines: Vec<StyledLine>,
@@ -534,7 +660,6 @@ struct MediaPreviewRuntime {
 
 #[derive(Clone)]
 struct UiSnapshot {
-    subtitle: String,
     current_scope: String,
     scopes: Vec<ScopeRow>,
     timeline: Vec<TimelineEntry>,
@@ -547,6 +672,12 @@ struct UiSnapshot {
     input_cursor: usize,
     scroll_offset: usize,
     media_enabled: bool,
+    markdown_enabled: bool,
+    notifications_enabled: bool,
+    notification_sound_enabled: bool,
+    auto_reconnect: bool,
+    animations_enabled: bool,
+    screen_active: bool,
     media_preview: Option<MediaPreviewCandidate>,
     known_users: usize,
     total_unread: usize,
@@ -644,18 +775,6 @@ impl MediaPreviewRuntime {
 impl UiSnapshot {
     fn from_state(state: &ClientState) -> Self {
         let current_scope = state.ch.clone();
-        let subtitle = format!(
-            "{} @ {}://{}:{}",
-            if state.me.is_empty() {
-                "anonymous"
-            } else {
-                &state.me
-            },
-            if state.client_config.tls { "wss" } else { "ws" },
-            state.client_config.host,
-            state.client_config.port
-        );
-
         let scopes = collect_scopes(state)
             .into_iter()
             .map(|scope| {
@@ -666,6 +785,7 @@ impl UiSnapshot {
                 };
 
                 ScopeRow {
+                    scope: scope.clone(),
                     label: format_scope_label(&scope),
                     unread: *state.unread_counts.get(&scope).unwrap_or(&0),
                     is_current: scope == current_scope,
@@ -729,6 +849,8 @@ impl UiSnapshot {
                     .unwrap_or(false);
 
             timeline.push(TimelineEntry {
+                msg_id: message.id.clone(),
+                channel: message.channel.clone(),
                 when,
                 sender: message.sender.clone(),
                 body_lines,
@@ -816,7 +938,6 @@ impl UiSnapshot {
         let total_unread = state.unread_counts.values().sum();
 
         Self {
-            subtitle,
             current_scope,
             scopes,
             timeline,
@@ -829,6 +950,12 @@ impl UiSnapshot {
             input_cursor: state.input_cursor,
             scroll_offset: state.scroll_offset,
             media_enabled: state.media_enabled,
+            markdown_enabled: state.client_config.markdown_enabled,
+            notifications_enabled: state.config.notifications.enabled,
+            notification_sound_enabled: state.config.notifications.sound_enabled,
+            auto_reconnect: state.client_config.auto_reconnect,
+            animations_enabled: state.client_config.animations_enabled,
+            screen_active: state.screen_share.is_some(),
             media_preview,
             known_users: state.users.len(),
             total_unread,
@@ -858,6 +985,7 @@ where
     let mut terminal = TerminalSession::enter()?;
     let mut media_preview = MediaPreviewRuntime::from_terminal();
     let mut palette = PaletteState::default();
+    let mut settings = SettingsState::default();
     let mut hitboxes = UiHitboxes::default();
     let input_thread = InputThread::start();
 
@@ -894,6 +1022,7 @@ where
                     &snapshot,
                     &mut media_preview,
                     &palette,
+                    &settings,
                     &mut hitboxes,
                 )
             })
@@ -902,7 +1031,7 @@ where
 
         let mut actions = Vec::new();
         while let Ok(event) = input_thread.try_recv() {
-            let action = handle_event(&state, event, &mut palette, &hitboxes).await;
+            let action = handle_event(&state, event, &mut palette, &mut settings, &hitboxes).await;
             if !matches!(action, UiAction::None) {
                 actions.push(action);
             }
@@ -916,6 +1045,37 @@ where
                     if !submit(state.clone(), command).await {
                         return Ok(());
                     }
+                }
+                UiAction::OpenSettings => {
+                    open_settings(&mut settings);
+                }
+                UiAction::ToggleSetting(toggle) => {
+                    toggle_setting(&state, toggle).await;
+                }
+                UiAction::SwitchScope(scope) => {
+                    switch_to_scope(&state, scope).await;
+                }
+                UiAction::PrefillInput {
+                    value,
+                    cursor_back,
+                    activity,
+                } => {
+                    let mut state_lock = state.lock().await;
+                    if !state_lock.input_buffer.trim().is_empty() {
+                        state_lock.add_activity(
+                            "Composer already has text. Send it or press Esc before using that action.",
+                            false,
+                        );
+                    } else {
+                        prefill_input(&mut state_lock, &value);
+                        state_lock.input_cursor =
+                            state_lock.input_cursor.saturating_sub(cursor_back);
+                        state_lock.add_activity(activity, false);
+                    }
+                }
+                UiAction::AddActivity { message, is_error } => {
+                    let mut state_lock = state.lock().await;
+                    state_lock.add_activity(message, is_error);
                 }
                 UiAction::PlayAudio(target) => start_audio_playback(target),
             }
@@ -970,11 +1130,12 @@ async fn handle_event(
     state: &SharedState,
     event: Event,
     palette: &mut PaletteState,
+    settings: &mut SettingsState,
     hitboxes: &UiHitboxes,
 ) -> UiAction {
     let key = match event {
         Event::Key(key) => key,
-        Event::Mouse(mouse) => return handle_mouse_event(mouse, palette, hitboxes),
+        Event::Mouse(mouse) => return handle_mouse_event(mouse, palette, settings, hitboxes),
         _ => return UiAction::None,
     };
 
@@ -991,12 +1152,23 @@ async fn handle_event(
     if matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
     {
+        close_settings(settings);
         open_palette(palette);
+        return UiAction::None;
+    }
+
+    if matches!(key.code, KeyCode::Char(',')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        close_palette(palette);
+        open_settings(settings);
         return UiAction::None;
     }
 
     if palette.open {
         return handle_palette_event(state, key.code, key.modifiers, palette).await;
+    }
+
+    if settings.open {
+        return handle_settings_event(key.code, settings);
     }
 
     match (key.code, key.modifiers) {
@@ -1157,6 +1329,7 @@ async fn handle_event(
 fn handle_mouse_event(
     mouse: MouseEvent,
     palette: &PaletteState,
+    _settings: &SettingsState,
     hitboxes: &UiHitboxes,
 ) -> UiAction {
     if palette.open {
@@ -1168,9 +1341,31 @@ fn handle_mouse_event(
     }
 
     hitboxes
-        .audio_at(mouse.column, mouse.row)
-        .map(UiAction::PlayAudio)
+        .action_at(mouse.column, mouse.row)
+        .map(ui_action_from_click_action)
         .unwrap_or(UiAction::None)
+}
+
+fn ui_action_from_click_action(action: ClickAction) -> UiAction {
+    match action {
+        ClickAction::Execute(command) => UiAction::Execute(command),
+        ClickAction::OpenSettings => UiAction::OpenSettings,
+        ClickAction::ToggleSetting(toggle) => UiAction::ToggleSetting(toggle),
+        ClickAction::SwitchScope(scope) => UiAction::SwitchScope(scope),
+        ClickAction::Prefill {
+            value,
+            cursor_back,
+            activity,
+        } => UiAction::PrefillInput {
+            value,
+            cursor_back,
+            activity,
+        },
+        ClickAction::AddActivity { message, is_error } => {
+            UiAction::AddActivity { message, is_error }
+        }
+        ClickAction::PlayAudio(target) => UiAction::PlayAudio(target),
+    }
 }
 
 fn open_palette(palette: &mut PaletteState) {
@@ -1183,6 +1378,111 @@ fn close_palette(palette: &mut PaletteState) {
     palette.open = false;
     palette.query.clear();
     palette.selected = 0;
+}
+
+fn open_settings(settings: &mut SettingsState) {
+    settings.open = true;
+    settings.selected = settings.selected.min(SETTINGS_ROWS.len().saturating_sub(1));
+}
+
+fn close_settings(settings: &mut SettingsState) {
+    settings.open = false;
+    settings.selected = 0;
+}
+
+fn handle_settings_event(code: KeyCode, settings: &mut SettingsState) -> UiAction {
+    match code {
+        KeyCode::Esc => {
+            close_settings(settings);
+            UiAction::None
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => SETTINGS_ROWS
+            .get(settings.selected)
+            .map(|row| UiAction::ToggleSetting(row.toggle))
+            .unwrap_or(UiAction::None),
+        KeyCode::Up => {
+            move_settings_selection(settings, false);
+            UiAction::None
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            move_settings_selection(settings, true);
+            UiAction::None
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            close_settings(settings);
+            UiAction::None
+        }
+        _ => UiAction::None,
+    }
+}
+
+fn move_settings_selection(settings: &mut SettingsState, forward: bool) {
+    let count = SETTINGS_ROWS.len();
+    if count == 0 {
+        settings.selected = 0;
+        return;
+    }
+
+    settings.selected = if forward {
+        (settings.selected + 1) % count
+    } else if settings.selected == 0 {
+        count - 1
+    } else {
+        settings.selected - 1
+    };
+}
+
+async fn toggle_setting(state: &SharedState, toggle: SettingToggle) {
+    let mut state_lock = state.lock().await;
+    let (label, value) = apply_setting_toggle(&mut state_lock, toggle);
+    let save_result = state_lock.config.save();
+    match save_result {
+        Ok(()) => state_lock.add_activity(format!("Setting saved: {} {}", label, value), false),
+        Err(err) => state_lock.add_activity(format!("Failed to save setting: {}", err), true),
+    }
+}
+
+fn apply_setting_toggle(
+    state: &mut ClientState,
+    toggle: SettingToggle,
+) -> (&'static str, &'static str) {
+    match toggle {
+        SettingToggle::Media => {
+            let enabled = !state.media_enabled;
+            state.media_enabled = enabled;
+            state.client_config.media_enabled = enabled;
+            state.config.ui.enable_media = enabled;
+            ("media", on_off(enabled))
+        }
+        SettingToggle::Markdown => {
+            let enabled = !state.client_config.markdown_enabled;
+            state.client_config.markdown_enabled = enabled;
+            state.config.ui.enable_markdown = enabled;
+            ("markdown", on_off(enabled))
+        }
+        SettingToggle::Notifications => {
+            let enabled = !state.config.notifications.enabled;
+            state.config.notifications.enabled = enabled;
+            ("notifications", on_off(enabled))
+        }
+        SettingToggle::NotificationSound => {
+            let enabled = !state.config.notifications.sound_enabled;
+            state.config.notifications.sound_enabled = enabled;
+            ("sound", on_off(enabled))
+        }
+        SettingToggle::AutoReconnect => {
+            let enabled = !state.client_config.auto_reconnect;
+            state.client_config.auto_reconnect = enabled;
+            state.config.connection.auto_reconnect = enabled;
+            ("reconnect", on_off(enabled))
+        }
+        SettingToggle::Animations => {
+            let enabled = !state.client_config.animations_enabled;
+            state.client_config.animations_enabled = enabled;
+            state.config.ui.disable_animations = !enabled;
+            ("animations", on_off(enabled))
+        }
+    }
 }
 
 async fn handle_palette_event(
@@ -1246,6 +1546,7 @@ async fn activate_palette_selection(state: &SharedState, palette: &mut PaletteSt
 
     match resolved {
         PaletteResolvedAction::Execute(command) => UiAction::Execute(command),
+        PaletteResolvedAction::OpenSettings => UiAction::OpenSettings,
         PaletteResolvedAction::Prefill { value, cursor_back } => {
             let mut state_lock = state.lock().await;
             if !state_lock.input_buffer.trim().is_empty() {
@@ -1362,6 +1663,7 @@ fn resolve_palette_action(action: &PaletteAction, state: &ClientState) -> Palett
                 PaletteResolvedAction::Execute("/voice deafen".to_string())
             }
         }
+        PaletteActionKind::OpenSettings => PaletteResolvedAction::OpenSettings,
     }
 }
 
@@ -1414,6 +1716,30 @@ async fn switch_scope(state: &SharedState, forward: bool) {
         let needs_join = !target_scope.starts_with("dm:");
         state_lock.switch_scope(target_scope.clone());
         (target_scope, needs_join)
+    };
+
+    if needs_join {
+        let state_lock = state.lock().await;
+        if let Err(err) = state_lock.send_join(&target_scope) {
+            drop(state_lock);
+            let mut state_lock = state.lock().await;
+            state_lock.add_activity(format!("failed to join {}: {}", target_scope, err), true);
+        }
+    }
+}
+
+async fn switch_to_scope(state: &SharedState, target_scope: String) {
+    let needs_join = {
+        let mut state_lock = state.lock().await;
+        if state_lock.ch == target_scope {
+            state_lock.add_activity(
+                format!("Already in {}.", format_scope_label(&target_scope)),
+                false,
+            );
+            return;
+        }
+        state_lock.switch_scope(target_scope.clone());
+        !target_scope.starts_with("dm:")
     };
 
     if needs_join {
@@ -1706,7 +2032,7 @@ fn composer_hint(snapshot: &UiSnapshot) -> &'static str {
     {
         "Verify fingerprint before sending private messages"
     } else if !snapshot.composer_suggestions.is_empty() {
-        "Tab completes mention"
+        "Tab to complete mention"
     } else if snapshot.input_buffer.trim().starts_with("/image")
         || snapshot.input_buffer.trim().starts_with("/file")
         || snapshot.input_buffer.trim().starts_with("/video")
@@ -1714,44 +2040,310 @@ fn composer_hint(snapshot: &UiSnapshot) -> &'static str {
     {
         "Add a file path inside quotes"
     } else if snapshot.input_buffer.trim().starts_with("/join") {
-        "Type a room name, then Enter"
+        "Room name"
     } else if snapshot.input_buffer.trim().starts_with("/dm") {
-        "Type a username and message"
+        "User and message"
     } else if snapshot.input_buffer.trim().starts_with("/search") {
-        "Type search words, then Enter"
+        "Search words"
     } else if snapshot.input_buffer.trim().is_empty() {
-        "Type a message or press Ctrl+K for actions"
+        "Message or Ctrl+K"
     } else {
-        "Enter sends"
+        "Enter to send"
     }
 }
 
 fn panel_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            title.into(),
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .border_style(quiet_border_style())
+        .title(Span::styled(title.into(), panel_title_style()))
+}
+
+fn primary_style() -> Style {
+    Style::default().fg(Color::Rgb(226, 232, 240))
+}
+
+fn secondary_style() -> Style {
+    Style::default().fg(Color::Rgb(148, 163, 184))
+}
+
+fn quiet_border_style() -> Style {
+    Style::default().fg(Color::Rgb(71, 85, 105))
+}
+
+fn panel_title_style() -> Style {
+    secondary_style().add_modifier(Modifier::BOLD)
+}
+
+fn label_style() -> Style {
+    secondary_style()
+}
+
+fn danger_style() -> Style {
+    Style::default().fg(Color::Rgb(248, 113, 113))
 }
 
 fn muted_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(Color::Rgb(100, 116, 139))
 }
 
 fn accent_style() -> Style {
-    Style::default().fg(Color::Cyan)
+    Style::default().fg(Color::Rgb(94, 234, 212))
 }
 
 fn success_style() -> Style {
-    Style::default().fg(Color::Green)
+    Style::default().fg(Color::Rgb(134, 239, 172))
 }
 
 fn warning_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(Color::Rgb(251, 191, 36))
+}
+
+#[derive(Clone)]
+struct QuickButton {
+    label: &'static str,
+    action: ClickAction,
+    enabled: bool,
+}
+
+fn call_quick_buttons(snapshot: &UiSnapshot, compact: bool) -> Vec<QuickButton> {
+    if !snapshot.media_enabled && !snapshot.voice.active {
+        return vec![QuickButton {
+            label: if compact { "Call" } else { "Join call" },
+            action: ClickAction::AddActivity {
+                message: "Voice is disabled by client media settings (--no_media or config)."
+                    .to_string(),
+                is_error: false,
+            },
+            enabled: false,
+        }];
+    }
+
+    if !snapshot.voice.active {
+        return vec![QuickButton {
+            label: if compact { "Call" } else { "Join call" },
+            action: ClickAction::Execute("/voice on".to_string()),
+            enabled: true,
+        }];
+    }
+
+    vec![
+        QuickButton {
+            label: if compact { "Leave" } else { "Leave call" },
+            action: ClickAction::Execute("/voice off".to_string()),
+            enabled: true,
+        },
+        QuickButton {
+            label: if snapshot.voice.muted {
+                "Unmute"
+            } else if compact {
+                "Mic"
+            } else {
+                "Mute"
+            },
+            action: ClickAction::Execute(if snapshot.voice.muted {
+                "/voice unmute".to_string()
+            } else {
+                "/voice mute".to_string()
+            }),
+            enabled: true,
+        },
+        QuickButton {
+            label: if snapshot.voice.deafened {
+                "Undeafen"
+            } else if compact {
+                "Sound"
+            } else {
+                "Deafen"
+            },
+            action: ClickAction::Execute(if snapshot.voice.deafened {
+                "/voice undeafen".to_string()
+            } else {
+                "/voice deafen".to_string()
+            }),
+            enabled: true,
+        },
+    ]
+}
+
+fn screen_quick_button(snapshot: &UiSnapshot) -> QuickButton {
+    if !snapshot.media_enabled {
+        return QuickButton {
+            label: if snapshot.screen_active {
+                "Stop share"
+            } else {
+                "Share"
+            },
+            action: ClickAction::AddActivity {
+                message: "media uploads are disabled by client settings (--no-media or config)."
+                    .to_string(),
+                is_error: true,
+            },
+            enabled: false,
+        };
+    }
+
+    if snapshot.screen_active {
+        QuickButton {
+            label: "Stop share",
+            action: ClickAction::Execute("/screen stop".to_string()),
+            enabled: true,
+        }
+    } else {
+        QuickButton {
+            label: "Share",
+            action: ClickAction::Execute("/screen start".to_string()),
+            enabled: true,
+        }
+    }
+}
+
+fn media_quick_buttons(snapshot: &UiSnapshot) -> Vec<QuickButton> {
+    [
+        (
+            "Image",
+            "/image \"\"",
+            "Open image upload with a quoted path",
+        ),
+        (
+            "Video",
+            "/video \"\"",
+            "Open video upload with a quoted path",
+        ),
+        (
+            "Audio",
+            "/audio \"\"",
+            "Open audio-note upload with a quoted path",
+        ),
+    ]
+    .into_iter()
+    .map(|(label, value, activity)| {
+        if snapshot.media_enabled {
+            QuickButton {
+                label,
+                action: ClickAction::Prefill {
+                    value: value.to_string(),
+                    cursor_back: 1,
+                    activity,
+                },
+                enabled: true,
+            }
+        } else {
+            QuickButton {
+                label,
+                action: ClickAction::AddActivity {
+                    message:
+                        "media uploads are disabled by client settings (--no-media or config)."
+                            .to_string(),
+                    is_error: true,
+                },
+                enabled: false,
+            }
+        }
+    })
+    .collect()
+}
+
+fn chat_quick_buttons() -> Vec<QuickButton> {
+    vec![
+        QuickButton {
+            label: "Search",
+            action: ClickAction::Prefill {
+                value: "/search ".to_string(),
+                cursor_back: 0,
+                activity: "Search this conversation",
+            },
+            enabled: true,
+        },
+        QuickButton {
+            label: "Users",
+            action: ClickAction::Execute("/users".to_string()),
+            enabled: true,
+        },
+        QuickButton {
+            label: "Settings",
+            action: ClickAction::OpenSettings,
+            enabled: true,
+        },
+    ]
+}
+
+fn button_style(enabled: bool) -> Style {
+    if enabled {
+        Style::default()
+            .fg(Color::Rgb(236, 253, 245))
+            .bg(Color::Rgb(13, 92, 99))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        muted_style().add_modifier(Modifier::DIM)
+    }
+}
+
+fn subtle_button_style(enabled: bool) -> Style {
+    if enabled {
+        Style::default()
+            .fg(Color::Rgb(153, 246, 228))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        muted_style().add_modifier(Modifier::DIM)
+    }
+}
+
+fn append_quick_buttons(
+    spans: &mut Vec<Span<'static>>,
+    hitboxes: &mut UiHitboxes,
+    area: Rect,
+    inner_row: u16,
+    mut column: usize,
+    buttons: &[QuickButton],
+) -> usize {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2);
+    if inner_width == 0 || inner_row >= inner_height {
+        return column;
+    }
+
+    for button in buttons {
+        let label = format!("[{}]", button.label);
+        let label_width = label.chars().count();
+        let required = if column == 0 {
+            label_width
+        } else {
+            1 + label_width
+        };
+        if column.saturating_add(required) > inner_width {
+            break;
+        }
+
+        if column > 0 {
+            spans.push(Span::raw(" "));
+            column += 1;
+        }
+
+        let Ok(x_offset) = u16::try_from(column) else {
+            break;
+        };
+        let Ok(width) = u16::try_from(label_width) else {
+            break;
+        };
+        hitboxes.push_control(
+            Rect {
+                x: area.x.saturating_add(1).saturating_add(x_offset),
+                y: area.y.saturating_add(1).saturating_add(inner_row),
+                width,
+                height: 1,
+            },
+            button.action.clone(),
+        );
+        spans.push(Span::styled(label, button_style(button.enabled)));
+        column += label_width;
+    }
+
+    column
+}
+
+fn span_line_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 fn render(
@@ -1759,6 +2351,7 @@ fn render(
     snapshot: &UiSnapshot,
     media_preview: &mut MediaPreviewRuntime,
     palette: &PaletteState,
+    settings: &SettingsState,
     hitboxes: &mut UiHitboxes,
 ) {
     hitboxes.clear();
@@ -1774,7 +2367,7 @@ fn render(
         ])
         .split(area);
 
-    render_header(frame, root[0], snapshot);
+    render_header(frame, root[0], snapshot, hitboxes);
 
     match mode {
         UiLayoutMode::Full => {
@@ -1791,9 +2384,9 @@ fn render(
                 ])
                 .split(root[1]);
 
-            render_sidebar(frame, body[0], snapshot);
+            render_sidebar(frame, body[0], snapshot, hitboxes);
             render_timeline(frame, body[1], snapshot, hitboxes);
-            render_right_panel(frame, body[2], snapshot, media_preview);
+            render_right_panel(frame, body[2], snapshot, media_preview, hitboxes);
         }
         UiLayoutMode::Narrow => {
             let body = Layout::default()
@@ -1801,7 +2394,7 @@ fn render(
                 .constraints([Constraint::Length(18), Constraint::Min(30)])
                 .split(root[1]);
 
-            render_sidebar(frame, body[0], snapshot);
+            render_sidebar(frame, body[0], snapshot, hitboxes);
             render_timeline(frame, body[1], snapshot, hitboxes);
         }
     }
@@ -1809,6 +2402,9 @@ fn render(
     render_footer(frame, root[3], snapshot);
     if palette.open {
         render_palette(frame, area, snapshot, palette);
+    }
+    if settings.open {
+        render_settings(frame, area, snapshot, settings, hitboxes);
     }
 }
 
@@ -1834,8 +2430,8 @@ fn render_palette(
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("What do you want to do?", muted_style()),
-            Span::raw("  "),
+            Span::styled("Actions", panel_title_style()),
+            Span::styled("  ", muted_style()),
             Span::styled("Enter run | Esc close | Up/Down choose", muted_style()),
         ]),
         Line::from(vec![
@@ -1847,9 +2443,9 @@ fn render_palette(
                     &palette.query
                 },
                 Style::default().fg(if palette.query.is_empty() {
-                    Color::DarkGray
+                    Color::Rgb(100, 116, 139)
                 } else {
-                    Color::White
+                    Color::Rgb(226, 232, 240)
                 }),
             ),
         ]),
@@ -1867,12 +2463,9 @@ fn render_palette(
             let is_selected = absolute_index == selected;
             let prefix = if is_selected { "> " } else { "  " };
             let style = if is_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                button_style(true)
             } else {
-                Style::default().fg(Color::White)
+                primary_style()
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix, accent_style()),
@@ -1900,6 +2493,86 @@ fn render_palette(
         palette_area.x + 3 + cursor_column as u16,
         palette_area.y + 2,
     ));
+}
+
+fn render_settings(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    settings: &SettingsState,
+    hitboxes: &mut UiHitboxes,
+) {
+    let settings_area = centered_rect(area, 76, 18);
+    frame.render_widget(Clear, settings_area);
+
+    let selected = settings.selected.min(SETTINGS_ROWS.len().saturating_sub(1));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Settings", panel_title_style()),
+            Span::styled("  ", muted_style()),
+            Span::styled(
+                "Enter/Space toggle | Esc close | Ctrl+, open",
+                muted_style(),
+            ),
+        ]),
+        Line::default(),
+    ];
+
+    for (index, row) in SETTINGS_ROWS.iter().enumerate() {
+        let row_index = lines.len();
+        let enabled = setting_value(snapshot, row.toggle);
+        let marker = if index == selected { "> " } else { "  " };
+        let value = if enabled { "on " } else { "off" };
+        lines.push(Line::from(vec![
+            Span::styled(marker, accent_style()),
+            Span::styled(
+                format!("{:<14}", row.label),
+                if index == selected {
+                    primary_style().add_modifier(Modifier::BOLD)
+                } else {
+                    secondary_style()
+                },
+            ),
+            Span::styled(
+                format!("[{}]", value),
+                if enabled {
+                    success_style()
+                } else {
+                    muted_style()
+                },
+            ),
+            Span::styled("  ", muted_style()),
+            Span::styled(row.detail, muted_style()),
+        ]));
+        push_full_row_hitbox(
+            hitboxes,
+            settings_area,
+            row_index,
+            ClickAction::ToggleSetting(row.toggle),
+        );
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Saved immediately to config.toml.",
+        muted_style(),
+    )));
+
+    let widget = Paragraph::new(Text::from(lines))
+        .block(panel_block("Settings"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(widget, settings_area);
+}
+
+fn setting_value(snapshot: &UiSnapshot, toggle: SettingToggle) -> bool {
+    match toggle {
+        SettingToggle::Media => snapshot.media_enabled,
+        SettingToggle::Markdown => snapshot.markdown_enabled,
+        SettingToggle::Notifications => snapshot.notifications_enabled,
+        SettingToggle::NotificationSound => snapshot.notification_sound_enabled,
+        SettingToggle::AutoReconnect => snapshot.auto_reconnect,
+        SettingToggle::Animations => snapshot.animations_enabled,
+    }
 }
 
 fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
@@ -1942,29 +2615,25 @@ fn palette_action_label(action: &PaletteAction, snapshot: &UiSnapshot) -> String
     }
 }
 
-fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnapshot) {
-    let title = Line::from(vec![
-        Span::styled(
-            "Chatify",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
+fn render_header(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    hitboxes: &mut UiHitboxes,
+) {
+    let mut spans = vec![
+        Span::styled("Chatify", accent_style().add_modifier(Modifier::BOLD)),
+        Span::styled("  ", muted_style()),
         Span::styled(
             format_scope_label(&snapshot.current_scope),
-            Style::default().add_modifier(Modifier::BOLD),
+            primary_style().add_modifier(Modifier::BOLD),
         ),
-    ]);
-    let mut subtitle_spans = vec![
-        Span::styled(&snapshot.subtitle, Style::default().fg(Color::Gray)),
-        Span::raw("  "),
+        Span::styled("  ", muted_style()),
         Span::styled(
             if snapshot.voice.active {
-                "Voice on"
+                "voice on"
             } else {
-                "Voice off"
+                "voice off"
             },
             if snapshot.voice.active {
                 success_style()
@@ -1972,55 +2641,64 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnapsh
                 muted_style()
             },
         ),
-        Span::raw("  "),
-        Span::styled(format!("People {}", snapshot.known_users), warning_style()),
+        Span::styled("  ", muted_style()),
+        Span::styled(
+            format!("{} people", snapshot.known_users),
+            secondary_style(),
+        ),
     ];
     if snapshot.total_unread > 0 {
-        subtitle_spans.push(Span::raw("  "));
-        subtitle_spans.push(Span::styled(
-            format!("Unread {}", snapshot.total_unread),
+        spans.push(Span::styled("  ", muted_style()));
+        spans.push(Span::styled(
+            format!("{} unread", snapshot.total_unread),
             warning_style().add_modifier(Modifier::BOLD),
         ));
     }
-    let subtitle = Line::from(subtitle_spans);
 
-    let header = Paragraph::new(Text::from(vec![title, subtitle]))
-        .block(panel_block("Session"))
+    let mut controls = call_quick_buttons(snapshot, true);
+    if area.width >= 76 {
+        controls.push(screen_quick_button(snapshot));
+    }
+    let column = span_line_width(&spans);
+    append_quick_buttons(&mut spans, hitboxes, area, 0, column, &controls);
+
+    let header = Paragraph::new(Text::from(vec![Line::from(spans)]))
+        .block(panel_block("Chatify"))
         .wrap(Wrap { trim: true });
     frame.render_widget(header, area);
 }
 
-fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnapshot) {
+fn render_sidebar(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    hitboxes: &mut UiHitboxes,
+) {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
-        "Chats",
-        warning_style().add_modifier(Modifier::BOLD),
+        "Conversations",
+        panel_title_style(),
     )));
     lines.push(Line::default());
 
     for scope in &snapshot.scopes {
+        let row_index = lines.len();
         let mut spans = Vec::new();
         spans.push(Span::styled(
             if scope.is_current { "> " } else { "  " },
-            Style::default().fg(if scope.is_current {
-                Color::Cyan
+            if scope.is_current {
+                accent_style()
             } else {
-                Color::DarkGray
-            }),
+                muted_style()
+            },
         ));
         spans.push(Span::styled(
             &scope.label,
-            Style::default()
-                .fg(if scope.is_current {
-                    Color::White
-                } else {
-                    Color::Gray
-                })
-                .add_modifier(if scope.is_current {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
+            if scope.is_current {
+                primary_style().add_modifier(Modifier::BOLD)
+            } else {
+                secondary_style()
+            },
         ));
         if let Some(online) = scope.online {
             spans.push(Span::raw(" "));
@@ -2034,17 +2712,22 @@ fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnaps
             ));
         }
         if scope.has_voice {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled("voice", success_style()));
+            spans.push(Span::styled(" call", success_style()));
         }
         if scope.unread > 0 {
-            spans.push(Span::raw(" "));
+            spans.push(Span::styled(" ", muted_style()));
             spans.push(Span::styled(
-                format!("[{}]", scope.unread),
+                format!("{}", scope.unread),
                 warning_style().add_modifier(Modifier::BOLD),
             ));
         }
         lines.push(Line::from(spans));
+        push_full_row_hitbox(
+            hitboxes,
+            area,
+            row_index,
+            ClickAction::SwitchScope(scope.scope.clone()),
+        );
         if let Some(status_text) = &scope.status_text {
             lines.push(Line::from(vec![
                 Span::raw("    "),
@@ -2083,14 +2766,16 @@ fn render_timeline(
 ) {
     if snapshot.timeline.is_empty() {
         let empty = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(
-                "No messages in this conversation yet.",
-                Style::default().fg(Color::Gray),
-            )),
+            Line::from(Span::styled("No messages yet.", secondary_style())),
             Line::default(),
-            Line::from("Type below and press Enter to send."),
-            Line::from("Press Ctrl+K for actions: join room, start DM, attach file, search."),
-            Line::from("Use Alt+Up/Down when you want to switch rooms quickly."),
+            Line::from(Span::styled(
+                "Type below to start the conversation.",
+                primary_style(),
+            )),
+            Line::from(Span::styled(
+                "Ctrl+K opens actions. Click rooms, people, calls, and media controls.",
+                muted_style(),
+            )),
         ]))
         .block(panel_block(format!(
             "Chat {}",
@@ -2103,17 +2788,15 @@ fn render_timeline(
 
     let mut lines = Vec::new();
     let mut pending_hitboxes = Vec::new();
+    let mut pending_control_hitboxes = Vec::new();
     for (item_index, item) in snapshot.timeline.iter().enumerate() {
         if item.unread_divider_before {
             lines.push(Line::from(vec![
                 Span::styled(
-                    "New messages ",
+                    "new messages ",
                     warning_style().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("[{}]", snapshot.unread_marker_count),
-                    warning_style(),
-                ),
+                Span::styled(format!("{}", snapshot.unread_marker_count), warning_style()),
             ]));
         }
 
@@ -2128,13 +2811,13 @@ fn render_timeline(
                     } else {
                         format!("{} system", item.when)
                     },
-                    warning_style().add_modifier(Modifier::BOLD),
+                    secondary_style().add_modifier(Modifier::BOLD),
                 )]));
             } else {
                 let accent = if item.is_self {
-                    Color::Green
+                    Color::Rgb(134, 239, 172)
                 } else {
-                    Color::Cyan
+                    Color::Rgb(94, 234, 212)
                 };
                 let author = if item.when.is_empty() {
                     item.sender.clone()
@@ -2143,24 +2826,22 @@ fn render_timeline(
                 };
                 lines.push(Line::from(vec![Span::styled(
                     author,
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent),
                 )]));
             }
         }
 
         let content_style = if item.is_system {
-            Style::default().fg(Color::Gray)
+            secondary_style()
         } else {
-            Style::default().fg(Color::White)
+            primary_style()
         };
         if let Some(reply) = item.reply.as_ref() {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
                     reply_context_line(reply),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
+                    muted_style().add_modifier(Modifier::ITALIC),
                 ),
             ]));
         }
@@ -2191,10 +2872,21 @@ fn render_timeline(
                         });
                     }
                 }
+                let action_start_col = span_line_width(&spans);
+                append_message_action_controls(
+                    &mut spans,
+                    &mut pending_control_hitboxes,
+                    lines.len(),
+                    action_start_col,
+                    item,
+                );
             }
             if index == 0 && !item.reaction_summary.is_empty() {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(item.reaction_summary.clone(), warning_style()));
+                spans.push(Span::styled(" ", muted_style()));
+                spans.push(Span::styled(
+                    item.reaction_summary.clone(),
+                    secondary_style(),
+                ));
             }
             lines.push(Line::from(spans));
         }
@@ -2208,9 +2900,7 @@ fn render_timeline(
         };
         lines.push(Line::from(Span::styled(
             label,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            muted_style().add_modifier(Modifier::ITALIC),
         )));
     }
 
@@ -2218,6 +2908,13 @@ fn render_timeline(
     let total_lines = lines.len();
     let scroll_top = total_lines.saturating_sub(inner_height + snapshot.scroll_offset);
     record_visible_audio_hitboxes(hitboxes, &pending_hitboxes, area, scroll_top, inner_height);
+    record_visible_control_hitboxes(
+        hitboxes,
+        &pending_control_hitboxes,
+        area,
+        scroll_top,
+        inner_height,
+    );
 
     let timeline = Paragraph::new(Text::from(lines))
         .block(panel_block(format!(
@@ -2229,6 +2926,69 @@ fn render_timeline(
     frame.render_widget(timeline, area);
 }
 
+fn append_message_action_controls(
+    spans: &mut Vec<Span<'static>>,
+    pending: &mut Vec<PendingControlHitbox>,
+    line_index: usize,
+    mut column: usize,
+    item: &TimelineEntry,
+) {
+    if item.msg_id.is_empty() || item.is_system || item.channel.starts_with("dm:") {
+        return;
+    }
+
+    let reply_command = format!("/reply {} ", item.msg_id);
+    append_inline_control(
+        spans,
+        pending,
+        line_index,
+        &mut column,
+        "Reply",
+        ClickAction::Prefill {
+            value: reply_command,
+            cursor_back: 0,
+            activity: "Reply to this message",
+        },
+    );
+
+    let reaction_command = format!("/react {} ", item.msg_id);
+    append_inline_control(
+        spans,
+        pending,
+        line_index,
+        &mut column,
+        "React",
+        ClickAction::Prefill {
+            value: reaction_command,
+            cursor_back: 0,
+            activity: "React to this message",
+        },
+    );
+}
+
+fn append_inline_control(
+    spans: &mut Vec<Span<'static>>,
+    pending: &mut Vec<PendingControlHitbox>,
+    line_index: usize,
+    column: &mut usize,
+    label: &'static str,
+    action: ClickAction,
+) {
+    spans.push(Span::raw(" "));
+    *column += 1;
+
+    let rendered = format!("[{}]", label);
+    let width = rendered.chars().count();
+    pending.push(PendingControlHitbox {
+        line_index,
+        start_col: *column,
+        width,
+        action,
+    });
+    spans.push(Span::styled(rendered, subtle_button_style(true)));
+    *column += width;
+}
+
 fn append_audio_control_spans(spans: &mut Vec<Span<'static>>, control: &AudioControlState) {
     spans.push(Span::raw("  "));
     match control {
@@ -2236,8 +2996,8 @@ fn append_audio_control_spans(spans: &mut Vec<Span<'static>>, control: &AudioCon
             spans.push(Span::styled(
                 AUDIO_PLAY_BUTTON_LABEL,
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
+                    .fg(Color::Rgb(236, 253, 245))
+                    .bg(Color::Rgb(22, 101, 52))
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -2245,10 +3005,7 @@ fn append_audio_control_spans(spans: &mut Vec<Span<'static>>, control: &AudioCon
             spans.push(Span::styled(AUDIO_RECEIVING_LABEL, muted_style()));
         }
         AudioControlState::Unavailable => {
-            spans.push(Span::styled(
-                AUDIO_UNAVAILABLE_LABEL,
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(AUDIO_UNAVAILABLE_LABEL, muted_style()));
         }
     }
 }
@@ -2317,6 +3074,81 @@ fn record_visible_audio_hitboxes(
     }
 }
 
+fn record_visible_control_hitboxes(
+    hitboxes: &mut UiHitboxes,
+    pending: &[PendingControlHitbox],
+    area: Rect,
+    scroll_top: usize,
+    inner_height: usize,
+) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    if inner_width == 0 || inner_height == 0 {
+        return;
+    }
+
+    let visible_end = scroll_top.saturating_add(inner_height);
+    for pending_hitbox in pending {
+        if pending_hitbox.line_index < scroll_top || pending_hitbox.line_index >= visible_end {
+            continue;
+        }
+        if pending_hitbox
+            .start_col
+            .saturating_add(pending_hitbox.width)
+            > inner_width
+        {
+            continue;
+        }
+
+        let Ok(x_offset) = u16::try_from(pending_hitbox.start_col) else {
+            continue;
+        };
+        let Ok(y_offset) = u16::try_from(pending_hitbox.line_index - scroll_top) else {
+            continue;
+        };
+        let Ok(width) = u16::try_from(pending_hitbox.width) else {
+            continue;
+        };
+        if width == 0 {
+            continue;
+        }
+
+        hitboxes.push_control(
+            Rect {
+                x: area.x.saturating_add(1).saturating_add(x_offset),
+                y: area.y.saturating_add(1).saturating_add(y_offset),
+                width,
+                height: 1,
+            },
+            pending_hitbox.action.clone(),
+        );
+    }
+}
+
+fn push_full_row_hitbox(
+    hitboxes: &mut UiHitboxes,
+    area: Rect,
+    inner_row: usize,
+    action: ClickAction,
+) {
+    let Ok(y_offset) = u16::try_from(inner_row) else {
+        return;
+    };
+    let inner_height = area.height.saturating_sub(2);
+    if area.width <= 2 || y_offset >= inner_height {
+        return;
+    }
+
+    hitboxes.push_control(
+        Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1).saturating_add(y_offset),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        },
+        action,
+    );
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     let right = rect.x.saturating_add(rect.width);
     let bottom = rect.y.saturating_add(rect.height);
@@ -2356,6 +3188,7 @@ fn render_right_panel(
     area: Rect,
     snapshot: &UiSnapshot,
     media_preview: &mut MediaPreviewRuntime,
+    hitboxes: &mut UiHitboxes,
 ) {
     match right_panel_mode(snapshot) {
         RightPanelMode::Media => {
@@ -2364,7 +3197,7 @@ fn render_right_panel(
             }
         }
         RightPanelMode::Suggestions => render_suggestions_panel(frame, area, snapshot),
-        RightPanelMode::Now => render_now_panel(frame, area, snapshot),
+        RightPanelMode::Now => render_now_panel(frame, area, snapshot, hitboxes),
     }
 }
 
@@ -2391,10 +3224,19 @@ fn render_suggestions_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot
     frame.render_widget(suggestions, area);
 }
 
-fn render_now_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnapshot) {
+fn render_now_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    hitboxes: &mut UiHitboxes,
+) {
     let mut lines = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        "Status",
+        panel_title_style(),
+    )]));
     lines.push(Line::from(vec![
-        Span::styled("Voice: ", muted_style()),
+        Span::styled("voice ", label_style()),
         Span::styled(
             if snapshot.voice.active { "on" } else { "off" },
             if snapshot.voice.active {
@@ -2403,54 +3245,103 @@ fn render_now_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSna
                 muted_style()
             },
         ),
+        Span::styled("  media ", label_style()),
+        Span::styled(on_off(snapshot.media_enabled), primary_style()),
     ]));
     if snapshot.voice.active {
         if let Some(room) = &snapshot.voice.room {
             lines.push(Line::from(vec![
-                Span::styled("Room: ", muted_style()),
-                Span::raw(format_scope_label(room)),
+                Span::styled("room ", label_style()),
+                Span::styled(format_scope_label(room), primary_style()),
             ]));
         }
         lines.push(Line::from(vec![
-            Span::styled("Mic: ", muted_style()),
-            Span::raw(if snapshot.voice.muted {
-                "muted"
-            } else {
-                "live"
-            }),
-            Span::raw("  "),
-            Span::styled("Sound: ", muted_style()),
-            Span::raw(if snapshot.voice.deafened { "off" } else { "on" }),
+            Span::styled("mic ", label_style()),
+            Span::styled(
+                if snapshot.voice.muted {
+                    "muted"
+                } else {
+                    "live"
+                },
+                primary_style(),
+            ),
+            Span::styled("  sound ", label_style()),
+            Span::styled(
+                if snapshot.voice.deafened { "off" } else { "on" },
+                primary_style(),
+            ),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled("Speaking: ", muted_style()),
-            Span::raw(on_off(snapshot.voice.speaking)),
-        ]));
+        if snapshot.voice.speaking {
+            lines.push(Line::from(vec![
+                Span::styled("speaking ", label_style()),
+                Span::styled("active", success_style()),
+            ]));
+        }
         if !snapshot.voice.members.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("In call: ", muted_style()),
-                Span::raw(snapshot.voice.members.join(", ")),
+                Span::styled("in call ", label_style()),
+                Span::styled(snapshot.voice.members.join(", "), secondary_style()),
             ]));
         }
     }
-    lines.push(Line::from(vec![
-        Span::styled("Media: ", muted_style()),
-        Span::raw(on_off(snapshot.media_enabled)),
-    ]));
     if let Some(label) = &snapshot.dm_trust_label {
         lines.push(Line::from(vec![
-            Span::styled("Trust: ", muted_style()),
+            Span::styled("trust ", label_style()),
             Span::styled(label.clone(), warning_style()),
         ]));
     }
     lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Chat", panel_title_style())));
+    let mut chat_line = Vec::new();
+    append_quick_buttons(
+        &mut chat_line,
+        hitboxes,
+        area,
+        lines.len() as u16,
+        0,
+        &chat_quick_buttons(),
+    );
+    lines.push(Line::from(chat_line));
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Call", panel_title_style())));
+    let mut call_line = Vec::new();
+    let mut buttons = call_quick_buttons(snapshot, false);
+    buttons.push(screen_quick_button(snapshot));
+    append_quick_buttons(
+        &mut call_line,
+        hitboxes,
+        area,
+        lines.len() as u16,
+        0,
+        &buttons,
+    );
+    lines.push(Line::from(call_line));
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Media", panel_title_style())));
+    let mut media_line = Vec::new();
+    append_quick_buttons(
+        &mut media_line,
+        hitboxes,
+        area,
+        lines.len() as u16,
+        0,
+        &media_quick_buttons(snapshot),
+    );
+    if !media_line.is_empty() {
+        lines.push(Line::from(media_line));
+    }
+
+    lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         format!("People {}", snapshot.known_users),
-        warning_style().add_modifier(Modifier::BOLD),
+        panel_title_style(),
     )));
 
     let people_take = area.height.saturating_sub(10).clamp(2, 6) as usize;
     for person in snapshot.online_people.iter().take(people_take) {
+        let row_index = lines.len();
         lines.push(Line::from(vec![
             Span::styled(
                 if person.online { "o " } else { "- " },
@@ -2462,15 +3353,21 @@ fn render_now_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSna
             ),
             Span::styled(
                 person.user.clone(),
-                Style::default().fg(if person.online {
-                    Color::White
+                if person.online {
+                    primary_style()
                 } else {
-                    Color::Gray
-                }),
+                    secondary_style()
+                },
             ),
-            Span::raw(" "),
+            Span::styled(" ", muted_style()),
             Span::styled(person.status_text.clone(), muted_style()),
         ]));
+        push_full_row_hitbox(
+            hitboxes,
+            area,
+            row_index,
+            ClickAction::SwitchScope(format!("dm:{}", person.user)),
+        );
     }
 
     let recent_activity: Vec<Line<'_>> = snapshot
@@ -2482,10 +3379,7 @@ fn render_now_panel(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSna
         .collect();
     if !recent_activity.is_empty() {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "Recent",
-            muted_style().add_modifier(Modifier::BOLD),
-        )));
+        lines.push(Line::from(Span::styled("Recent", panel_title_style())));
         lines.extend(recent_activity);
     }
 
@@ -2519,10 +3413,7 @@ fn render_media_preview_panel(
         let disabled = Paragraph::new(Text::from(vec![
             Line::from(candidate.summary.clone()),
             Line::default(),
-            Line::from(Span::styled(
-                "Media rendering is disabled.",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled("Media rendering is disabled.", muted_style())),
         ]))
         .wrap(Wrap { trim: true });
         frame.render_widget(disabled, inner);
@@ -2533,10 +3424,10 @@ fn render_media_preview_panel(
         let fallback = Paragraph::new(Text::from(vec![
             Line::from(candidate.summary.clone()),
             Line::default(),
-            Line::from(Span::styled(reason, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(reason, muted_style())),
             Line::from(Span::styled(
                 format!("saved: {}", candidate.path),
-                Style::default().fg(Color::DarkGray),
+                muted_style(),
             )),
         ]))
         .wrap(Wrap { trim: true });
@@ -2548,10 +3439,10 @@ fn render_media_preview_panel(
         let fallback = Paragraph::new(Text::from(vec![
             Line::from(candidate.summary.clone()),
             Line::default(),
-            Line::from(Span::styled(error, Style::default().fg(Color::Red))),
+            Line::from(Span::styled(error, danger_style())),
             Line::from(Span::styled(
                 format!("saved: {}", candidate.path),
-                Style::default().fg(Color::DarkGray),
+                muted_style(),
             )),
         ]))
         .wrap(Wrap { trim: true });
@@ -2567,10 +3458,7 @@ fn render_media_preview_panel(
     let loading = Paragraph::new(Text::from(vec![
         Line::from(candidate.title.clone()),
         Line::default(),
-        Line::from(Span::styled(
-            "Loading image preview...",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("Loading image preview...", muted_style())),
     ]))
     .wrap(Wrap { trim: true });
     frame.render_widget(loading, inner);
@@ -2594,15 +3482,15 @@ fn render_activity_line(entry: &ActivityEntry) -> Line<'static> {
             } else {
                 format!("{} ", when)
             },
-            Style::default().fg(Color::DarkGray),
+            muted_style(),
         ),
         Span::styled(
             entry.text.clone(),
-            Style::default().fg(if entry.is_error {
-                Color::Red
+            if entry.is_error {
+                danger_style()
             } else {
-                Color::Gray
-            }),
+                secondary_style()
+            },
         ),
     ])
 }
@@ -2631,9 +3519,9 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &UiSnap
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _snapshot: &UiSnapshot) {
     let footer = Paragraph::new(
-        "Enter send | Ctrl+K actions | Tab complete | PageUp/PageDown scroll | Ctrl+C quit",
+        "Enter send  |  Ctrl+K actions  |  Ctrl+, settings  |  Click rooms, people, calls",
     )
-    .style(Style::default().fg(Color::DarkGray));
+    .style(muted_style());
     frame.render_widget(footer, area);
 }
 
@@ -2671,18 +3559,22 @@ fn protocol_type_label(protocol_type: ProtocolType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_mention_completion, audio_control_for_media, audio_playback_target_for_media,
-        composer_hint, filtered_palette_actions, layout_mode, mention_query, mention_suggestions,
-        move_palette_selection, resolve_palette_action, right_panel_mode, AudioControlState,
-        AudioPlaybackRejection, AudioPlaybackTarget, PaletteActionKind, PaletteResolvedAction,
-        PaletteState, RightPanelMode, UiHitboxes, UiLayoutMode, UiSnapshot,
+        apply_mention_completion, apply_setting_toggle, audio_control_for_media,
+        audio_playback_target_for_media, call_quick_buttons, chat_quick_buttons, composer_hint,
+        filtered_palette_actions, layout_mode, media_quick_buttons, mention_query,
+        mention_suggestions, move_palette_selection, render, resolve_palette_action,
+        right_panel_mode, screen_quick_button, setting_value, ui_action_from_click_action,
+        AudioControlState, AudioPlaybackRejection, AudioPlaybackTarget, ClickAction,
+        MediaPreviewRuntime, PaletteActionKind, PaletteResolvedAction, PaletteState,
+        RightPanelMode, SettingToggle, SettingsState, UiAction, UiHitboxes, UiLayoutMode,
+        UiSnapshot,
     };
     use crate::args::ClientConfig;
     use crate::{
         media::{MediaKind, MediaRenderStatus, TimelineMedia, TimelinePayload},
         state::{ClientState, DisplayedMessage, PeerTrust, ReplyPreview},
     };
-    use ratatui::layout::Rect;
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
@@ -2796,6 +3688,63 @@ mod tests {
         assert_eq!(hitboxes.audio_at(15, 4), Some(target));
         assert_eq!(hitboxes.audio_at(16, 4), None);
         assert_eq!(hitboxes.audio_at(10, 5), None);
+    }
+
+    #[test]
+    fn generic_click_hitboxes_resolve_controls_before_audio() {
+        let target = AudioPlaybackTarget {
+            filename: "voice-note.ogg".to_string(),
+            local_path: "C:/tmp/voice-note.ogg".to_string(),
+        };
+        let mut hitboxes = UiHitboxes::default();
+        hitboxes.push_audio(
+            Rect {
+                x: 3,
+                y: 2,
+                width: 8,
+                height: 1,
+            },
+            target,
+        );
+        hitboxes.push_control(
+            Rect {
+                x: 3,
+                y: 2,
+                width: 8,
+                height: 1,
+            },
+            ClickAction::Execute("/voice on".to_string()),
+        );
+
+        assert_eq!(
+            hitboxes.action_at(4, 2),
+            Some(ClickAction::Execute("/voice on".to_string()))
+        );
+        assert_eq!(hitboxes.action_at(12, 2), None);
+    }
+
+    #[test]
+    fn click_actions_convert_to_ui_actions() {
+        assert!(matches!(
+            ui_action_from_click_action(ClickAction::Execute("/voice on".to_string())),
+            UiAction::Execute(command) if command == "/voice on"
+        ));
+        assert!(matches!(
+            ui_action_from_click_action(ClickAction::SwitchScope("dm:alice".to_string())),
+            UiAction::SwitchScope(scope) if scope == "dm:alice"
+        ));
+        assert!(matches!(
+            ui_action_from_click_action(ClickAction::Prefill {
+                value: "/image \"\"".to_string(),
+                cursor_back: 1,
+                activity: "Open image upload with a quoted path",
+            }),
+            UiAction::PrefillInput {
+                value,
+                cursor_back: 1,
+                activity: "Open image upload with a quoted path",
+            } if value == "/image \"\""
+        ));
     }
 
     #[test]
@@ -2964,6 +3913,410 @@ mod tests {
     }
 
     #[test]
+    fn quick_call_buttons_dispatch_dynamic_voice_commands() {
+        let mut state = make_test_state();
+        let snapshot = UiSnapshot::from_state(&state);
+        let buttons = call_quick_buttons(&snapshot, false);
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(
+            buttons[0].action,
+            ClickAction::Execute("/voice on".to_string())
+        );
+
+        state.voice_active = true;
+        state.voice_muted = true;
+        state.voice_deafened = false;
+        let snapshot = UiSnapshot::from_state(&state);
+        let buttons = call_quick_buttons(&snapshot, false);
+        assert!(buttons
+            .iter()
+            .any(|button| button.action == ClickAction::Execute("/voice off".to_string())));
+        assert!(buttons
+            .iter()
+            .any(|button| button.action == ClickAction::Execute("/voice unmute".to_string())));
+        assert!(buttons
+            .iter()
+            .any(|button| button.action == ClickAction::Execute("/voice deafen".to_string())));
+    }
+
+    #[test]
+    fn quick_media_buttons_prefill_paths_or_report_disabled() {
+        let mut state = make_test_state();
+        let snapshot = UiSnapshot::from_state(&state);
+        let buttons = media_quick_buttons(&snapshot);
+        assert_eq!(buttons.len(), 3);
+        assert_eq!(
+            buttons[0].action,
+            ClickAction::Prefill {
+                value: "/image \"\"".to_string(),
+                cursor_back: 1,
+                activity: "Open image upload with a quoted path",
+            }
+        );
+
+        state.media_enabled = false;
+        let snapshot = UiSnapshot::from_state(&state);
+        let buttons = media_quick_buttons(&snapshot);
+        assert!(matches!(
+            buttons[0].action,
+            ClickAction::AddActivity { is_error: true, .. }
+        ));
+    }
+
+    #[test]
+    fn screen_button_toggles_existing_screen_commands() {
+        let mut state = make_test_state();
+        let snapshot = UiSnapshot::from_state(&state);
+        assert_eq!(
+            screen_quick_button(&snapshot).action,
+            ClickAction::Execute("/screen start".to_string())
+        );
+
+        state.screen_share = Some(());
+        let snapshot = UiSnapshot::from_state(&state);
+        assert_eq!(
+            screen_quick_button(&snapshot).action,
+            ClickAction::Execute("/screen stop".to_string())
+        );
+    }
+
+    #[test]
+    fn render_registers_sidebar_and_people_click_targets() {
+        let mut state = make_test_state();
+        state.drafts.insert("random".to_string(), String::new());
+        state
+            .users
+            .insert("alice".to_string(), "pubkey-alice".to_string());
+        state.online_users.insert("alice".to_string());
+        state.set_peer_status("alice", "Online", "");
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 32)).expect("test terminal should initialize");
+        let mut media_preview = MediaPreviewRuntime {
+            picker: None,
+            protocol_label: None,
+            unsupported_reason: None,
+            active_key: None,
+            image: None,
+            last_error: None,
+        };
+        let palette = PaletteState::default();
+        let settings = SettingsState::default();
+        let mut hitboxes = UiHitboxes::default();
+        let snapshot = UiSnapshot::from_state(&state);
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("render should register chat click targets");
+
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::SwitchScope("random".to_string())));
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::SwitchScope("dm:alice".to_string())));
+    }
+
+    #[test]
+    fn render_registers_message_reply_and_react_targets_by_msg_id() {
+        let mut state = make_test_state();
+        state.message_history.push_back(DisplayedMessage {
+            id: "msg-123".to_string(),
+            ts: 1.0,
+            channel: "general".to_string(),
+            sender: "alice".to_string(),
+            content: "hello there".to_string(),
+            reply: None,
+            payload: None,
+            encrypted: true,
+            edited: false,
+        });
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 32)).expect("test terminal should initialize");
+        let mut media_preview = MediaPreviewRuntime {
+            picker: None,
+            protocol_label: None,
+            unsupported_reason: None,
+            active_key: None,
+            image: None,
+            last_error: None,
+        };
+        let palette = PaletteState::default();
+        let settings = SettingsState::default();
+        let mut hitboxes = UiHitboxes::default();
+        let snapshot = UiSnapshot::from_state(&state);
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("render should register message action targets");
+
+        assert!(hitboxes.controls.iter().any(|hitbox| {
+            hitbox.action
+                == ClickAction::Prefill {
+                    value: "/reply msg-123 ".to_string(),
+                    cursor_back: 0,
+                    activity: "Reply to this message",
+                }
+        }));
+        assert!(hitboxes.controls.iter().any(|hitbox| {
+            hitbox.action
+                == ClickAction::Prefill {
+                    value: "/react msg-123 ".to_string(),
+                    cursor_back: 0,
+                    activity: "React to this message",
+                }
+        }));
+    }
+
+    #[test]
+    fn render_smoke_keeps_narrow_dm_trust_and_click_targets() {
+        let mut state = make_test_state();
+        state.ch = "dm:alice".to_string();
+        state
+            .users
+            .insert("alice".to_string(), "pubkey-alice".to_string());
+        state.trust_store.peers.insert(
+            "alice".to_string(),
+            PeerTrust {
+                fingerprint: "abc".to_string(),
+                trusted_at: 1,
+                verified: false,
+            },
+        );
+        state.message_history.push_back(DisplayedMessage {
+            id: "dm-1".to_string(),
+            ts: 1.0,
+            channel: "dm:alice".to_string(),
+            sender: "alice".to_string(),
+            content: "private hello".to_string(),
+            reply: None,
+            payload: None,
+            encrypted: true,
+            edited: false,
+        });
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(92, 28)).expect("test terminal should initialize");
+        let mut media_preview = MediaPreviewRuntime {
+            picker: None,
+            protocol_label: None,
+            unsupported_reason: None,
+            active_key: None,
+            image: None,
+            last_error: None,
+        };
+        let palette = PaletteState::default();
+        let settings = SettingsState::default();
+        let mut hitboxes = UiHitboxes::default();
+        let snapshot = UiSnapshot::from_state(&state);
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("narrow dm render should succeed");
+
+        assert_eq!(
+            snapshot.dm_trust_label.as_deref(),
+            Some("Fingerprint recorded but unverified")
+        );
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::SwitchScope("general".to_string())));
+        assert!(hitboxes
+            .controls
+            .iter()
+            .all(|hitbox| !matches!(hitbox.action, ClickAction::Prefill { ref value, .. } if value.starts_with("/reply "))));
+    }
+
+    #[test]
+    fn chat_quick_buttons_expose_search_and_users_actions() {
+        let buttons = chat_quick_buttons();
+        assert!(buttons.iter().any(|button| {
+            button.action
+                == ClickAction::Prefill {
+                    value: "/search ".to_string(),
+                    cursor_back: 0,
+                    activity: "Search this conversation",
+                }
+        }));
+        assert!(buttons
+            .iter()
+            .any(|button| button.action == ClickAction::Execute("/users".to_string())));
+        assert!(buttons
+            .iter()
+            .any(|button| button.action == ClickAction::OpenSettings));
+    }
+
+    #[test]
+    fn settings_toggle_updates_runtime_and_persisted_config() {
+        let mut state = make_test_state();
+        let snapshot = UiSnapshot::from_state(&state);
+        assert!(setting_value(&snapshot, SettingToggle::Media));
+
+        let (label, value) = apply_setting_toggle(&mut state, SettingToggle::Media);
+        assert_eq!(label, "media");
+        assert_eq!(value, "off");
+        assert!(!state.media_enabled);
+        assert!(!state.client_config.media_enabled);
+        assert!(!state.config.ui.enable_media);
+
+        let (label, value) = apply_setting_toggle(&mut state, SettingToggle::AutoReconnect);
+        assert_eq!(label, "reconnect");
+        assert_eq!(value, "off");
+        assert!(!state.client_config.auto_reconnect);
+        assert!(!state.config.connection.auto_reconnect);
+    }
+
+    #[test]
+    fn render_settings_overlay_registers_toggle_hitboxes() {
+        let state = make_test_state();
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 32)).expect("test terminal should initialize");
+        let mut media_preview = MediaPreviewRuntime {
+            picker: None,
+            protocol_label: None,
+            unsupported_reason: None,
+            active_key: None,
+            image: None,
+            last_error: None,
+        };
+        let palette = PaletteState::default();
+        let settings = SettingsState {
+            open: true,
+            selected: 0,
+        };
+        let mut hitboxes = UiHitboxes::default();
+        let snapshot = UiSnapshot::from_state(&state);
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("settings render should succeed");
+
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::ToggleSetting(SettingToggle::Media)));
+    }
+
+    #[test]
+    fn render_registers_click_controls_for_inactive_and_active_voice() {
+        let mut state = make_test_state();
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 32)).expect("test terminal should initialize");
+        let mut media_preview = MediaPreviewRuntime {
+            picker: None,
+            protocol_label: None,
+            unsupported_reason: None,
+            active_key: None,
+            image: None,
+            last_error: None,
+        };
+        let mut palette = PaletteState::default();
+        let settings = SettingsState::default();
+        let mut hitboxes = UiHitboxes::default();
+
+        let snapshot = UiSnapshot::from_state(&state);
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("inactive voice render should succeed");
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::Execute("/voice on".to_string())));
+
+        state.voice_active = true;
+        state.voice_muted = false;
+        state.voice_deafened = false;
+        let snapshot = UiSnapshot::from_state(&state);
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("active voice render should succeed");
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::Execute("/voice off".to_string())));
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::Execute("/voice mute".to_string())));
+        assert!(hitboxes
+            .controls
+            .iter()
+            .any(|hitbox| hitbox.action == ClickAction::Execute("/voice deafen".to_string())));
+
+        palette.open = true;
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("palette render should not disturb base controls");
+    }
+
+    #[test]
     fn palette_resolves_audio_prefill() {
         let state = make_test_state();
         let audio_action = filtered_palette_actions("audio")
@@ -3027,10 +4380,7 @@ mod tests {
     fn composer_hint_is_contextual_without_blocking_typing() {
         let mut state = make_test_state();
         let snapshot = UiSnapshot::from_state(&state);
-        assert_eq!(
-            composer_hint(&snapshot),
-            "Type a message or press Ctrl+K for actions"
-        );
+        assert_eq!(composer_hint(&snapshot), "Message or Ctrl+K");
 
         state.input_buffer = "/image \"\"".to_string();
         state.input_cursor = state.input_buffer.chars().count().saturating_sub(1);

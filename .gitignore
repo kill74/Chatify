@@ -1,5 +1,10 @@
 # Build artifacts
 target/
+dist/chatify-windows-x64/
+dist/chatify-windows-x64.zip
+dist/chatify-windows-x64.zip.sha256
+dist/chatify-setup-*.exe
+dist/chatify-setup-*.exe.sha256
 
 # Local runtime artifacts
 chatify.db

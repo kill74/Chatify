@@ -42,15 +42,49 @@ Any non-command text is sent as a channel message to the active scope.
 | Shortcut       | Description                                      |
 | -------------- | ------------------------------------------------ |
 | `Ctrl+K`       | Open searchable actions for common tasks         |
+| `Ctrl+,`       | Open settings toggles                            |
 | `Enter`        | Send the composer text or run selected action    |
 | `Tab`          | Complete the current `@mention` suggestion       |
 | `PageUp/Down`  | Scroll the timeline                              |
 | `Alt+Up/Down`  | Switch rooms quickly                             |
 | `Ctrl+C`       | Quit                                             |
 
+## Click-First Call and Media Controls
+
+The TUI exposes common call and media actions as clickable controls, so users
+do not need to memorize slash commands for the main flows.
+
+- Click `Call` / `Join call` to enter voice for the active room. From a DM, it
+  uses the same default as `/voice on` and joins `general`.
+- While in voice, click `Leave`, `Mic`/`Mute`, and `Sound`/`Deafen` to control
+  the call.
+- Click `Share` / `Stop share` to start or stop screen-share signaling.
+- Click `Image`, `Video`, or `Audio` in the Now panel to prefill the matching
+  upload command with the cursor inside the quoted path.
+- Received audio notes keep their inline `Play` button.
+
+Slash commands remain available as a fallback and for scripting.
+
+## Click-First Chat Controls
+
+Daily chat actions are also clickable in the TUI:
+
+- Click a room or DM in `Chats` to switch there without typing `/join`.
+- Click a person in the `Now` panel to open a DM draft.
+- Click `Reply` or `React` beside a channel message to prefill the exact
+  message ID.
+- Click `Search` to prefill search for the active conversation.
+- Click `Users` to refresh presence and key directory.
+- Click `Settings` or press `Ctrl+,` to toggle media, markdown, notifications,
+  sound, reconnect, and animations. Changes are saved to `config.toml`.
+
 The TUI adapts to terminal width: narrow windows prioritize the chat list,
 timeline, and composer; wider windows show a compact contextual panel for media,
 mentions, people, voice state, and recent activity.
+
+The visual layout is intentionally quiet: status, chat actions, call controls,
+media actions, people, and recent activity are grouped in predictable sections
+so the conversation stays easy to scan.
 
 ### Mentions and Notifications
 

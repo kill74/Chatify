@@ -20,6 +20,8 @@ pub struct Config {
     pub completion: CompletionConfig,
     #[serde(default)]
     pub session: SessionConfig,
+    #[serde(default)]
+    pub launcher: LauncherConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +146,28 @@ pub struct SessionConfig {
     pub last_channel: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LauncherConfig {
+    #[serde(default)]
+    pub first_run_complete: bool,
+    #[serde(default)]
+    pub last_mode: String,
+    #[serde(default = "default_host")]
+    pub last_host: String,
+    #[serde(default = "default_port")]
+    pub last_port: u16,
+    #[serde(default = "default_server_profiles")]
+    pub profiles: Vec<ServerProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerProfileConfig {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
 // Default value functions
 fn default_host() -> String {
     "127.0.0.1".to_string()
@@ -221,6 +245,26 @@ impl Default for SessionConfig {
             last_channel: default_channel(),
         }
     }
+}
+
+impl Default for LauncherConfig {
+    fn default() -> Self {
+        Self {
+            first_run_complete: false,
+            last_mode: String::new(),
+            last_host: default_host(),
+            last_port: default_port(),
+            profiles: default_server_profiles(),
+        }
+    }
+}
+
+fn default_server_profiles() -> Vec<ServerProfileConfig> {
+    vec![ServerProfileConfig {
+        name: "Local".to_string(),
+        host: default_host(),
+        port: default_port(),
+    }]
 }
 
 impl Config {
@@ -339,6 +383,9 @@ impl Config {
             "ui.enable_emoji" => {
                 self.ui.enable_emoji = parse_bool(value)?;
             }
+            "ui.enable_media" => {
+                self.ui.enable_media = parse_bool(value)?;
+            }
             "ui.compact_mode" => {
                 self.ui.compact_mode = parse_bool(value)?;
             }
@@ -382,6 +429,22 @@ impl Config {
                 self.session.last_channel = value.to_string();
             }
 
+            // Launcher
+            "launcher.first_run_complete" => {
+                self.launcher.first_run_complete = parse_bool(value)?;
+            }
+            "launcher.last_mode" => {
+                self.launcher.last_mode = value.to_string();
+            }
+            "launcher.last_host" => {
+                self.launcher.last_host = value.to_string();
+            }
+            "launcher.last_port" => {
+                self.launcher.last_port = value
+                    .parse()
+                    .map_err(|_| format!("Invalid port number: {}", value))?;
+            }
+
             _ => return Err(format!("Unknown configuration key: {}", key)),
         }
 
@@ -410,6 +473,7 @@ impl Config {
   enable_markdown = {}
   enable_syntax_highlighting = {}
   enable_emoji = {}
+  enable_media = {}
   compact_mode = {}
   disable_animations = {}
   custom_themes = [{}]
@@ -431,6 +495,13 @@ impl Config {
   remember_channel = {}
   last_channel = "{}"
 
+[launcher]
+  first_run_complete = {}
+  last_mode = "{}"
+  last_host = "{}"
+  last_port = {}
+  profiles = {}
+
 Config file: {}"#,
             self.connection.default_host,
             self.connection.default_port,
@@ -440,6 +511,7 @@ Config file: {}"#,
             self.ui.enable_markdown,
             self.ui.enable_syntax_highlighting,
             self.ui.enable_emoji,
+            self.ui.enable_media,
             self.ui.compact_mode,
             self.ui.disable_animations,
             custom_theme_names.join(", "),
@@ -454,6 +526,11 @@ Config file: {}"#,
             self.session.last_username,
             self.session.remember_channel,
             self.session.last_channel,
+            self.launcher.first_run_complete,
+            self.launcher.last_mode,
+            self.launcher.last_host,
+            self.launcher.last_port,
+            self.launcher.profiles.len(),
             Self::config_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(unknown)".to_string())
@@ -504,6 +581,8 @@ mod tests {
         assert_eq!(config.connection.default_port, 8765);
         assert!(config.ui.enable_markdown);
         assert!(config.notifications.enabled);
+        assert_eq!(config.launcher.last_host, "127.0.0.1");
+        assert_eq!(config.launcher.profiles.len(), 1);
     }
 
     #[test]
@@ -524,6 +603,11 @@ mod tests {
 
         config.set_value("notifications.enabled", "false").unwrap();
         assert!(!config.notifications.enabled);
+
+        config
+            .set_value("launcher.first_run_complete", "true")
+            .unwrap();
+        assert!(config.launcher.first_run_complete);
 
         assert!(config.set_value("invalid.key", "value").is_err());
     }
