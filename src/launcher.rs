@@ -1,4 +1,5 @@
 use std::env;
+#[cfg(windows)]
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -685,6 +686,7 @@ fn parse_port_or_default(raw: &str, default: u16) -> Option<u16> {
     value.parse::<u16>().ok().filter(|port| *port > 0)
 }
 
+#[cfg(windows)]
 fn quote_cmd_arg(value: impl AsRef<OsStr>) -> String {
     let value = value.as_ref().to_string_lossy();
     if value.is_empty() {
@@ -706,7 +708,7 @@ fn quote_cmd_arg(value: impl AsRef<OsStr>) -> String {
 mod tests {
     use super::{
         clean_host_or_default, clean_profile_name, normalize_menu_choice, parse_port_or_default,
-        quote_cmd_arg, upsert_profile, LauncherMode,
+        upsert_profile, LauncherMode,
     };
     use chatify::config::{Config, ServerProfileConfig};
 
@@ -736,8 +738,11 @@ mod tests {
         assert_eq!(clean_host_or_default("bad host", "127.0.0.1"), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn quote_cmd_arg_only_quotes_when_needed() {
+        use super::quote_cmd_arg;
+
         assert_eq!(quote_cmd_arg("chatify-client.exe"), "chatify-client.exe");
         assert_eq!(
             quote_cmd_arg(r#"C:\Program Files\Chatify\chatify.exe"#),
