@@ -54,8 +54,8 @@ impl User2FA {
         }
     }
 
-    /// Enable 2FA for the user
-    pub fn enable(&mut self, secret: String) {
+    /// Enable 2FA for the user and return plaintext backup codes once.
+    pub fn enable(&mut self, secret: String) -> Vec<String> {
         self.totp_config = Some(TotpConfig {
             secret,
             digits: 6,
@@ -64,7 +64,7 @@ impl User2FA {
         });
         self.enabled = true;
         self.enabled_at = Some(now());
-        self.generate_backup_codes();
+        self.generate_backup_codes()
     }
 
     /// Disable 2FA for the user
@@ -76,19 +76,22 @@ impl User2FA {
         self.last_verified = None;
     }
 
-    /// Generate backup codes for the user
-    /// Codes are stored as hashes for security
-    fn generate_backup_codes(&mut self) {
+    /// Generate backup codes for the user.
+    /// Returns plaintext codes for one-time display while storing only hashes.
+    fn generate_backup_codes(&mut self) -> Vec<String> {
         let mut rng = rand::thread_rng();
-        self.backup_codes = (0..10)
+        let plaintext_codes: Vec<String> = (0..10)
             .map(|_| {
                 let mut bytes = [0u8; 8];
                 rng.fill_bytes(&mut bytes);
-                let code = hex::encode(bytes);
-                // Store hash of the code, not the code itself
-                hash_backup_code(&code)
+                hex::encode(bytes)
             })
             .collect();
+        self.backup_codes = plaintext_codes
+            .iter()
+            .map(|code| hash_backup_code(code))
+            .collect();
+        plaintext_codes
     }
 
     /// Verify a TOTP code
@@ -252,11 +255,18 @@ mod tests {
         assert!(!user_2fa.enabled);
 
         let secret = generate_secret();
-        user_2fa.enable(secret.clone());
+        let backup_codes = user_2fa.enable(secret.clone());
         assert!(user_2fa.enabled);
         assert!(user_2fa.totp_config.is_some());
         assert!(!user_2fa.backup_codes.is_empty());
         assert_eq!(user_2fa.backup_codes.len(), 10);
+        assert_eq!(backup_codes.len(), 10);
+        assert!(
+            backup_codes
+                .iter()
+                .zip(user_2fa.backup_codes.iter())
+                .all(|(plain, stored)| hash_backup_code(plain) == *stored)
+        );
         assert_eq!(user_2fa.remaining_backup_codes(), 10);
 
         user_2fa.disable();
@@ -292,6 +302,19 @@ mod tests {
         // Test that the second code still works
         assert!(test_user.verify_backup_code(code2));
         assert_eq!(test_user.remaining_backup_codes(), 0);
+    }
+
+    #[test]
+    fn test_generated_backup_codes_are_usable_once() {
+        let mut user_2fa = User2FA::new("testuser".to_string());
+        let secret = generate_secret();
+        let backup_codes = user_2fa.enable(secret);
+
+        let first = backup_codes
+            .first()
+            .expect("2FA enable must emit at least one backup code");
+        assert!(user_2fa.verify_backup_code(first));
+        assert!(!user_2fa.verify_backup_code(first));
     }
 
     #[test]

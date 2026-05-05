@@ -266,7 +266,10 @@ impl State {
 
     /// Creates a new session token for a user.
     pub fn create_session(&self, username: &str) -> String {
-        let token = crate::protocol::now().to_bits().to_string();
+        use rand::{rngs::OsRng, RngCore};
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
         self.session_tokens
             .insert(token.clone(), username.to_string());
         token
@@ -320,11 +323,11 @@ impl State {
         *count += 1;
         if *count > self.max_msgs_per_minute {
             let reset_in = 60.0 - (now - *window_start);
-            (false, self.max_msgs_per_minute - *count, reset_in)
+            (false, 0, reset_in)
         } else {
             (
                 true,
-                self.max_msgs_per_minute - *count,
+                self.max_msgs_per_minute.saturating_sub(*count),
                 60.0 - (now - *window_start),
             )
         }

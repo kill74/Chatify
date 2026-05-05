@@ -4153,7 +4153,10 @@ async fn run_plugin_message_hooks(
 /// Lagged messages (`RecvError::Lagged`) are silently skipped ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the client
 /// will see a gap in the message stream, which is preferable to crashing the
 /// connection.
-fn spawn_broadcast_forwarder(mut rx: broadcast::Receiver<String>, out_tx: OutboundTx) {
+fn spawn_broadcast_forwarder(
+    mut rx: broadcast::Receiver<String>,
+    out_tx: OutboundTx,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -4166,7 +4169,7 @@ fn spawn_broadcast_forwarder(mut rx: broadcast::Receiver<String>, out_tx: Outbou
                 Err(_) => {} // Lagged: skip and continue
             }
         }
-    });
+    })
 }
 
 fn spawn_voice_audio_forwarder(
@@ -4193,7 +4196,7 @@ fn spawn_channel_forwarder(
     out_tx: OutboundTx,
     joined_channels: Arc<DashSet<String>>,
     channel: String,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             if !joined_channels.contains(&channel) {
@@ -4218,7 +4221,7 @@ fn spawn_channel_forwarder(
                 }
             }
         }
-    });
+    })
 }
 
 fn voice_event_room(event: &VoiceBroadcast) -> &str {
@@ -4239,7 +4242,7 @@ fn spawn_voice_relay_forwarder(
     mut rx: broadcast::Receiver<VoiceBroadcast>,
     out_tx: OutboundTx,
     active_room: Arc<RwLock<Option<String>>>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -4267,7 +4270,12 @@ fn spawn_voice_relay_forwarder(
                 Err(_) => {}
             }
         }
-    });
+    })
+}
+
+fn track_forwarder(forwarders: &mut Vec<JoinHandle<()>>, handle: JoinHandle<()>) {
+    forwarders.retain(|existing| !existing.is_finished());
+    forwarders.push(handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -4425,9 +4433,11 @@ struct ConnectionSession {
     voice_room: Option<String>,
     active_voice_room: Arc<RwLock<Option<String>>>,
     voice_audio_forwarder: Option<JoinHandle<()>>,
-    voice_relay_subscribed: bool,
+    voice_relay_forwarder: Option<JoinHandle<()>>,
     screen_room: Option<String>,
+    screen_forwarder: Option<JoinHandle<()>>,
     joined_channels: Arc<DashSet<String>>,
+    channel_forwarders: Vec<JoinHandle<()>>,
 }
 
 async fn handle_event(
@@ -4442,9 +4452,11 @@ async fn handle_event(
         voice_room,
         active_voice_room,
         voice_audio_forwarder,
-        voice_relay_subscribed,
+        voice_relay_forwarder,
         screen_room,
+        screen_forwarder,
         joined_channels,
+        channel_forwarders,
     } = session;
 
     let t = d["t"].as_str().unwrap_or("");
@@ -4879,11 +4891,14 @@ async fn handle_event(
             // Avoid duplicate forwarders when the same channel is joined
             // multiple times during one connection lifetime.
             if joined_channels.insert(ch.clone()) {
-                spawn_channel_forwarder(
-                    chan.tx.subscribe(),
-                    out_tx.clone(),
-                    joined_channels.clone(),
-                    ch.clone(),
+                track_forwarder(
+                    channel_forwarders,
+                    spawn_channel_forwarder(
+                        chan.tx.subscribe(),
+                        out_tx.clone(),
+                        joined_channels.clone(),
+                        ch.clone(),
+                    ),
                 );
             }
 
@@ -4932,6 +4947,7 @@ async fn handle_event(
             }
 
             let was_joined = joined_channels.remove(&ch).is_some();
+            channel_forwarders.retain(|handle| !handle.is_finished());
             state.store.remove_channel_subscription(username, &ch);
 
             send_out_json(
@@ -5391,13 +5407,12 @@ async fn handle_event(
                 let mut room_guard = active_voice_room.write().await;
                 *room_guard = Some(room.clone());
             }
-            if !*voice_relay_subscribed {
-                spawn_voice_relay_forwarder(
+            if voice_relay_forwarder.is_none() {
+                *voice_relay_forwarder = Some(spawn_voice_relay_forwarder(
                     state.voice_relay.subscribe(),
                     out_tx.clone(),
                     active_voice_room.clone(),
-                );
-                *voice_relay_subscribed = true;
+                ));
             }
             *voice_room = Some(room.clone());
             let join_voice = serde_json::json!({
@@ -5530,9 +5545,13 @@ async fn handle_event(
                 .map(safe_ch)
                 .unwrap_or_else(|| "general".to_string());
 
-            if screen_room.as_ref() != Some(&room) {
+            if screen_room.as_ref() != Some(&room) || screen_forwarder.is_none() {
+                if let Some(handle) = screen_forwarder.take() {
+                    handle.abort();
+                }
                 let stx = state.screen_tx(&room);
-                spawn_broadcast_forwarder(stx.subscribe(), out_tx.clone());
+                *screen_forwarder =
+                    Some(spawn_broadcast_forwarder(stx.subscribe(), out_tx.clone()));
                 *screen_room = Some(room.clone());
             }
 
@@ -5639,6 +5658,9 @@ async fn handle_event(
             }
         }
         "ss_stop" => {
+            if let Some(handle) = screen_forwarder.take() {
+                handle.abort();
+            }
             let requested_room = d
                 .get("r")
                 .or_else(|| d.get("ch"))
@@ -5971,7 +5993,7 @@ async fn handle_event(
             }
 
             let mut user_2fa = User2FA::new(username.to_string());
-            user_2fa.enable(secret);
+            let backup_codes = user_2fa.enable(secret);
             if !user_2fa.verify_totp(&code) {
                 send_err(out_tx, "invalid 2FA code", &state.metrics);
                 return;
@@ -5982,7 +6004,7 @@ async fn handle_event(
                 out_tx,
                 serde_json::json!({
                     "t":"2fa_enabled","enabled":true,
-                    "backup_codes":user_2fa.backup_codes,"ts":now()
+                    "backup_codes":backup_codes,"ts":now()
                 }),
             );
         }
@@ -7973,6 +7995,7 @@ where
     // challenge explicitly asks for enrollment/migration.
     let mut legacy_hash_to_persist: Option<String> = None;
     let mut v2_secret_to_persist: Option<String> = None;
+    let mut credential_verified = false;
     let credential_result = match credential {
         AuthCredential::LegacyHash(pw_hash) => {
             if state
@@ -8065,12 +8088,7 @@ where
     };
 
     match credential_result {
-        Ok(true) => {
-            state.store.clear_failed_logins(&username);
-            if let Some(secret) = v2_secret_to_persist.take() {
-                state.store.upsert_auth_v2_secret(&username, &secret);
-            }
-        } // Hash matches ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â proceed.
+        Ok(true) => credential_verified = true, // Hash matches — continue auth flow.
         Ok(false) => {
             let (locked, attempts) = state
                 .store
@@ -8187,12 +8205,57 @@ where
     }
 
     if let Err(err) = enforce_2fa_on_auth(&state, &username, otp_code.as_deref()) {
-        let _ = sink
-            .send(Message::text(
-                serde_json::json!({"t":"err","m":err.to_string()}).to_string(),
-            ))
-            .await;
+        let error_text = err.to_string();
+        if error_text == "invalid 2FA code" {
+            let (locked, attempts) = state
+                .store
+                .record_failed_login(&username, MAX_FAILED_ATTEMPTS);
+            if locked {
+                state.store.log_suspicious_activity(
+                    &username,
+                    "brute_force",
+                    "high",
+                    Some(&format!("{} failed 2FA attempts", attempts)),
+                );
+                let _ = sink
+                    .send(Message::text(
+                        serde_json::json!({
+                            "t":"err",
+                            "m":"account locked due to too many failed attempts",
+                            "locked": true,
+                            "retry_after": 900
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+            } else {
+                let remaining = MAX_FAILED_ATTEMPTS - attempts;
+                let _ = sink
+                    .send(Message::text(
+                        serde_json::json!({
+                            "t":"err",
+                            "m":"invalid 2FA code",
+                            "remaining_attempts": remaining
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+            }
+            warn!("auth failed: invalid 2FA code attempts={}", attempts);
+        } else {
+            let _ = sink
+                .send(Message::text(
+                    serde_json::json!({"t":"err","m":error_text}).to_string(),
+                ))
+                .await;
+        }
         return;
+    }
+    if credential_verified {
+        state.store.clear_failed_logins(&username);
+        if let Some(secret) = v2_secret_to_persist.take() {
+            state.store.upsert_auth_v2_secret(&username, &secret);
+        }
     }
 
     if is_default_online_status(&status) {
@@ -8273,10 +8336,17 @@ where
         state.prometheus.clone(),
     );
 
+    let mut channel_forwarders: Vec<JoinHandle<()>> = Vec::new();
     // Forward "general" broadcast to the outbound queue.
-    spawn_broadcast_forwarder(gen_rx, out_tx.clone());
+    track_forwarder(
+        &mut channel_forwarders,
+        spawn_broadcast_forwarder(gen_rx, out_tx.clone()),
+    );
     // Forward this user's DM broadcast channel to the outbound queue.
-    spawn_broadcast_forwarder(dm_rx, out_tx.clone());
+    track_forwarder(
+        &mut channel_forwarders,
+        spawn_broadcast_forwarder(dm_rx, out_tx.clone()),
+    );
 
     // Track subscribed channels for this connection to prevent duplicate
     // forwarders, support reconnect recovery, and allow leave-time cleanup.
@@ -8290,11 +8360,14 @@ where
         }
         if joined_channels.insert(channel.clone()) {
             let chan = state.chan(&channel);
-            spawn_channel_forwarder(
-                chan.tx.subscribe(),
-                out_tx.clone(),
-                joined_channels.clone(),
-                channel.clone(),
+            track_forwarder(
+                &mut channel_forwarders,
+                spawn_channel_forwarder(
+                    chan.tx.subscribe(),
+                    out_tx.clone(),
+                    joined_channels.clone(),
+                    channel.clone(),
+                ),
             );
             restored_subscriptions += 1;
         }
@@ -8324,9 +8397,11 @@ where
         voice_room: None,
         active_voice_room: Arc::new(RwLock::new(None)),
         voice_audio_forwarder: None,
-        voice_relay_subscribed: false,
+        voice_relay_forwarder: None,
         screen_room: None,
+        screen_forwarder: None,
         joined_channels: joined_channels.clone(),
+        channel_forwarders,
     };
 
     loop {
@@ -8399,6 +8474,9 @@ where
     if let Some(handle) = session.voice_audio_forwarder.take() {
         handle.abort();
     }
+    if let Some(handle) = session.voice_relay_forwarder.take() {
+        handle.abort();
+    }
     if let Some(room) = session.voice_room.take() {
         state.voice_relay.leave_room(&room, &username);
     }
@@ -8407,6 +8485,9 @@ where
         *room_guard = None;
     }
 
+    if let Some(handle) = session.screen_forwarder.take() {
+        handle.abort();
+    }
     if let Some(room) = session.screen_room.take() {
         if let Some(stx) = state.screen.get(&room) {
             let _ = stx.send(
@@ -8422,6 +8503,10 @@ where
                 .to_string(),
             );
         }
+    }
+    session.joined_channels.clear();
+    for handle in session.channel_forwarders.drain(..) {
+        handle.abort();
     }
 
     // Remove user presence so they no longer appear in the user directory.
@@ -8546,7 +8631,7 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
         let qr_url = chatify::totp::generate_qr_url(username, "Chatify", &secret);
 
         let mut user_2fa = chatify::totp::User2FA::new(username.clone());
-        user_2fa.enable(secret);
+        let backup_codes = user_2fa.enable(secret);
 
         state.store.upsert_user_2fa(&user_2fa);
         state
@@ -8568,7 +8653,7 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
         println!("  Secret: {}", config.secret);
         println!("  QR URL: {}", qr_url);
         println!("  Backup codes:");
-        for code in user_2fa.backup_codes.iter().take(10) {
+        for code in backup_codes.iter().take(10) {
             println!("    {}", code);
         }
         return Ok(());
