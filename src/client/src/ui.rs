@@ -40,7 +40,7 @@ use crate::media::{
     render_message_lines, MediaKind, MediaRenderStatus, RgbColor, StyledFragment, StyledLine,
     TimelineMedia, TimelinePayload,
 };
-use crate::state::{ActivityEntry, ClientState, ReplyPreview, SharedState};
+use crate::state::{ActivityEntry, ClientState, MediaGalleryState, ReplyPreview, SharedState};
 use chatify::error::{ChatifyError, ChatifyResult};
 
 #[derive(Clone, Debug)]
@@ -205,6 +205,10 @@ enum UiAction {
         is_error: bool,
     },
     PlayAudio(AudioPlaybackTarget),
+    SelectMediaGallery {
+        index: usize,
+        message_id: String,
+    },
     Quit,
 }
 
@@ -303,6 +307,10 @@ enum ClickAction {
         is_error: bool,
     },
     PlayAudio(AudioPlaybackTarget),
+    SelectMediaGallery {
+        index: usize,
+        message_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -554,6 +562,24 @@ const PALETTE_ACTIONS: &[PaletteAction] = &[
         },
     },
     PaletteAction {
+        label: "Show media",
+        detail: "Open the media gallery for this chat",
+        keywords: &["gallery", "attachments", "files"],
+        kind: PaletteActionKind::Execute("/media"),
+    },
+    PaletteAction {
+        label: "Show images",
+        detail: "Open recent image previews for this chat",
+        keywords: &["gallery", "media", "photos", "pictures"],
+        kind: PaletteActionKind::Execute("/media image"),
+    },
+    PaletteAction {
+        label: "Show audio notes",
+        detail: "Open recent playable audio notes for this chat",
+        keywords: &["gallery", "media", "voice", "sound"],
+        kind: PaletteActionKind::Execute("/media audio"),
+    },
+    PaletteAction {
         label: "Show people",
         detail: "Refresh users and key directory",
         keywords: &["users", "online", "presence"],
@@ -649,6 +675,21 @@ struct MediaPreviewCandidate {
     path: String,
 }
 
+#[derive(Clone)]
+struct MediaGalleryItem {
+    message_id: String,
+    sender: String,
+    when: String,
+    media: TimelineMedia,
+    audio_control: Option<AudioControlState>,
+}
+
+#[derive(Clone)]
+struct MediaGallerySnapshot {
+    state: MediaGalleryState,
+    items: Vec<MediaGalleryItem>,
+}
+
 struct MediaPreviewRuntime {
     picker: Option<Picker>,
     protocol_label: Option<String>,
@@ -678,6 +719,7 @@ struct UiSnapshot {
     auto_reconnect: bool,
     animations_enabled: bool,
     screen_active: bool,
+    media_gallery: Option<MediaGallerySnapshot>,
     media_preview: Option<MediaPreviewCandidate>,
     known_users: usize,
     total_unread: usize,
@@ -770,6 +812,26 @@ impl MediaPreviewRuntime {
             }
         }
     }
+}
+
+fn media_preview_candidate(
+    message_id: &str,
+    media: &TimelineMedia,
+) -> Option<MediaPreviewCandidate> {
+    if media.media_kind != MediaKind::Image {
+        return None;
+    }
+
+    Some(MediaPreviewCandidate {
+        key: if message_id.is_empty() {
+            media.file_id.clone()
+        } else {
+            message_id.to_string()
+        },
+        title: media.filename.clone(),
+        summary: media.summary_line(),
+        path: media.local_path.as_ref()?.clone(),
+    })
 }
 
 impl UiSnapshot {
@@ -916,21 +978,54 @@ impl UiSnapshot {
             .collect();
         online_people.sort_by_key(|row| (!row.online, row.user.to_ascii_lowercase()));
 
-        let media_preview = visible_messages.iter().rev().find_map(|message| {
-            let Some(TimelinePayload::Media(media)) = message.payload.as_ref() else {
-                return None;
-            };
-            if media.media_kind != MediaKind::Image {
-                return None;
-            }
+        let media_gallery = state.media_gallery.map(|gallery| {
+            let items: Vec<MediaGalleryItem> = visible_messages
+                .iter()
+                .rev()
+                .filter_map(|message| {
+                    let Some(TimelinePayload::Media(media)) = message.payload.as_ref() else {
+                        return None;
+                    };
+                    if !gallery.filter.matches(media.media_kind) {
+                        return None;
+                    }
 
-            Some(MediaPreviewCandidate {
-                key: message.id.clone(),
-                title: media.filename.clone(),
-                summary: media.summary_line(),
-                path: media.local_path.as_ref()?.clone(),
-            })
+                    Some(MediaGalleryItem {
+                        message_id: message.id.clone(),
+                        sender: message.sender.clone(),
+                        when: format_timestamp(message.ts),
+                        media: media.clone(),
+                        audio_control: audio_control_for_media(media, state.media_enabled),
+                    })
+                })
+                .take(gallery.limit)
+                .collect();
+            let selected = if items.is_empty() {
+                0
+            } else {
+                gallery.selected.min(items.len() - 1)
+            };
+            MediaGallerySnapshot {
+                state: MediaGalleryState {
+                    selected,
+                    ..gallery
+                },
+                items,
+            }
         });
+
+        let media_preview = media_gallery
+            .as_ref()
+            .and_then(|gallery| gallery.items.get(gallery.state.selected))
+            .and_then(|item| media_preview_candidate(&item.message_id, &item.media))
+            .or_else(|| {
+                visible_messages.iter().rev().find_map(|message| {
+                    let Some(TimelinePayload::Media(media)) = message.payload.as_ref() else {
+                        return None;
+                    };
+                    media_preview_candidate(&message.id, media)
+                })
+            });
 
         let composer_suggestions = mention_query(&state.input_buffer, state.input_cursor)
             .map(|query| mention_suggestions(state, &query.query))
@@ -956,6 +1051,7 @@ impl UiSnapshot {
             auto_reconnect: state.client_config.auto_reconnect,
             animations_enabled: state.client_config.animations_enabled,
             screen_active: state.screen_share.is_some(),
+            media_gallery,
             media_preview,
             known_users: state.users.len(),
             total_unread,
@@ -1078,6 +1174,11 @@ where
                     state_lock.add_activity(message, is_error);
                 }
                 UiAction::PlayAudio(target) => start_audio_playback(target),
+                UiAction::SelectMediaGallery { index, message_id } => {
+                    let mut state_lock = state.lock().await;
+                    state_lock.select_media_gallery_item(index);
+                    state_lock.focus_message_in_current_scope(&message_id);
+                }
             }
         }
 
@@ -1169,6 +1270,41 @@ async fn handle_event(
 
     if settings.open {
         return handle_settings_event(key.code, settings);
+    }
+
+    if key.code == KeyCode::Esc {
+        let mut state_lock = state.lock().await;
+        if state_lock.media_gallery.is_some() {
+            state_lock.close_media_gallery();
+            return UiAction::None;
+        }
+    }
+
+    if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter) {
+        let mut state_lock = state.lock().await;
+        if state_lock.media_gallery.is_some() && state_lock.input_buffer.trim().is_empty() {
+            let item_count = media_gallery_item_count(&state_lock);
+            match key.code {
+                KeyCode::Up => {
+                    state_lock.move_media_gallery_selection(item_count, false);
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    state_lock.move_media_gallery_selection(item_count, true);
+                    return UiAction::None;
+                }
+                KeyCode::Enter => {
+                    if let Some(message_id) = selected_gallery_message_id(&state_lock) {
+                        state_lock.focus_message_in_current_scope(&message_id);
+                    }
+                    if let Some(target) = selected_gallery_audio_target(&state_lock) {
+                        return UiAction::PlayAudio(target);
+                    }
+                    return UiAction::None;
+                }
+                _ => {}
+            }
+        }
     }
 
     match (key.code, key.modifiers) {
@@ -1326,6 +1462,60 @@ async fn handle_event(
     }
 }
 
+fn media_gallery_item_count(state: &ClientState) -> usize {
+    let Some(gallery) = state.media_gallery else {
+        return 0;
+    };
+    state
+        .message_history
+        .iter()
+        .rev()
+        .filter(|message| message.channel == state.ch)
+        .filter_map(|message| match message.payload.as_ref() {
+            Some(TimelinePayload::Media(media)) if gallery.filter.matches(media.media_kind) => {
+                Some(())
+            }
+            _ => None,
+        })
+        .take(gallery.limit)
+        .count()
+}
+
+fn selected_gallery_audio_target(state: &ClientState) -> Option<AudioPlaybackTarget> {
+    let gallery = state.media_gallery?;
+    state
+        .message_history
+        .iter()
+        .rev()
+        .filter(|message| message.channel == state.ch)
+        .filter_map(|message| match message.payload.as_ref() {
+            Some(TimelinePayload::Media(media)) if gallery.filter.matches(media.media_kind) => {
+                Some(media)
+            }
+            _ => None,
+        })
+        .take(gallery.limit)
+        .nth(gallery.selected)
+        .and_then(|media| audio_playback_target_for_media(media, state.media_enabled).ok())
+}
+
+fn selected_gallery_message_id(state: &ClientState) -> Option<String> {
+    let gallery = state.media_gallery?;
+    state
+        .message_history
+        .iter()
+        .rev()
+        .filter(|message| message.channel == state.ch)
+        .filter_map(|message| match message.payload.as_ref() {
+            Some(TimelinePayload::Media(media)) if gallery.filter.matches(media.media_kind) => {
+                Some(message.id.clone())
+            }
+            _ => None,
+        })
+        .take(gallery.limit)
+        .nth(gallery.selected)
+}
+
 fn handle_mouse_event(
     mouse: MouseEvent,
     palette: &PaletteState,
@@ -1365,6 +1555,9 @@ fn ui_action_from_click_action(action: ClickAction) -> UiAction {
             UiAction::AddActivity { message, is_error }
         }
         ClickAction::PlayAudio(target) => UiAction::PlayAudio(target),
+        ClickAction::SelectMediaGallery { index, message_id } => {
+            UiAction::SelectMediaGallery { index, message_id }
+        }
     }
 }
 
@@ -2013,7 +2206,7 @@ fn layout_mode(width: u16) -> UiLayoutMode {
 }
 
 fn right_panel_mode(snapshot: &UiSnapshot) -> RightPanelMode {
-    if snapshot.media_preview.is_some() {
+    if snapshot.media_gallery.is_some() || snapshot.media_preview.is_some() {
         RightPanelMode::Media
     } else if !snapshot.composer_suggestions.is_empty() {
         RightPanelMode::Suggestions
@@ -2045,6 +2238,8 @@ fn composer_hint(snapshot: &UiSnapshot) -> &'static str {
         "User and message"
     } else if snapshot.input_buffer.trim().starts_with("/search") {
         "Search words"
+    } else if snapshot.input_buffer.trim().starts_with("/media") {
+        "Media filter or limit"
     } else if snapshot.input_buffer.trim().is_empty() {
         "Message or Ctrl+K"
     } else {
@@ -2199,49 +2394,56 @@ fn screen_quick_button(snapshot: &UiSnapshot) -> QuickButton {
 }
 
 fn media_quick_buttons(snapshot: &UiSnapshot) -> Vec<QuickButton> {
-    [
-        (
-            "Image",
-            "/image \"\"",
-            "Open image upload with a quoted path",
-        ),
-        (
-            "Video",
-            "/video \"\"",
-            "Open video upload with a quoted path",
-        ),
-        (
-            "Audio",
-            "/audio \"\"",
-            "Open audio-note upload with a quoted path",
-        ),
-    ]
-    .into_iter()
-    .map(|(label, value, activity)| {
-        if snapshot.media_enabled {
-            QuickButton {
-                label,
-                action: ClickAction::Prefill {
-                    value: value.to_string(),
-                    cursor_back: 1,
-                    activity,
-                },
-                enabled: true,
+    let mut buttons = vec![QuickButton {
+        label: "Gallery",
+        action: ClickAction::Execute("/media".to_string()),
+        enabled: true,
+    }];
+    buttons.extend(
+        [
+            (
+                "Image",
+                "/image \"\"",
+                "Open image upload with a quoted path",
+            ),
+            (
+                "Video",
+                "/video \"\"",
+                "Open video upload with a quoted path",
+            ),
+            (
+                "Audio",
+                "/audio \"\"",
+                "Open audio-note upload with a quoted path",
+            ),
+        ]
+        .into_iter()
+        .map(|(label, value, activity)| {
+            if snapshot.media_enabled {
+                QuickButton {
+                    label,
+                    action: ClickAction::Prefill {
+                        value: value.to_string(),
+                        cursor_back: 1,
+                        activity,
+                    },
+                    enabled: true,
+                }
+            } else {
+                QuickButton {
+                    label,
+                    action: ClickAction::AddActivity {
+                        message:
+                            "media uploads are disabled by client settings (--no-media or config)."
+                                .to_string(),
+                        is_error: true,
+                    },
+                    enabled: false,
+                }
             }
-        } else {
-            QuickButton {
-                label,
-                action: ClickAction::AddActivity {
-                    message:
-                        "media uploads are disabled by client settings (--no-media or config)."
-                            .to_string(),
-                    is_error: true,
-                },
-                enabled: false,
-            }
-        }
-    })
-    .collect()
+        }),
+    );
+    buttons
 }
 
 fn chat_quick_buttons() -> Vec<QuickButton> {
@@ -3192,7 +3394,9 @@ fn render_right_panel(
 ) {
     match right_panel_mode(snapshot) {
         RightPanelMode::Media => {
-            if let Some(candidate) = &snapshot.media_preview {
+            if let Some(gallery) = &snapshot.media_gallery {
+                render_media_gallery_panel(frame, area, snapshot, gallery, media_preview, hitboxes);
+            } else if let Some(candidate) = &snapshot.media_preview {
                 render_media_preview_panel(frame, area, snapshot, candidate, media_preview);
             }
         }
@@ -3389,6 +3593,243 @@ fn render_now_panel(
     frame.render_widget(now, area);
 }
 
+fn render_media_gallery_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    gallery: &MediaGallerySnapshot,
+    media_preview: &mut MediaPreviewRuntime,
+    hitboxes: &mut UiHitboxes,
+) {
+    let title = format!(
+        "Media Gallery - {} ({})",
+        gallery.state.filter.label(),
+        gallery.items.len()
+    );
+    let block = panel_block(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 4 || inner.height == 0 {
+        return;
+    }
+
+    if gallery.items.is_empty() {
+        let empty = Paragraph::new(Text::from(vec![
+            Line::from(Span::styled(
+                format!("No {} in this chat yet.", gallery.state.filter.label()),
+                muted_style(),
+            )),
+            if snapshot.media_enabled {
+                Line::from(Span::styled(
+                    "Use /image, /audio, /video, or /file.",
+                    muted_style(),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    "Media is disabled in client settings.",
+                    muted_style(),
+                ))
+            },
+        ]))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(empty, inner);
+        return;
+    }
+
+    let selected_index = gallery.state.selected.min(gallery.items.len() - 1);
+    let selected = &gallery.items[selected_index];
+    let detail_height = if inner.height >= 14 {
+        8
+    } else if inner.height >= 10 {
+        5
+    } else {
+        0
+    };
+    let areas = if detail_height > 0 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(detail_height), Constraint::Min(1)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1)])
+            .split(inner)
+    };
+
+    let list_area = if detail_height > 0 {
+        render_selected_media_detail(frame, areas[0], snapshot, selected, media_preview, hitboxes);
+        areas[1]
+    } else {
+        inner
+    };
+
+    render_media_gallery_list(frame, list_area, gallery, selected_index, hitboxes);
+}
+
+fn render_selected_media_detail(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &UiSnapshot,
+    item: &MediaGalleryItem,
+    media_preview: &mut MediaPreviewRuntime,
+    hitboxes: &mut UiHitboxes,
+) {
+    let media = &item.media;
+    if snapshot.media_enabled && media.media_kind == MediaKind::Image {
+        if let Some(reason) = media_preview.unsupported_reason.as_deref() {
+            render_media_detail_text(frame, area, item, Some(reason), hitboxes);
+            return;
+        }
+        if let Some(error) = media_preview.last_error.as_deref() {
+            render_media_detail_text(frame, area, item, Some(error), hitboxes);
+            return;
+        }
+        if let Some(image) = media_preview.image.as_mut() {
+            frame.render_stateful_widget(StatefulImage::default(), area, image);
+            return;
+        }
+    }
+
+    let status = if !snapshot.media_enabled {
+        Some("Media rendering is disabled.")
+    } else {
+        None
+    };
+    render_media_detail_text(frame, area, item, status, hitboxes);
+}
+
+fn render_media_detail_text(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    item: &MediaGalleryItem,
+    status: Option<&str>,
+    hitboxes: &mut UiHitboxes,
+) {
+    let media = &item.media;
+    let mut lines = vec![
+        Line::from(Span::styled(media.filename.clone(), panel_title_style())),
+        Line::from(vec![
+            Span::styled(media.media_kind.label(), label_style()),
+            Span::raw("  "),
+            Span::styled(media.summary_line(), secondary_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("from ", label_style()),
+            Span::styled(item.sender.clone(), primary_style()),
+            Span::raw("  "),
+            Span::styled(media_status_label(media), muted_style()),
+        ]),
+    ];
+
+    if let Some(path) = media.local_path.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("saved: {}", path),
+            muted_style(),
+        )));
+    } else if let Some(progress) = media.progress_label() {
+        lines.push(Line::from(Span::styled(progress, muted_style())));
+    }
+
+    if let Some(status) = status {
+        lines.push(Line::from(Span::styled(status.to_string(), muted_style())));
+    }
+
+    if let Some(control) = &item.audio_control {
+        let row = lines.len();
+        let mut spans = vec![Span::styled("audio", label_style())];
+        append_audio_control_spans(&mut spans, control);
+        if let AudioControlState::Play(target) = control {
+            let start_col = "audio  ".chars().count();
+            let width = audio_control_label(control).chars().count();
+            if area.width > start_col as u16 && row < area.height as usize {
+                hitboxes.push_audio(
+                    Rect {
+                        x: area.x.saturating_add(start_col as u16),
+                        y: area.y.saturating_add(row as u16),
+                        width: width as u16,
+                        height: 1,
+                    },
+                    target.clone(),
+                );
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let details = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    frame.render_widget(details, area);
+}
+
+fn render_media_gallery_list(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    gallery: &MediaGallerySnapshot,
+    selected_index: usize,
+    hitboxes: &mut UiHitboxes,
+) {
+    let visible_rows = area.height as usize;
+    let start_index = selected_index
+        .saturating_add(1)
+        .saturating_sub(visible_rows);
+    let mut lines = Vec::new();
+    for (row, (index, item)) in gallery
+        .items
+        .iter()
+        .enumerate()
+        .skip(start_index)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let media = &item.media;
+        let selected = index == selected_index;
+        let marker = if selected { "> " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker,
+                if selected {
+                    accent_style()
+                } else {
+                    muted_style()
+                },
+            ),
+            Span::styled(media.media_kind.label(), label_style()),
+            Span::raw(" "),
+            Span::styled(media.filename.clone(), primary_style()),
+            Span::raw(" "),
+            Span::styled(item.when.clone(), muted_style()),
+        ]));
+        hitboxes.push_control(
+            Rect {
+                x: area.x,
+                y: area.y.saturating_add(row as u16),
+                width: area.width,
+                height: 1,
+            },
+            ClickAction::SelectMediaGallery {
+                index,
+                message_id: item.message_id.clone(),
+            },
+        );
+    }
+
+    let list = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    frame.render_widget(list, area);
+}
+
+fn media_status_label(media: &TimelineMedia) -> &'static str {
+    match media.render_status {
+        MediaRenderStatus::MetadataOnly => "metadata",
+        MediaRenderStatus::Pending => "receiving",
+        MediaRenderStatus::Complete => "complete",
+        MediaRenderStatus::Disabled => "disabled",
+        MediaRenderStatus::Unsupported => "unsupported",
+        MediaRenderStatus::TooLarge => "too large",
+        MediaRenderStatus::DecodeFailed => "preview failed",
+    }
+}
+
 fn render_media_preview_panel(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -3572,7 +4013,7 @@ mod tests {
     use crate::args::ClientConfig;
     use crate::{
         media::{MediaKind, MediaRenderStatus, TimelineMedia, TimelinePayload},
-        state::{ClientState, DisplayedMessage, PeerTrust, ReplyPreview},
+        state::{ClientState, DisplayedMessage, MediaGalleryFilter, PeerTrust, ReplyPreview},
     };
     use ratatui::{backend::TestBackend, layout::Rect, Terminal};
     use std::fs;
@@ -3622,6 +4063,45 @@ mod tests {
             preview: Vec::new(),
             render_status,
         }
+    }
+
+    fn image_media(file_id: &str, filename: &str, local_path: Option<String>) -> TimelineMedia {
+        TimelineMedia {
+            file_id: file_id.to_string(),
+            filename: filename.to_string(),
+            media_kind: MediaKind::Image,
+            mime: Some("image/png".to_string()),
+            size: 64,
+            duration_ms: None,
+            received_bytes: 64,
+            local_path,
+            preview: Vec::new(),
+            render_status: MediaRenderStatus::Complete,
+        }
+    }
+
+    fn media_message(id: &str, ts: f64, sender: &str, media: TimelineMedia) -> DisplayedMessage {
+        DisplayedMessage {
+            id: id.to_string(),
+            ts,
+            channel: "general".to_string(),
+            sender: sender.to_string(),
+            content: format!("[{}] {}", media.media_kind.label(), media.filename),
+            reply: None,
+            payload: Some(TimelinePayload::Media(media)),
+            encrypted: false,
+            edited: false,
+        }
+    }
+
+    fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     #[test]
@@ -3944,9 +4424,13 @@ mod tests {
         let mut state = make_test_state();
         let snapshot = UiSnapshot::from_state(&state);
         let buttons = media_quick_buttons(&snapshot);
-        assert_eq!(buttons.len(), 3);
+        assert_eq!(buttons.len(), 4);
         assert_eq!(
             buttons[0].action,
+            ClickAction::Execute("/media".to_string())
+        );
+        assert_eq!(
+            buttons[1].action,
             ClickAction::Prefill {
                 value: "/image \"\"".to_string(),
                 cursor_back: 1,
@@ -3958,7 +4442,7 @@ mod tests {
         let snapshot = UiSnapshot::from_state(&state);
         let buttons = media_quick_buttons(&snapshot);
         assert!(matches!(
-            buttons[0].action,
+            buttons[1].action,
             ClickAction::AddActivity { is_error: true, .. }
         ));
     }
@@ -4334,6 +4818,18 @@ mod tests {
     }
 
     #[test]
+    fn palette_exposes_media_gallery_actions() {
+        let labels: Vec<&str> = filtered_palette_actions("gallery")
+            .into_iter()
+            .map(|action| action.label)
+            .collect();
+
+        assert!(labels.contains(&"Show media"));
+        assert!(labels.contains(&"Show images"));
+        assert!(labels.contains(&"Show audio notes"));
+    }
+
+    #[test]
     fn layout_mode_hides_right_panel_on_narrow_terminals() {
         assert_eq!(layout_mode(107), UiLayoutMode::Narrow);
         assert_eq!(layout_mode(108), UiLayoutMode::Full);
@@ -4350,28 +4846,12 @@ mod tests {
         let snapshot = UiSnapshot::from_state(&state);
         assert_eq!(right_panel_mode(&snapshot), RightPanelMode::Suggestions);
 
-        state.message_history.push_back(DisplayedMessage {
-            id: "media:general:img-1".to_string(),
-            ts: 1.0,
-            channel: "general".to_string(),
-            sender: "alice".to_string(),
-            content: "[image] preview.png".to_string(),
-            reply: None,
-            payload: Some(TimelinePayload::Media(TimelineMedia {
-                file_id: "img-1".to_string(),
-                filename: "preview.png".to_string(),
-                media_kind: MediaKind::Image,
-                mime: Some("image/png".to_string()),
-                size: 64,
-                duration_ms: None,
-                received_bytes: 64,
-                local_path: Some("/tmp/preview.png".to_string()),
-                preview: Vec::new(),
-                render_status: MediaRenderStatus::Complete,
-            })),
-            encrypted: false,
-            edited: false,
-        });
+        state.message_history.push_back(media_message(
+            "media:general:img-1",
+            1.0,
+            "alice",
+            image_media("img-1", "preview.png", Some("/tmp/preview.png".to_string())),
+        ));
         let snapshot = UiSnapshot::from_state(&state);
         assert_eq!(right_panel_mode(&snapshot), RightPanelMode::Media);
     }
@@ -4406,28 +4886,16 @@ mod tests {
     #[test]
     fn ui_snapshot_prefers_latest_image_with_local_path_for_preview_panel() {
         let mut state = make_test_state();
-        state.message_history.push_back(DisplayedMessage {
-            id: "media:general:img-1".to_string(),
-            ts: 1.0,
-            channel: "general".to_string(),
-            sender: "alice".to_string(),
-            content: "[image] preview.png".to_string(),
-            reply: None,
-            payload: Some(TimelinePayload::Media(TimelineMedia {
-                file_id: "img-1".to_string(),
-                filename: "preview.png".to_string(),
-                media_kind: MediaKind::Image,
-                mime: Some("image/png".to_string()),
-                size: 64,
-                duration_ms: None,
-                received_bytes: 64,
-                local_path: Some("C:/tmp/preview.png".to_string()),
-                preview: Vec::new(),
-                render_status: MediaRenderStatus::Complete,
-            })),
-            encrypted: false,
-            edited: false,
-        });
+        state.message_history.push_back(media_message(
+            "media:general:img-1",
+            1.0,
+            "alice",
+            image_media(
+                "img-1",
+                "preview.png",
+                Some("C:/tmp/preview.png".to_string()),
+            ),
+        ));
 
         let snapshot = UiSnapshot::from_state(&state);
         let preview = snapshot
@@ -4435,5 +4903,171 @@ mod tests {
             .expect("latest image should be promoted to the preview panel");
         assert_eq!(preview.title, "preview.png");
         assert_eq!(preview.path, "C:/tmp/preview.png");
+    }
+
+    #[test]
+    fn media_gallery_snapshot_lists_recent_media_for_active_scope() {
+        let mut state = make_test_state();
+        state.message_history.push_back(media_message(
+            "media:general:img-1",
+            1.0,
+            "alice",
+            image_media(
+                "img-1",
+                "preview.png",
+                Some("C:/tmp/preview.png".to_string()),
+            ),
+        ));
+        state.message_history.push_back(media_message(
+            "media:general:audio-1",
+            2.0,
+            "bob",
+            audio_media(MediaRenderStatus::Pending, 4, None),
+        ));
+        state.open_media_gallery(MediaGalleryFilter::All, 10);
+
+        let snapshot = UiSnapshot::from_state(&state);
+        let gallery = snapshot
+            .media_gallery
+            .as_ref()
+            .expect("media gallery should be present");
+        assert_eq!(gallery.items.len(), 2);
+        assert_eq!(gallery.items[0].message_id, "media:general:audio-1");
+        assert_eq!(gallery.items[1].message_id, "media:general:img-1");
+        assert_eq!(right_panel_mode(&snapshot), RightPanelMode::Media);
+    }
+
+    #[test]
+    fn media_gallery_snapshot_shows_empty_state_when_no_media_matches() {
+        let mut state = make_test_state();
+        state.open_media_gallery(MediaGalleryFilter::Video, 10);
+
+        let snapshot = UiSnapshot::from_state(&state);
+        let gallery = snapshot
+            .media_gallery
+            .as_ref()
+            .expect("media gallery should stay open without matches");
+        assert!(gallery.items.is_empty());
+        assert_eq!(gallery.state.selected, 0);
+        assert!(snapshot.media_preview.is_none());
+        assert_eq!(right_panel_mode(&snapshot), RightPanelMode::Media);
+    }
+
+    #[test]
+    fn media_gallery_selected_image_drives_preview_panel() {
+        let mut state = make_test_state();
+        state.message_history.push_back(media_message(
+            "media:general:img-1",
+            1.0,
+            "alice",
+            image_media(
+                "img-1",
+                "preview.png",
+                Some("C:/tmp/preview.png".to_string()),
+            ),
+        ));
+        state.message_history.push_back(media_message(
+            "media:general:audio-1",
+            2.0,
+            "bob",
+            audio_media(MediaRenderStatus::Pending, 4, None),
+        ));
+        state.open_media_gallery(MediaGalleryFilter::All, 10);
+        state.select_media_gallery_item(1);
+
+        let snapshot = UiSnapshot::from_state(&state);
+        let preview = snapshot
+            .media_preview
+            .expect("selected image should be promoted to the preview panel");
+        assert_eq!(preview.key, "media:general:img-1");
+        assert_eq!(preview.title, "preview.png");
+    }
+
+    #[test]
+    fn media_gallery_audio_items_expose_playable_pending_and_unavailable_states() {
+        let path = temp_audio_file_path();
+        fs::write(&path, b"placeholder audio bytes").expect("write audio placeholder");
+        let path_text = path.to_string_lossy().to_string();
+
+        let mut state = make_test_state();
+        state.message_history.push_back(media_message(
+            "media:general:audio-play",
+            1.0,
+            "alice",
+            audio_media(MediaRenderStatus::Complete, 12, Some(path_text.clone())),
+        ));
+        state.message_history.push_back(media_message(
+            "media:general:audio-pending",
+            2.0,
+            "bob",
+            audio_media(MediaRenderStatus::Pending, 4, None),
+        ));
+        state.message_history.push_back(media_message(
+            "media:general:audio-missing",
+            3.0,
+            "carol",
+            audio_media(
+                MediaRenderStatus::Complete,
+                12,
+                Some("C:/chatify/missing/voice-note.ogg".to_string()),
+            ),
+        ));
+        state.open_media_gallery(MediaGalleryFilter::Audio, 10);
+
+        let snapshot = UiSnapshot::from_state(&state);
+        let gallery = snapshot
+            .media_gallery
+            .expect("audio media gallery should be present");
+        assert!(matches!(
+            gallery.items[0].audio_control,
+            Some(AudioControlState::Unavailable)
+        ));
+        assert!(matches!(
+            gallery.items[1].audio_control,
+            Some(AudioControlState::Receiving)
+        ));
+        assert!(matches!(
+            gallery.items[2].audio_control,
+            Some(AudioControlState::Play(AudioPlaybackTarget { ref local_path, .. }))
+                if local_path == &path_text
+        ));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn media_gallery_render_mentions_disabled_media_setting() {
+        let mut state = make_test_state();
+        state.media_enabled = false;
+        state.open_media_gallery(MediaGalleryFilter::Image, 10);
+        let snapshot = UiSnapshot::from_state(&state);
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 32)).expect("test terminal should initialize");
+        let mut media_preview = MediaPreviewRuntime {
+            picker: None,
+            protocol_label: None,
+            unsupported_reason: None,
+            active_key: None,
+            image: None,
+            last_error: None,
+        };
+        let palette = PaletteState::default();
+        let settings = SettingsState::default();
+        let mut hitboxes = UiHitboxes::default();
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &snapshot,
+                    &mut media_preview,
+                    &palette,
+                    &settings,
+                    &mut hitboxes,
+                )
+            })
+            .expect("media gallery render should succeed");
+
+        assert!(terminal_text(&terminal).contains("Media is disabled"));
     }
 }

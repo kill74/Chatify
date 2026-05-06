@@ -12,7 +12,34 @@ Thanks for contributing to Chatify.
 
 ## Quality Gates
 
-Run all checks before opening a pull request:
+Run the local CI-equivalent gate before opening a pull request or calling a
+task complete:
+
+```powershell
+.\scripts\ci-local.ps1
+```
+
+This script mirrors the GitHub Actions quality gates and does not rewrite
+tracked files. It runs the release target inventory check, workspace compile,
+format check, Clippy, workspace tests, protocol contract gates, and
+feature-gated bridge builds.
+
+For a release-readiness summary with branch, commit, dirty-worktree status, and
+gate durations, run:
+
+```powershell
+.\scripts\release-readiness.ps1
+```
+
+`release-readiness.ps1` fails when tracked worktree changes are present. Use
+`-AllowDirty` only when intentionally validating uncommitted local work. Add
+`-Json` when automation needs a structured report.
+
+After pushing a branch or opening a PR, verify the GitHub Actions result before
+calling the work complete. At minimum, inspect the CI workflow; also inspect
+CodeQL and Windows package smoke when those workflows run.
+
+Equivalent manual commands:
 
 1. cargo fmt --all --check
 2. cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -39,6 +66,7 @@ Optional feature check for Discord bridge:
 2. Include testing evidence.
 3. Call out protocol or schema changes explicitly.
 4. Update README and docs when behavior changes.
+5. Link or summarize the relevant GitHub Actions result after pushing.
 
 ## Style Expectations
 

@@ -21,7 +21,7 @@ use chatify::error::{ChatifyError, ChatifyResult};
 use chatify_client::{
     args::Args,
     handlers,
-    state::{ClientState, OutgoingMediaMeta, SharedState},
+    state::{ClientState, MediaGalleryFilter, OutgoingMediaMeta, SharedState},
     voice::{start_voice_session, VoiceEvent},
 };
 
@@ -48,6 +48,8 @@ const MAX_RECENT_LIMIT: usize = 50;
 const DEFAULT_REACTION_SYNC_LIMIT: usize = 500;
 const DEFAULT_TRUST_AUDIT_LIMIT: usize = 20;
 const MAX_TRUST_AUDIT_LIMIT: usize = 200;
+const DEFAULT_MEDIA_GALLERY_LIMIT: usize = 25;
+const MAX_MEDIA_GALLERY_LIMIT: usize = 100;
 
 #[derive(Clone, Copy)]
 struct CommandHelp {
@@ -77,6 +79,12 @@ enum AdminCommand {
         role: String,
     },
     Audit(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaCommand {
+    filter: MediaGalleryFilter,
+    limit: usize,
 }
 
 #[cfg(feature = "bridge-client")]
@@ -126,6 +134,12 @@ const COMMANDS: &[CommandHelp] = &[
         name: "/replay",
         usage: "/replay <from_ts> [#ch|dm:user] [limit=N]",
         summary: "Replay events from a timestamp",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/media",
+        usage: "/media [image|audio|video|file|all] [limit]",
+        summary: "Open the local media gallery for the active room or DM",
         aliases: &[],
     },
     CommandHelp {
@@ -519,6 +533,39 @@ fn parse_plugin_command(input: &str) -> Result<PluginCommand, &'static str> {
             .ok_or("Usage: /plugin disable <plugin>"),
         _ => Err("Usage: /plugin [list|install <plugin>|disable <plugin>]"),
     }
+}
+
+fn parse_media_command(input: &str) -> Result<MediaCommand, &'static str> {
+    let mut parts = input.split_whitespace();
+    let _ = parts.next();
+    let usage = "Usage: /media [image|audio|video|file|all] [limit]";
+
+    let mut filter = MediaGalleryFilter::All;
+    let mut limit = DEFAULT_MEDIA_GALLERY_LIMIT;
+
+    if let Some(first) = parts.next() {
+        if let Ok(parsed_limit) = first.parse::<usize>() {
+            limit = parsed_limit.clamp(1, MAX_MEDIA_GALLERY_LIMIT);
+        } else if let Some(parsed_filter) = MediaGalleryFilter::from_token(first) {
+            filter = parsed_filter;
+        } else {
+            return Err(usage);
+        }
+    }
+
+    if let Some(second) = parts.next() {
+        if let Ok(parsed_limit) = second.parse::<usize>() {
+            limit = parsed_limit.clamp(1, MAX_MEDIA_GALLERY_LIMIT);
+        } else {
+            return Err(usage);
+        }
+    }
+
+    if parts.next().is_some() {
+        return Err(usage);
+    }
+
+    Ok(MediaCommand { filter, limit })
 }
 
 fn parse_admin_command(input: &str) -> Result<AdminCommand, &'static str> {
@@ -1224,6 +1271,23 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 );
             }
         }
+        "/media" => match parse_media_command(trimmed) {
+            Ok(command) => {
+                let mut state_lock = state.lock().await;
+                state_lock.open_media_gallery(command.filter, command.limit);
+                let scope_label = format_scope_for_help(&state_lock.ch);
+                state_lock.add_activity(
+                    format!(
+                        "Showing {} for {} (limit {}).",
+                        command.filter.label(),
+                        scope_label,
+                        command.limit
+                    ),
+                    false,
+                );
+            }
+            Err(usage) => println!("{}", usage),
+        },
         "/users" => {
             let state_lock = state.lock().await;
             if let Err(err) = state_lock.send_json(serde_json::json!({"t": "users"})) {
@@ -2697,11 +2761,14 @@ mod tests {
     use super::{
         build_notification_export, build_notify_diagnostics_json, notification_key_for_token,
         notification_value_for_key, notify_export_default_path, parse_admin_command,
-        parse_notify_probe_level, parse_notify_test_args, parse_plugin_command, parse_toggle_bool,
-        redact_notification_export, sanitize_notify_component, AdminCommand, PluginCommand,
+        parse_media_command, parse_notify_probe_level, parse_notify_test_args,
+        parse_plugin_command, parse_toggle_bool, redact_notification_export,
+        sanitize_notify_component, AdminCommand, MediaCommand, PluginCommand,
+        DEFAULT_MEDIA_GALLERY_LIMIT, MAX_MEDIA_GALLERY_LIMIT,
     };
     #[cfg(feature = "bridge-client")]
     use super::{parse_bridge_command, BridgeCommand};
+    use chatify_client::state::MediaGalleryFilter;
 
     #[test]
     fn parse_toggle_bool_accepts_truthy_and_falsey_values() {
@@ -2789,6 +2856,50 @@ mod tests {
         assert_eq!(
             parse_plugin_command("/plugin list extra"),
             Err("Usage: /plugin [list|install <plugin>|disable <plugin>]")
+        );
+    }
+
+    #[test]
+    fn parse_media_command_supports_filter_and_limit() {
+        assert_eq!(
+            parse_media_command("/media"),
+            Ok(MediaCommand {
+                filter: MediaGalleryFilter::All,
+                limit: DEFAULT_MEDIA_GALLERY_LIMIT,
+            })
+        );
+        assert_eq!(
+            parse_media_command("/media image"),
+            Ok(MediaCommand {
+                filter: MediaGalleryFilter::Image,
+                limit: DEFAULT_MEDIA_GALLERY_LIMIT,
+            })
+        );
+        assert_eq!(
+            parse_media_command("/media audio 50"),
+            Ok(MediaCommand {
+                filter: MediaGalleryFilter::Audio,
+                limit: 50,
+            })
+        );
+        assert_eq!(
+            parse_media_command("/media 200"),
+            Ok(MediaCommand {
+                filter: MediaGalleryFilter::All,
+                limit: MAX_MEDIA_GALLERY_LIMIT,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_media_command_rejects_invalid_input() {
+        assert_eq!(
+            parse_media_command("/media stickers"),
+            Err("Usage: /media [image|audio|video|file|all] [limit]")
+        );
+        assert_eq!(
+            parse_media_command("/media image extra"),
+            Err("Usage: /media [image|audio|video|file|all] [limit]")
         );
     }
 

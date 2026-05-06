@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, Mutex};
 use zeroize::Zeroize;
 
 use crate::args::ClientConfig;
-use crate::media::{PendingMediaTransfer, TimelinePayload};
+use crate::media::{MediaKind, PendingMediaTransfer, TimelinePayload};
 
 const MAX_MESSAGE_HISTORY: usize = 1000;
 const MAX_REACTION_EVENT_DEDUP: usize = 10_000;
@@ -125,6 +125,8 @@ pub struct ClientState {
     pub screen_last_frame_seq: Option<u64>,
     /// Username of the user whose screen we're viewing.
     pub screen_last_frame_from: Option<String>,
+    /// Active media gallery panel state, if the user opened `/media`.
+    pub media_gallery: Option<MediaGalleryState>,
     /// Usernames of members in the current voice room.
     pub voice_members: Vec<String>,
     /// Whether this client's microphone is muted in voice.
@@ -251,6 +253,55 @@ pub struct FileTransfer {
     pub direction: FileTransferDirection,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaGalleryFilter {
+    All,
+    Image,
+    Audio,
+    Video,
+    File,
+}
+
+impl MediaGalleryFilter {
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "all" => Some(Self::All),
+            "image" | "images" => Some(Self::Image),
+            "audio" | "audios" | "note" | "notes" => Some(Self::Audio),
+            "video" | "videos" => Some(Self::Video),
+            "file" | "files" => Some(Self::File),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all media",
+            Self::Image => "images",
+            Self::Audio => "audio notes",
+            Self::Video => "videos",
+            Self::File => "files",
+        }
+    }
+
+    pub fn matches(self, kind: MediaKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Image => kind == MediaKind::Image,
+            Self::Audio => kind == MediaKind::Audio,
+            Self::Video => kind == MediaKind::Video,
+            Self::File => kind == MediaKind::File,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaGalleryState {
+    pub filter: MediaGalleryFilter,
+    pub limit: usize,
+    pub selected: usize,
+}
+
 pub enum FileTransferDirection {
     Upload,
     Download,
@@ -365,6 +416,7 @@ impl ClientState {
             screen_frames_received: 0,
             screen_last_frame_seq: None,
             screen_last_frame_from: None,
+            media_gallery: None,
             voice_members: Vec::new(),
             voice_muted: false,
             voice_deafened: false,
@@ -454,6 +506,69 @@ impl ClientState {
             let overflow = self.activity_log.len() - MAX_ACTIVITY_LOG;
             self.activity_log.drain(0..overflow);
         }
+    }
+
+    pub fn open_media_gallery(&mut self, filter: MediaGalleryFilter, limit: usize) {
+        let selected = self
+            .media_gallery
+            .filter(|gallery| gallery.filter == filter)
+            .map(|gallery| gallery.selected)
+            .unwrap_or(0);
+        self.media_gallery = Some(MediaGalleryState {
+            filter,
+            limit,
+            selected,
+        });
+    }
+
+    pub fn close_media_gallery(&mut self) {
+        self.media_gallery = None;
+    }
+
+    pub fn select_media_gallery_item(&mut self, selected: usize) {
+        if let Some(gallery) = &mut self.media_gallery {
+            gallery.selected = selected;
+        }
+    }
+
+    pub fn move_media_gallery_selection(&mut self, item_count: usize, forward: bool) {
+        let Some(gallery) = &mut self.media_gallery else {
+            return;
+        };
+        if item_count == 0 {
+            gallery.selected = 0;
+            return;
+        }
+
+        gallery.selected = gallery.selected.min(item_count - 1);
+        gallery.selected = if forward {
+            (gallery.selected + 1) % item_count
+        } else if gallery.selected == 0 {
+            item_count - 1
+        } else {
+            gallery.selected - 1
+        };
+    }
+
+    pub fn focus_message_in_current_scope(&mut self, message_id: &str) {
+        if message_id.is_empty() {
+            return;
+        }
+
+        let mut visible: Vec<&DisplayedMessage> = self
+            .message_history
+            .iter()
+            .filter(|message| message.channel == self.ch)
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+
+        if let Some(index) = visible.iter().position(|message| message.id == message_id) {
+            let newer_messages = visible.len().saturating_sub(index + 1);
+            self.scroll_offset = newer_messages.saturating_mul(3);
+        }
+        visible.clear();
     }
 
     pub fn add_reaction(&mut self, msg_id: &str, emoji: &str) {

@@ -30,6 +30,7 @@
 | `/reply <msg_id\|#index> <message>`                               | Reply to a channel message by stable `msg_id` or recent index      |
 | `/react <msg_id\|#index> <emoji>`                                 | React to a message by stable `msg_id` or recent index              |
 | `/sync`                                                           | Request reaction sync for the active channel                       |
+| `/media [image\|audio\|video\|file\|all] [limit]`                 | Open the local media gallery for the active room or DM             |
 | `/image "<path>"`                                                 | Send an image file to the active channel                           |
 | `/video "<path>"`                                                 | Send a video file to the active channel                            |
 | `/audio "<path>"`                                                 | Send a short audio note to the active channel                      |
@@ -59,9 +60,12 @@ do not need to memorize slash commands for the main flows.
 - While in voice, click `Leave`, `Mic`/`Mute`, and `Sound`/`Deafen` to control
   the call.
 - Click `Share` / `Stop share` to start or stop screen-share signaling.
+- Click `Gallery` to browse recent media for the active room or DM.
 - Click `Image`, `Video`, or `Audio` in the Now panel to prefill the matching
   upload command with the cursor inside the quoted path.
 - Received audio notes keep their inline `Play` button.
+- Press `Ctrl+K` and choose `Show media`, `Show images`, or `Show audio notes`
+  to open filtered gallery views.
 
 Slash commands remain available as a fallback and for scripting.
 
@@ -131,6 +135,9 @@ so the conversation stays easy to scan.
 Media transfer uses `file_meta` + `file_chunk` framing over the existing WebSocket connection — no separate HTTP endpoint and no second auth context.
 
 ```text
+/media
+/media image
+/media audio 50
 /image "/path/to/screenshot.png"
 /video "/path/to/demo.mp4"
 /audio "/path/to/voice-note.ogg"
@@ -140,6 +147,8 @@ Received files are written to:
 
 - **Windows:** `%APPDATA%\Chatify\media\`
 - **Linux/macOS:** `$HOME/.chatify/media/`
+
+The `/media` gallery browses media already present in the local timeline/history for the active room or DM. It supports `image`, `audio`, `video`, `file`, and `all` filters plus an optional limit, for example `/media all 50`. Images selected in the gallery use the right-panel preview, audio notes expose the same `Play` action when ready, and video/file entries show metadata, sender, received status, and local cache path when available.
 
 Image transfers render an ASCII preview inline in the terminal feed. Audio notes show an inline `Play` button in the TUI after the file is received; pending notes show `Receiving...`, and missing local files show `Unavailable`. Video transfers produce a metadata card (sender, filename, size, local path). The 100 MB cap is enforced at the application layer on the sender side.
 

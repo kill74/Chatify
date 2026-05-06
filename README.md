@@ -87,8 +87,9 @@ Most common actions are clickable in the terminal UI:
 - click a person to open a DM
 - click `Join call`, `Mute`, `Deafen`, or `Share screen`
 - click `Reply` or `React` on messages
+- click `Gallery` or run `/media` to browse recent images, audio notes, videos, and files
 - click `Image`, `Video`, or `Audio` to attach media
-- press `Ctrl+K` for the action palette
+- press `Ctrl+K` for the action palette, including filtered media gallery actions
 - press `Ctrl+,` or click `Settings` to toggle media, markdown, notifications, sound, reconnect, and animations
 
 Slash commands still work as a fallback. See [docs/COMMANDS.md](docs/COMMANDS.md).
@@ -125,7 +126,24 @@ Build only the ZIP:
 
 ## Checks
 
-Before committing changes, run:
+Before calling work complete, run the local CI-equivalent gate:
+
+```powershell
+.\scripts\ci-local.ps1
+```
+
+For release readiness metadata, including branch, commit, dirty-worktree status,
+step durations, and an optional JSON report, run:
+
+```powershell
+.\scripts\release-readiness.ps1
+.\scripts\release-readiness.ps1 -AllowDirty -Json
+```
+
+After pushing a branch or opening a PR, verify the GitHub Actions run before
+calling the work complete.
+
+The local CI script runs the same core commands as CI:
 
 ```bash
 cargo check --workspace --bins --locked
