@@ -261,12 +261,10 @@ mod tests {
         assert!(!user_2fa.backup_codes.is_empty());
         assert_eq!(user_2fa.backup_codes.len(), 10);
         assert_eq!(backup_codes.len(), 10);
-        assert!(
-            backup_codes
-                .iter()
-                .zip(user_2fa.backup_codes.iter())
-                .all(|(plain, stored)| hash_backup_code(plain) == *stored)
-        );
+        assert!(backup_codes
+            .iter()
+            .zip(user_2fa.backup_codes.iter())
+            .all(|(plain, stored)| hash_backup_code(plain) == *stored));
         assert_eq!(user_2fa.remaining_backup_codes(), 10);
 
         user_2fa.disable();
