@@ -4807,12 +4807,10 @@ async fn handle_event(
             state
                 .store
                 .persist("msg", &ch, username, None, &entry, searchable);
-            let _ = chan.tx.send(serialized);
-
-            // Update message cache for this channel
             state
                 .message_cache
                 .push_and_trim(&format!("h:{}", ch), entry, 50);
+            let _ = chan.tx.send(serialized);
 
             // Check for spam
             state.check_and_alert_spam(username, &ch);
@@ -4864,10 +4862,6 @@ async fn handle_event(
                 &event,
                 searchable,
             );
-            let _ = state.chan(&dm_channel_name(&target)).tx.send(p.clone());
-            let _ = state.chan(&dm_channel_name(username)).tx.send(p.clone());
-
-            // Update DM cache for both parties
             state.message_cache.push_and_trim(
                 &format!("dm:{}:{}", username, target),
                 event.clone(),
@@ -4876,6 +4870,8 @@ async fn handle_event(
             state
                 .message_cache
                 .push_and_trim(&format!("dm:{}:{}", target, username), event, 50);
+            let _ = state.chan(&dm_channel_name(&target)).tx.send(p.clone());
+            let _ = state.chan(&dm_channel_name(username)).tx.send(p.clone());
         }
         "join" => {
             // Subscribe to a channel and immediately receive its history.
@@ -5018,7 +5014,7 @@ async fn handle_event(
                         if let Some(cached) = state.message_cache.get(&cache_key) {
                             if !cached.is_empty() {
                                 let result: Vec<Value> =
-                                    cached.iter().take(limit).cloned().collect();
+                                    cached.iter().rev().take(limit).cloned().collect();
                                 send_out_json(
                                     out_tx,
                                     serde_json::json!({"t":"history","ch":response_ch,"events":result,"ts":now()}),
@@ -5039,7 +5035,7 @@ async fn handle_event(
                         if let Some(cached) = state.message_cache.get(&cache_key) {
                             if !cached.is_empty() {
                                 let result: Vec<Value> =
-                                    cached.iter().take(limit).cloned().collect();
+                                    cached.iter().rev().take(limit).cloned().collect();
                                 send_out_json(
                                     out_tx,
                                     serde_json::json!({"t":"history","ch":response_ch,"events":result,"ts":now()}),
