@@ -42,7 +42,7 @@ once_cell = "1"
 pbkdf2 = "0.12"
 argon2 = { version = "0.5", features = ["std"] }
 hmac = "0.12"
-generic-array = "0.14"
+generic-array = "1.4"
 crossterm = "0.29"
 ratatui = "0.30"
 chrono = "0.4"
