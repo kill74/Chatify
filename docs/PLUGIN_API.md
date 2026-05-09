@@ -68,8 +68,14 @@ Return `blocked: true` to stop the original message from being sent.
 
 - API version must be `1`.
 - Plugin specs can be built-ins or executable paths.
+- External executable paths must resolve under a trusted plugin directory:
+  `./plugins` by default, plus any semicolon-separated roots in
+  `CHATIFY_PLUGIN_DIR`.
 - Worker stdout and payload sizes are bounded by the server.
 - Slow workers are terminated by timeout.
+- External workers run from their own directory with a scrubbed environment.
+  Only minimal OS process variables such as `PATH`, `SYSTEMROOT`, `TEMP`, and
+  user home paths are passed through, plus `CHATIFY_PLUGIN_SANDBOX=process-v1`.
 - Invalid JSON, unsupported API versions, and non-zero process exits are treated
   as plugin failures and do not stop core chat availability.
 

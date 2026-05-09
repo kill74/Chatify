@@ -3,7 +3,7 @@
 //! Provides TOTP-based two-factor authentication with QR code generation,
 //! backup codes, and recovery mechanisms.
 
-use crate::crypto::secure_string_eq;
+use crate::crypto::{pw_hash, pw_verify, secure_string_eq};
 use base64::{engine::general_purpose, Engine as _};
 use hmac::Hmac;
 use rand::RngCore;
@@ -132,12 +132,11 @@ impl User2FA {
             return false;
         }
 
-        let code_hash = hash_backup_code(code);
         let mut found_index = None;
 
         // Constant-time search to prevent timing attacks
         for (i, stored_hash) in self.backup_codes.iter().enumerate() {
-            if secure_string_eq(&code_hash, stored_hash) {
+            if verify_backup_code_hash(code, stored_hash) {
                 found_index = Some(i);
                 // Don't break - continue to maintain constant time
             }
@@ -161,10 +160,22 @@ impl User2FA {
 
 /// Hash a backup code for secure storage
 fn hash_backup_code(code: &str) -> String {
+    pw_hash(&format!("chatify:backup:v2:{code}"))
+}
+
+fn legacy_hash_backup_code(code: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"chatify:backup:v1:");
     hasher.update(code.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn verify_backup_code_hash(code: &str, stored_hash: &str) -> bool {
+    let scoped = format!("chatify:backup:v2:{code}");
+    if pw_verify(&scoped, stored_hash) {
+        return true;
+    }
+    secure_string_eq(&legacy_hash_backup_code(code), stored_hash)
 }
 
 /// Generate a random secret for TOTP
@@ -264,7 +275,7 @@ mod tests {
         assert!(backup_codes
             .iter()
             .zip(user_2fa.backup_codes.iter())
-            .all(|(plain, stored)| hash_backup_code(plain) == *stored));
+            .all(|(plain, stored)| verify_backup_code_hash(plain, stored)));
         assert_eq!(user_2fa.remaining_backup_codes(), 10);
 
         user_2fa.disable();

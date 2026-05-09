@@ -18,13 +18,19 @@ It is intentionally explicit to avoid overstating guarantees.
 3. CI checks that prevent unchecked changes from bypassing lint and tests.
 4. Optional bridge isolation through feature flags so default builds stay minimal.
 5. Structured security test report is generated per release tag and attached to release assets (`.json` + `.md`).
+6. Server-side credential storage uses Argon2id PHC hashes for new password writes while retaining legacy PBKDF2 verification for existing rows.
+7. Session bearer tokens are stored only as SHA-256 digests in memory and expire by absolute and idle TTL.
+8. The client refuses plaintext `ws://` connections to non-loopback hosts unless explicitly started with the insecure-development override.
 
 ## Known Limits
 
-1. Authentication model is still minimal and under active hardening.
+1. Authentication model is still under active hardening; auth-v2 is a challenge/response flow, not a full PAKE.
 2. Full independent security review has not been completed.
 3. Production threat model is not fully closed for hostile network environments.
-4. Security claims should be treated as controlled-environment level unless additional hardening is applied.
+4. Certificate pinning and first-class trust-on-transport UX are not complete.
+5. DM encryption does not yet provide a full Signal-style Double Ratchet or MLS group security model.
+6. Plugin workers are restricted to trusted plugin roots and run with a scrubbed environment, but not yet OS-sandboxed with a least-privilege profile.
+7. Security claims should be treated as controlled-environment level unless additional hardening is applied.
 
 ## Threat Model (Current)
 
@@ -42,9 +48,14 @@ It is intentionally explicit to avoid overstating guarantees.
 
 ## Hardening Backlog
 
-1. Add stronger identity trust workflow and explicit fingerprint verification UX.
-2. Add replay and tamper-resistance tests for sensitive message flows.
-3. Add adversarial integration tests for malformed and reordered payloads.
+1. Replace auth-v2 credential verification with an audited PAKE/verifier design such as OPAQUE or SRP.
+2. Add certificate/SPKI pinning for `wss://` and store server pins per profile with rotation UX.
+3. Move DMs to an audited forward-secret protocol: Signal-style X3DH + Double Ratchet for one-to-one messaging, or MLS for groups.
+4. Add stronger identity trust workflow: device identity keys, signed prekeys, QR/safety-number verification, and key-transparency style audit evidence.
+5. Require fresh 2FA or recent re-auth for all admin and sensitive actions, including plugin install, 2FA disable, password change, DB backup/restore, bridge setup, and role changes.
+6. Add signed plugin manifests and OS-level job/AppContainer restrictions where available.
+7. Add replay and tamper-resistance tests for sensitive message flows.
+8. Add adversarial integration tests for malformed and reordered payloads.
 
 ## Release Security Report Artifact
 

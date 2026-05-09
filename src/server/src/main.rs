@@ -97,6 +97,7 @@ use plugin_runtime::{
 use prometheus::Encoder;
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3252,6 +3253,16 @@ struct BridgeInfo {
     route_count: usize,
 }
 
+#[derive(Clone, Debug)]
+struct SessionRecord {
+    username: String,
+    issued_at: f64,
+    last_seen_at: f64,
+}
+
+const SESSION_TTL_SECS: f64 = 12.0 * 60.0 * 60.0;
+const SESSION_IDLE_TTL_SECS: f64 = 60.0 * 60.0;
+
 // ---------------------------------------------------------------------------
 // State ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â shared, thread-safe server state
 // ---------------------------------------------------------------------------
@@ -3311,8 +3322,8 @@ struct State {
     ip_connections: DashMap<std::net::IpAddr, usize>,
 
     /// Session tokens keyed by token string ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ username.
-    /// Generated at auth time and validated on every post-auth frame.
-    session_tokens: DashMap<String, String>,
+    /// Generated at auth time and validated when a client supplies a token.
+    session_tokens: DashMap<String, SessionRecord>,
 
     /// Transient client credential hashes accepted while a password change is
     /// being re-hashed and persisted server-side.
@@ -3647,6 +3658,13 @@ impl State {
     // Session tokens
     // -----------------------------------------------------------------------
 
+    fn session_token_digest(token: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"chatify:session:v1:");
+        hasher.update(token.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     /// Generates a cryptographically random session token and associates it
     /// with `username`. Returns the token string.
     fn create_session(&self, username: &str) -> String {
@@ -3654,14 +3672,21 @@ impl State {
         let mut bytes = <[u8; 32]>::default();
         OsRng.fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
-        self.session_tokens
-            .insert(token.clone(), username.to_string());
+        let now = crate::now();
+        self.session_tokens.insert(
+            Self::session_token_digest(&token),
+            SessionRecord {
+                username: username.to_string(),
+                issued_at: now,
+                last_seen_at: now,
+            },
+        );
         token
     }
 
     /// Removes the session token associated with `username`.
     fn remove_session(&self, username: &str) {
-        self.session_tokens.retain(|_, v| v != username);
+        self.session_tokens.retain(|_, v| v.username != username);
     }
 
     /// Validates a session token for a user.
@@ -3669,15 +3694,26 @@ impl State {
         let Some(token) = token else {
             return false;
         };
-        self.session_tokens
-            .get(token)
-            .map(|t| t.as_str() == username)
-            .unwrap_or(false)
+        let digest = Self::session_token_digest(token);
+        let now = crate::now();
+        let Some(mut record) = self.session_tokens.get_mut(&digest) else {
+            return false;
+        };
+        if record.username != username
+            || now - record.issued_at > SESSION_TTL_SECS
+            || now - record.last_seen_at > SESSION_IDLE_TTL_SECS
+        {
+            drop(record);
+            self.session_tokens.remove(&digest);
+            return false;
+        }
+        record.last_seen_at = now;
+        true
     }
 
     /// Invalidates all sessions for a user (e.g., when password changes)
     fn invalidate_all_user_sessions(&self, username: &str) {
-        self.session_tokens.retain(|_, v| v != username);
+        self.session_tokens.retain(|_, v| v.username != username);
     }
 
     /// Check if user can send messages in a channel (checks bans, mutes, and permissions)

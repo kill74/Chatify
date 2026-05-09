@@ -17,6 +17,9 @@ pub struct Args {
     pub tls: bool,
 
     #[arg(long)]
+    pub allow_insecure: bool,
+
+    #[arg(long)]
     pub log: bool,
 
     #[arg(long)]
@@ -50,6 +53,7 @@ impl Args {
             host: host.to_string(),
             port,
             tls,
+            allow_insecure: self.allow_insecure,
             auto_reconnect,
             log_enabled: self.log,
             markdown_enabled,
@@ -64,6 +68,7 @@ pub struct ClientConfig {
     pub host: String,
     pub port: u16,
     pub tls: bool,
+    pub allow_insecure: bool,
     pub auto_reconnect: bool,
     pub log_enabled: bool,
     pub markdown_enabled: bool,

@@ -19,7 +19,7 @@ use chatify::config::Config;
 use chatify::error::{ChatifyError, ChatifyResult};
 
 use chatify_client::{
-    args::Args,
+    args::{Args, ClientConfig},
     handlers,
     state::{ClientState, MediaGalleryFilter, OutgoingMediaMeta, SharedState},
     voice::{start_voice_session, VoiceEvent},
@@ -761,6 +761,27 @@ fn notify_recommendations(cfg: &chatify::config::NotificationConfig) -> Vec<Stri
     }
 
     recommendations
+}
+
+fn is_localhost_host(host: &str) -> bool {
+    let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    normalized == "localhost"
+        || normalized == "::1"
+        || normalized
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn enforce_transport_policy(config: &ClientConfig) -> ChatifyResult<()> {
+    if config.tls || config.allow_insecure || is_localhost_host(&config.host) {
+        return Ok(());
+    }
+
+    Err(ChatifyError::Validation(format!(
+        "refusing plaintext ws:// connection to {}; use --tls or pass --allow-insecure for explicit local/dev testing",
+        config.host
+    )))
 }
 
 fn build_notify_diagnostics_json(
@@ -2534,6 +2555,8 @@ async fn main() -> ChatifyResult<()> {
             .try_init();
     }
 
+    enforce_transport_policy(&client_config)?;
+
     let uri = client_config.uri();
     info!("Connecting to {}", uri);
 
@@ -2758,12 +2781,13 @@ async fn main() -> ChatifyResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::enforce_transport_policy;
     use super::{
         build_notification_export, build_notify_diagnostics_json, notification_key_for_token,
         notification_value_for_key, notify_export_default_path, parse_admin_command,
         parse_media_command, parse_notify_probe_level, parse_notify_test_args,
         parse_plugin_command, parse_toggle_bool, redact_notification_export,
-        sanitize_notify_component, AdminCommand, MediaCommand, PluginCommand,
+        sanitize_notify_component, AdminCommand, ClientConfig, MediaCommand, PluginCommand,
         DEFAULT_MEDIA_GALLERY_LIMIT, MAX_MEDIA_GALLERY_LIMIT,
     };
     #[cfg(feature = "bridge-client")]
@@ -3052,6 +3076,32 @@ mod tests {
         let path = notify_export_default_path("alice", "chatify.local", 8765, true);
         let as_text = path.to_string_lossy();
         assert!(as_text.contains("notify-export-alice-chatify.local-8765-tls.json"));
+    }
+
+    #[test]
+    fn transport_policy_allows_plaintext_only_for_loopback_or_explicit_override() {
+        let mut cfg = ClientConfig {
+            host: "127.0.0.1".to_string(),
+            port: 8765,
+            tls: false,
+            allow_insecure: false,
+            auto_reconnect: true,
+            log_enabled: false,
+            markdown_enabled: true,
+            media_enabled: true,
+            animations_enabled: true,
+        };
+        assert!(enforce_transport_policy(&cfg).is_ok());
+
+        cfg.host = "chatify.example.com".to_string();
+        assert!(enforce_transport_policy(&cfg).is_err());
+
+        cfg.allow_insecure = true;
+        assert!(enforce_transport_policy(&cfg).is_ok());
+
+        cfg.allow_insecure = false;
+        cfg.tls = true;
+        assert!(enforce_transport_policy(&cfg).is_ok());
     }
 
     #[test]

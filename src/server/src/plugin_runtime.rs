@@ -2,8 +2,9 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::env;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ const MAX_PLUGIN_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_PLUGIN_STDERR_BYTES: usize = 16 * 1024;
 const PLUGIN_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_millis(500);
+const PLUGIN_TRUSTED_DIR_ENV: &str = "CHATIFY_PLUGIN_DIR";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashCommandRegistration {
@@ -362,6 +364,7 @@ impl PluginRuntime {
         let external = PathBuf::from(trimmed)
             .canonicalize()
             .map_err(|err| format!("failed to resolve plugin path '{}': {}", trimmed, err))?;
+        validate_external_plugin_path(&external)?;
 
         Ok(PluginSpec::External(external))
     }
@@ -504,7 +507,12 @@ impl PluginRuntime {
                         path.to_string_lossy()
                     ));
                 }
-                Command::new(path)
+                let mut cmd = Command::new(path);
+                if let Some(parent) = path.parent() {
+                    cmd.current_dir(parent);
+                }
+                configure_plugin_environment(&mut cmd);
+                cmd
             }
         };
 
@@ -1217,6 +1225,76 @@ fn deploy_status_icon(status: &str) -> &'static str {
     }
 }
 
+fn trusted_plugin_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(configured) = env::var(PLUGIN_TRUSTED_DIR_ENV) {
+        for raw in configured
+            .split(';')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if let Ok(path) = PathBuf::from(raw).canonicalize() {
+                roots.push(path);
+            }
+        }
+    }
+
+    if let Ok(default_root) = PathBuf::from("plugins").canonicalize() {
+        roots.push(default_root);
+    }
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn validate_external_plugin_path(path: &Path) -> Result<(), String> {
+    let roots = trusted_plugin_roots();
+    if roots.is_empty() {
+        return Err(format!(
+            "external plugins are disabled until a trusted plugin directory exists; create ./plugins or set {}",
+            PLUGIN_TRUSTED_DIR_ENV
+        ));
+    }
+
+    if roots.iter().any(|root| path.starts_with(root)) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "external plugin '{}' is outside trusted plugin directories ({})",
+        path.to_string_lossy(),
+        roots
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
+}
+
+fn configure_plugin_environment(command: &mut Command) {
+    command.env_clear();
+
+    for key in [
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+    ] {
+        if let Ok(value) = env::var(key) {
+            command.env(key, value);
+        }
+    }
+
+    command.env("CHATIFY_PLUGIN_SANDBOX", "process-v1");
+}
+
 fn plugin_error(msg: impl AsRef<str>) -> Value {
     json!({
         "api_version": PLUGIN_API_VERSION,
@@ -1270,6 +1348,21 @@ mod tests {
 
         let oversized = "a".repeat(MAX_PLUGIN_ID_LEN + 1);
         assert_eq!(normalize_plugin_id(&oversized), None);
+    }
+
+    #[test]
+    fn external_plugin_path_must_live_under_trusted_root() {
+        let outside = env::temp_dir().join(format!(
+            "chatify-outside-plugin-{}",
+            chatify::fresh_nonce_hex()
+        ));
+        std::fs::write(&outside, b"plugin").expect("create temp plugin file");
+        let outside = outside.canonicalize().expect("canonical temp plugin path");
+
+        let result = validate_external_plugin_path(&outside);
+        let _ = std::fs::remove_file(&outside);
+
+        assert!(result.is_err());
     }
 
     #[test]

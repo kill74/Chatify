@@ -13,6 +13,11 @@ use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 /// Maximum allowed plaintext length for encryption (10 MB).
 const MAX_PLAINTEXT_LEN: usize = 10 * 1024 * 1024;
 
@@ -206,17 +211,21 @@ pub fn auth_proof(
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Hash a password using PBKDF2 with SHA256 and a random per-user salt.
+/// Hash a password using Argon2id and a random per-user salt.
 ///
-/// This is used SERVER-SIDE to store credentials. Returns `"salt_hex$hash_hex"`
-/// so both salt and hash can be recovered during verification.
+/// This is used SERVER-SIDE to store credentials. The returned value is a PHC
+/// string that records the algorithm and parameters alongside the salt/hash.
 pub fn pw_hash(password: &str) -> String {
-    let mut salt = <[u8; 16]>::default();
-    OsRng.fill_bytes(&mut salt);
-    pw_hash_with_salt(password, &salt)
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Argon2id password hashing should succeed with valid generated salt")
+        .to_string()
 }
 
-/// Hash a password with a specific salt. Returns `"salt_hex$hash_hex"`.
+/// Legacy PBKDF2 helper kept for compatibility tests and old credential rows.
+///
+/// New credential writes must use [`pw_hash`].
 pub fn pw_hash_with_salt(password: &str, salt: &[u8]) -> String {
     let mut hash = <[u8; 32]>::default();
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 120_000, &mut hash)
@@ -224,11 +233,18 @@ pub fn pw_hash_with_salt(password: &str, salt: &[u8]) -> String {
     format!("{}${}", hex::encode(salt), hex::encode(hash))
 }
 
-/// Verify a password against a `"salt_hex$hash_hex"` hash string.
+/// Verify a password against either an Argon2id PHC hash or a legacy
+/// `"salt_hex$hash_hex"` PBKDF2 hash string.
 ///
 /// Returns `false` if the stored hash is malformed or the comparison fails.
 /// Uses constant-time comparison via `subtle` to prevent timing attacks.
 pub fn pw_verify(password: &str, stored: &str) -> bool {
+    if let Ok(parsed_hash) = PasswordHash::new(stored) {
+        return Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok();
+    }
+
     let Some((salt_hex, expected_hash_hex)) = stored.split_once('$') else {
         return false;
     };
@@ -315,6 +331,23 @@ mod tests {
         assert!(pw_hash_client(empty_password.as_str()).is_err());
         let password = crate::fresh_nonce_hex();
         assert!(pw_hash_client(&password).is_ok());
+    }
+
+    #[test]
+    fn test_server_password_hash_uses_argon2id_and_verifies() {
+        let password = crate::fresh_nonce_hex();
+        let stored = pw_hash(&password);
+        assert!(stored.starts_with("$argon2id$"));
+        assert!(pw_verify(&password, &stored));
+        assert!(!pw_verify("wrong-password", &stored));
+    }
+
+    #[test]
+    fn test_legacy_pbkdf2_password_hash_still_verifies() {
+        let password = crate::fresh_nonce_hex();
+        let stored = pw_hash_with_salt(&password, b"legacy-salt");
+        assert!(pw_verify(&password, &stored));
+        assert!(!pw_verify("wrong-password", &stored));
     }
 
     #[test]
