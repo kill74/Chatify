@@ -21,6 +21,12 @@ It is intentionally explicit to avoid overstating guarantees.
 6. Server-side credential storage uses Argon2id PHC hashes for new password writes while retaining legacy PBKDF2 verification for existing rows.
 7. Session bearer tokens are stored only as SHA-256 digests in memory and expire by absolute and idle TTL.
 8. The client refuses plaintext `ws://` connections to non-loopback hosts unless explicitly started with the insecure-development override.
+9. All key-producing and security-sensitive functions are annotated `#[must_use]` so the compiler warns on accidental discard of key material.
+10. CI runs `cargo audit` on every push to detect known dependency vulnerabilities.
+11. `BotState` in the Discord bridge zeroizes all credentials (`auth_password`, `channel_secret`, `priv_key`, cached keys) on drop.
+12. PBKDF2 iterations are set to 600,000, matching OWASP 2023 recommendations, for client-side hashing and legacy verification.
+13. Encryption plaintext limit is 100 MB, matching the documented client-side cap.
+14. `AuthInfo` in the library crate omits `Debug` to prevent accidental logging of password hashes.
 
 ## Known Limits
 

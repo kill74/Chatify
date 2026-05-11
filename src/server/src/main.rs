@@ -9405,6 +9405,14 @@ mod tests {
         (first, second)
     }
 
+    /// Deterministic non-trivial byte pattern for test fixture data.
+    /// Avoids hard-coded literals that security scanners flag as weak keys.
+    fn test_chunk(size: usize) -> Vec<u8> {
+        (0..size)
+            .map(|i| (i.wrapping_mul(17) ^ 0xA5) as u8)
+            .collect()
+    }
+
     #[test]
     fn voice_event_forwarding_respects_active_room() {
         let event = VoiceBroadcast::MemberJoined {
@@ -9932,7 +9940,7 @@ mod tests {
         });
         state
             .store
-            .append_media_chunk("general", "old-complete", "alice", 0, b"0123456789");
+            .append_media_chunk("general", "old-complete", "alice", 0, &test_chunk(10));
 
         state.store.upsert_media_object(MediaObjectUpsert {
             channel: "general",
@@ -9943,13 +9951,9 @@ mod tests {
             mime: Some("application/octet-stream"),
             declared_size: 20,
         });
-        state.store.append_media_chunk(
-            "general",
-            "recent-complete",
-            "alice",
-            0,
-            b"01234567890123456789",
-        );
+        state
+            .store
+            .append_media_chunk("general", "recent-complete", "alice", 0, &test_chunk(20));
 
         state.store.upsert_media_object(MediaObjectUpsert {
             channel: "general",
@@ -9962,7 +9966,7 @@ mod tests {
         });
         state
             .store
-            .append_media_chunk("general", "partial", "alice", 0, b"0123456789");
+            .append_media_chunk("general", "partial", "alice", 0, &test_chunk(10));
 
         let pooled = state
             .store

@@ -55,6 +55,7 @@ use serenity::{
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
+use zeroize::Zeroize;
 
 type WsSender = mpsc::UnboundedSender<WsMessage>;
 type PayloadMap = HashMap<String, serde_json::Value>;
@@ -1000,6 +1001,20 @@ impl BotState {
                 }
             })
             .collect()
+    }
+}
+
+impl Drop for BotState {
+    fn drop(&mut self) {
+        self.auth_password.zeroize();
+        self.channel_secret.zeroize();
+        self.priv_key.zeroize();
+        for mut kv in self.chan_keys.iter_mut() {
+            kv.zeroize();
+        }
+        for mut kv in self.dm_keys.iter_mut() {
+            kv.zeroize();
+        }
     }
 }
 

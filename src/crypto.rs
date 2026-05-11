@@ -18,21 +18,22 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-/// Maximum allowed plaintext length for encryption (10 MB).
-const MAX_PLAINTEXT_LEN: usize = 10 * 1024 * 1024;
+/// Maximum allowed plaintext length for encryption (100 MB).
+const MAX_PLAINTEXT_LEN: usize = 100 * 1024 * 1024;
 
-/// Maximum allowed ciphertext length for decryption (10 MB + overhead).
-const MAX_CIPHERTEXT_LEN: usize = 10 * 1024 * 1024 + 28; // 28 bytes overhead for nonce + tag
+/// Maximum allowed ciphertext length for decryption (100 MB + overhead).
+const MAX_CIPHERTEXT_LEN: usize = 100 * 1024 * 1024 + 28; // 28 bytes overhead for nonce + tag
 
 /// Derive a channel-specific encryption key using PBKDF2.
 ///
 /// Uses the channel name as part of the salt for domain separation.
+#[must_use]
 pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
     let mut key = <[u8; 32]>::default();
     pbkdf2::<Hmac<Sha256>>(
         password.as_bytes(),
         format!("chatify:{}", channel).as_bytes(),
-        120_000,
+        600_000,
         &mut key,
     )
     .expect("PBKDF2 with 32-byte output should always succeed");
@@ -40,12 +41,7 @@ pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
 }
 
 fn client_password_salt() -> Vec<u8> {
-    let mut salt = env!("CARGO_PKG_NAME").as_bytes().to_vec();
-    salt.push(b':');
-    salt.extend_from_slice("client".as_bytes());
-    salt.push(b':');
-    salt.extend_from_slice("v1".as_bytes());
-    salt
+    b"chatify:client:v1".to_vec()
 }
 
 /// Perform X25519 Diffie-Hellman and derive a 32-byte symmetric key.
@@ -153,6 +149,7 @@ pub fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Generate a random 12-byte nonce for ChaCha20.
+#[must_use]
 pub fn chacha20_nonce() -> [u8; 12] {
     let mut nonce = <[u8; 12]>::default();
     OsRng.fill_bytes(&mut nonce);
@@ -215,6 +212,7 @@ pub fn auth_proof(
 ///
 /// This is used SERVER-SIDE to store credentials. The returned value is a PHC
 /// string that records the algorithm and parameters alongside the salt/hash.
+#[must_use]
 pub fn pw_hash(password: &str) -> String {
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     Argon2::default()
@@ -226,6 +224,7 @@ pub fn pw_hash(password: &str) -> String {
 /// Legacy PBKDF2 helper kept for compatibility tests and old credential rows.
 ///
 /// New credential writes must use [`pw_hash`].
+#[must_use]
 pub fn pw_hash_with_salt(password: &str, salt: &[u8]) -> String {
     let mut hash = <[u8; 32]>::default();
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 120_000, &mut hash)
@@ -238,6 +237,7 @@ pub fn pw_hash_with_salt(password: &str, salt: &[u8]) -> String {
 ///
 /// Returns `false` if the stored hash is malformed or the comparison fails.
 /// Uses constant-time comparison via `subtle` to prevent timing attacks.
+#[must_use]
 pub fn pw_verify(password: &str, stored: &str) -> bool {
     if let Ok(parsed_hash) = PasswordHash::new(stored) {
         return Argon2::default()
@@ -268,6 +268,7 @@ pub fn pw_verify(password: &str, stored: &str) -> bool {
 }
 
 /// Generate a new X25519 private key (32 bytes).
+#[must_use]
 pub fn new_keypair() -> Vec<u8> {
     let mut key = <[u8; 32]>::default();
     OsRng.fill_bytes(&mut key);
@@ -294,6 +295,7 @@ pub fn pub_b64(priv_key: &[u8]) -> Result<String, String> {
 /// Returns `true` if the slices are equal, `false` otherwise.
 /// This function executes in constant time regardless of where the
 /// first difference occurs, preventing timing side-channel attacks.
+#[must_use]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
@@ -301,6 +303,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Securely compare two strings in constant time.
 ///
 /// Returns `true` if the strings are equal, `false` otherwise.
+#[must_use]
 pub fn secure_string_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }

@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 
 /// Validated, strongly-typed representation of a successful auth frame parse.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthInfo {
     /// Validated username (ASCII alphanumeric / `-` / `_`, ≤ 32 chars).
     pub username: String,

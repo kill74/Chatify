@@ -47,8 +47,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -71,6 +69,15 @@ jobs:
 
       - name: Workspace tests
         run: cargo test --workspace --all-targets --locked
+
+      - name: Dependency audit (advisory)
+        continue-on-error: true
+        run: |
+          if ! cargo install cargo-audit --locked 2>/dev/null; then
+            echo "::warning::cargo-audit installation failed — skipping audit"
+            exit 0
+          fi
+          cargo audit
 
   protocol-contracts:
     name: Protocol contract gates
