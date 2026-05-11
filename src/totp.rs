@@ -297,19 +297,22 @@ mod tests {
         let mut test_user = User2FA::new("test".to_string());
         test_user.enabled = true;
         // Manually set backup codes (hashes of known codes)
-        let code1 = "abcdef1234567890";
-        let code2 = "fedcba0987654321";
-        test_user.backup_codes = vec![hash_backup_code(code1), hash_backup_code(code2)];
+        let code1 = crate::fresh_nonce_hex();
+        let mut code2 = crate::fresh_nonce_hex();
+        while code2 == code1 {
+            code2 = crate::fresh_nonce_hex();
+        }
+        test_user.backup_codes = vec![hash_backup_code(&code1), hash_backup_code(&code2)];
 
         // Test that we can verify a backup code
-        assert!(test_user.verify_backup_code(code1));
+        assert!(test_user.verify_backup_code(&code1));
         assert_eq!(test_user.remaining_backup_codes(), 1);
 
         // Test that the same code no longer works after use
-        assert!(!test_user.verify_backup_code(code1));
+        assert!(!test_user.verify_backup_code(&code1));
 
         // Test that the second code still works
-        assert!(test_user.verify_backup_code(code2));
+        assert!(test_user.verify_backup_code(&code2));
         assert_eq!(test_user.remaining_backup_codes(), 0);
     }
 
@@ -353,14 +356,15 @@ mod tests {
 
     #[test]
     fn test_generate_qr_url() {
-        let url = generate_qr_url("alice", "Chatify", "JBSWY3DPEHPK3PXP");
+        let secret = generate_secret();
+        let url = generate_qr_url("alice", "Chatify", &secret);
         assert!(url.starts_with("otpauth://totp/"));
-        assert!(url.contains("secret=JBSWY3DPEHPK3PXP"));
+        assert!(url.contains(&format!("secret={secret}")));
         assert!(url.contains("issuer=Chatify"));
 
         // Test empty inputs
-        assert!(generate_qr_url("", "Chatify", "secret").is_empty());
-        assert!(generate_qr_url("alice", "", "secret").is_empty());
+        assert!(generate_qr_url("", "Chatify", &secret).is_empty());
+        assert!(generate_qr_url("alice", "", &secret).is_empty());
         assert!(generate_qr_url("alice", "Chatify", "").is_empty());
     }
 
@@ -368,7 +372,8 @@ mod tests {
     fn test_backup_code_rejects_invalid_input() {
         let mut user_2fa = User2FA::new("testuser".to_string());
         user_2fa.enabled = true;
-        user_2fa.backup_codes = vec![hash_backup_code("valid")];
+        let valid_code = crate::fresh_nonce_hex();
+        user_2fa.backup_codes = vec![hash_backup_code(&valid_code)];
 
         // Empty code should be rejected
         assert!(!user_2fa.verify_backup_code(""));

@@ -1868,11 +1868,12 @@ async fn submit_current_input(state: &SharedState) -> UiAction {
             return UiAction::None;
         }
 
-        if state_lock
-            .command_history
-            .last()
-            .map(|previous| previous != &command)
-            .unwrap_or(true)
+        if should_store_command_history(&command)
+            && state_lock
+                .command_history
+                .last()
+                .map(|previous| previous != &command)
+                .unwrap_or(true)
         {
             state_lock.command_history.push(command.clone());
         }
@@ -1884,6 +1885,18 @@ async fn submit_current_input(state: &SharedState) -> UiAction {
     };
 
     UiAction::Execute(command)
+}
+
+fn should_store_command_history(command: &str) -> bool {
+    let mut parts = command.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return true;
+    };
+
+    !(first.eq_ignore_ascii_case("/admin") && second.eq_ignore_ascii_case("register"))
 }
 
 async fn switch_scope(state: &SharedState, forward: bool) {
@@ -4004,11 +4017,11 @@ mod tests {
         audio_playback_target_for_media, call_quick_buttons, chat_quick_buttons, composer_hint,
         filtered_palette_actions, layout_mode, media_quick_buttons, mention_query,
         mention_suggestions, move_palette_selection, render, resolve_palette_action,
-        right_panel_mode, screen_quick_button, setting_value, ui_action_from_click_action,
-        AudioControlState, AudioPlaybackRejection, AudioPlaybackTarget, ClickAction,
-        MediaPreviewRuntime, PaletteActionKind, PaletteResolvedAction, PaletteState,
-        RightPanelMode, SettingToggle, SettingsState, UiAction, UiHitboxes, UiLayoutMode,
-        UiSnapshot,
+        right_panel_mode, screen_quick_button, setting_value, should_store_command_history,
+        ui_action_from_click_action, AudioControlState, AudioPlaybackRejection,
+        AudioPlaybackTarget, ClickAction, MediaPreviewRuntime, PaletteActionKind,
+        PaletteResolvedAction, PaletteState, RightPanelMode, SettingToggle, SettingsState,
+        UiAction, UiHitboxes, UiLayoutMode, UiSnapshot,
     };
     use crate::args::ClientConfig;
     use crate::{
@@ -4103,6 +4116,18 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn admin_register_commands_are_not_kept_in_tui_history() {
+        assert!(!should_store_command_history(
+            "/admin register alice secret member"
+        ));
+        assert!(!should_store_command_history(
+            "/ADMIN REGISTER alice secret"
+        ));
+        assert!(should_store_command_history("/admin users"));
+        assert!(should_store_command_history("hello team"));
     }
 
     #[test]

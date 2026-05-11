@@ -259,6 +259,57 @@ impl EventStore {
         }
     }
 
+    fn encrypt_field(&self, plaintext: &str) -> Option<String> {
+        if plaintext.is_empty() {
+            return Some(String::new());
+        }
+
+        if let Some(ref key) = self.pool.encryption_key {
+            match chatify::crypto::enc_bytes(key, plaintext.as_bytes()) {
+                Ok(ct) => Some(serde_json::json!({"ct": hex::encode(ct)}).to_string()),
+                Err(e) => {
+                    log::warn!("encryption failed; dropping persistence write: {}", e);
+                    None
+                }
+            }
+        } else {
+            Some(plaintext.to_string())
+        }
+    }
+
+    fn decrypt_field(&self, stored: &str) -> Option<String> {
+        if stored.is_empty() {
+            return Some(String::new());
+        }
+
+        if let Some(ref key) = self.pool.encryption_key {
+            let val = match serde_json::from_str::<serde_json::Value>(stored) {
+                Ok(v) => v,
+                Err(_) => {
+                    log::warn!("legacy plaintext row encountered while encryption is enabled");
+                    return Some(stored.to_string());
+                }
+            };
+            let Some(ct_hex) = val.get("ct").and_then(|v| v.as_str()) else {
+                log::warn!("legacy plaintext row encountered while encryption is enabled");
+                return Some(stored.to_string());
+            };
+            let Ok(ct_bytes) = hex::decode(ct_hex) else {
+                log::warn!("encrypted payload has invalid ciphertext encoding; dropping row");
+                return None;
+            };
+            match chatify::crypto::dec_bytes(key, &ct_bytes) {
+                Ok(pt) => Some(String::from_utf8_lossy(&pt).to_string()),
+                Err(e) => {
+                    log::warn!("decryption failed; dropping row: {}", e);
+                    None
+                }
+            }
+        } else {
+            Some(stored.to_string())
+        }
+    }
+
     /// Stores an event in the database (append-only).
     ///
     /// Events are immutable and never deleted, ensuring full audit trails. The `search_text`
@@ -278,6 +329,20 @@ impl EventStore {
     ) -> Result<(), rusqlite::Error> {
         let started = Instant::now();
         let conn = self.get_connection()?;
+        let Some(stored_payload) = self.encrypt_field(payload) else {
+            self.record_db_observation("store_event", started, true);
+            return Err(rusqlite::Error::InvalidQuery);
+        };
+        let stored_search_text = match search_text {
+            Some(value) => match self.encrypt_field(value) {
+                Some(encrypted) => Some(encrypted),
+                None => {
+                    self.record_db_observation("store_event", started, true);
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            },
+            None => None,
+        };
 
         conn.execute(
             "INSERT INTO events (event_type, channel, sender, target, payload, search_text, ts)
@@ -287,8 +352,8 @@ impl EventStore {
                 channel,
                 sender,
                 target,
-                payload,
-                search_text,
+                stored_payload,
+                stored_search_text,
                 ts
             ],
         )?;
@@ -322,7 +387,10 @@ impl EventStore {
         let mut results = Vec::new();
         if let Ok(rows) = rows {
             for row in rows.flatten() {
-                if let Ok(val) = serde_json::from_str(&row) {
+                let Some(payload) = self.decrypt_field(&row) else {
+                    continue;
+                };
+                if let Ok(val) = serde_json::from_str(&payload) {
                     results.push(val);
                 }
             }
@@ -354,11 +422,17 @@ impl EventStore {
             Ok(c) => c,
             Err(_) => return,
         };
+        let status_json = status.to_string();
+        let Some(stored_status) = self.encrypt_field(&status_json) else {
+            log::warn!("presence snapshot upsert skipped because encryption failed");
+            self.record_db_observation("upsert_presence_snapshot", started, true);
+            return;
+        };
 
         let _ = conn.execute(
             "INSERT OR REPLACE INTO user_presence (username, status, updated_at)
              VALUES (?1, ?2, ?3)",
-            params![username, status.to_string(), crate::protocol::now()],
+            params![username, stored_status, crate::protocol::now()],
         );
 
         self.record_db_observation("upsert_presence_snapshot", started, false);
@@ -384,7 +458,9 @@ impl EventStore {
 
         self.record_db_observation("load_presence_snapshot", started, false);
 
-        result.and_then(|s| serde_json::from_str(&s).ok())
+        result
+            .and_then(|s| self.decrypt_field(&s))
+            .and_then(|s| serde_json::from_str(&s).ok())
     }
 
     /// Verifies user credentials.
@@ -403,9 +479,10 @@ impl EventStore {
 
         self.record_db_observation("verify_credential", started, false);
 
-        match stored {
+        match stored.and_then(|stored_hash| self.decrypt_field(&stored_hash)) {
             None => Err("first_login"),
-            Some(stored_hash) => Ok(stored_hash == pw_hash),
+            Some(stored_hash) => Ok(chatify::crypto::pw_verify(pw_hash, &stored_hash)
+                || chatify::crypto::secure_string_eq(&stored_hash, pw_hash)),
         }
     }
 
@@ -416,11 +493,16 @@ impl EventStore {
             Ok(c) => c,
             Err(_) => return,
         };
+        let Some(stored_pw_hash) = self.encrypt_field(pw_hash) else {
+            log::warn!("credential upsert skipped because encryption failed");
+            self.record_db_observation("upsert_credentials", started, true);
+            return;
+        };
 
         let _ = conn.execute(
             "INSERT OR REPLACE INTO user_credentials (username, pw_hash, created_at)
              VALUES (?1, ?2, ?3)",
-            params![username, pw_hash, crate::protocol::now()],
+            params![username, stored_pw_hash, crate::protocol::now()],
         );
 
         self.record_db_observation("upsert_credentials", started, false);
@@ -499,8 +581,16 @@ impl EventStore {
 
         self.record_db_observation("load_user_2fa", started, false);
 
-        result.map(
+        result.and_then(
             |(enabled, secret, backup_codes, enabled_at, last_verified)| {
+                let secret = match secret {
+                    Some(stored) => Some(self.decrypt_field(&stored)?),
+                    None => None,
+                };
+                let backup_codes = match backup_codes {
+                    Some(stored) => Some(self.decrypt_field(&stored)?),
+                    None => None,
+                };
                 let backup_codes_vec: Vec<String> = backup_codes
                     .as_deref()
                     .and_then(|v| serde_json::from_str(v).ok())
@@ -513,14 +603,14 @@ impl EventStore {
                     algorithm: "SHA256".to_string(),
                 });
 
-                chatify::totp::User2FA {
+                Some(chatify::totp::User2FA {
                     username: username.to_string(),
                     enabled,
                     totp_config,
                     backup_codes: backup_codes_vec,
                     enabled_at,
                     last_verified,
-                }
+                })
             },
         )
     }
@@ -536,6 +626,22 @@ impl EventStore {
         let secret = user.totp_config.as_ref().map(|c| c.secret.clone());
         let backup_codes =
             serde_json::to_string(&user.backup_codes).unwrap_or_else(|_| "[]".to_string());
+        let secret = match secret {
+            Some(value) => match self.encrypt_field(&value) {
+                Some(encrypted) => Some(encrypted),
+                None => {
+                    log::warn!("2fa upsert skipped because TOTP secret encryption failed");
+                    self.record_db_observation("upsert_user_2fa", started, true);
+                    return;
+                }
+            },
+            None => None,
+        };
+        let Some(backup_codes) = self.encrypt_field(&backup_codes) else {
+            log::warn!("2fa upsert skipped because backup code encryption failed");
+            self.record_db_observation("upsert_user_2fa", started, true);
+            return;
+        };
 
         let _ = conn.execute(
             "INSERT INTO user_2fa (username, enabled, secret, backup_codes, enabled_at, last_verified)
@@ -625,5 +731,113 @@ impl EventStore {
     /// Checks if the database is encrypted.
     pub fn is_encrypted(&self) -> bool {
         self.pool.encryption_key.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn unique_test_db_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{}-{}.db", name, chatify::fresh_nonce_hex()))
+    }
+
+    fn read_raw_field(db_path: &std::path::Path, table: &str, field: &str) -> String {
+        let conn = Connection::open(db_path).expect("open sqlite db");
+        conn.query_row(
+            &format!("SELECT {field} FROM {table} WHERE username = ?1"),
+            params!["alice"],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read raw field")
+    }
+
+    #[test]
+    fn encrypted_store_roundtrips_credentials_presence_and_2fa() {
+        let db_path = unique_test_db_path("chatify-library-store-encrypted");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let key = chatify::crypto::new_keypair();
+        let store = EventStore::new(db_path_str, Some(key), DbDurabilityMode::Balanced, None);
+
+        let client_hash = chatify::fresh_nonce_hex();
+        let server_hash = chatify::crypto::pw_hash(&client_hash);
+        store.upsert_credentials("alice", &server_hash);
+        assert_eq!(store.verify_credential("alice", &client_hash), Ok(true));
+
+        let status = serde_json::json!({"text":"Away","emoji":"."});
+        store.upsert_presence_snapshot("alice", &status);
+        assert_eq!(store.load_presence_snapshot("alice"), Some(status));
+
+        let totp_secret = chatify::fresh_nonce_hex();
+        let backup_code_hash = chatify::fresh_nonce_hex();
+        let mut user_2fa = chatify::totp::User2FA::new("alice".to_string());
+        user_2fa.enabled = true;
+        user_2fa.totp_config = Some(chatify::totp::TotpConfig {
+            secret: totp_secret.clone(),
+            digits: 6,
+            step: 30,
+            algorithm: "SHA256".to_string(),
+        });
+        user_2fa.backup_codes = vec![backup_code_hash.clone()];
+        store.upsert_user_2fa(&user_2fa);
+        let loaded_2fa = store.load_user_2fa("alice").expect("2fa row should load");
+        assert_eq!(
+            loaded_2fa.totp_config.map(|cfg| cfg.secret),
+            Some(totp_secret.clone())
+        );
+        assert_eq!(loaded_2fa.backup_codes, vec![backup_code_hash.clone()]);
+
+        let payload = serde_json::json!({"t":"msg","c":"ciphertext"}).to_string();
+        store
+            .store_event(
+                "msg",
+                "general",
+                "alice",
+                None,
+                &payload,
+                Some("plaintext index"),
+                1.0,
+            )
+            .expect("store event");
+        assert_eq!(
+            store.history("general", 10),
+            vec![serde_json::json!({"t":"msg","c":"ciphertext"})]
+        );
+
+        for (table, field, plaintext) in [
+            ("user_credentials", "pw_hash", server_hash.as_str()),
+            (
+                "user_presence",
+                "status",
+                "{\"text\":\"Away\",\"emoji\":\".\"}",
+            ),
+            ("user_2fa", "secret", totp_secret.as_str()),
+            ("user_2fa", "backup_codes", backup_code_hash.as_str()),
+        ] {
+            let raw = read_raw_field(&db_path, table, field);
+            assert_ne!(raw, plaintext, "{table}.{field} should not store plaintext");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|value| value
+                        .get("ct")
+                        .and_then(|ct| ct.as_str())
+                        .map(str::to_string))
+                    .is_some(),
+                "{table}.{field} should be stored as an encrypted ct wrapper"
+            );
+        }
+
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        let raw_payload: String = conn
+            .query_row("SELECT payload FROM events LIMIT 1", [], |row| row.get(0))
+            .expect("read raw event payload");
+        assert_ne!(raw_payload, payload);
+
+        drop(store);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 }

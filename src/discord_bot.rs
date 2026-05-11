@@ -1431,9 +1431,7 @@ async fn run_chatify_session(
         });
         send_ws_json(&bridge_tx, auth_msg);
         info!(
-            "event=bridge_auth_sent username={} instance_id={} routes={}",
-            bot_state.username,
-            bot_state.bridge_src_tag,
+            "event=bridge_auth_sent routes={}",
             bot_state.channel_map.len()
         );
     }
@@ -1484,7 +1482,6 @@ async fn run_chatify_session(
     }
 
     let auth_username;
-    let bridge_instance_id;
     {
         let mut bot_state = state.lock().await;
         auth_username = resp_val["u"]
@@ -1494,12 +1491,8 @@ async fn run_chatify_session(
         bot_state.username = auth_username.clone();
         load_users(&resp_val["users"], &bot_state.users);
         bot_state.ws_tx = Some(bridge_tx.clone());
-        bridge_instance_id = bot_state.bridge_src_tag.clone();
     }
-    info!(
-        "event=bridge_authenticated username={} instance_id={}",
-        auth_username, bridge_instance_id
-    );
+    info!("event=bridge_authenticated");
 
     let mut ping_interval = if cfg.ping_secs > 0 {
         let mut interval = tokio::time::interval(Duration::from_secs(cfg.ping_secs));

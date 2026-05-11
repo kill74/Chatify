@@ -74,6 +74,7 @@ mod plugin_runtime;
 use crate::args::{Args, DbDurabilityMode};
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -113,6 +114,7 @@ use tokio_tungstenite::{
         http, Message,
     },
 };
+use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // CLI configuration
@@ -2278,10 +2280,7 @@ impl EventStore {
             Some(plaintext) => match self.encrypt_field(&plaintext) {
                 Some(encrypted) => Some(encrypted),
                 None => {
-                    warn!(
-                        "2fa upsert skipped for user {} due to secret encryption failure",
-                        user.username
-                    );
+                    warn!("2fa upsert skipped because TOTP secret encryption failed");
                     self.record_db_observation("auth_upsert_user_2fa", started, true);
                     return;
                 }
@@ -2292,10 +2291,7 @@ impl EventStore {
         let backup_codes_json = match self.encrypt_field(&backup_codes_json) {
             Some(encrypted) => encrypted,
             None => {
-                warn!(
-                    "2fa upsert skipped for user {} due to backup code encryption failure",
-                    user.username
-                );
+                warn!("2fa upsert skipped because backup code encryption failed");
                 self.record_db_observation("auth_upsert_user_2fa", started, true);
                 return;
             }
@@ -2383,10 +2379,7 @@ impl EventStore {
             return;
         };
         let Some(encrypted_pw_hash) = self.encrypt_field(pw_hash) else {
-            warn!(
-                "credential upsert skipped for user {} due to encryption failure",
-                username
-            );
+            warn!("credential upsert skipped because encryption failed");
             self.record_db_observation("auth_upsert_credentials", started, true);
             return;
         };
@@ -2496,10 +2489,7 @@ impl EventStore {
         ) {
             Ok(affected) => affected > 0,
             Err(e) => {
-                warn!(
-                    "channel subscription delete failed for user {} channel {}: {}",
-                    username, channel, e
-                );
+                warn!("channel subscription delete failed: {}", e);
                 false
             }
         }
@@ -2517,10 +2507,7 @@ impl EventStore {
         ) {
             Ok(stmt) => stmt,
             Err(e) => {
-                warn!(
-                    "channel subscription query prepare failed for user {}: {}",
-                    username, e
-                );
+                warn!("channel subscription query prepare failed: {}", e);
                 return Vec::new();
             }
         };
@@ -2528,10 +2515,7 @@ impl EventStore {
         let rows = match stmt.query_map(params![username], |row| row.get::<_, String>(0)) {
             Ok(rows) => rows,
             Err(e) => {
-                warn!(
-                    "channel subscription query failed for user {}: {}",
-                    username, e
-                );
+                warn!("channel subscription query failed: {}", e);
                 return Vec::new();
             }
         };
@@ -8627,11 +8611,10 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
     );
 
     if let Some(username) = &args.register_user {
-        let password = args.user_password.as_ref().ok_or_else(|| {
-            ChatifyError::Message("--user-password required with --register-user".to_string())
-        })?;
+        let mut password = read_registration_password(args)?;
 
-        let server_hash = crypto::pw_hash(password);
+        let server_hash = crypto::pw_hash(&password);
+        password.zeroize();
         state.store.upsert_credentials(username, &server_hash);
         state.store.log_audit(
             "cli_register",
@@ -8659,6 +8642,13 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
     }
 
     if let Some(username) = &args.enable_2fa_for {
+        let output_path = args.two_fa_provisioning_output.as_ref().ok_or_else(|| {
+            ChatifyError::Message(
+                "--2fa-provisioning-output is required with --enable-2fa-for".to_string(),
+            )
+        })?;
+        let provisioning_file = create_sensitive_file(output_path)?;
+
         let secret = chatify::totp::generate_secret();
         let qr_url = chatify::totp::generate_qr_url(username, "Chatify", &secret);
 
@@ -8681,13 +8671,16 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
             }
         };
 
+        write_2fa_provisioning_file(
+            provisioning_file,
+            username,
+            &config.secret,
+            &qr_url,
+            &backup_codes,
+        )?;
+
         println!("2FA enabled for: {}", username);
-        println!("  Secret: {}", config.secret);
-        println!("  QR URL: {}", qr_url);
-        println!("  Backup codes:");
-        for code in backup_codes.iter().take(10) {
-            println!("    {}", code);
-        }
+        println!("One-time enrollment material written to: {}", output_path);
         return Ok(());
     }
 
@@ -8708,6 +8701,76 @@ fn handle_admin_commands(args: &Args) -> ChatifyResult<()> {
     Err(ChatifyError::Message(
         "No admin command specified".to_string(),
     ))
+}
+
+fn read_registration_password(args: &Args) -> ChatifyResult<String> {
+    if let Some(password) = &args.user_password {
+        if password.is_empty() {
+            return Err(ChatifyError::Validation(
+                "--user-password cannot be empty".to_string(),
+            ));
+        }
+        return Ok(password.clone());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(ChatifyError::Message(
+            "--user-password is required with --register-user in non-interactive mode".to_string(),
+        ));
+    }
+
+    let password = rpassword::prompt_password("New user password: ")
+        .map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    if password.is_empty() {
+        return Err(ChatifyError::Validation(
+            "registered user password cannot be empty".to_string(),
+        ));
+    }
+
+    Ok(password)
+}
+
+fn create_sensitive_file(path: &str) -> ChatifyResult<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| ChatifyError::Io(Box::new(e)))
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| ChatifyError::Io(Box::new(e)))
+    }
+}
+
+fn write_2fa_provisioning_file(
+    mut file: std::fs::File,
+    username: &str,
+    secret: &str,
+    qr_url: &str,
+    backup_codes: &[String],
+) -> ChatifyResult<()> {
+    use std::io::Write;
+
+    writeln!(file, "Chatify 2FA enrollment").map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    writeln!(file, "User: {}", username).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    writeln!(file, "Secret: {}", secret).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    writeln!(file, "QR URL: {}", qr_url).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    writeln!(file, "Backup codes:").map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    for code in backup_codes {
+        writeln!(file, "{}", code).map_err(|e| ChatifyError::Io(Box::new(e)))?;
+    }
+    file.flush().map_err(|e| ChatifyError::Io(Box::new(e)))
 }
 
 /// Holds either a plain TCP stream or a TLS-wrapped stream.

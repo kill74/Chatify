@@ -336,18 +336,27 @@ mod tests {
     #[test]
     fn test_server_password_hash_uses_argon2id_and_verifies() {
         let password = crate::fresh_nonce_hex();
+        let mut wrong_password = crate::fresh_nonce_hex();
+        while wrong_password == password {
+            wrong_password = crate::fresh_nonce_hex();
+        }
         let stored = pw_hash(&password);
         assert!(stored.starts_with("$argon2id$"));
         assert!(pw_verify(&password, &stored));
-        assert!(!pw_verify("wrong-password", &stored));
+        assert!(!pw_verify(&wrong_password, &stored));
     }
 
     #[test]
     fn test_legacy_pbkdf2_password_hash_still_verifies() {
         let password = crate::fresh_nonce_hex();
-        let stored = pw_hash_with_salt(&password, b"legacy-salt");
+        let mut wrong_password = crate::fresh_nonce_hex();
+        while wrong_password == password {
+            wrong_password = crate::fresh_nonce_hex();
+        }
+        let salt = new_keypair();
+        let stored = pw_hash_with_salt(&password, &salt);
         assert!(pw_verify(&password, &stored));
-        assert!(!pw_verify("wrong-password", &stored));
+        assert!(!pw_verify(&wrong_password, &stored));
     }
 
     #[test]

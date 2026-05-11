@@ -1,26 +1,9 @@
 //! Markdown rendering for the terminal.
 //!
 //! Converts markdown text into ANSI-escaped strings for display in the client dashboard.
-//! Uses `pulldown-cmark` for parsing and `syntect` for syntax highlighting of code blocks.
+//! Uses `pulldown-cmark` for parsing and lightweight ANSI styling for code blocks.
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-use std::sync::OnceLock;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
-
-// Global syntax and theme sets to avoid reloading them on every message
-static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
-
-fn get_syntax_set() -> &'static SyntaxSet {
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn get_theme_set() -> &'static ThemeSet {
-    THEME_SET.get_or_init(ThemeSet::load_defaults)
-}
 
 /// Renders markdown text into an ANSI-escaped terminal string.
 ///
@@ -28,7 +11,7 @@ fn get_theme_set() -> &'static ThemeSet {
 ///
 /// * `input` - The raw markdown string.
 /// * `enable_markdown` - If false, returns the input unmodified.
-/// * `enable_syntax_highlighting` - If true, highlights code blocks using `syntect`.
+/// * `enable_syntax_highlighting` - If true, applies lightweight ANSI code styling.
 pub fn render_markdown(
     input: &str,
     enable_markdown: bool,
@@ -75,7 +58,7 @@ pub fn render_markdown(
                     out.push_str("]\x1b[0m\n");
                 }
                 if enable_syntax_highlighting {
-                    let highlighted = highlight_code(&code_lang, &code_buffer);
+                    let highlighted = highlight_code_block(&code_buffer);
                     out.push_str(&highlighted);
                     if !highlighted.ends_with('\n') {
                         out.push('\n');
@@ -103,30 +86,34 @@ pub fn render_markdown(
     out
 }
 
-/// Highlights a block of code using `syntect`.
-fn highlight_code(lang: &str, code: &str) -> String {
-    let ps = get_syntax_set();
-    let ts = get_theme_set();
-
-    // Default to plain text if syntax not found or not specified
-    let syntax = ps
-        .find_syntax_by_token(lang)
-        .unwrap_or_else(|| ps.find_syntax_plain_text());
-
-    // "base16-ocean.dark" is a nice default dark theme in syntect
-    let theme = &ts.themes["base16-ocean.dark"];
-    let mut h = HighlightLines::new(syntax, theme);
-
+/// Applies a dependency-light style to fenced code blocks.
+fn highlight_code_block(code: &str) -> String {
     let mut output = String::new();
-    for line in LinesWithEndings::from(code) {
-        if let Ok(ranges) = h.highlight_line(line, ps) {
-            let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
-            output.push_str(&escaped);
-        } else {
-            output.push_str(line);
-        }
+    output.push_str("\x1b[38;5;152m");
+    output.push_str(code);
+    if !code.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str("\x1b[0m");
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_markdown;
+
+    #[test]
+    fn markdown_disabled_returns_input_unchanged() {
+        let input = "**hi** `there`";
+        assert_eq!(render_markdown(input, false, true), input);
     }
 
-    output.push_str("\x1b[0m"); // reset
-    output
+    #[test]
+    fn fenced_code_blocks_are_styled_without_external_syntax_assets() {
+        let rendered = render_markdown("```rust\nfn main() {}\n```", true, true);
+
+        assert!(rendered.contains("[rust]"));
+        assert!(rendered.contains("fn main() {}"));
+        assert!(rendered.ends_with('\n'));
+    }
 }

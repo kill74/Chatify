@@ -11,6 +11,7 @@ chatify.db
 chatify-*.db
 *.sqlite
 *.sqlite3
+bridge-channel-map.json
 *.db.key
 chatify.db.key
 cert.pem

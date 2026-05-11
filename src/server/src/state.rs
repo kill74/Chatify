@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Notify};
 
 use crate::protocol::DM_CHANNEL_PREFIX;
@@ -85,6 +86,22 @@ pub struct BridgeInfo {
     pub route_count: usize,
 }
 
+/// In-memory session metadata, keyed by a digest of the bearer token.
+#[derive(Clone, Debug)]
+pub struct SessionRecord {
+    /// Authenticated username associated with the session.
+    pub username: String,
+    /// Unix timestamp when the session was created.
+    pub issued_at: f64,
+    /// Unix timestamp when the session was most recently accepted.
+    pub last_seen_at: f64,
+}
+
+/// Absolute lifetime for a session token.
+const SESSION_TTL_SECS: f64 = 12.0 * 60.0 * 60.0;
+/// Idle lifetime for a session token.
+const SESSION_IDLE_TTL_SECS: f64 = 60.0 * 60.0;
+
 // ============================================================================
 // Server State
 // ============================================================================
@@ -116,8 +133,8 @@ pub struct State {
     pub ip_connections: DashMap<std::net::IpAddr, usize>,
     /// Per-IP last auth attempt timestamp.
     pub ip_last_auth: DashMap<std::net::IpAddr, f64>,
-    /// Session tokens keyed by token → username.
-    pub session_tokens: DashMap<String, String>,
+    /// Session records keyed by token digest, never by the raw bearer token.
+    pub session_tokens: DashMap<String, SessionRecord>,
     /// Connected bridge instances, keyed by username.
     pub bridges: DashMap<String, BridgeInfo>,
     /// Internal metrics for runtime stats.
@@ -264,29 +281,65 @@ impl State {
         )
     }
 
+    /// Returns the non-reversible storage key for a raw session token.
+    pub fn session_token_digest(token: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"chatify:session:v1:");
+        hasher.update(token.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     /// Creates a new session token for a user.
     pub fn create_session(&self, username: &str) -> String {
         use rand::{rngs::OsRng, RngCore};
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
-        self.session_tokens
-            .insert(token.clone(), username.to_string());
+        let now = crate::protocol::now();
+        self.session_tokens.insert(
+            Self::session_token_digest(&token),
+            SessionRecord {
+                username: username.to_string(),
+                issued_at: now,
+                last_seen_at: now,
+            },
+        );
         token
     }
 
     /// Ends a user's session.
     pub fn end_session(&self, username: &str) {
-        // Find and remove the token for this user
-        let token_to_remove: Option<String> = self
-            .session_tokens
-            .iter()
-            .find(|v| *v.value() == username)
-            .map(|v| v.key().clone());
+        self.session_tokens
+            .retain(|_, record| record.username != username);
+    }
 
-        if let Some(token) = token_to_remove {
-            self.session_tokens.remove(token.as_str());
+    /// Validates a session token for a user and refreshes its idle timestamp.
+    pub fn validate_session_token(&self, username: &str, token: Option<&str>) -> bool {
+        let Some(token) = token else {
+            return false;
+        };
+        let digest = Self::session_token_digest(token);
+        let now = crate::protocol::now();
+        let Some(mut record) = self.session_tokens.get_mut(&digest) else {
+            return false;
+        };
+
+        if record.username != username
+            || now - record.issued_at > SESSION_TTL_SECS
+            || now - record.last_seen_at > SESSION_IDLE_TTL_SECS
+        {
+            drop(record);
+            self.session_tokens.remove(&digest);
+            return false;
         }
+
+        record.last_seen_at = now;
+        true
+    }
+
+    /// Invalidates all sessions for a user, for example after password change.
+    pub fn invalidate_all_user_sessions(&self, username: &str) {
+        self.end_session(username);
     }
 
     /// Checks if an auth attempt from this IP is allowed.
@@ -373,5 +426,58 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::DbDurabilityMode;
+    use crate::plugin_runtime::PluginRuntime;
+
+    fn test_state() -> Arc<State> {
+        State::new(
+            ":memory:".to_string(),
+            None,
+            DbDurabilityMode::Balanced,
+            None,
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe")),
+            60,
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn session_tokens_are_stored_by_digest_and_validate() {
+        let state = test_state();
+        let token = state.create_session("alice");
+        let digest = State::session_token_digest(&token);
+
+        assert!(!state.session_tokens.contains_key(&token));
+        assert!(state.session_tokens.contains_key(&digest));
+        assert!(state.validate_session_token("alice", Some(&token)));
+        assert!(!state.validate_session_token("alice", None));
+
+        state.end_session("alice");
+        assert!(!state.session_tokens.contains_key(&digest));
+    }
+
+    #[test]
+    fn invalid_or_expired_session_tokens_are_removed() {
+        let state = test_state();
+
+        let mismatched = state.create_session("alice");
+        let mismatched_digest = State::session_token_digest(&mismatched);
+        assert!(!state.validate_session_token("bob", Some(&mismatched)));
+        assert!(!state.session_tokens.contains_key(&mismatched_digest));
+
+        let expired = state.create_session("alice");
+        let expired_digest = State::session_token_digest(&expired);
+        if let Some(mut record) = state.session_tokens.get_mut(&expired_digest) {
+            record.issued_at -= SESSION_TTL_SECS + 1.0;
+        }
+        assert!(!state.validate_session_token("alice", Some(&expired)));
+        assert!(!state.session_tokens.contains_key(&expired_digest));
     }
 }

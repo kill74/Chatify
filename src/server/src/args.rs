@@ -173,10 +173,10 @@ pub struct Args {
     pub disable_media_retention: bool,
 
     /// Register a new user (admin operation).
-    #[arg(long, requires = "user_password")]
+    #[arg(long)]
     pub register_user: Option<String>,
 
-    /// Password for --register-user operation.
+    /// Password for --register-user operation. Omit to be prompted when interactive.
     #[arg(long)]
     pub user_password: Option<String>,
 
@@ -185,8 +185,12 @@ pub struct Args {
     pub make_admin: bool,
 
     /// Enable 2FA for a user (admin operation).
-    #[arg(long)]
+    #[arg(long, requires = "two_fa_provisioning_output")]
     pub enable_2fa_for: Option<String>,
+
+    /// Path for one-time 2FA enrollment material created by --enable-2fa-for.
+    #[arg(long = "2fa-provisioning-output", requires = "enable_2fa_for")]
+    pub two_fa_provisioning_output: Option<String>,
 
     /// Disable 2FA for a user (admin operation).
     #[arg(long)]
@@ -215,4 +219,44 @@ pub struct Args {
     /// Internal mode: slash command identifier.
     #[arg(long, hide = true)]
     pub chatify_plugin_command: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn enable_2fa_requires_provisioning_output_path() {
+        let result = Args::try_parse_from(["chatify-server", "--enable-2fa-for", "alice"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn enable_2fa_accepts_explicit_provisioning_output_path() {
+        let args = Args::try_parse_from([
+            "chatify-server",
+            "--enable-2fa-for",
+            "alice",
+            "--2fa-provisioning-output",
+            "alice-2fa.txt",
+        ])
+        .expect("2FA provisioning output should satisfy CLI requirements");
+
+        assert_eq!(args.enable_2fa_for.as_deref(), Some("alice"));
+        assert_eq!(
+            args.two_fa_provisioning_output.as_deref(),
+            Some("alice-2fa.txt")
+        );
+    }
+
+    #[test]
+    fn register_user_can_prompt_without_password_arg() {
+        let args = Args::try_parse_from(["chatify-server", "--register-user", "alice"])
+            .expect("register-user should not force password into CLI args");
+
+        assert_eq!(args.register_user.as_deref(), Some("alice"));
+        assert!(args.user_password.is_none());
+    }
 }
