@@ -4,64 +4,67 @@
 //! across all connection handler tasks via Arc.
 
 use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use chatify::metrics::PrometheusMetrics;
+use chatify::performance::{Metrics as PerfMetrics, VecCache};
+use chatify::voice::VoiceRelay;
 use dashmap::DashMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Notify, RwLock};
 
-use crate::protocol::DM_CHANNEL_PREFIX;
+use crate::db::EventStore;
+use crate::plugin_runtime::PluginRuntime;
+use crate::protocol::{DM_CHANNEL_PREFIX, HISTORY_CAP, MAX_CONNECTIONS_PER_IP};
 
 // ============================================================================
 // Channel Types
 // ============================================================================
 
-/// A named chat channel with broadcast messaging and bounded history.
+/// A named chat channel consisting of a bounded in-memory history ring buffer
+/// and a [tokio broadcast] channel for real-time fan-out to all subscribers.
+///
+/// `Channel` is cheap to clone; all clones share the same `Arc`-wrapped
+/// history and the same `broadcast::Sender` handle. New subscribers obtain a
+/// fresh `Receiver` via `tx.subscribe()`.
 #[derive(Clone)]
 pub struct Channel {
-    /// Channel name.
-    pub name: String,
-    /// Broadcast sender for real-time fan-out to all subscribers.
+    /// In-memory ring buffer of the last [`HISTORY_CAP`] messages.
+    /// Wrapped in `Arc<RwLock<…>>` so multiple tasks can read concurrently
+    /// while writes are exclusive.
+    pub history: Arc<RwLock<VecDeque<Value>>>,
+
+    /// Broadcast sender. The channel capacity (256) is deliberately larger
+    /// than [`HISTORY_CAP`] to absorb short bursts without dropping frames.
     pub tx: broadcast::Sender<String>,
-    /// Bounded in-memory history ring buffer.
-    pub history: Arc<tokio::sync::Mutex<VecDeque<(String, f64)>>>,
 }
 
 impl Channel {
-    /// Creates a new channel with default settings.
+    /// Creates a new, empty channel with a 256-message broadcast buffer.
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(1000);
+        let (tx, _) = broadcast::channel(256);
         Self {
-            name: String::new(),
+            history: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAP))),
             tx,
-            history: Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(50))),
         }
     }
 
-    /// Adds a message to the channel history.
-    pub fn add_message(&self, msg: String, ts: f64) {
-        let mut hist = self.history.blocking_lock();
-        hist.push_back((msg, ts));
-        if hist.len() > 50 {
-            hist.pop_front();
+    /// Appends `entry` to the in-memory history, evicting the oldest entry if
+    /// the ring buffer is at capacity.
+    pub async fn push(&self, entry: Value) {
+        let mut h = self.history.write().await;
+        if h.len() >= HISTORY_CAP {
+            h.pop_front();
         }
+        h.push_back(entry);
     }
 
-    /// Returns the last N messages from history.
-    pub async fn hist(&self, limit: usize) -> Vec<Value> {
-        let hist = self.history.lock().await;
-        hist.iter()
-            .rev()
-            .take(limit)
-            .map(|(msg, ts)| {
-                serde_json::json!({
-                    "c": msg,
-                    "ts": ts
-                })
-            })
-            .collect()
+    /// Returns a snapshot of the current history as a `Vec`, oldest first.
+    pub async fn hist(&self) -> Vec<Value> {
+        self.history.read().await.iter().cloned().collect()
     }
 }
 
@@ -103,78 +106,179 @@ const SESSION_TTL_SECS: f64 = 12.0 * 60.0 * 60.0;
 const SESSION_IDLE_TTL_SECS: f64 = 60.0 * 60.0;
 
 // ============================================================================
+// Normalize helpers
+// ============================================================================
+
+const OUTBOUND_QUEUE_CAPACITY_DEFAULT: usize = 1024;
+const OUTBOUND_QUEUE_CAPACITY_MIN: usize = 64;
+const OUTBOUND_QUEUE_CAPACITY_MAX: usize = 16_384;
+const SLOW_CLIENT_DROP_BURST_DEFAULT: usize = 64;
+const SLOW_CLIENT_DROP_BURST_MIN: usize = 1;
+const SLOW_CLIENT_DROP_BURST_MAX: usize = 4096;
+
+pub fn normalize_outbound_queue_capacity(requested: usize) -> usize {
+    let requested = if requested == 0 {
+        OUTBOUND_QUEUE_CAPACITY_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(OUTBOUND_QUEUE_CAPACITY_MIN, OUTBOUND_QUEUE_CAPACITY_MAX)
+}
+
+pub fn normalize_slow_client_drop_burst(requested: usize) -> usize {
+    let requested = if requested == 0 {
+        SLOW_CLIENT_DROP_BURST_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(SLOW_CLIENT_DROP_BURST_MIN, SLOW_CLIENT_DROP_BURST_MAX)
+}
+
+// ============================================================================
 // Server State
 // ============================================================================
 
-/// Central server state shared by all connection handler tasks.
+/// Central server state shared by all connection handler tasks via `Arc`.
 ///
 /// Every field uses a lock-free concurrent map ([`DashMap`]) or atomic
-/// primitive so that individual operations do not require global locking.
+/// primitive so that individual operations (insert, remove, lookup) do not
+/// require global locking. Per-channel operations that require exclusive
+/// history access use `tokio::sync::RwLock` scoped to the specific channel.
 pub struct State {
     /// Named public channels, keyed by sanitised channel name.
+    /// DM channels live here too under the `__dm__<username>` naming
+    /// convention; they are filtered out when listing channels to clients.
     pub channels: DashMap<String, Channel>,
-    /// Per-room voice broadcast senders.
+
+    /// Per-room voice broadcast senders, keyed by room name.
     pub voice: DashMap<String, broadcast::Sender<String>>,
-    /// Current status value for each online user.
+
+    /// Per-room screen-share relay senders, keyed by room name.
+    pub screen: DashMap<String, broadcast::Sender<String>>,
+
+    /// Current status value for each online user
+    /// (e.g. `{"text":"Online","emoji":"✓"}`).
+    /// Presence in this map is the authoritative signal that a user is online.
     pub user_statuses: DashMap<String, Value>,
-    /// Public key (base64) for each online user.
+
+    /// Public key (base64) for each online user, used by clients to encrypt
+    /// DM payloads without a separate key-exchange round-trip.
     pub user_pubkeys: DashMap<String, String>,
+
     /// Per-user ring buffer of recently seen nonce values.
+    /// Bounded to [`NONCE_CACHE_CAP`] entries; the oldest entry is evicted
+    /// once the cap is reached.
     pub recent_nonces: DashMap<String, VecDeque<String>>,
+
     /// Last-seen timestamp for each user's nonce cache entry.
+    /// Updated on every nonce validation. Used by the periodic cleanup
+    /// task to evict stale entries from `recent_nonces` when a user's
+    /// connection drops without proper cleanup (crash, network partition).
     pub nonce_last_seen: DashMap<String, f64>,
-    /// Number of WebSocket connections currently open.
+
+    /// Number of WebSocket connections currently open. Managed via
+    /// [`ConnectionGuard`] RAII to guarantee accurate accounting even on
+    /// panics.
     pub active_connections: AtomicUsize,
-    /// Notified when active_connections reaches zero.
+
+    /// Notified whenever `active_connections` reaches zero, allowing the
+    /// graceful-shutdown loop to wake immediately rather than polling.
     pub drained_notify: Notify,
+
     /// SQLite-backed event persistence and 2-FA storage.
-    pub store: crate::db::EventStore,
+    pub store: EventStore,
+
     /// Per-IP connection count for rate limiting.
-    pub ip_connections: DashMap<std::net::IpAddr, usize>,
-    /// Per-IP last auth attempt timestamp.
-    pub ip_last_auth: DashMap<std::net::IpAddr, f64>,
-    /// Session records keyed by token digest, never by the raw bearer token.
+    /// Incremented on TCP accept, decremented on disconnect.
+    pub ip_connections: DashMap<IpAddr, usize>,
+
+    /// Per-IP last auth timestamp for auth rate limiting.
+    /// Enforces a minimum 500ms interval between auth attempts from the same IP.
+    pub ip_last_auth: DashMap<IpAddr, f64>,
+
+    /// Session tokens keyed by token string → username.
+    /// Generated at auth time and validated when a client supplies a token.
     pub session_tokens: DashMap<String, SessionRecord>,
+
+    /// Transient client credential hashes accepted while a password change is
+    /// being re-hashed and persisted server-side.
+    pub pending_credentials: DashMap<String, String>,
+
     /// Connected bridge instances, keyed by username.
+    /// Populated during auth when the client sends `"bridge": true`.
     pub bridges: DashMap<String, BridgeInfo>,
-    /// Internal metrics for runtime stats.
-    pub metrics: chatify::performance::Metrics,
+
+    /// Internal metrics for runtime stats and debugging.
+    pub metrics: PerfMetrics,
+
     /// Prometheus metrics for export.
-    pub prometheus: Option<Arc<std::sync::Mutex<chatify::metrics::PrometheusMetrics>>>,
+    pub prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+
+    pub message_cache: VecCache<Value>,
+
+    /// Voice channel relay for managing voice rooms, members, and state
+    pub voice_relay: VoiceRelay,
+
     /// Flag to signal graceful shutdown in progress.
+    /// When true, server stops accepting new connections.
     pub shutdown_in_progress: AtomicBool,
-    /// Shutdown trigger for external signaling.
+
+    /// Shutdown trigger for external signaling (SIGHUP, shutdown endpoint).
     pub shutdown_notify: Notify,
-    /// Per-user message rate limiting: username → (count, window_start).
+
+    /// Per-user message rate limiting: username -> (count, window_start).
+    /// Uses DashMap for concurrent access without locking.
     pub user_msg_rate: DashMap<String, (u32, f64)>,
+
     /// Maximum messages per user per minute.
     pub max_msgs_per_minute: u32,
+
     /// Whether per-user rate limiting is enabled.
     pub user_rate_limit_enabled: bool,
-    /// Whether self-registration is enabled.
+
+    /// Whether self-registration is enabled via CLI flag.
     pub self_registration_enabled: bool,
-    /// Plugin runtime manager.
-    pub plugin_runtime: crate::plugin_runtime::PluginRuntime,
+
+    /// Per-connection outbound queue capacity.
+    pub outbound_queue_capacity: usize,
+
+    /// Number of consecutive dropped non-blocking outbound messages that
+    /// triggers a slow-client disconnect.
+    pub slow_client_drop_burst: usize,
+
+    /// Plugin runtime manager (API v1).
+    pub plugin_runtime: PluginRuntime,
 }
 
 impl State {
-    /// Creates the initial server state with the "general" channel pre-populated.
+    /// Creates the initial server state, pre-populating the `"general"` channel.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db_path: String,
         db_key: Option<Vec<u8>>,
         db_durability: crate::args::DbDurabilityMode,
-        prometheus: Option<Arc<std::sync::Mutex<chatify::metrics::PrometheusMetrics>>>,
-        plugin_runtime: crate::plugin_runtime::PluginRuntime,
+        db_pool_size: u32,
+        prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+        plugin_runtime: PluginRuntime,
         max_msgs_per_minute: u32,
         user_rate_limit_enabled: bool,
         self_registration_enabled: bool,
+        outbound_queue_capacity: usize,
+        slow_client_drop_burst: usize,
     ) -> Arc<Self> {
-        let store = crate::db::EventStore::new(db_path, db_key, db_durability, prometheus.clone());
-
+        let outbound_queue_capacity = normalize_outbound_queue_capacity(outbound_queue_capacity);
+        let slow_client_drop_burst = normalize_slow_client_drop_burst(slow_client_drop_burst);
+        let store = EventStore::new(
+            db_path,
+            db_key,
+            db_durability,
+            db_pool_size,
+            prometheus.clone(),
+        );
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
+            screen: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
             recent_nonces: DashMap::new(),
@@ -185,77 +289,61 @@ impl State {
             ip_connections: DashMap::new(),
             ip_last_auth: DashMap::new(),
             session_tokens: DashMap::new(),
+            pending_credentials: DashMap::new(),
             bridges: DashMap::new(),
-            metrics: chatify::performance::Metrics::new(),
+            metrics: PerfMetrics::new(),
             prometheus,
+            message_cache: VecCache::new(1000),
+            voice_relay: VoiceRelay::new(),
             shutdown_in_progress: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
             user_msg_rate: DashMap::new(),
             max_msgs_per_minute,
             user_rate_limit_enabled,
             self_registration_enabled,
+            outbound_queue_capacity,
+            slow_client_drop_burst,
             plugin_runtime,
         });
-
-        // Pre-create the "general" channel
         s.channels.insert("general".into(), Channel::new());
         s
     }
 
-    /// Returns or creates a channel by name.
+    /// Returns the [`Channel`] for `name`, creating it lazily on first access.
     pub fn chan(&self, name: &str) -> Channel {
         self.channels.entry(name.into()).or_default().clone()
     }
 
-    /// Returns the number of active connections.
-    pub fn active_connection_count(&self) -> usize {
-        self.active_connections.load(Ordering::SeqCst)
+    /// Returns the voice broadcast sender for `room`, creating it lazily on
+    /// first access.
+    pub fn voice_tx(&self, room: &str) -> broadcast::Sender<String> {
+        self.voice
+            .entry(room.into())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(128);
+                tx
+            })
+            .clone()
     }
 
-    /// Attempts to register a new IP connection. Returns false if limit exceeded.
-    pub fn ip_connect(&self, addr: &std::net::SocketAddr) -> bool {
-        let ip = addr.ip();
-        let mut count = self.ip_connections.entry(ip).or_insert(0);
-        if *count >= 5 {
-            false
-        } else {
-            *count += 1;
-            true
-        }
+    /// Returns the screen-share relay sender for `room`, creating it lazily
+    /// on first access.
+    pub fn screen_tx(&self, room: &str) -> broadcast::Sender<String> {
+        self.screen
+            .entry(room.into())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(128);
+                tx
+            })
+            .clone()
     }
 
-    /// Decrements the connection count for an IP.
-    pub fn ip_disconnect(&self, addr: &std::net::SocketAddr) {
-        let ip = addr.ip();
-        if let Some(mut count) = self.ip_connections.get_mut(&ip) {
-            if *count > 0 {
-                *count -= 1;
-            }
-            if *count == 0 {
-                drop(count);
-                self.ip_connections.remove(&ip);
-            }
-        }
-    }
-
-    /// Returns true if this is the first shutdown request.
-    pub fn initiate_shutdown(&self) -> bool {
-        self.shutdown_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    }
-
-    /// Returns whether shutdown is in progress.
-    pub fn is_shutting_down(&self) -> bool {
-        self.shutdown_in_progress.load(Ordering::SeqCst)
-    }
-
-    /// Returns the number of online users.
+    /// Returns the number of currently online users.
     pub fn online_count(&self) -> usize {
         self.user_statuses.len()
     }
 
-    /// Returns channel names as JSON array (excluding DM channels).
+    /// Serialises the list of public (non-DM) channel names as a JSON array.
     pub fn channels_json(&self) -> Value {
         Value::Array(
             self.channels
@@ -266,7 +354,8 @@ impl State {
         )
     }
 
-    /// Returns user info as JSON array.
+    /// Serialises the list of online users with their public keys as a JSON
+    /// array of `{"u": "...", "pk": "..."}` objects.
     pub fn users_with_keys_json(&self) -> Value {
         Value::Array(
             self.user_pubkeys
@@ -281,6 +370,134 @@ impl State {
         )
     }
 
+    fn connection_opened(&self) {
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+        self.metrics.inc_accepted();
+        if let Some(ref m) = self.prometheus {
+            if let Ok(mutex_guard) = m.lock() {
+                mutex_guard.record_connection_accepted();
+            }
+        }
+    }
+
+    fn connection_closed(&self) {
+        let prev = self.active_connections.fetch_sub(1, Ordering::SeqCst);
+        self.metrics.inc_closed();
+        if let Some(ref m) = self.prometheus {
+            if let Ok(mutex_guard) = m.lock() {
+                mutex_guard.record_connection_closed();
+            }
+        }
+        if prev <= 1 {
+            self.drained_notify.notify_waiters();
+        }
+    }
+
+    /// Returns the number of active connections.
+    pub fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::SeqCst)
+    }
+
+    /// Increments the per-IP connection counter. Returns `false` if the
+    /// IP has exceeded [`MAX_CONNECTIONS_PER_IP`].
+    pub fn ip_connect(&self, addr: &SocketAddr) -> bool {
+        let ip = addr.ip();
+        let mut entry = self.ip_connections.entry(ip).or_insert(0);
+        if *entry >= MAX_CONNECTIONS_PER_IP {
+            return false;
+        }
+        *entry += 1;
+        true
+    }
+
+    /// Decrements the per-IP connection counter, removing the entry if it
+    /// reaches zero.
+    pub fn ip_disconnect(&self, addr: &SocketAddr) {
+        let ip = addr.ip();
+        if let Some(mut entry) = self.ip_connections.get_mut(&ip) {
+            *entry = entry.saturating_sub(1);
+            if *entry == 0 {
+                drop(entry);
+                self.ip_connections.remove(&ip);
+            }
+        }
+    }
+
+    /// Checks whether an auth attempt from `addr` is allowed.
+    /// Enforces a minimum 500ms interval between auth attempts from the same IP.
+    pub fn ip_auth_allowed(&self, addr: &SocketAddr) -> bool {
+        let ip = addr.ip();
+        let now = chatify::now();
+        let min_interval = 0.5;
+
+        let mut last_auth = self.ip_last_auth.entry(ip).or_insert(0.0);
+        if now - *last_auth < min_interval {
+            return false;
+        }
+        *last_auth = now;
+        true
+    }
+
+    /// Check and record per-user message rate limit.
+    /// Returns (allowed, remaining, reset_in_secs).
+    pub fn check_user_rate_limit(&self, username: &str) -> (bool, u32, u64) {
+        if !self.user_rate_limit_enabled {
+            return (true, self.max_msgs_per_minute, 60);
+        }
+
+        if self.max_msgs_per_minute == 0 {
+            return (true, u32::MAX, 60);
+        }
+
+        let now = chatify::now();
+        let window_secs = 60.0;
+
+        let mut entry = self
+            .user_msg_rate
+            .entry(username.to_string())
+            .or_insert((0, now));
+
+        if now - entry.1 >= window_secs {
+            entry.0 = 1;
+            entry.1 = now;
+            return (true, self.max_msgs_per_minute - 1, 60);
+        }
+
+        if entry.0 >= self.max_msgs_per_minute {
+            let reset_in = (window_secs - (now - entry.1)) as u64;
+            return (false, 0, reset_in);
+        }
+
+        entry.0 += 1;
+        let remaining = self.max_msgs_per_minute - entry.0;
+        let reset_in = (window_secs - (now - entry.1)) as u64;
+        (true, remaining, reset_in)
+    }
+
+    /// Signal the server to begin graceful shutdown.
+    /// Returns true if shutdown was initiated, false if already shutting down.
+    pub fn initiate_shutdown(&self) -> bool {
+        if self
+            .shutdown_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.shutdown_notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if server is shutting down.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_in_progress.load(Ordering::SeqCst)
+    }
+
+    pub fn notify_shutdown(&self) {
+        self.shutdown_notify.notify_waiters();
+    }
+
     /// Returns the non-reversible storage key for a raw session token.
     pub fn session_token_digest(token: &str) -> String {
         let mut hasher = Sha256::new();
@@ -292,10 +509,10 @@ impl State {
     /// Creates a new session token for a user.
     pub fn create_session(&self, username: &str) -> String {
         use rand::{rngs::OsRng, RngCore};
-        let mut bytes = [0u8; 32];
+        let mut bytes = <[u8; 32]>::default();
         OsRng.fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
-        let now = crate::protocol::now();
+        let now = chatify::now();
         self.session_tokens.insert(
             Self::session_token_digest(&token),
             SessionRecord {
@@ -319,7 +536,7 @@ impl State {
             return false;
         };
         let digest = Self::session_token_digest(token);
-        let now = crate::protocol::now();
+        let now = chatify::now();
         let Some(mut record) = self.session_tokens.get_mut(&digest) else {
             return false;
         };
@@ -342,57 +559,95 @@ impl State {
         self.end_session(username);
     }
 
-    /// Checks if an auth attempt from this IP is allowed.
-    pub fn ip_auth_allowed(&self, addr: &std::net::SocketAddr) -> bool {
-        let ip = addr.ip();
-        let now = crate::protocol::now();
-        if let Some(last) = self.ip_last_auth.get(&ip) {
-            if now - *last < 0.5 {
+    /// Check if user can send messages in a channel (checks bans, mutes, and permissions)
+    pub fn can_send(&self, username: &str, channel: &str) -> bool {
+        if let Some(ban) = self.store.is_banned(username, channel) {
+            if ban.is_active() {
                 return false;
             }
         }
-        self.ip_last_auth.insert(ip, now);
-        true
-    }
-
-    /// Checks rate limit for a user. Returns (allowed, remaining, reset_in).
-    pub fn check_user_rate_limit(&self, username: &str) -> (bool, u32, f64) {
-        if !self.user_rate_limit_enabled {
-            return (true, self.max_msgs_per_minute, 0.0);
+        if let Some(mute) = self.store.is_muted(username, channel) {
+            if mute.is_active() {
+                return false;
+            }
         }
-
-        let now = crate::protocol::now();
-        let mut entry = self
-            .user_msg_rate
-            .entry(username.to_string())
-            .or_insert((0, now));
-
-        let (count, window_start) = &mut *entry;
-        if now - *window_start >= 60.0 {
-            *count = 0;
-            *window_start = now;
-        }
-
-        *count += 1;
-        if *count > self.max_msgs_per_minute {
-            let reset_in = 60.0 - (now - *window_start);
-            (false, 0, reset_in)
-        } else {
-            (
-                true,
-                self.max_msgs_per_minute.saturating_sub(*count),
-                60.0 - (now - *window_start),
-            )
+        let role = self
+            .store
+            .get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        match role {
+            Some(r) => r.permissions.contains(crate::db::RolePermissions::SEND),
+            None => true,
         }
     }
 
-    /// Checks if a user can send to a channel.
-    pub fn can_send(&self, username: &str, channel: &str) -> bool {
-        if let Ok(muted) = self.store.is_user_muted(username, channel) {
-            !muted
-        } else {
-            true
+    /// Check if user can kick others in a channel
+    pub fn can_kick(&self, username: &str, channel: &str) -> bool {
+        let role = self
+            .store
+            .get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        match role {
+            Some(r) => r.can_kick(),
+            None => false,
         }
+    }
+
+    /// Check if user can ban others in a channel
+    pub fn can_ban(&self, username: &str, channel: &str) -> bool {
+        let role = self
+            .store
+            .get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        match role {
+            Some(r) => r.can_ban(),
+            None => false,
+        }
+    }
+
+    /// Check if user can mute others in a channel
+    pub fn can_mute(&self, username: &str, channel: &str) -> bool {
+        let role = self
+            .store
+            .get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        match role {
+            Some(r) => r.can_mute(),
+            None => false,
+        }
+    }
+
+    /// Check if user can perform administrative management actions.
+    pub fn can_manage(&self, username: &str, channel: &str) -> bool {
+        let role = self
+            .store
+            .get_user_role(username, channel)
+            .or_else(|| self.store.get_default_role());
+        match role {
+            Some(r) => r.can_manage(),
+            None => false,
+        }
+    }
+
+    /// Get user's role in a channel
+    pub fn get_user_role(&self, username: &str, channel: &str) -> Option<String> {
+        self.store.get_user_role(username, channel).map(|r| r.name)
+    }
+
+    /// Check if user is banned in a channel
+    pub fn is_banned(&self, username: &str, channel: &str) -> bool {
+        self.store
+            .is_banned(username, channel)
+            .map(|b| b.is_active())
+            .unwrap_or(false)
+    }
+
+    /// Check if user is muted in a channel
+    pub fn is_muted(&self, username: &str, channel: &str) -> bool {
+        self.store
+            .is_muted(username, channel)
+            .map(|m| m.is_active())
+            .unwrap_or(false)
     }
 }
 
@@ -400,32 +655,26 @@ impl State {
 // Connection Guard
 // ============================================================================
 
-/// RAII guard that tracks active connections.
+/// RAII guard that increments [`State::active_connections`] on construction
+/// and decrements it on drop, guaranteeing accurate accounting even when a
+/// connection handler panics or returns early.
 pub struct ConnectionGuard {
     state: Arc<State>,
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
 }
 
 impl ConnectionGuard {
     /// Creates a new guard, incrementing active_connections.
-    pub fn new(state: Arc<State>, addr: std::net::SocketAddr) -> Self {
-        state.active_connections.fetch_add(1, Ordering::SeqCst);
+    pub fn new(state: Arc<State>, addr: SocketAddr) -> Self {
+        state.connection_opened();
         Self { state, addr }
-    }
-
-    /// Decrements active_connections and notifies if zero.
-    pub fn cleanup(&self) {
-        let prev = self.state.active_connections.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
-            self.state.drained_notify.notify_waiters();
-        }
-        self.state.ip_disconnect(&self.addr);
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.cleanup();
+        self.state.ip_disconnect(&self.addr);
+        self.state.connection_closed();
     }
 }
 
@@ -440,11 +689,14 @@ mod tests {
             ":memory:".to_string(),
             None,
             DbDurabilityMode::Balanced,
+            8,
             None,
             PluginRuntime::new(std::env::current_exe().expect("resolve current exe")),
             60,
             true,
             true,
+            1024,
+            64,
         )
     }
 

@@ -22,8 +22,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 pub mod audio;
 pub mod events;
 pub mod relay;
@@ -33,10 +31,7 @@ pub use events::{VoiceEvent, VoiceMember, VoiceMemberInfo, VoiceState};
 pub use relay::VoiceRelay;
 
 fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::now()
 }
 
 /// A named voice room with member tracking.

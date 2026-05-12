@@ -13,6 +13,7 @@ use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -37,7 +38,9 @@ pub fn channel_key(password: &str, channel: &str) -> Vec<u8> {
         &mut key,
     )
     .expect("PBKDF2 with 32-byte output should always succeed");
-    key.to_vec()
+    let result = key.to_vec();
+    key.zeroize();
+    result
 }
 
 fn client_password_salt() -> Vec<u8> {
@@ -53,7 +56,7 @@ pub fn dh_key(priv_key: &[u8], pubkey_b64: &str) -> Result<Vec<u8>, String> {
         return Err("private key must be exactly 32 bytes".to_string());
     }
 
-    let priv_arr: [u8; 32] = priv_key
+    let mut priv_arr: [u8; 32] = priv_key
         .try_into()
         .map_err(|_| "private key must be exactly 32 bytes".to_string())?;
 
@@ -75,6 +78,7 @@ pub fn dh_key(priv_key: &[u8], pubkey_b64: &str) -> Result<Vec<u8>, String> {
         .map_err(|_| "decoded public key must be exactly 32 bytes".to_string())?;
 
     let secret = StaticSecret::from(priv_arr);
+    priv_arr.zeroize();
     let peer_public = PublicKey::from(peer_pub_arr);
     let shared = secret.diffie_hellman(&peer_public);
 
@@ -82,7 +86,10 @@ pub fn dh_key(priv_key: &[u8], pubkey_b64: &str) -> Result<Vec<u8>, String> {
     let mut hasher = Sha256::new();
     hasher.update(b"chatify:dm:v1");
     hasher.update(shared.as_bytes());
-    Ok(hasher.finalize().to_vec())
+    let result = hasher.finalize().to_vec();
+    // StaticSecret implements ZeroizeOnDrop, so `secret` is auto-cleared.
+    // `shared` is consumed by the drop.
+    Ok(result)
 }
 
 /// Encrypt data using ChaCha20Poly1305 with a random nonce.
@@ -176,7 +183,9 @@ pub fn pw_hash_client(password: &str) -> Result<String, String> {
     let salt = client_password_salt();
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, 120_000, &mut hash)
         .expect("PBKDF2 with 32-byte output should always succeed");
-    Ok(hex::encode(hash))
+    let result = hex::encode(hash);
+    hash.zeroize();
+    Ok(result)
 }
 
 /// Build the proof sent by auth-v2 clients.
@@ -229,7 +238,9 @@ pub fn pw_hash_with_salt(password: &str, salt: &[u8]) -> String {
     let mut hash = <[u8; 32]>::default();
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, 120_000, &mut hash)
         .expect("PBKDF2 with 32-byte output should always succeed");
-    format!("{}${}", hex::encode(salt), hex::encode(hash))
+    let result = format!("{}${}", hex::encode(salt), hex::encode(hash));
+    hash.zeroize();
+    result
 }
 
 /// Verify a password against either an Argon2id PHC hash or a legacy
@@ -256,6 +267,7 @@ pub fn pw_verify(password: &str, stored: &str) -> bool {
         return false;
     };
     let actual_hash_hex = hex::encode(hash);
+    hash.zeroize();
 
     // Constant-time comparison to prevent timing attacks.
     if actual_hash_hex.len() != expected_hash_hex.len() {
@@ -272,7 +284,9 @@ pub fn pw_verify(password: &str, stored: &str) -> bool {
 pub fn new_keypair() -> Vec<u8> {
     let mut key = <[u8; 32]>::default();
     OsRng.fill_bytes(&mut key);
-    key.to_vec()
+    let result = key.to_vec();
+    key.zeroize();
+    result
 }
 
 /// Encode an X25519 public key as base64.
@@ -287,6 +301,7 @@ pub fn pub_b64(priv_key: &[u8]) -> Result<String, String> {
         .map_err(|_| "private key must be exactly 32 bytes".to_string())?;
     let secret = StaticSecret::from(priv_arr);
     let public = PublicKey::from(&secret);
+    // priv_arr consumed by StaticSecret which implements ZeroizeOnDrop
     Ok(general_purpose::STANDARD.encode(public.as_bytes()))
 }
 

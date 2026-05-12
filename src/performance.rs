@@ -535,7 +535,10 @@ impl<T: Clone> VecCache<T> {
                 vec.drain(0..drain_start);
             }
         } else {
-            cache.put(key.to_string(), Arc::new(vec![item]));
+            let v = vec![item];
+            if max_len > 0 {
+                cache.put(key.to_string(), Arc::new(v));
+            }
         }
     }
 }

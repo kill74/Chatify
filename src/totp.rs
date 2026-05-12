@@ -6,10 +6,10 @@
 use crate::crypto::{pw_hash, pw_verify, secure_string_eq};
 use base64::{engine::general_purpose, Engine as _};
 use hmac::Hmac;
+use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// TOTP configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,11 +79,10 @@ impl User2FA {
     /// Generate backup codes for the user.
     /// Returns plaintext codes for one-time display while storing only hashes.
     fn generate_backup_codes(&mut self) -> Vec<String> {
-        let mut rng = rand::thread_rng();
         let plaintext_codes: Vec<String> = (0..10)
             .map(|_| {
                 let mut bytes = [0u8; 8];
-                rng.fill_bytes(&mut bytes);
+                OsRng.fill_bytes(&mut bytes);
                 hex::encode(bytes)
             })
             .collect();
@@ -180,9 +179,8 @@ fn verify_backup_code_hash(code: &str, stored_hash: &str) -> bool {
 
 /// Generate a random secret for TOTP
 pub fn generate_secret() -> String {
-    let mut rng = rand::thread_rng();
     let mut bytes = [0u8; 20];
-    rng.fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     general_purpose::STANDARD.encode(bytes)
 }
 
@@ -242,10 +240,7 @@ pub fn generate_qr_url(username: &str, issuer: &str, secret: &str) -> String {
 
 /// Get current Unix timestamp
 fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    crate::now()
 }
 
 #[cfg(test)]

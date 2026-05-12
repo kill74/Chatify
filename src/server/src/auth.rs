@@ -11,13 +11,31 @@ use crate::protocol::{
     MAX_STATUS_EMOJI_LEN, MAX_STATUS_TEXT_LEN,
 };
 
+/// Credential variants for authentication.
+#[derive(Clone)]
+pub enum AuthCredential {
+    /// Legacy password hash sent directly by the client.
+    LegacyHash(String),
+    /// V2 proof-of-knowledge using a challenge-response protocol.
+    V2Proof {
+        /// Hex-encoded proof string.
+        proof: String,
+        /// Client-generated nonce.
+        client_nonce: String,
+        /// Server-generated nonce.
+        server_nonce: String,
+        /// Optional enrollment secret for migrating from legacy.
+        enrollment_secret: Option<String>,
+    },
+}
+
 /// Validated, strongly-typed representation of a successful auth frame parse.
 #[derive(Clone)]
 pub struct AuthInfo {
     /// Validated username (ASCII alphanumeric / `-` / `_`, ≤ 32 chars).
     pub username: String,
-    /// Password hash submitted by the client.
-    pub pw_hash: String,
+    /// Authentication credential (legacy hash or V2 proof).
+    pub credential: AuthCredential,
     /// Validated status object (text + emoji), or default.
     pub status: Value,
     /// Base64-encoded 32-byte X25519 public key used for E2E DM encryption.
@@ -165,7 +183,7 @@ pub fn validate_auth_payload(d: &Value) -> Result<AuthInfo, AuthError> {
 
     Ok(AuthInfo {
         username,
-        pw_hash: pw.to_string(),
+        credential: AuthCredential::LegacyHash(pw.to_string()),
         status,
         pubkey,
         otp_code,
@@ -237,7 +255,7 @@ mod tests {
         assert!(result.is_ok());
         let auth = result.unwrap();
         assert_eq!(auth.username, "testuser");
-        assert_eq!(auth.pw_hash, "test-hash");
+        assert!(matches!(auth.credential, AuthCredential::LegacyHash(ref h) if h == "test-hash"));
     }
 
     #[test]

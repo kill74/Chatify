@@ -892,11 +892,6 @@ fn jittered_backoff_secs(base_secs: u64, jitter_pct: u64) -> u64 {
     base_secs.saturating_add(noise)
 }
 
-/// Get current Unix timestamp
-fn now_secs() -> u64 {
-    chatify::now() as u64
-}
-
 fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
     let _ = tx.send(WsMessage::text(payload.to_string()));
 }
@@ -1158,7 +1153,7 @@ impl EventHandler for DiscordHandler {
             "ch": channel,
             "c": encoded,
             "p": bridge_body,
-            "ts": now_secs(),
+            "ts": chatify::now_secs(),
             "n": fresh_nonce_hex(),
             "src": src_tag.clone(),
             "relay": serde_json::Value::Object(relay)
@@ -1521,7 +1516,7 @@ async fn run_chatify_session(
         let frame = if let Some(interval) = ping_interval.as_mut() {
             tokio::select! {
                 _ = interval.tick() => {
-                    send_ws_json(&bridge_tx, serde_json::json!({"t": "ping", "ts": now_secs()}));
+                    send_ws_json(&bridge_tx, serde_json::json!({"t": "ping", "ts": chatify::now_secs()}));
                     metrics.inc_pings_sent();
                     debug!("event=chatify_ping");
                     continue;

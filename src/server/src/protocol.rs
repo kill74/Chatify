@@ -278,10 +278,7 @@ pub fn clamp_limit(raw: Option<u64>, default: usize, max: usize) -> usize {
 
 /// Returns the current Unix timestamp as seconds (f64).
 pub fn now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    chatify::now()
 }
 
 /// Validates that a username meets protocol requirements.

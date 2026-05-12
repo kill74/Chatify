@@ -739,7 +739,7 @@ async fn auth_contract_rejects_first_login_when_self_registration_disabled() {
     let err = recv_by_type(&mut ws, "err").await;
     assert_eq!(
         err.get("m").and_then(|v| v.as_str()),
-        Some("self-registration is disabled")
+        Some("invalid credentials")
     );
 }
 

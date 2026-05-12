@@ -639,7 +639,7 @@ impl DbPool {
                 DB_POOL_IDLE_TIMEOUT_SECS,
             )))
             .connection_timeout(std::time::Duration::from_secs(10))
-            .test_on_check_out(true)
+            .test_on_check_out(false)
             .build(manager)?;
         Ok(Self {
             pool,
@@ -1325,7 +1325,7 @@ impl EventStore {
     fn encrypt_field(&self, plaintext: &str) -> Option<String> {
         if let Some(ref key) = self.pool.encryption_key {
             match crypto::enc_bytes(key, plaintext.as_bytes()) {
-                Ok(ct) => Some(serde_json::json!({"ct": hex::encode(ct)}).to_string()),
+                Ok(ct) => Some(format!("{{\"ct\":\"{}\"}}", hex::encode(ct))),
                 Err(e) => {
                     warn!("encryption failed; dropping persistence write: {}", e);
                     None
@@ -7987,14 +7987,11 @@ where
     const MAX_FAILED_ATTEMPTS: i32 = 5;
     if let Some((_, locked_until)) = state.store.get_lockout_status(&username) {
         if locked_until > crate::now() {
-            let remaining = (locked_until - crate::now()) as i32;
             let _ = sink
                 .send(Message::text(
                     serde_json::json!({
                         "t": "err",
-                        "m": format!("account locked, try again in {} seconds", remaining),
-                        "locked": true,
-                        "retry_after": remaining
+                        "m": "invalid credentials",
                     })
                     .to_string(),
                 ))
@@ -8106,7 +8103,7 @@ where
     match credential_result {
         Ok(true) => credential_verified = true, // Hash matches — continue auth flow.
         Ok(false) => {
-            let (locked, attempts) = state
+            let (locked, _attempts) = state
                 .store
                 .record_failed_login(&username, MAX_FAILED_ATTEMPTS);
             if locked {
@@ -8114,33 +8111,19 @@ where
                     &username,
                     "brute_force",
                     "high",
-                    Some(&format!("{} failed login attempts", attempts)),
+                    Some("account locked due to repeated failed login attempts"),
                 );
-                let _ = sink
-                    .send(Message::text(
-                        serde_json::json!({
-                            "t":"err",
-                            "m":"account locked due to too many failed attempts",
-                            "locked": true,
-                            "retry_after": 900
-                        })
-                        .to_string(),
-                    ))
-                    .await;
-            } else {
-                let remaining = MAX_FAILED_ATTEMPTS - attempts;
-                let _ = sink
-                    .send(Message::text(
-                        serde_json::json!({
-                            "t":"err",
-                            "m":"invalid credentials",
-                            "remaining_attempts": remaining
-                        })
-                        .to_string(),
-                    ))
-                    .await;
             }
-            warn!("auth failed: invalid password attempts={}", attempts);
+            let _ = sink
+                .send(Message::text(
+                    serde_json::json!({
+                        "t":"err",
+                        "m":"invalid credentials",
+                    })
+                    .to_string(),
+                ))
+                .await;
+            warn!("auth failed: invalid password");
             return;
         }
         Err("first_login") => {
@@ -8149,7 +8132,7 @@ where
                     .send(Message::text(
                         serde_json::json!({
                             "t": "err",
-                            "m": "self-registration is disabled"
+                            "m": "invalid credentials",
                         })
                         .to_string(),
                     ))
@@ -8223,7 +8206,7 @@ where
     if let Err(err) = enforce_2fa_on_auth(&state, &username, otp_code.as_deref()) {
         let error_text = err.to_string();
         if error_text == "invalid 2FA code" {
-            let (locked, attempts) = state
+            let (locked, _attempts) = state
                 .store
                 .record_failed_login(&username, MAX_FAILED_ATTEMPTS);
             if locked {
@@ -8231,33 +8214,19 @@ where
                     &username,
                     "brute_force",
                     "high",
-                    Some(&format!("{} failed 2FA attempts", attempts)),
+                    Some("account locked due to repeated failed 2FA attempts"),
                 );
-                let _ = sink
-                    .send(Message::text(
-                        serde_json::json!({
-                            "t":"err",
-                            "m":"account locked due to too many failed attempts",
-                            "locked": true,
-                            "retry_after": 900
-                        })
-                        .to_string(),
-                    ))
-                    .await;
-            } else {
-                let remaining = MAX_FAILED_ATTEMPTS - attempts;
-                let _ = sink
-                    .send(Message::text(
-                        serde_json::json!({
-                            "t":"err",
-                            "m":"invalid 2FA code",
-                            "remaining_attempts": remaining
-                        })
-                        .to_string(),
-                    ))
-                    .await;
             }
-            warn!("auth failed: invalid 2FA code attempts={}", attempts);
+            let _ = sink
+                .send(Message::text(
+                    serde_json::json!({
+                        "t":"err",
+                        "m":"invalid 2FA code",
+                    })
+                    .to_string(),
+                ))
+                .await;
+            warn!("auth failed: invalid 2FA code");
         } else {
             let _ = sink
                 .send(Message::text(

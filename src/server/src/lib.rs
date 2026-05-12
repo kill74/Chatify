@@ -29,11 +29,11 @@ pub mod state;
 
 // Re-exports for convenience
 pub use args::{Args, DbDurabilityMode};
-pub use auth::{validate_auth_payload, AuthError, AuthInfo};
+pub use auth::{validate_auth_payload, AuthCredential, AuthError, AuthInfo};
 pub use db::{DbPool, EventStore};
 pub use plugin_runtime::{
     MessageHookResult, PluginMessage, PluginMessageTarget, PluginRuntime, SlashExecutionResult,
     PLUGIN_API_VERSION,
 };
 pub use protocol::*;
-pub use state::{BridgeInfo, Channel, ConnectionGuard, State};
+pub use state::{BridgeInfo, Channel, ConnectionGuard, SessionRecord, State};
