@@ -47,6 +47,8 @@ const MAX_REACTION_EVENT_DEDUP: usize = 10_000;
 const MAX_TRUST_AUDIT_ENTRIES: usize = 2_000;
 const MAX_ACTIVITY_LOG: usize = 200;
 const TRUST_STORE_SCHEMA_VERSION: u8 = 1;
+#[allow(dead_code)]
+const MAX_RECENT_SENTS: usize = 200;
 
 /// Complete ephemeral state of a connected client session.
 ///

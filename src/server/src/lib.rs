@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Chatify Server Library
 //!
 //! This library provides the core server components for Chatify,
@@ -30,10 +32,18 @@ pub mod state;
 // Re-exports for convenience
 pub use args::{Args, DbDurabilityMode};
 pub use auth::{validate_auth_payload, AuthCredential, AuthError, AuthInfo};
-pub use db::{DbPool, EventStore};
+pub use db::{
+    clamp_u64_to_i64, clamp_usize_to_i64, gib_to_bytes_i64, normalize_media_max_total_size_gb,
+    normalize_media_prune_interval_secs, normalize_media_retention_days, DbPool, EventStore,
+    MediaObjectUpsert,
+};
 pub use plugin_runtime::{
     MessageHookResult, PluginMessage, PluginMessageTarget, PluginRuntime, SlashExecutionResult,
     PLUGIN_API_VERSION,
 };
 pub use protocol::*;
-pub use state::{BridgeInfo, Channel, ConnectionGuard, SessionRecord, State};
+pub use state::{
+    normalize_outbound_queue_capacity, normalize_slow_client_drop_burst, BridgeInfo, Channel,
+    ConnectionGuard, SessionRecord, State, OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+    SLOW_CLIENT_DROP_BURST_DEFAULT,
+};

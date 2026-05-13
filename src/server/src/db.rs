@@ -16,6 +16,8 @@
 //! - **WAL mode**: Database uses Write-Ahead Logging for durability and concurrent reads
 
 use std::collections::HashSet;
+#[cfg(feature = "batch-writes")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,6 +26,8 @@ use chatify::error::{ChatifyError, ChatifyResult};
 use chatify::metrics::PrometheusMetrics;
 use chatify::performance::PoolStats;
 use log::warn;
+#[cfg(feature = "batch-writes")]
+use parking_lot;
 use r2d2;
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use serde_json::Value;
@@ -91,7 +95,7 @@ impl Role {
         let (id, name, level, can_kick, can_ban, can_mute, can_manage, can_pin) = row;
         let mut permissions =
             RolePermissions::from_db_row(can_kick, can_ban, can_mute, can_manage, can_pin);
-        if name == "readonly" {
+        if name == "readonly" || name == "guest" {
             permissions.remove(RolePermissions::SEND);
         }
 
@@ -175,14 +179,29 @@ impl Mute {
 // EventStore — SQLite persistence layer with connection pooling
 // ---------------------------------------------------------------------------
 
-const DB_POOL_SIZE_DEFAULT: u32 = 8;
-const DB_POOL_SIZE_MIN: u32 = 1;
-const DB_POOL_SIZE_MAX: u32 = 128;
+pub const DB_POOL_SIZE_DEFAULT: u32 = 8;
+pub const DB_POOL_SIZE_MIN: u32 = 1;
+pub const DB_POOL_SIZE_MAX: u32 = 128;
 const DB_POOL_MIN_IDLE: u32 = 2;
 const DB_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
 const DB_BUSY_TIMEOUT_SECS: u64 = 5;
 const ENCRYPTED_SEARCH_SCAN_CAP: usize = 100_000;
 const MEDIA_CHUNK_ENC_PREFIX: &[u8] = b"cfm1";
+
+#[cfg(feature = "batch-writes")]
+const BATCH_SIZE: usize = 256;
+#[cfg(feature = "batch-writes")]
+const BATCH_FLUSH_MS: u64 = 250;
+
+pub const MEDIA_RETENTION_DAYS_DEFAULT: u32 = 30;
+pub const MEDIA_RETENTION_DAYS_MIN: u32 = 1;
+pub const MEDIA_RETENTION_DAYS_MAX: u32 = 3650;
+pub const MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT: f64 = 20.0;
+pub const MEDIA_MAX_TOTAL_SIZE_GB_MIN: f64 = 0.5;
+pub const MEDIA_MAX_TOTAL_SIZE_GB_MAX: f64 = 10_240.0;
+pub const MEDIA_PRUNE_INTERVAL_SECS_DEFAULT: u64 = 600;
+pub const MEDIA_PRUNE_INTERVAL_SECS_MIN: u64 = 60;
+pub const MEDIA_PRUNE_INTERVAL_SECS_MAX: u64 = 86_400;
 
 fn normalize_db_pool_size(requested: u32) -> u32 {
     let requested = if requested == 0 {
@@ -191,6 +210,210 @@ fn normalize_db_pool_size(requested: u32) -> u32 {
         requested
     };
     requested.clamp(DB_POOL_SIZE_MIN, DB_POOL_SIZE_MAX)
+}
+
+pub fn clamp_u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+pub fn clamp_usize_to_i64(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
+}
+
+pub fn gib_to_bytes_i64(gib: f64) -> i64 {
+    let bytes = gib * 1024.0 * 1024.0 * 1024.0;
+    bytes.min(i64::MAX as f64).round() as i64
+}
+
+pub fn normalize_media_retention_days(requested: u32) -> u32 {
+    let requested = if requested == 0 {
+        MEDIA_RETENTION_DAYS_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(MEDIA_RETENTION_DAYS_MIN, MEDIA_RETENTION_DAYS_MAX)
+}
+
+pub fn normalize_media_prune_interval_secs(requested: u64) -> u64 {
+    let requested = if requested == 0 {
+        MEDIA_PRUNE_INTERVAL_SECS_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(MEDIA_PRUNE_INTERVAL_SECS_MIN, MEDIA_PRUNE_INTERVAL_SECS_MAX)
+}
+
+pub fn normalize_media_max_total_size_gb(requested: f64) -> f64 {
+    let requested = if !requested.is_finite() || requested <= 0.0 {
+        MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT
+    } else {
+        requested
+    };
+    requested.clamp(MEDIA_MAX_TOTAL_SIZE_GB_MIN, MEDIA_MAX_TOTAL_SIZE_GB_MAX)
+}
+
+// ---------------------------------------------------------------------------
+// Batch-write queue (behind `batch-writes` feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "batch-writes")]
+pub struct EventRow {
+    event_type: String,
+    channel: String,
+    sender: String,
+    target: Option<String>,
+    payload: String,
+    search_text: String,
+    ts: f64,
+}
+
+#[cfg(feature = "batch-writes")]
+pub struct WriteQueue {
+    pool: DbPool,
+    rows: parking_lot::Mutex<Vec<EventRow>>,
+    flush_count: AtomicUsize,
+}
+
+#[cfg(feature = "batch-writes")]
+impl WriteQueue {
+    fn new(pool: DbPool) -> Self {
+        Self {
+            pool,
+            rows: parking_lot::Mutex::new(Vec::with_capacity(BATCH_SIZE)),
+            flush_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, row: EventRow) {
+        let should_flush = {
+            let mut rows = self.rows.lock();
+            rows.push(row);
+            rows.len() >= BATCH_SIZE
+        };
+        if should_flush {
+            self.flush();
+        }
+    }
+
+    fn flush(&self) {
+        let rows: Vec<EventRow> = {
+            let mut rows_guard = self.rows.lock();
+            if rows_guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *rows_guard)
+        };
+
+        if let Err(failed_rows) = self.flush_rows(rows) {
+            let mut pending = self.rows.lock();
+            if pending.is_empty() {
+                *pending = failed_rows;
+            } else {
+                let mut merged = failed_rows;
+                merged.append(&mut *pending);
+                *pending = merged;
+            }
+        }
+    }
+
+    fn flush_rows(&self, rows: Vec<EventRow>) -> Result<(), Vec<EventRow>> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = match self.pool.pool.get() {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!("batch flush failed to acquire db connection: {}", e);
+                return Err(rows);
+            }
+        };
+
+        let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!("batch flush failed to start transaction: {}", e);
+                return Err(rows);
+            }
+        };
+
+        {
+            let mut stmt = match tx.prepare_cached(
+                "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    warn!("batch flush failed to prepare statement: {}", e);
+                    return Err(rows);
+                }
+            };
+
+            for row in &rows {
+                if let Err(e) = stmt.execute(params![
+                    row.ts,
+                    row.event_type,
+                    row.channel,
+                    row.sender,
+                    row.target,
+                    row.payload,
+                    row.search_text
+                ]) {
+                    warn!("batch flush insert failed: {}", e);
+                    return Err(rows);
+                }
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            warn!("batch flush commit failed: {}", e);
+            return Err(rows);
+        }
+
+        self.flush_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn start_worker(queue: &std::sync::Arc<Self>) {
+        let weak_queue = std::sync::Arc::downgrade(queue);
+        let spawn_result = std::thread::Builder::new()
+            .name("chatify-batch-writer".to_string())
+            .spawn(move || {
+                let interval = std::time::Duration::from_millis(BATCH_FLUSH_MS);
+                loop {
+                    std::thread::sleep(interval);
+                    let Some(queue) = weak_queue.upgrade() else {
+                        break;
+                    };
+                    queue.flush();
+                }
+            });
+
+        if let Err(e) = spawn_result {
+            warn!("failed to spawn batch write worker: {}", e);
+        }
+    }
+}
+
+#[cfg(feature = "batch-writes")]
+impl Drop for WriteQueue {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Media object upsert payload
+// ---------------------------------------------------------------------------
+
+pub struct MediaObjectUpsert<'a> {
+    pub channel: &'a str,
+    pub file_id: &'a str,
+    pub sender: &'a str,
+    pub filename: &'a str,
+    pub media_kind: &'a str,
+    pub mime: Option<&'a str>,
+    pub declared_size: u64,
 }
 
 #[derive(Clone)]
@@ -283,6 +506,8 @@ type BanMuteRow = (String, String, String, Option<String>, f64, Option<f64>);
 pub struct EventStore {
     pool: DbPool,
     prometheus: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
+    #[cfg(feature = "batch-writes")]
+    write_queue: Option<std::sync::Arc<WriteQueue>>,
 }
 
 impl EventStore {
@@ -300,7 +525,20 @@ impl EventStore {
             db_pool_size,
         )
         .expect("failed to create database pool");
-        let store = Self { pool, prometheus };
+        #[cfg(feature = "batch-writes")]
+        let write_queue = {
+            let queue = std::sync::Arc::new(WriteQueue::new(pool.clone()));
+            WriteQueue::start_worker(&queue);
+            Some(queue)
+        };
+        #[cfg(not(feature = "batch-writes"))]
+        let _write_queue = ();
+        let store = Self {
+            pool,
+            prometheus,
+            #[cfg(feature = "batch-writes")]
+            write_queue,
+        };
         store
             .init()
             .expect("failed to initialise event store; check database path, permissions, and encryption key");
@@ -503,7 +741,7 @@ impl EventStore {
         }
     }
 
-    fn get_connection(&self) -> Option<r2d2::PooledConnection<PooledConnection>> {
+    pub fn get_connection(&self) -> Option<r2d2::PooledConnection<PooledConnection>> {
         self.pool.pool.get().ok()
     }
 
@@ -1094,16 +1332,89 @@ impl EventStore {
         payload: &Value,
         search_text: &str,
     ) {
-        let payload_str = payload.to_string();
-        let _ = self.store_event(
-            event_type,
-            channel,
-            sender,
-            target,
-            &payload_str,
-            Some(search_text),
-            chatify::now(),
-        );
+        let started = Instant::now();
+        #[cfg(feature = "batch-writes")]
+        if let Some(ref queue) = self.write_queue {
+            let payload_json = payload.to_string();
+            let Some(enc_payload) = self.encrypt_field(&payload_json) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=payload_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_enqueue", started, true);
+                return;
+            };
+            let Some(enc_search) = self.encrypt_field(&search_text.to_lowercase()) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=search_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_enqueue", started, true);
+                return;
+            };
+            queue.push(EventRow {
+                event_type: event_type.to_string(),
+                channel: channel.to_string(),
+                sender: sender.to_string(),
+                target: target.map(String::from),
+                payload: enc_payload,
+                search_text: enc_search,
+                ts: chatify::now(),
+            });
+            self.record_db_observation("persist_enqueue", started, false);
+        }
+
+        #[cfg(not(feature = "batch-writes"))]
+        {
+            let Some(conn) = self.get_connection() else {
+                self.record_db_observation("persist_insert", started, true);
+                return;
+            };
+            let payload_json = payload.to_string();
+            let Some(enc_payload) = self.encrypt_field(&payload_json) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=payload_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_insert", started, true);
+                return;
+            };
+            let Some(enc_search) = self.encrypt_field(&search_text.to_lowercase()) else {
+                warn!(
+                    "event persist dropped: type={} channel={} sender={} reason=search_encrypt_failed",
+                    event_type, channel, sender
+                );
+                self.record_db_observation("persist_insert", started, true);
+                return;
+            };
+            let mut stmt = match conn.prepare_cached(
+                "INSERT INTO events(ts, event_type, channel, sender, target, payload, search_text)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    warn!("event persist prepare failed: {}", e);
+                    self.record_db_observation("persist_insert", started, true);
+                    return;
+                }
+            };
+
+            if let Err(e) = stmt.execute(params![
+                chatify::now(),
+                event_type,
+                channel,
+                sender,
+                target,
+                enc_payload,
+                enc_search,
+            ]) {
+                warn!("event persist failed: {}", e);
+                self.record_db_observation("persist_insert", started, true);
+                return;
+            }
+
+            self.record_db_observation("persist_insert", started, false);
+        }
     }
 
     pub fn history(&self, channel: &str, limit: usize) -> Vec<Value> {
@@ -2369,6 +2680,395 @@ impl EventStore {
         ).map_err(|e| format!("failed to resolve suspicious activity: {}", e))?;
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Media storage
+    // -------------------------------------------------------------------------
+
+    pub fn upsert_media_object(&self, media: MediaObjectUpsert<'_>) {
+        let started = Instant::now();
+        let Some(conn) = self.get_connection() else {
+            self.record_db_observation("media_upsert_object", started, true);
+            return;
+        };
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO media_objects(
+                 channel, file_id, sender, filename, media_kind, mime,
+                 declared_size, received_size, chunk_count, completed, created_ts, completed_ts
+             )
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, FALSE, ?8, NULL)
+             ON CONFLICT(channel, file_id) DO UPDATE SET
+                 sender = excluded.sender,
+                 filename = excluded.filename,
+                 media_kind = excluded.media_kind,
+                 mime = excluded.mime,
+                 declared_size = excluded.declared_size",
+            params![
+                media.channel,
+                media.file_id,
+                media.sender,
+                media.filename,
+                media.media_kind,
+                media.mime,
+                clamp_u64_to_i64(media.declared_size),
+                now()
+            ],
+        ) {
+            warn!(
+                "media object upsert failed channel={} file_id={}: {}",
+                media.channel, media.file_id, e
+            );
+            self.record_db_observation("media_upsert_object", started, true);
+            return;
+        }
+
+        self.record_db_observation("media_upsert_object", started, false);
+    }
+
+    pub fn append_media_chunk(
+        &self,
+        channel: &str,
+        file_id: &str,
+        sender: &str,
+        chunk_index: u64,
+        chunk_bytes: &[u8],
+    ) {
+        if chunk_bytes.is_empty() {
+            return;
+        }
+
+        let started = Instant::now();
+        let Some(mut conn) = self.get_connection() else {
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        };
+
+        let stored_blob = if let Some(ref key) = self.pool.encryption_key {
+            match crypto::enc_bytes(key, chunk_bytes) {
+                Ok(encrypted) => {
+                    let mut wrapped =
+                        Vec::with_capacity(MEDIA_CHUNK_ENC_PREFIX.len() + encrypted.len());
+                    wrapped.extend_from_slice(MEDIA_CHUNK_ENC_PREFIX);
+                    wrapped.extend_from_slice(&encrypted);
+                    wrapped
+                }
+                Err(e) => {
+                    warn!(
+                        "media chunk encryption failed channel={} file_id={} idx={}: {}",
+                        channel, file_id, chunk_index, e
+                    );
+                    self.record_db_observation("media_append_chunk", started, true);
+                    return;
+                }
+            }
+        } else {
+            chunk_bytes.to_vec()
+        };
+
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!(
+                    "media chunk transaction open failed channel={} file_id={} idx={}: {}",
+                    channel, file_id, chunk_index, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        };
+
+        if let Err(e) = tx.execute(
+            "INSERT INTO media_objects(
+                 channel, file_id, sender, filename, media_kind, mime,
+                 declared_size, received_size, chunk_count, completed, created_ts, completed_ts
+             )
+             VALUES(?1, ?2, ?3, 'unknown', 'file', NULL, 0, 0, 0, FALSE, ?4, NULL)
+             ON CONFLICT(channel, file_id) DO NOTHING",
+            params![channel, file_id, sender, now()],
+        ) {
+            warn!(
+                "media object ensure failed channel={} file_id={}: {}",
+                channel, file_id, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        let media_row: Option<(i64, i64, i64)> = match tx
+            .query_row(
+                "SELECT id, declared_size, received_size
+                 FROM media_objects
+                 WHERE channel = ?1 AND file_id = ?2",
+                params![channel, file_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+        {
+            Ok(row) => row,
+            Err(e) => {
+                warn!(
+                    "media object lookup failed channel={} file_id={}: {}",
+                    channel, file_id, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        };
+
+        let Some((media_id, declared_size, received_size)) = media_row else {
+            warn!(
+                "media object missing for chunk persist channel={} file_id={}",
+                channel, file_id
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        };
+
+        let existing_chunk_size: Option<i64> = match tx
+            .query_row(
+                "SELECT chunk_size FROM media_chunks WHERE media_id = ?1 AND chunk_index = ?2",
+                params![media_id, clamp_u64_to_i64(chunk_index)],
+                |row| row.get(0),
+            )
+            .optional()
+        {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(
+                    "media chunk lookup failed channel={} file_id={} idx={}: {}",
+                    channel, file_id, chunk_index, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        };
+
+        let chunk_size = clamp_usize_to_i64(chunk_bytes.len());
+        if let Err(e) = tx.execute(
+            "INSERT INTO media_chunks(media_id, chunk_index, chunk_blob, chunk_size, created_ts)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(media_id, chunk_index) DO UPDATE SET
+                 chunk_blob = excluded.chunk_blob,
+                 chunk_size = excluded.chunk_size,
+                 created_ts = excluded.created_ts",
+            params![
+                media_id,
+                clamp_u64_to_i64(chunk_index),
+                stored_blob,
+                chunk_size,
+                now()
+            ],
+        ) {
+            warn!(
+                "media chunk upsert failed channel={} file_id={} idx={}: {}",
+                channel, file_id, chunk_index, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        let delta = chunk_size - existing_chunk_size.unwrap_or(0);
+        let new_received = (received_size + delta).max(0);
+        if let Err(e) = tx.execute(
+            "UPDATE media_objects SET received_size = ?2 WHERE id = ?1",
+            params![media_id, new_received],
+        ) {
+            warn!(
+                "media received_size update failed channel={} file_id={}: {}",
+                channel, file_id, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        if existing_chunk_size.is_none() {
+            if let Err(e) = tx.execute(
+                "UPDATE media_objects SET chunk_count = chunk_count + 1 WHERE id = ?1",
+                params![media_id],
+            ) {
+                warn!(
+                    "media chunk_count update failed channel={} file_id={}: {}",
+                    channel, file_id, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        }
+
+        if declared_size > 0 && new_received >= declared_size {
+            if let Err(e) = tx.execute(
+                "UPDATE media_objects
+                 SET completed = TRUE,
+                     completed_ts = COALESCE(completed_ts, ?2)
+                 WHERE id = ?1",
+                params![media_id, now()],
+            ) {
+                warn!(
+                    "media completion update failed channel={} file_id={}: {}",
+                    channel, file_id, e
+                );
+                self.record_db_observation("media_append_chunk", started, true);
+                return;
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            warn!(
+                "media chunk commit failed channel={} file_id={} idx={}: {}",
+                channel, file_id, chunk_index, e
+            );
+            self.record_db_observation("media_append_chunk", started, true);
+            return;
+        }
+
+        self.record_db_observation("media_append_chunk", started, false);
+    }
+
+    pub fn prune_media_storage(&self, max_age_secs: u64, max_total_bytes: i64) -> (usize, i64) {
+        let started = Instant::now();
+        let Some(mut conn) = self.get_connection() else {
+            self.record_db_observation("media_prune", started, true);
+            return (0, 0);
+        };
+
+        let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!("media prune transaction start failed: {}", e);
+                self.record_db_observation("media_prune", started, true);
+                return (0, 0);
+            }
+        };
+
+        let mut deleted_objects = 0usize;
+        let mut reclaimed_bytes = 0i64;
+        let cutoff_ts = now() - max_age_secs as f64;
+
+        let aged_candidates: Vec<(i64, i64)> = {
+            let mut stmt = match tx.prepare_cached(
+                "SELECT id,
+                        CASE WHEN received_size > 0 THEN received_size ELSE declared_size END AS stored_size
+                 FROM media_objects
+                 WHERE COALESCE(completed_ts, created_ts) < ?1
+                 ORDER BY COALESCE(completed_ts, created_ts) ASC
+                 LIMIT 4096",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("no such table") {
+                        self.record_db_observation("media_prune", started, false);
+                        return (0, 0);
+                    }
+                    warn!("media prune age prepare failed: {}", e);
+                    self.record_db_observation("media_prune", started, true);
+                    return (0, 0);
+                }
+            };
+
+            let rows = match stmt.query_map(params![cutoff_ts], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!("media prune age query failed: {}", e);
+                    self.record_db_observation("media_prune", started, true);
+                    return (0, 0);
+                }
+            };
+
+            rows.filter_map(|row| row.ok()).collect()
+        };
+
+        for (id, stored_size) in aged_candidates {
+            if let Err(e) = tx.execute("DELETE FROM media_objects WHERE id = ?1", params![id]) {
+                warn!("media prune age delete failed id={}: {}", id, e);
+                self.record_db_observation("media_prune", started, true);
+                return (0, 0);
+            }
+            deleted_objects += 1;
+            reclaimed_bytes += stored_size.max(0);
+        }
+
+        if max_total_bytes > 0 {
+            let total_bytes: i64 = match tx.query_row(
+                "SELECT COALESCE(SUM(CASE WHEN received_size > 0 THEN received_size ELSE declared_size END), 0)
+                 FROM media_objects",
+                [],
+                |row| row.get(0),
+            ) {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!("media prune size query failed: {}", e);
+                    self.record_db_observation("media_prune", started, true);
+                    return (0, 0);
+                }
+            };
+
+            if total_bytes > max_total_bytes {
+                let mut excess = total_bytes - max_total_bytes;
+                let budget_candidates: Vec<(i64, i64)> = {
+                    let mut stmt = match tx.prepare_cached(
+                        "SELECT id,
+                                CASE WHEN received_size > 0 THEN received_size ELSE declared_size END AS stored_size
+                         FROM media_objects
+                         WHERE completed = TRUE
+                         ORDER BY COALESCE(completed_ts, created_ts) ASC
+                         LIMIT 8192",
+                    ) {
+                        Ok(stmt) => stmt,
+                        Err(e) => {
+                            warn!("media prune budget prepare failed: {}", e);
+                            self.record_db_observation("media_prune", started, true);
+                            return (0, 0);
+                        }
+                    };
+
+                    let rows = match stmt
+                        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            warn!("media prune budget query failed: {}", e);
+                            self.record_db_observation("media_prune", started, true);
+                            return (0, 0);
+                        }
+                    };
+
+                    rows.filter_map(|row| row.ok()).collect()
+                };
+
+                for (id, stored_size) in budget_candidates {
+                    if excess <= 0 {
+                        break;
+                    }
+
+                    if let Err(e) =
+                        tx.execute("DELETE FROM media_objects WHERE id = ?1", params![id])
+                    {
+                        warn!("media prune budget delete failed id={}: {}", id, e);
+                        self.record_db_observation("media_prune", started, true);
+                        return (0, 0);
+                    }
+
+                    let accounted = stored_size.max(0);
+                    deleted_objects += 1;
+                    reclaimed_bytes += accounted;
+                    excess = excess.saturating_sub(accounted);
+                }
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            warn!("media prune transaction commit failed: {}", e);
+            self.record_db_observation("media_prune", started, true);
+            return (0, 0);
+        }
+
+        self.record_db_observation("media_prune", started, false);
+        (deleted_objects, reclaimed_bytes)
     }
 }
 

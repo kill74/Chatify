@@ -296,12 +296,12 @@ pub fn pub_b64(priv_key: &[u8]) -> Result<String, String> {
     if priv_key.len() != 32 {
         return Err("private key must be exactly 32 bytes".to_string());
     }
-    let priv_arr: [u8; 32] = priv_key
+    let mut priv_arr: [u8; 32] = priv_key
         .try_into()
         .map_err(|_| "private key must be exactly 32 bytes".to_string())?;
     let secret = StaticSecret::from(priv_arr);
+    priv_arr.zeroize();
     let public = PublicKey::from(&secret);
-    // priv_arr consumed by StaticSecret which implements ZeroizeOnDrop
     Ok(general_purpose::STANDARD.encode(public.as_bytes()))
 }
 

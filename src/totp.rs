@@ -106,14 +106,15 @@ impl User2FA {
 
         if let Some(config) = &self.totp_config {
             // Check ±1 time window for clock skew tolerance
+            // Use integer arithmetic to avoid f64 precision loss.
             let current_time = now();
+            if current_time <= 0.0 {
+                return false;
+            }
+            let current_counter = (current_time as u64) / config.step;
             for offset in -1..=1i64 {
-                let check_time = current_time + (offset * config.step as i64) as f64;
-                if check_time < 0.0 {
-                    continue;
-                }
-                let check_code =
-                    generate_totp_code_at_time(&config.secret, config.step, check_time);
+                let check_counter = (current_counter as i64 + offset).max(0) as u64;
+                let check_code = generate_hotp_code(&config.secret, check_counter);
                 if secure_string_eq(code, &check_code) {
                     return true;
                 }
@@ -185,6 +186,7 @@ pub fn generate_secret() -> String {
 }
 
 /// Generate a TOTP code at a specific time
+#[cfg(test)]
 fn generate_totp_code_at_time(secret: &str, step: u64, time: f64) -> String {
     let counter = (time as u64) / step;
     generate_hotp_code(secret, counter)

@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::env;
 #[cfg(windows)]
 use std::ffi::OsStr;

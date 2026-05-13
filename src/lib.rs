@@ -9,6 +9,8 @@
 //! - `config`: configuration management for persistent settings.
 //! - utility functions for channel normalization, timestamps, and nonces.
 
+#![deny(unsafe_code)]
+
 pub mod config;
 pub mod crypto;
 pub mod error;
@@ -47,7 +49,7 @@ pub fn normalize_channel(raw: &str) -> Option<String> {
 pub fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is before Unix epoch")
         .as_secs_f64()
 }
 
@@ -55,7 +57,7 @@ pub fn now() -> f64 {
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is before Unix epoch")
         .as_secs()
 }
 

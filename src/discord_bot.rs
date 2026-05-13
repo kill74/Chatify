@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Discord ↔ Chatify Bridge Bot
 //!
 //! Bridges messages between Discord and a Chatify WebSocket server.

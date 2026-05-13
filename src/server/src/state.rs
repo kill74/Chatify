@@ -109,12 +109,12 @@ const SESSION_IDLE_TTL_SECS: f64 = 60.0 * 60.0;
 // Normalize helpers
 // ============================================================================
 
-const OUTBOUND_QUEUE_CAPACITY_DEFAULT: usize = 1024;
-const OUTBOUND_QUEUE_CAPACITY_MIN: usize = 64;
-const OUTBOUND_QUEUE_CAPACITY_MAX: usize = 16_384;
-const SLOW_CLIENT_DROP_BURST_DEFAULT: usize = 64;
-const SLOW_CLIENT_DROP_BURST_MIN: usize = 1;
-const SLOW_CLIENT_DROP_BURST_MAX: usize = 4096;
+pub const OUTBOUND_QUEUE_CAPACITY_DEFAULT: usize = 1024;
+pub const OUTBOUND_QUEUE_CAPACITY_MIN: usize = 64;
+pub const OUTBOUND_QUEUE_CAPACITY_MAX: usize = 16_384;
+pub const SLOW_CLIENT_DROP_BURST_DEFAULT: usize = 64;
+pub const SLOW_CLIENT_DROP_BURST_MIN: usize = 1;
+pub const SLOW_CLIENT_DROP_BURST_MAX: usize = 4096;
 
 pub fn normalize_outbound_queue_capacity(requested: usize) -> usize {
     let requested = if requested == 0 {
@@ -248,6 +248,11 @@ pub struct State {
 
     /// Plugin runtime manager (API v1).
     pub plugin_runtime: PluginRuntime,
+
+    /// Whether per-IP auth rate limiting is enabled.
+    /// The binary may disable this behind NAT/localhost where it would
+    /// interfere with legitimate multi-client bootstrap.
+    pub ip_auth_enabled: bool,
 }
 
 impl State {
@@ -265,6 +270,7 @@ impl State {
         self_registration_enabled: bool,
         outbound_queue_capacity: usize,
         slow_client_drop_burst: usize,
+        ip_auth_enabled: bool,
     ) -> Arc<Self> {
         let outbound_queue_capacity = normalize_outbound_queue_capacity(outbound_queue_capacity);
         let slow_client_drop_burst = normalize_slow_client_drop_burst(slow_client_drop_burst);
@@ -304,6 +310,7 @@ impl State {
             outbound_queue_capacity,
             slow_client_drop_burst,
             plugin_runtime,
+            ip_auth_enabled,
         });
         s.channels.insert("general".into(), Channel::new());
         s
@@ -425,7 +432,12 @@ impl State {
 
     /// Checks whether an auth attempt from `addr` is allowed.
     /// Enforces a minimum 500ms interval between auth attempts from the same IP.
+    /// When `ip_auth_enabled` is false, always returns true (used by the server
+    /// binary behind NAT/localhost where IP throttle interferes with bootstrap).
     pub fn ip_auth_allowed(&self, addr: &SocketAddr) -> bool {
+        if !self.ip_auth_enabled {
+            return true;
+        }
         let ip = addr.ip();
         let now = chatify::now();
         let min_interval = 0.5;
@@ -649,6 +661,136 @@ impl State {
             .map(|m| m.is_active())
             .unwrap_or(false)
     }
+
+    // -----------------------------------------------------------------------
+    // Nonce cache maintenance
+    // -----------------------------------------------------------------------
+
+    /// Removes stale nonce cache entries for users whose last activity is
+    /// older than `max_age_secs`. Called periodically by the server binary.
+    pub fn evict_stale_nonce_entries(&self, max_age_secs: f64) -> usize {
+        let cutoff = chatify::now() - max_age_secs;
+        let stale_keys: Vec<String> = self
+            .nonce_last_seen
+            .iter()
+            .filter_map(|entry| {
+                if *entry.value() < cutoff {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            self.nonce_last_seen.remove(key);
+            self.recent_nonces.remove(key);
+        }
+        count
+    }
+
+    // -----------------------------------------------------------------------
+    // Suspicious Activity Detection
+    // -----------------------------------------------------------------------
+
+    const SPAM_MSG_THRESHOLD: usize = 30;
+    const SPAM_WINDOW_SECS: f64 = 60.0;
+    const RAID_JOIN_THRESHOLD: usize = 10;
+    const RAID_WINDOW_SECS: f64 = 60.0;
+
+    pub fn check_and_alert_spam(&self, username: &str, _channel: &str) {
+        self.store.log_suspicious_activity(
+            username,
+            "spam",
+            "low",
+            Some("message activity recorded"),
+        );
+
+        let recent = self
+            .store
+            .get_recent_activity_count(username, "spam", Self::SPAM_WINDOW_SECS);
+        if recent < Self::SPAM_MSG_THRESHOLD as i64 {
+            return;
+        }
+
+        let already_alerted =
+            self.store
+                .get_recent_activity_count(username, "spam_alert", Self::SPAM_WINDOW_SECS);
+        if already_alerted > 0 {
+            return;
+        }
+
+        self.store.log_suspicious_activity(
+            username,
+            "spam_alert",
+            "medium",
+            Some(&format!(
+                "user sent {} messages in {}s window",
+                recent,
+                Self::SPAM_WINDOW_SECS
+            )),
+        );
+    }
+
+    pub fn check_and_alert_raid(&self, username: &str, _channel: &str) {
+        self.store.log_suspicious_activity(
+            username,
+            "raid_join",
+            "low",
+            Some("channel join activity recorded"),
+        );
+
+        let recent =
+            self.store
+                .get_recent_activity_count(username, "raid_join", Self::RAID_WINDOW_SECS);
+        if recent < Self::RAID_JOIN_THRESHOLD as i64 {
+            return;
+        }
+
+        let already_alerted =
+            self.store
+                .get_recent_activity_count(username, "raid_alert", Self::RAID_WINDOW_SECS);
+        if already_alerted > 0 {
+            return;
+        }
+
+        self.store.log_suspicious_activity(
+            username,
+            "raid_alert",
+            "high",
+            Some(&format!(
+                "user joined {} channels in {}s window",
+                recent,
+                Self::RAID_WINDOW_SECS
+            )),
+        );
+        self.broadcast_alert(
+            "raid",
+            username,
+            "high",
+            &format!(
+                "Possible raid detected: user {} joining multiple channels rapidly",
+                username
+            ),
+        );
+    }
+
+    pub fn broadcast_alert(&self, alert_type: &str, target: &str, severity: &str, message: &str) {
+        let alert = serde_json::json!({
+            "t": "alert",
+            "alert_type": alert_type,
+            "target": target,
+            "severity": severity,
+            "message": message,
+            "ts": chatify::now()
+        })
+        .to_string();
+
+        for channel in self.channels.iter() {
+            let _ = channel.tx.send(alert.clone());
+        }
+    }
 }
 
 // ============================================================================
@@ -697,6 +839,7 @@ mod tests {
             true,
             1024,
             64,
+            true,
         )
     }
 

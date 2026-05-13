@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Client library - modular structure for Chatify client.
 
 pub mod args;

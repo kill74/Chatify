@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};

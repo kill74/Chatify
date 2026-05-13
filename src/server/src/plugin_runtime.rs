@@ -580,14 +580,12 @@ impl PluginRuntime {
             }
 
             if Instant::now() >= deadline {
+                // Kill child process first so its pipes close, unblocking readers.
                 let termination_error = terminate_plugin_process(&mut child).err();
-                let (stderr_bytes, stderr_truncated) = if termination_error.is_none() {
+                // Always join reader threads to avoid resource leaks.
+                let (stderr_bytes, stderr_truncated) = {
                     let _ = join_stream_reader(stdout_reader, "stdout");
                     join_stream_reader(stderr_reader, "stderr").unwrap_or_default()
-                } else {
-                    drop(stdout_reader);
-                    drop(stderr_reader);
-                    (Vec::new(), false)
                 };
                 let stderr_message = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
                 let stderr_preview = if stderr_message.is_empty() {
