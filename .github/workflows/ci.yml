@@ -73,9 +73,11 @@ jobs:
       - name: Dependency audit (advisory)
         continue-on-error: true
         run: |
-          if ! cargo install cargo-audit --locked 2>/dev/null; then
-            echo "::warning::cargo-audit installation failed — skipping audit"
-            exit 0
+          if ! command -v cargo-audit &> /dev/null; then
+            if ! cargo install cargo-audit --locked; then
+              echo "::warning::cargo-audit installation failed — skipping audit"
+              exit 0
+            fi
           fi
           cargo audit
 

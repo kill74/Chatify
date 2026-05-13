@@ -52,6 +52,9 @@ jobs:
           }
 
           git -C release-src describe --tags --exact-match "HEAD" | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tag '$tag' does not match HEAD in release-src checkout."
+          }
 
       - name: Install system dependencies
         run: |
@@ -67,8 +70,10 @@ jobs:
       - name: Install cargo-audit (best effort)
         shell: bash
         run: |
-          if ! cargo install cargo-audit --locked; then
-            echo "::warning::cargo-audit installation failed. dependency_audit will be reported as warning by the report generator."
+          if ! command -v cargo-audit &> /dev/null; then
+            if ! cargo install cargo-audit --locked; then
+              echo "::warning::cargo-audit installation failed. dependency_audit will be reported as warning by the report generator."
+            fi
           fi
 
       - name: Generate structured security report

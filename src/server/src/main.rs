@@ -73,8 +73,8 @@
 
 use chatify_server::args::Args;
 use chatify_server::plugin_runtime::{
-    MessageHookResult, PluginMessage, PluginMessageTarget, PluginRuntime, SlashExecutionResult,
-    run_builtin_plugin_worker, DEFAULT_BUILTIN_PLUGINS, PLUGIN_API_VERSION,
+    run_builtin_plugin_worker, MessageHookResult, PluginMessage, PluginMessageTarget,
+    PluginRuntime, SlashExecutionResult, DEFAULT_BUILTIN_PLUGINS, PLUGIN_API_VERSION,
 };
 
 use std::collections::BTreeMap;
@@ -128,8 +128,8 @@ use chatify_server::db::{
 };
 use chatify_server::protocol::*;
 use chatify_server::state::{
-    normalize_slow_client_drop_burst,
-    OUTBOUND_QUEUE_CAPACITY_DEFAULT, SLOW_CLIENT_DROP_BURST_DEFAULT,
+    normalize_slow_client_drop_burst, OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+    SLOW_CLIENT_DROP_BURST_DEFAULT,
 };
 
 // Data structures
@@ -5614,11 +5614,10 @@ mod tests {
     use super::*;
     use chatify::totp::TotpConfig;
     use chatify_server::db::{
-        DB_POOL_SIZE_DEFAULT, EventStore, MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT,
+        EventStore, RolePermissions, DB_POOL_SIZE_DEFAULT, MEDIA_MAX_TOTAL_SIZE_GB_DEFAULT,
         MEDIA_MAX_TOTAL_SIZE_GB_MAX, MEDIA_MAX_TOTAL_SIZE_GB_MIN,
         MEDIA_PRUNE_INTERVAL_SECS_DEFAULT, MEDIA_PRUNE_INTERVAL_SECS_MAX,
         MEDIA_PRUNE_INTERVAL_SECS_MIN, MEDIA_RETENTION_DAYS_DEFAULT, MEDIA_RETENTION_DAYS_MAX,
-        RolePermissions,
     };
     use chatify_server::state::{
         normalize_outbound_queue_capacity, OUTBOUND_QUEUE_CAPACITY_DEFAULT,
