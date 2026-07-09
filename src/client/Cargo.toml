@@ -36,7 +36,7 @@ rpassword = "7"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 base64 = "0.22"
-rand = "0.8.6"
+rand = "0.9.4"
 bitflags = "2"
 parking_lot = "0.12"
 crossterm = "0.29"
