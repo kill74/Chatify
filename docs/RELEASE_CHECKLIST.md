@@ -1,4 +1,4 @@
-# Release Checklist (v0.3.0)
+# Release Checklist (v0.4.0)
 
 Use this checklist to cut a clean, repeatable release.
 
@@ -50,26 +50,26 @@ Expected artifacts:
 
 ```bash
 git add README.md CHANGELOG.md docs/SECURITY_NOTES.md docs/BENCHMARKS.md docs/ENGINEERING_CASE_STUDY.md docs/RELEASE_CHECKLIST.md
-git commit -m "release: prepare v0.3.0"
+git commit -m "release: prepare v0.4.0"
 ```
 
 ## 6. Create Annotated Tag
 
 ```bash
-git tag -a v0.3.0 -m "v0.3.0"
+git tag -a v0.4.0 -m "v0.4.0"
 ```
 
 ## 7. Push Commit and Tag
 
 ```bash
 git push origin main
-git push origin v0.3.0
+git push origin v0.4.0
 ```
 
 ## 8. Publish GitHub Release
 
-1. Open the v0.3.0 tag in GitHub Releases.
-2. Use the CHANGELOG v0.3.0 section as release notes.
+1. Open the v0.4.0 tag in GitHub Releases.
+2. Use the CHANGELOG v0.4.0 section as release notes.
 3. Publish release.
 4. Verify windows-release-package workflow completes.
 5. Verify release-security-report workflow completes.

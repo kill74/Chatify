@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "chatify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "base64",
@@ -782,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "chatify-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "bitflags 2.13.2",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "chatify-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "bitflags 2.13.2",

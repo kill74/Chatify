@@ -1,6 +1,6 @@
 # Chatify Uniqueness Roadmap
 
-Last updated: 2026-04-21
+Last updated: 2026-11-22
 
 This document is the single source of truth for product execution and release readiness.
 
@@ -45,6 +45,7 @@ Chatify should feel differentiated by default in three ways:
 | Phase 3 Discord Bridge Re-Enable      | In progress (alpha)     | Medium     | Bridge runtime, route mapping, and status visibility exist                        | Stabilize and decide default-off vs default-on |
 | Phase 4 Terminal-Native Rich Messages | In progress             | Medium     | Markdown and ANSI are good; media UX is incomplete                                | Ship one media milestone cleanly               |
 | Phase 5 Plugin Runtime                | In progress (ecosystem enablement) | High       | API v1, built-ins, runtime management, client plugin UX, and a reference example are shipped | Widen third-party validation |
+| v0.4.0 Polish & Reliability           | Complete                           | High       | Real client E2E, protocol v2, key-rotation handling, bounded state, sanitization, lifecycle cleanup, health counters | Ship release and monitor |
 
 ## Program Health Metrics
 
@@ -223,8 +224,8 @@ Cycle goal: complete plugin operator follow-through and de-risk the next promoti
 
 ## Re-Baselined Milestones
 
-1. v0.6.0: plugin runtime beta plus client command parity (`/plugin list`, `/plugin install`, `/plugin disable`)
-2. v0.7.0: bridge stabilization cycle complete and default-policy decision
-3. v0.8.0: first rich terminal media milestone (image preview or audio notes)
-4. v0.9.0: plugin docs/examples and ecosystem conformance pass
+1. v0.4.0: polish and reliability release — real client E2E encryption, protocol v2 negotiation, trust/key-rotation handling, bounded client state, terminal sanitization, lifecycle cleanup, and health reliability counters (shipped)
+2. v0.5.0: bridge stabilization cycle complete and default-policy decision
+3. v0.6.0: first rich terminal media milestone (image preview or audio notes)
+4. v0.7.0: plugin docs/examples and ecosystem conformance pass
 5. v1.0.0 candidate: all phases at "Complete" with one stable-cycle validation

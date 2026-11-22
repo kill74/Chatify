@@ -70,7 +70,7 @@ pub fn play_startup_animation(config: &AnimationConfig) -> bool {
 
     let logo_lines = get_logo_art();
     let subtitle = "  Secure • Encrypted • Real-time Chat  ";
-    let version = "v0.3.0";
+    let version = "v0.4.0";
 
     let box_height = 22u16;
     let start_y = (rows - box_height) / 2;
