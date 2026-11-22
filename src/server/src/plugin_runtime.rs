@@ -500,22 +500,9 @@ impl PluginRuntime {
                 cmd
             }
             PluginSpec::External(path) => {
-                // Re-validate immediately before spawn. The spec was checked
-                // when it was parsed, but the file may have been swapped for
-                // a symlink pointing outside the trusted root since then.
-                let resolved = path
-                    .canonicalize()
-                    .map_err(|err| format!("failed to resolve plugin path: {}", err))?;
-                if resolved != *path {
-                    return Err("plugin path changed after validation".to_string());
-                }
-                validate_external_plugin_path(&resolved)?;
-                if !resolved.is_file() {
-                    return Err(format!(
-                        "plugin executable path is not a file: {}",
-                        resolved.to_string_lossy()
-                    ));
-                }
+                // Re-validate immediately before spawn to close the
+                // check/use window against symlink swaps after spec parsing.
+                let resolved = revalidate_external_plugin_path(path)?;
                 let mut cmd = Command::new(&resolved);
                 if let Some(parent) = resolved.parent() {
                     cmd.current_dir(parent);
@@ -1276,6 +1263,26 @@ fn trusted_plugin_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Re-resolves an already-validated plugin path immediately before spawn to
+/// close the check/use window: a file can be swapped for a symlink pointing
+/// outside the trusted root after the spec was first parsed.
+fn revalidate_external_plugin_path(path: &Path) -> Result<PathBuf, String> {
+    let resolved = path
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve plugin path: {}", err))?;
+    if resolved != path {
+        return Err("plugin path changed after validation".to_string());
+    }
+    validate_external_plugin_path(&resolved)?;
+    if !resolved.is_file() {
+        return Err(format!(
+            "plugin executable path is not a file: {}",
+            resolved.to_string_lossy()
+        ));
+    }
+    Ok(resolved)
+}
+
 fn validate_external_plugin_path(path: &Path) -> Result<(), String> {
     let roots = trusted_plugin_roots();
     if roots.is_empty() {
@@ -1390,6 +1397,37 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn revalidate_rejects_symlink_swapped_after_parse() {
+        // Simulates a plugin path that was validated as a regular file but was
+        // replaced by a symlink before spawn. Canonicalization resolves to a
+        // different path, which must be rejected by the check/use re-validation.
+        let dir = env::temp_dir().join(format!(
+            "chatify-plugin-toctou-{}",
+            chatify::fresh_nonce_hex()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let target = dir.join("real-plugin");
+        std::fs::write(&target, b"plugin").expect("create target file");
+        let link = dir.join("plugin-link");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).expect("create symlink");
+
+        let result = revalidate_external_plugin_path(&link);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir(&dir);
+
+        assert!(result.is_err(), "a swapped symlink must be rejected");
+        assert!(
+            result.unwrap_err().contains("changed after validation"),
+            "rejection must name the TOCTOU check"
+        );
     }
 
     #[test]

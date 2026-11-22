@@ -160,6 +160,14 @@ pub fn normalize_slow_client_drop_burst(requested: usize) -> usize {
 // Server State
 // ============================================================================
 
+/// Kinds of lifetime events tracked for reliability monitoring.
+#[derive(Clone, Copy, Debug)]
+pub enum ReliabilityEvent {
+    Message,
+    Dm,
+    Reconnect,
+}
+
 /// Central server state shared by all connection handler tasks via `Arc`.
 ///
 /// Every field uses a lock-free concurrent map ([`DashMap`]) or atomic
@@ -208,6 +216,18 @@ pub struct State {
     /// [`ConnectionGuard`] RAII to guarantee accurate accounting even on
     /// panics.
     pub active_connections: AtomicUsize,
+
+    /// Wall-clock instant the server started, used to report uptime in the
+    /// health endpoint.
+    pub started_at: std::time::Instant,
+
+    /// Lifetime counters surfaced by the health endpoint for reliability
+    /// monitoring. All are monotonic and saturating.
+    pub total_connections: AtomicU64,
+    pub total_messages: AtomicU64,
+    pub total_dms: AtomicU64,
+    pub total_reconnects: AtomicU64,
+    pub last_event_at: AtomicU64,
 
     /// Notified whenever `active_connections` reaches zero, allowing the
     /// graceful-shutdown loop to wake immediately rather than polling.
@@ -328,6 +348,12 @@ impl State {
             recent_nonces: DashMap::new(),
             nonce_last_seen: DashMap::new(),
             active_connections: AtomicUsize::new(0),
+            started_at: std::time::Instant::now(),
+            total_connections: AtomicU64::new(0),
+            total_messages: AtomicU64::new(0),
+            total_dms: AtomicU64::new(0),
+            total_reconnects: AtomicU64::new(0),
+            last_event_at: AtomicU64::new(0),
             drained_notify: Notify::new(),
             store,
             ip_connections: DashMap::new(),
@@ -429,6 +455,7 @@ impl State {
 
     fn connection_opened(&self) {
         self.active_connections.fetch_add(1, Ordering::SeqCst);
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
         self.metrics.inc_accepted();
         if let Some(ref m) = self.prometheus {
             if let Ok(mutex_guard) = m.lock() {
@@ -775,6 +802,24 @@ impl State {
     ///
     /// Only entries with no remaining broadcast subscribers and no activity
     /// for `max_age_secs` are removed, so active conversations are untouched.
+    /// Records a lifetime reliability event for the health endpoint. All
+    /// counters saturate and updates are lock-free.
+    pub fn note_reliability_event(&self, event: ReliabilityEvent) {
+        let now = crate::now() as u64;
+        self.last_event_at.store(now, Ordering::Relaxed);
+        match event {
+            ReliabilityEvent::Message => {
+                self.total_messages.fetch_add(1, Ordering::Relaxed);
+            }
+            ReliabilityEvent::Dm => {
+                self.total_dms.fetch_add(1, Ordering::Relaxed);
+            }
+            ReliabilityEvent::Reconnect => {
+                self.total_reconnects.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn prune_idle_channels(&self, max_age_secs: u64) -> usize {
         let now = chatify::now_secs();
         let mut pruned = 0usize;

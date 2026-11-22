@@ -190,7 +190,7 @@ struct AuthInfo {
 
 // EventStore is imported from chatify-server library.
 // Channel Ã¢â‚¬â€ in-memory broadcast + history ring buffer
-use chatify_server::state::{BridgeInfo, ConnectionGuard, State};
+use chatify_server::state::{BridgeInfo, ConnectionGuard, ReliabilityEvent, State};
 
 // ---------------------------------------------------------------------------
 // State ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â shared, thread-safe server state
@@ -1085,6 +1085,7 @@ async fn handle_event(
                 None
             };
 
+            state.note_reliability_event(ReliabilityEvent::Message);
             let msg_id = chatify::fresh_nonce_hex();
             let mut entry = serde_json::json!({
                 "t":"msg",
@@ -1167,6 +1168,7 @@ async fn handle_event(
                 send_err(out_tx, "DM recipient does not exist", &state.metrics);
                 return;
             }
+            state.note_reliability_event(ReliabilityEvent::Dm);
             let sender_pk = state
                 .user_pubkeys
                 .get(username)
@@ -1230,7 +1232,7 @@ async fn handle_event(
             );
             let join_msg = serde_json::json!({
                 "t":"sys",
-                "m":format!("ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {} joined #{}", username, ch),
+                "m":format!("\u{2022} {} joined #{}", username, ch),
                 "ts":now()
             });
             let join_event = serde_json::json!({
@@ -1738,7 +1740,7 @@ async fn handle_event(
             *voice_room = Some(room.clone());
             let join_voice = serde_json::json!({
                 "t":"sys",
-                "m":format!("ÃƒÂ°Ã…Â¸Ã…Â½Ã¢â€žÂ¢ {} joined voice #{}", username, room),
+                "m":format!("\u{1F3A4} {} joined voice #{}", username, room),
                 "ts":now()
             });
             state.store.persist(
@@ -1766,7 +1768,7 @@ async fn handle_event(
 
                 let leave_voice = serde_json::json!({
                     "t":"sys",
-                    "m":format!("ÃƒÂ°Ã…Â¸Ã…Â½Ã¢â€žÂ¢ {} left voice #{}", username, room),
+                    "m":format!("\u{1F3A4} {} left voice #{}", username, room),
                     "ts":now()
                 });
                 state.store.persist(
@@ -3424,14 +3426,32 @@ fn create_health_response(state: &Arc<State>) -> String {
     let channels = state.channels.len();
     let online = state.online_count();
     let connections = state.active_connection_count();
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let last_event_age_secs = {
+        let last = state
+            .last_event_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 {
+            None
+        } else {
+            Some((chatify::now() - last as f64).max(0.0) as u64)
+        }
+    };
 
     let response = serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        "uptime_secs": 0,
+        "uptime_secs": uptime_secs,
         "channels": channels,
         "online_users": online,
-        "active_connections": connections
+        "active_connections": connections,
+        "reliability": {
+            "total_connections": state.total_connections.load(std::sync::atomic::Ordering::Relaxed),
+            "total_messages": state.total_messages.load(std::sync::atomic::Ordering::Relaxed),
+            "total_dms": state.total_dms.load(std::sync::atomic::Ordering::Relaxed),
+            "total_reconnects": state.total_reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            "last_event_age_secs": last_event_age_secs
+        }
     });
 
     format!(
@@ -3578,17 +3598,24 @@ fn create_ok_response(
     state: &Arc<State>,
     hist: Vec<Value>,
     session_token: Option<&str>,
+    negotiated_version: u64,
 ) -> String {
+    let mut proto = serde_json::json!({
+        "v": negotiated_version,
+        "min_v": MIN_PROTOCOL_VERSION,
+        "max_v": PROTOCOL_VERSION_V2,
+        "max_payload_bytes": MAX_BYTES
+    });
+    if negotiated_version >= PROTOCOL_VERSION_V2 {
+        proto["features"] = serde_json::json!(PROTOCOL_FEATURES_V2);
+    }
     let mut response = serde_json::json!({
         "t": "ok",
         "u": username,
         "users": state.users_with_keys_json(),
         "channels": state.channels_json(),
         "hist": hist,
-        "proto": {
-            "v": PROTOCOL_VERSION,
-            "max_payload_bytes": MAX_BYTES
-        },
+        "proto": proto,
         "media": {
             "capabilities_version": MEDIA_CAPABILITIES_VERSION,
             "voice": {
@@ -4691,6 +4718,11 @@ where
 
     // ---- Phase 2: register user and send welcome response -------------------
 
+    // A user that was already present is re-authenticating (reconnect after a
+    // dropped socket). Track that for reliability monitoring.
+    if state.user_statuses.contains_key(&username) {
+        state.note_reliability_event(ReliabilityEvent::Reconnect);
+    }
     state.user_statuses.insert(username.clone(), status.clone());
     state.user_pubkeys.insert(username.clone(), pubkey);
     state.store.upsert_presence_snapshot(&username, &status);
@@ -4736,12 +4768,22 @@ where
         hist = general.hist().await;
     }
 
-    let ok = create_ok_response(&username, &state, hist, Some(&session_token));
+    // Negotiate the sub-protocol version from the client's requested version.
+    // Clients that omit `proto_v` stay on v1, so existing deployments are
+    // unaffected by this additive capability negotiation.
+    let negotiated_version = negotiate_protocol_version(d.get("proto_v").and_then(|v| v.as_u64()));
+    let ok = create_ok_response(
+        &username,
+        &state,
+        hist,
+        Some(&session_token),
+        negotiated_version,
+    );
     if sink.send(Message::text(ok)).await.is_err() {
         return;
     }
 
-    broadcast_system_msg(&state, &format!("ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {} joined", username)).await;
+    broadcast_system_msg(&state, &format!("\u{2022} {} joined", username)).await;
     info!("client joined");
 
     // ---- Phase 3: set up bidirectional message routing ----------------------
@@ -4944,7 +4986,7 @@ where
     if state.bridges.remove(&username).is_some() {
         info!("event=bridge_disconnected");
     }
-    broadcast_system_msg(&state, &format!("ÃƒÂ¢Ã…â€œÃ¢â‚¬â€œ {} left", username)).await;
+    broadcast_system_msg(&state, &format!("\u{2022} {} left", username)).await;
     info!("client left");
     // _conn_guard drops here, decrementing active_connections and IP counter.
 }
@@ -5997,6 +6039,53 @@ mod tests {
         }
 
         assert_eq!(state.active_connection_count(), 0);
+    }
+
+    #[test]
+    fn health_response_reports_reliability_counters() {
+        let plugin_runtime =
+            PluginRuntime::new(std::env::current_exe().expect("resolve current exe"));
+        let state = State::new(
+            ":memory:".to_string(),
+            None,
+            DbDurabilityMode::MaxSafety,
+            DB_POOL_SIZE_DEFAULT,
+            None,
+            plugin_runtime,
+            60,
+            false,
+            false,
+            OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+            SLOW_CLIENT_DROP_BURST_DEFAULT,
+            true,
+        );
+
+        state.note_reliability_event(ReliabilityEvent::Message);
+        state.note_reliability_event(ReliabilityEvent::Message);
+        state.note_reliability_event(ReliabilityEvent::Dm);
+        state.note_reliability_event(ReliabilityEvent::Reconnect);
+
+        let response = create_health_response(&state);
+        let body = response.split("\r\n\r\n").nth(1).expect("response body");
+        let json: serde_json::Value = serde_json::from_str(body).expect("health JSON");
+
+        assert!(json.get("uptime_secs").and_then(|v| v.as_u64()).is_some());
+        let reliability = json
+            .get("reliability")
+            .and_then(|v| v.as_object())
+            .expect("reliability block");
+        assert_eq!(
+            reliability.get("total_messages").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            reliability.get("total_dms").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            reliability.get("total_reconnects").and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 
     #[test]

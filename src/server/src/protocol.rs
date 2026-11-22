@@ -43,8 +43,37 @@ pub const DEFAULT_REWIND_LIMIT: usize = 100;
 /// DM channel name prefix.
 pub const DM_CHANNEL_PREFIX: &str = "__dm__";
 
-/// WebSocket sub-protocol version advertised in the `"ok"` auth response.
+/// Legacy WebSocket sub-protocol version, still fully supported.
 pub const PROTOCOL_VERSION: u64 = 1;
+
+/// Current WebSocket sub-protocol version advertised in the `"ok"` auth
+/// response. v2 is additive: it negotiates capabilities via the `proto`
+/// object but keeps every v1 field and event shape intact.
+pub const PROTOCOL_VERSION_V2: u64 = 2;
+
+/// Minimum protocol version the server still accepts. Older clients remain
+/// supported so a server upgrade never locks out deployed clients.
+pub const MIN_PROTOCOL_VERSION: u64 = 1;
+
+/// Feature flags advertised alongside `proto.v` in the auth response. Clients
+/// use these to detect capabilities without guessing from the version number.
+pub const PROTOCOL_FEATURES_V2: &[&str] = &[
+    "e2e-default",
+    "typing-ttl",
+    "media",
+    "session-tokens",
+    "reaction-sync",
+];
+
+/// Resolves the negotiated protocol version from a client's requested version.
+/// Unknown or absent values fall back to v1 for compatibility.
+#[must_use]
+pub fn negotiate_protocol_version(requested: Option<u64>) -> u64 {
+    match requested {
+        Some(v) if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION_V2).contains(&v) => v,
+        _ => PROTOCOL_VERSION,
+    }
+}
 
 /// Optional media capability envelope version.
 ///

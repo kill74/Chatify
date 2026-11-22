@@ -137,7 +137,7 @@ fn plugin_commands_summary(value: Option<&serde_json::Value>) -> String {
             command
                 .get("name")
                 .and_then(|v| v.as_str())
-                .map(|name| format!("/{}", name))
+                .map(|name| format!("/{}", clean_wire_text(name)))
         })
         .collect();
 
@@ -603,7 +603,7 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
     // Decrypt the wire ciphertext with the channel key. Legacy plaintext
     // messages fall through unchanged.
     state_lock.ensure_channel_key(&ch);
-    let plaintext = state_lock.decrypt_content(&ch, &c);
+    let (plaintext, was_encrypted) = state_lock.decrypt_content_checked(&ch, &c);
     let plaintext = clean_wire_text(&plaintext);
 
     let mut message = make_text_message(
@@ -612,7 +612,7 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
         ch.to_string(),
         u.to_string(),
         plaintext.clone(),
-        true,
+        was_encrypted,
     );
     message.reply = reply_preview_from_event(data).map(|mut preview| {
         let scope = message.channel.clone();
@@ -696,8 +696,8 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
     } else {
         state_lock.ensure_dm_key_from_pubkey(&peer, pk);
     }
-    let mut plaintext = state_lock.decrypt_dm_content(&peer, &content);
-    plaintext = clean_wire_text(&plaintext);
+    let (plaintext, was_encrypted) = state_lock.decrypt_dm_content_checked(&peer, &content);
+    let plaintext = clean_wire_text(&plaintext);
 
     let message = make_text_message(
         msg_id.clone(),
@@ -705,7 +705,7 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
         scope,
         from.to_string(),
         plaintext,
-        true,
+        was_encrypted,
     );
     state_lock.add_message(message.clone());
     state_lock.note_incoming_message(&message.channel, from_is_me);
@@ -1010,14 +1010,15 @@ async fn ingest_timeline_events(
                 let sender = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
                 let event_ts = extract_ts(event, 0);
                 state_lock.ensure_channel_key(scope);
-                let plaintext = clean_wire_text(&state_lock.decrypt_content(scope, content));
+                let (text, was_encrypted) = state_lock.decrypt_content_checked(scope, content);
+                let plaintext = clean_wire_text(&text);
                 let mut message = make_text_message(
                     extract_msg_id(event),
                     event_ts,
                     scope.to_string(),
                     sender.to_string(),
                     plaintext,
-                    true,
+                    was_encrypted,
                 );
                 message.reply = reply_preview_from_event(event).map(|mut preview| {
                     preview.preview = preview
@@ -1038,14 +1039,15 @@ async fn ingest_timeline_events(
                 let peer = scope.strip_prefix("dm:").unwrap_or(scope);
                 let pk = event.get("pk").and_then(|v| v.as_str()).unwrap_or("");
                 state_lock.ensure_dm_key_from_pubkey(peer, pk);
-                let plaintext = clean_wire_text(&state_lock.decrypt_dm_content(peer, content));
+                let (text, was_encrypted) = state_lock.decrypt_dm_content_checked(peer, content);
+                let plaintext = clean_wire_text(&text);
                 state_lock.add_message(make_text_message(
                     extract_msg_id(event),
                     event_ts,
                     scope.to_string(),
                     sender.to_string(),
                     plaintext,
-                    true,
+                    was_encrypted,
                 ));
             }
             "file_meta" => {
@@ -1224,26 +1226,32 @@ pub async fn handle_plugins_event(state: &SharedState, data: &serde_json::Value,
 
     println!("Installed plugins:");
     for plugin in plugins {
-        let id = plugin
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let id = clean_wire_text(
+            plugin
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        );
         let enabled = plugin
             .get("enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let api_version = plugin
-            .get("api_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let api_version = clean_wire_text(
+            plugin
+                .get("api_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        );
         let message_hook = plugin
             .get("message_hook")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let source = plugin
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let source = clean_wire_text(
+            plugin
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        );
         let commands = plugin_commands_summary(plugin.get("commands"));
 
         println!(
@@ -1263,15 +1271,17 @@ pub async fn handle_plugin_installed_event(
     data: &serde_json::Value,
     _ts: u64,
 ) {
-    let plugin = data
-        .get("plugin")
-        .or_else(|| data.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let api_version = data
-        .get("api_version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let plugin = clean_wire_text(
+        data.get("plugin")
+            .or_else(|| data.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+    );
+    let api_version = clean_wire_text(
+        data.get("api_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+    );
     let message_hook = data
         .get("message_hook")
         .and_then(|v| v.as_bool())
@@ -1300,11 +1310,12 @@ pub async fn handle_plugin_installed_event(
 }
 
 pub async fn handle_plugin_disabled_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
-    let plugin = data
-        .get("plugin")
-        .or_else(|| data.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let plugin = clean_wire_text(
+        data.get("plugin")
+            .or_else(|| data.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+    );
     let summary = format!("Plugin disabled: {}.", plugin);
 
     let mut state_lock = state.lock().await;
@@ -1351,18 +1362,24 @@ pub async fn handle_bridge_status_event(state: &SharedState, data: &serde_json::
 
     println!("Connected bridges:");
     for bridge in bridges {
-        let username = bridge
-            .get("username")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let bridge_type = bridge
-            .get("bridge_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let instance_id = bridge
-            .get("instance_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let username = clean_wire_text(
+            bridge
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        );
+        let bridge_type = clean_wire_text(
+            bridge
+                .get("bridge_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        );
+        let instance_id = clean_wire_text(
+            bridge
+                .get("instance_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        );
         let route_count = bridge
             .get("route_count")
             .and_then(|v| v.as_u64())

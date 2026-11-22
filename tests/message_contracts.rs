@@ -1065,6 +1065,83 @@ async fn protocol_contract_advertises_backward_compatible_version() {
     );
 }
 
+/// Verifies that a client requesting protocol v2 negotiates up to v2 and
+/// receives the advertised capability list, while legacy fields remain intact.
+#[tokio::test]
+async fn protocol_contract_negotiates_v2_with_capabilities() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for protocol v2 test");
+
+    ws.send(Message::text(
+        json!({
+            "t": "auth", "u": "proto-v2-check",
+            "proto_v": 2,
+            "pw": test_pw_hash_for("proto-v2-check"),
+            "pk": pub_b64(&new_keypair()).unwrap(),
+            "status": {"text":"Online","emoji":""}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send v2 auth");
+
+    let ok = recv_by_type(&mut ws, "ok").await;
+    let proto = ok
+        .get("proto")
+        .and_then(|v| v.as_object())
+        .expect("ok payload must include proto object");
+
+    assert_eq!(proto.get("v").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(proto.get("min_v").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(proto.get("max_v").and_then(|v| v.as_u64()), Some(2));
+    let features = proto
+        .get("features")
+        .and_then(|v| v.as_array())
+        .expect("v2 must advertise features");
+    assert!(features.iter().any(|f| f.as_str() == Some("e2e-default")));
+    assert!(
+        proto
+            .get("max_payload_bytes")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| v >= 1024),
+        "legacy max_payload_bytes field must remain present"
+    );
+}
+
+/// Verifies that an out-of-range requested protocol version falls back to v1
+/// rather than being accepted verbatim.
+#[tokio::test]
+async fn protocol_contract_clamps_unknown_protocol_version() {
+    let server = start_server().await;
+    let (mut ws, _) = connect_async(&server.url)
+        .await
+        .expect("connect websocket for protocol clamp test");
+
+    ws.send(Message::text(
+        json!({
+            "t": "auth", "u": "proto-clamp-check",
+            "pw": test_pw_hash_for("proto-clamp-check"),
+            "proto_v": 999,
+            "pk": pub_b64(&new_keypair()).unwrap(),
+            "status": {"text":"Online","emoji":""}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send auth with out-of-range proto_v");
+
+    let ok = recv_by_type(&mut ws, "ok").await;
+    assert_eq!(
+        ok.get("proto")
+            .and_then(|v| v.get("v"))
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "unknown versions must negotiate down to v1"
+    );
+}
+
 /// Verifies that usernames containing whitespace are rejected during auth.
 ///
 /// Whitespace in usernames would allow homoglyph-style confusion attacks and

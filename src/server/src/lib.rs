@@ -44,6 +44,6 @@ pub use plugin_runtime::{
 pub use protocol::*;
 pub use state::{
     normalize_outbound_queue_capacity, normalize_slow_client_drop_burst, BridgeInfo, Channel,
-    ConnectionGuard, SessionRecord, State, OUTBOUND_QUEUE_CAPACITY_DEFAULT,
+    ConnectionGuard, ReliabilityEvent, SessionRecord, State, OUTBOUND_QUEUE_CAPACITY_DEFAULT,
     SLOW_CLIENT_DROP_BURST_DEFAULT,
 };

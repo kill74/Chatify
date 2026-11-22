@@ -88,6 +88,9 @@ pub struct ClientState {
     pub chan_keys: HashMap<String, Vec<u8>>,
     /// Per-DM user keys: username → 32-byte key (derived from X25519 ECDH).
     pub dm_keys: HashMap<String, Vec<u8>>,
+    /// Public key each cached DM key was derived from. Used to detect key
+    /// rotation and re-derive before decrypting/sending to a rotated peer.
+    pub dm_key_pubkeys: HashMap<String, String>,
     /// Client's X25519 private key (32 bytes, used to derive DM keys).
     pub priv_key: Vec<u8>,
     /// Whether the connection is active.
@@ -404,6 +407,7 @@ impl ClientState {
             },
             chan_keys: HashMap::new(),
             dm_keys: HashMap::new(),
+            dm_key_pubkeys: HashMap::new(),
             priv_key: Vec::new(),
             running: true,
             voice_active: false,
@@ -517,6 +521,28 @@ impl ClientState {
                 None => break,
             }
         }
+    }
+
+    /// Clears state that is only valid for a single server connection. Called
+    /// on disconnect and again after a successful re-auth so stale indicators
+    /// (voice, screen share, typing, in-flight transfers) never leak across
+    /// reconnects. Durable data (history, trust, keys, drafts) is preserved.
+    pub fn reset_for_reconnect(&mut self) {
+        self.running = false;
+        self.voice_active = false;
+        self.voice_muted = false;
+        self.voice_deafened = false;
+        self.voice_speaking = false;
+        self.voice_members.clear();
+        self.screen_share = None;
+        self.screen_viewing = false;
+        self.screen_frames_received = 0;
+        self.screen_last_frame_seq = None;
+        self.typing_presence.clear();
+        self.file_transfers.clear();
+        self.pending_media_transfers.clear();
+        self.activity_hint = None;
+        self.unread_separator_scopes.clear();
     }
 
     /// Bounds the per-scope and per-message bookkeeping maps. Called whenever
@@ -1159,6 +1185,12 @@ impl ClientState {
             return None;
         }
 
+        // If this is a new key for a peer whose DM key we cached, invalidate
+        // the cache so the next send/decrypt derives from the current key.
+        if self.users.get(user).is_some_and(|pk| pk != pubkey_b64) {
+            self.dm_keys.remove(user);
+            self.dm_key_pubkeys.remove(user);
+        }
         self.users.insert(user.to_string(), pubkey_b64.to_string());
 
         let observed_fingerprint = Self::fingerprint_for_pubkey(pubkey_b64)?;
@@ -1604,17 +1636,23 @@ impl ClientState {
             .ok_or_else(|| "channel key unavailable".to_string())
     }
 
-    /// Returns the cached X25519-derived key for a DM peer.
+    /// Returns the cached X25519-derived key for a DM peer, re-deriving if
+    /// the peer's public key changed since the cache was populated.
     fn get_dm_key(&mut self, peer: &str) -> Result<&[u8], String> {
-        if !self.dm_keys.contains_key(peer) {
-            let peer_pk = self
-                .users
-                .get(peer)
-                .ok_or_else(|| format!("no public key known for '{}'", peer))?
-                .clone();
+        let peer_pk = self
+            .users
+            .get(peer)
+            .ok_or_else(|| format!("no public key known for '{}'", peer))?
+            .clone();
+        let stale = self
+            .dm_key_pubkeys
+            .get(peer)
+            .is_some_and(|cached| cached != &peer_pk);
+        if stale || !self.dm_keys.contains_key(peer) {
             let key = chatify::crypto::dh_key(&self.priv_key, &peer_pk)
                 .map_err(|err| format!("failed to derive DM key: {}", err))?;
             self.dm_keys.insert(peer.to_string(), key);
+            self.dm_key_pubkeys.insert(peer.to_string(), peer_pk);
         }
         self.dm_keys
             .get(peer)
@@ -1641,12 +1679,12 @@ impl ClientState {
         ))
     }
 
-    /// Decrypts a wire `c` field. Legacy/plaintext messages (valid UTF-8 that
-    /// is not valid ciphertext) are returned unchanged for compatibility.
-    pub fn decrypt_content(&self, channel: &str, ciphertext_b64: &str) -> String {
+    /// Decrypts a wire `c` field, returning `(text, was_encrypted)`. Legacy
+    /// plaintext messages are returned unchanged with `false`.
+    pub fn decrypt_content_checked(&self, channel: &str, ciphertext_b64: &str) -> (String, bool) {
         let encrypted = match base64::engine::general_purpose::STANDARD.decode(ciphertext_b64) {
             Ok(bytes) => bytes,
-            Err(_) => return ciphertext_b64.to_string(),
+            Err(_) => return (ciphertext_b64.to_string(), false),
         };
         let plaintext = if let Some(key) = self
             .chan_keys
@@ -1658,20 +1696,30 @@ impl ClientState {
             Err("no key for scope".to_string())
         };
         match plaintext {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(_) => ciphertext_b64.to_string(), // legacy plaintext or undecryptable
+            Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), true),
+            Err(_) => (ciphertext_b64.to_string(), false),
         }
+    }
+
+    /// Backwards-compatible wrapper that discards the encrypted flag.
+    pub fn decrypt_content(&self, channel: &str, ciphertext_b64: &str) -> String {
+        self.decrypt_content_checked(channel, ciphertext_b64).0
     }
 
     /// Derives and caches a DM key for `peer` using the public key already in
     /// the user directory (used for our own echoed DMs).
     pub fn ensure_dm_key(&mut self, peer: &str) {
-        if self.dm_keys.contains_key(peer) {
-            return;
-        }
-        if let Some(pk) = self.users.get(peer).cloned() {
-            if let Ok(key) = chatify::crypto::dh_key(&self.priv_key, &pk) {
-                self.dm_keys.insert(peer.to_string(), key);
+        let pk = self.users.get(peer).cloned();
+        if let Some(pk) = pk {
+            let stale = self
+                .dm_key_pubkeys
+                .get(peer)
+                .is_some_and(|cached| cached != &pk);
+            if stale || !self.dm_keys.contains_key(peer) {
+                if let Ok(key) = chatify::crypto::dh_key(&self.priv_key, &pk) {
+                    self.dm_keys.insert(peer.to_string(), key);
+                    self.dm_key_pubkeys.insert(peer.to_string(), pk);
+                }
             }
         }
     }
@@ -1679,28 +1727,40 @@ impl ClientState {
     /// Derives and caches a DM key for `peer` from the public key supplied in
     /// a wire event. Used on the receive path before any DM has been sent.
     pub fn ensure_dm_key_from_pubkey(&mut self, peer: &str, pubkey_b64: &str) {
-        if peer.trim().is_empty() || self.dm_keys.contains_key(peer) {
+        if peer.trim().is_empty() {
             return;
         }
-        if let Ok(key) = chatify::crypto::dh_key(&self.priv_key, pubkey_b64) {
-            self.dm_keys.insert(peer.to_string(), key);
+        let stale = self
+            .dm_key_pubkeys
+            .get(peer)
+            .is_some_and(|cached| cached != pubkey_b64);
+        if stale || !self.dm_keys.contains_key(peer) {
+            if let Ok(key) = chatify::crypto::dh_key(&self.priv_key, pubkey_b64) {
+                self.dm_keys.insert(peer.to_string(), key);
+                self.dm_key_pubkeys
+                    .insert(peer.to_string(), pubkey_b64.to_string());
+            }
         }
     }
 
-    /// Decrypts a DM `c` field using the derived key for `peer`, falling back
-    /// to plaintext for legacy messages.
-    pub fn decrypt_dm_content(&self, peer: &str, ciphertext_b64: &str) -> String {
+    /// Decrypts a DM `c` field, returning `(text, was_encrypted)`.
+    pub fn decrypt_dm_content_checked(&self, peer: &str, ciphertext_b64: &str) -> (String, bool) {
         let encrypted = match base64::engine::general_purpose::STANDARD.decode(ciphertext_b64) {
             Ok(bytes) => bytes,
-            Err(_) => return ciphertext_b64.to_string(),
+            Err(_) => return (ciphertext_b64.to_string(), false),
         };
         match self.dm_keys.get(peer) {
             Some(key) => match chatify::crypto::dec_bytes(key, &encrypted) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(_) => ciphertext_b64.to_string(),
+                Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), true),
+                Err(_) => (ciphertext_b64.to_string(), false),
             },
-            None => ciphertext_b64.to_string(),
+            None => (ciphertext_b64.to_string(), false),
         }
+    }
+
+    /// Backwards-compatible wrapper that discards the encrypted flag.
+    pub fn decrypt_dm_content(&self, peer: &str, ciphertext_b64: &str) -> String {
+        self.decrypt_dm_content_checked(peer, ciphertext_b64).0
     }
 
     pub fn send_dm(&mut self, to_user: &str, content: &str) -> Result<(), String> {
@@ -2631,5 +2691,136 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn key_rotation_invalidates_cached_dm_key() {
+        let mut state = make_test_state();
+        state.priv_key = chatify::crypto::new_keypair();
+        let old_peer = chatify::crypto::new_keypair();
+        let old_pk = chatify::crypto::pub_b64(&old_peer).unwrap();
+        state.users.insert("alice".to_string(), old_pk.clone());
+
+        state.ensure_dm_key("alice");
+        assert!(state.dm_keys.contains_key("alice"));
+        let cached = state.dm_keys.get("alice").cloned().unwrap();
+        assert_eq!(
+            state.dm_key_pubkeys.get("alice").map(String::as_str),
+            Some(old_pk.as_str())
+        );
+
+        // Peer rotates their key: the cached key must be discarded so a new
+        // one is derived from the new public key.
+        let new_peer = chatify::crypto::new_keypair();
+        let new_pk = chatify::crypto::pub_b64(&new_peer).unwrap();
+        state.observe_user_key("alice", &new_pk);
+        assert!(!state.dm_keys.contains_key("alice"));
+        assert!(!state.dm_key_pubkeys.contains_key("alice"));
+
+        state.ensure_dm_key_from_pubkey("alice", &new_pk);
+        let refreshed = state.dm_keys.get("alice").cloned().unwrap();
+        assert_ne!(cached, refreshed);
+        assert_eq!(
+            state.dm_key_pubkeys.get("alice").map(String::as_str),
+            Some(new_pk.as_str())
+        );
+    }
+
+    #[test]
+    fn bounded_collections_stay_capped_under_flood() {
+        let (mut state, _rx) = make_test_state_with_receiver();
+
+        for i in 0..(MAX_TRACKED_REACTION_MESSAGES + 50) {
+            state.reactions.insert(
+                format!("msg-{}", i),
+                [("👍".to_string(), 1)].into_iter().collect(),
+            );
+        }
+        for i in 0..(MAX_TYPING_PRESENCE + 50) {
+            state.typing_presence.insert(
+                format!("general|user-{}", i),
+                crate::state::TypingPresence {
+                    user: format!("user-{}", i),
+                    timestamp: 100,
+                },
+            );
+        }
+        for i in 0..(MAX_TRACKED_SCOPES + 50) {
+            let scope = format!("scope-{}", i);
+            state.unread_counts.insert(scope.clone(), 1);
+            state.unread_markers.insert(scope.clone(), 1);
+            state.drafts.insert(scope.clone(), "draft".to_string());
+            state.unread_separator_scopes.insert(scope);
+        }
+
+        state.prune_bounded_collections();
+
+        assert!(state.reactions.len() <= MAX_TRACKED_REACTION_MESSAGES);
+        assert!(state.typing_presence.len() <= MAX_TYPING_PRESENCE);
+        assert!(state.unread_counts.len() <= MAX_TRACKED_SCOPES);
+        assert!(state.unread_markers.len() <= MAX_TRACKED_SCOPES);
+        assert!(state.drafts.len() <= MAX_TRACKED_SCOPES);
+        assert!(state.unread_separator_scopes.len() <= MAX_TRACKED_SCOPES);
+    }
+
+    #[test]
+    fn reset_for_reconnect_clears_volatile_state_but_keeps_history() {
+        let (mut state, _rx) = make_test_state_with_receiver();
+        state.running = true;
+        state.voice_active = true;
+        state.voice_muted = true;
+        state.screen_share = Some(());
+        state.screen_viewing = true;
+        state.screen_frames_received = 42;
+        state.typing_presence.insert(
+            "alice".to_string(),
+            crate::state::TypingPresence {
+                user: "alice".to_string(),
+                timestamp: 123,
+            },
+        );
+        state.add_message(crate::state::DisplayedMessage {
+            id: "m1".to_string(),
+            ts: 1.0,
+            channel: "general".to_string(),
+            sender: "alice".to_string(),
+            content: "keep me".to_string(),
+            reply: None,
+            payload: None,
+            encrypted: true,
+            edited: false,
+        });
+
+        state.reset_for_reconnect();
+
+        assert!(!state.running);
+        assert!(!state.voice_active);
+        assert!(!state.voice_muted);
+        assert!(state.screen_share.is_none());
+        assert!(!state.screen_viewing);
+        assert_eq!(state.screen_frames_received, 0);
+        assert!(state.typing_presence.is_empty());
+        assert_eq!(state.message_history.len(), 1);
+        assert_eq!(state.message_history[0].content, "keep me");
+    }
+
+    #[test]
+    fn decrypt_content_checked_distinguishes_ciphertext_from_legacy_text() {
+        let mut state = make_test_state();
+        let key = chatify::crypto::channel_key("pw", "general");
+        state.chan_keys.insert("general".to_string(), key.clone());
+
+        let cipher = chatify::crypto::enc_bytes(&key, b"secret text").unwrap();
+        let cipher_b64 = base64::engine::general_purpose::STANDARD.encode(cipher);
+        assert_eq!(
+            state.decrypt_content_checked("general", &cipher_b64),
+            ("secret text".to_string(), true)
+        );
+
+        // Legacy plaintext is returned unchanged and flagged as unencrypted.
+        assert_eq!(
+            state.decrypt_content_checked("general", "legacy hello"),
+            ("legacy hello".to_string(), false)
+        );
     }
 }

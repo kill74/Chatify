@@ -39,6 +39,15 @@ macro_rules! eprintln {
     }};
 }
 
+/// Sub-protocol version this client requests. The server negotiates down to v1
+/// when talking to an older deployment, so this is safe to send unconditionally.
+const REQUESTED_PROTOCOL_VERSION: u64 = 2;
+
+/// Reconnect backoff in seconds for the given attempt, capped at 6s.
+fn reconnect_backoff_secs(attempt: u32) -> u64 {
+    std::cmp::min(attempt, 6) as u64
+}
+
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const MAX_HISTORY_LIMIT: usize = 500;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -209,6 +218,12 @@ const COMMANDS: &[CommandHelp] = &[
         name: "/dm",
         usage: "/dm <user> <message>",
         summary: "Send direct message (trust-verified)",
+        aliases: &[],
+    },
+    CommandHelp {
+        name: "/crypto",
+        usage: "/crypto",
+        summary: "Show E2E encryption status and key fingerprints",
         aliases: &[],
     },
     CommandHelp {
@@ -2135,6 +2150,32 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 }
             }
         }
+        "/crypto" => {
+            if parts.next().is_some() {
+                println!("Usage: /crypto");
+                return true;
+            }
+            let state_lock = state.lock().await;
+            println!("E2E encryption: ChaCha20-Poly1305 (X25519 for DMs, PBKDF2 for channels)");
+            let local_pub = chatify::crypto::pub_b64(&state_lock.priv_key).unwrap_or_default();
+            let local_fp = ClientState::fingerprint_for_pubkey(&local_pub).unwrap_or_default();
+            println!(
+                "Local fingerprint: {}",
+                if local_fp.is_empty() {
+                    "unavailable"
+                } else {
+                    &local_fp
+                }
+            );
+            println!(
+                "Channel keys cached: {}  DM keys cached: {}",
+                state_lock.chan_keys.len(),
+                state_lock.dm_keys.len()
+            );
+            if state_lock.chan_keys.is_empty() && state_lock.dm_keys.is_empty() {
+                println!("No messages encrypted yet; keys are derived on first send/receive.");
+            }
+        }
         "/fingerprint" => {
             let user_arg = parts.next();
             if parts.next().is_some() {
@@ -2601,6 +2642,7 @@ async fn run_client_session(
             serde_json::json!({
                 "t": "auth",
                 "auth_v": 2,
+                "proto_v": REQUESTED_PROTOCOL_VERSION,
                 "u": username,
                 "cn": client_nonce,
                 "pk": pub_key,
@@ -2651,6 +2693,7 @@ async fn run_client_session(
     let mut auth_finish = serde_json::json!({
         "t": "auth",
         "auth_v": 2,
+        "proto_v": REQUESTED_PROTOCOL_VERSION,
         "u": username,
         "proof": proof,
         "cn": client_nonce,
@@ -2773,6 +2816,8 @@ async fn run_client_session(
             task: session.task,
         });
     }
+    // Clear per-connection indicators so a reconnect starts from clean state.
+    state.lock().await.reset_for_reconnect();
 
     if connection_lost {
         println!("Disconnected");
@@ -2820,6 +2865,7 @@ async fn main() -> ChatifyResult<()> {
     // reconnection performs a full authentication using the same credentials.
     let mut attempt = 0u32;
     loop {
+        let session_started = std::time::Instant::now();
         match run_client_session(&uri, &username, &pw_hash, &client_config, config.clone()).await {
             Ok(()) => {
                 // Clean user-initiated exit (e.g. /quit) ends the process.
@@ -2830,10 +2876,16 @@ async fn main() -> ChatifyResult<()> {
                 if !client_config.auto_reconnect {
                     break;
                 }
+                // A session that stayed up for a while is a successful
+                // connection; restart the backoff so a later drop doesn't
+                // inherit a long delay from an earlier flaky period.
+                if session_started.elapsed() >= std::time::Duration::from_secs(10) {
+                    attempt = 0;
+                }
                 attempt += 1;
-                let delay = std::cmp::min(attempt, 6); // cap backoff at 6s
+                let delay = reconnect_backoff_secs(attempt);
                 eprintln!("Reconnecting in {}s (attempt {})...", delay, attempt);
-                tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             }
         }
     }
@@ -2844,6 +2896,7 @@ async fn main() -> ChatifyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::enforce_transport_policy;
+    use super::reconnect_backoff_secs;
     use super::{
         build_notification_export, build_notify_diagnostics_json, notification_key_for_token,
         notification_value_for_key, notify_export_default_path, parse_admin_command,
@@ -3219,5 +3272,14 @@ mod tests {
             notification_value_for_key(&cfg, "notifications.unknown"),
             None
         );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(reconnect_backoff_secs(0), 0);
+        assert_eq!(reconnect_backoff_secs(1), 1);
+        assert_eq!(reconnect_backoff_secs(4), 4);
+        assert_eq!(reconnect_backoff_secs(6), 6);
+        assert_eq!(reconnect_backoff_secs(u32::MAX), 6);
     }
 }
