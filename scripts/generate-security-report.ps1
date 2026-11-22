@@ -70,6 +70,22 @@ function ConvertFrom-JsonCompat {
   return ($JsonText | ConvertFrom-Json)
 }
 
+function Get-SafeProperty {
+  param(
+    [AllowNull()]$Object,
+    [Parameter(Mandatory = $true)][string]$Name
+  )
+
+  if ($null -eq $Object) {
+    return $null
+  }
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property) {
+    return $null
+  }
+  return $property.Value
+}
+
 function Parse-CargoAuditData {
   param([string[]]$OutputLines)
 
@@ -93,15 +109,26 @@ function Parse-CargoAuditData {
   }
 
   $vulns = @()
-  if ($null -ne $audit.vulnerabilities -and $null -ne $audit.vulnerabilities.list) {
-    $vulns = @($audit.vulnerabilities.list)
+  $vulnerabilities = Get-SafeProperty -Object $audit -Name "vulnerabilities"
+  $vulnList = Get-SafeProperty -Object $vulnerabilities -Name "list"
+  if ($null -ne $vulnList) {
+    $vulns = @($vulnList)
   }
 
   $severityCounts = @{}
   foreach ($entry in $vulns) {
     $severity = "unknown"
-    if ($null -ne $entry.advisory -and -not [string]::IsNullOrWhiteSpace([string]$entry.advisory.severity)) {
-      $severity = [string]$entry.advisory.severity
+    # Under StrictMode, dot-accessing a property that does not exist on the
+    # object is a terminating error. cargo audit has changed its JSON shape
+    # across versions (severity nested under `advisory`, directly on the
+    # entry, or absent entirely), so read properties defensively.
+    $advisory = Get-SafeProperty -Object $entry -Name "advisory"
+    $candidate = Get-SafeProperty -Object $advisory -Name "severity"
+    if ([string]::IsNullOrWhiteSpace([string]$candidate)) {
+      $candidate = Get-SafeProperty -Object $entry -Name "severity"
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$candidate)) {
+      $severity = [string]$candidate
     }
     if (-not $severityCounts.ContainsKey($severity)) {
       $severityCounts[$severity] = 0
