@@ -331,12 +331,10 @@ fn read_schema_version(db_path: &PathBuf) -> String {
 /// 2) Sibling binary next to the compiled test in `target/debug`
 /// 3) One-time `cargo build -p chatify-server --bin chatify-server`
 fn resolve_server_binary() -> PathBuf {
-    for var in ["CARGO_BIN_EXE_chatify-server"] {
-        if let Ok(path) = std::env::var(var) {
-            let candidate = PathBuf::from(path);
-            if candidate.is_file() {
-                return candidate;
-            }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_chatify-server") {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            return candidate;
         }
     }
 

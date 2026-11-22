@@ -5,11 +5,16 @@
 
 use crate::config::NotificationConfig;
 use notify_rust::{Notification, Timeout};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // Ensure we don't spam the user with too many notifications too quickly
 static LAST_NOTIFICATION_TIME: OnceLock<Mutex<Instant>> = OnceLock::new();
+/// Bounds the number of concurrently spawned notification threads so a burst
+/// of forced notifications cannot exhaust the thread pool.
+static IN_FLIGHT_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+const MAX_IN_FLIGHT_NOTIFICATIONS: usize = 8;
 
 /// The core notification service.
 pub struct NotificationService;
@@ -50,9 +55,27 @@ impl NotificationService {
             .body(message)
             .timeout(Timeout::Milliseconds(5000));
 
-        // Use thread-spawning to avoid blocking the async reactor or main thread
+        // Use thread-spawning to avoid blocking the async reactor or main
+        // thread, but cap concurrent threads so `force = true` bursts cannot
+        // grow without limit.
+        if IN_FLIGHT_NOTIFICATIONS
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < MAX_IN_FLIGHT_NOTIFICATIONS).then_some(count + 1)
+            })
+            .is_err()
+        {
+            log::debug!("notification dropped: too many in flight");
+            return;
+        }
+        struct SlotGuard;
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                IN_FLIGHT_NOTIFICATIONS.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
         let n: notify_rust::Notification = notification.clone();
         std::thread::spawn(move || {
+            let _guard = SlotGuard;
             if let Err(e) = n.show() {
                 log::debug!("Failed to send desktop notification: {}", e);
             }

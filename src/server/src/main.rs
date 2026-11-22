@@ -720,6 +720,9 @@ async fn handle_self_registration<S>(
 
 struct ConnectionSession {
     out_tx: OutboundTx,
+    /// Digest of this connection's session token. Bound at auth time so
+    /// revocation cannot be bypassed by omitting the optional `"token"` field.
+    session_digest: String,
     fresh_required: bool,
     voice_room: Option<String>,
     active_voice_room: Arc<RwLock<Option<String>>>,
@@ -739,6 +742,7 @@ async fn handle_event(
 ) {
     let ConnectionSession {
         out_tx,
+        session_digest,
         fresh_required,
         voice_room,
         active_voice_room,
@@ -788,10 +792,22 @@ async fn handle_event(
         }
     }
 
-    // --- Optional session token validation (backward compatible) ---
-    // Protocol v1 clients do not send session tokens on most events.
-    // To preserve compatibility, only validate when a token is explicitly
-    // provided by the client.
+    // --- Session validity (authoritative, connection-bound) ---
+    // Every frame is checked against the session created for *this* socket.
+    // The token is bound at authentication time and never taken from the
+    // frame: protocol v1 clients omit `"token"` on most events, and allowing
+    // omission to skip validation would let revoked sessions keep operating.
+    if !state.session_is_active(username, session_digest) {
+        send_err(
+            out_tx,
+            "invalid or expired session token. Please reconnect.",
+            &state.metrics,
+        );
+        return;
+    }
+
+    // Optional client-supplied token stays supported for compatibility, but
+    // it can only add a check — it is never the sole basis for authorization.
     if let Some(provided_token) = d.get("token").and_then(|v| v.as_str()) {
         if !state.validate_session_token(username, Some(provided_token)) {
             send_err(
@@ -2039,7 +2055,17 @@ async fn handle_event(
             }
             let size = d["size"].as_u64().unwrap_or(0);
 
-            // Reject files that exceed the maximum size.
+            // Reject files that are empty or exceed the maximum size. A
+            // zero-size announcement can never complete and would leak a
+            // pending transfer on the receiving client.
+            if size == 0 {
+                send_err(
+                    out_tx,
+                    "file size must be greater than zero",
+                    &state.metrics,
+                );
+                return;
+            }
             if size > MAX_FILE_SIZE {
                 send_err(
                     out_tx,
@@ -2051,12 +2077,18 @@ async fn handle_event(
 
             let file_id_raw = d["file_id"].as_str().unwrap_or("").trim();
             let file_id = if file_id_raw.is_empty() {
-                format!("{}_{}", username, now())
+                format!("{}_{}", username, chatify::fresh_nonce_hex())
             } else {
-                file_id_raw
+                let sanitized: String = file_id_raw
                     .chars()
                     .take(MAX_FILE_ID_LEN)
-                    .collect::<String>()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if sanitized.is_empty() {
+                    send_err(out_tx, "invalid file id", &state.metrics);
+                    return;
+                }
+                sanitized
             };
 
             let media_kind = match d
@@ -2092,6 +2124,14 @@ async fn handle_event(
             if let Some(duration_ms) = duration_ms {
                 file_announce["duration_ms"] = Value::from(duration_ms);
             }
+            if !state.announce_media_transfer(&ch, &file_id, username, size) {
+                send_err(
+                    out_tx,
+                    "file id already in use by another sender",
+                    &state.metrics,
+                );
+                return;
+            }
             state.store.persist(
                 "file_meta",
                 &ch,
@@ -2123,6 +2163,16 @@ async fn handle_event(
             let index = d["index"].as_u64().unwrap_or(0);
             match general_purpose::STANDARD.decode(chunk_data.as_bytes()) {
                 Ok(chunk_bytes) => {
+                    // Only accept chunks for a known announcement from the
+                    // same sender, and never allow the accumulated size to
+                    // exceed the declared (100 MB-capped) file size.
+                    if !state.accept_media_chunk(&ch, &file_id, username, chunk_bytes.len()) {
+                        warn!(
+                            "rejected media chunk channel={} file_id={} idx={} from={}",
+                            ch, file_id, index, username
+                        );
+                        return;
+                    }
                     state
                         .store
                         .append_media_chunk(&ch, &file_id, username, index, &chunk_bytes);
@@ -2349,11 +2399,25 @@ async fn handle_event(
             }
 
             debug!("password change verification started");
-            let credential_result = if let Some(pending) = state.pending_credentials.get(username) {
+            // v2 accounts store a client-derived secret (HMAC key) rather than
+            // an Argon2 verifier. Verify the submitted current secret directly
+            // and persist the new one in the same v2 format — writing an
+            // Argon2 hash here would silently downgrade the account and break
+            // all subsequent auth-v2 proof logins.
+            let v2_secret = state
+                .store
+                .credential_state(username)
+                .ok()
+                .flatten()
+                .and_then(|stored| stored.strip_prefix("v2$").map(|secret| secret.to_string()));
+            let credential_result = if let Some(secret) = v2_secret.as_deref() {
+                Ok(crypto::secure_string_eq(current_hash, secret))
+            } else if let Some(pending) = state.pending_credentials.get(username) {
                 Ok(crypto::secure_string_eq(current_hash, pending.value()))
             } else {
                 state.store.verify_credential(username, current_hash)
             };
+            let is_v2 = v2_secret.is_some();
 
             match credential_result {
                 Ok(true) => {
@@ -2362,6 +2426,7 @@ async fn handle_event(
                         .pending_credentials
                         .insert(username.to_string(), new_pw.to_string());
                     state.invalidate_all_user_sessions(username);
+                    state.store.clear_failed_logins(username);
                     send_out_json(
                         out_tx,
                         serde_json::json!({"t":"password_changed","ts":now()}),
@@ -2371,10 +2436,16 @@ async fn handle_event(
                     let username_for_task = username.to_string();
                     let new_pw_for_task = new_pw.to_string();
                     tokio::task::spawn_blocking(move || {
-                        let server_hash = crypto::pw_hash(&new_pw_for_task);
-                        state_for_task
-                            .store
-                            .upsert_credentials(&username_for_task, &server_hash);
+                        if is_v2 {
+                            state_for_task
+                                .store
+                                .upsert_auth_v2_secret(&username_for_task, &new_pw_for_task);
+                        } else {
+                            let server_hash = crypto::pw_hash(&new_pw_for_task);
+                            state_for_task
+                                .store
+                                .upsert_credentials(&username_for_task, &server_hash);
+                        }
                         state_for_task
                             .pending_credentials
                             .remove(&username_for_task);
@@ -2452,6 +2523,25 @@ async fn handle_event(
                             &state.metrics,
                         );
                         return;
+                    }
+
+                    // Never overwrite an existing account's credentials: a
+                    // channel manager must not be able to reset another
+                    // user's (or an admin's) password via `admin register`.
+                    match state.store.credential_state(&target) {
+                        Ok(Some(_)) => {
+                            send_err(out_tx, "target user already exists", &state.metrics);
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            send_err(
+                                out_tx,
+                                format!("failed to check target user: {}", err),
+                                &state.metrics,
+                            );
+                            return;
+                        }
                     }
 
                     let server_hash = crypto::pw_hash(password);
@@ -4117,6 +4207,24 @@ where
 
     let msg_type = d.get("t").and_then(|v| v.as_str()).unwrap_or("");
 
+    // --- Per-IP auth rate limiting ---
+    // Applied to every first-frame credential operation (including direct
+    // `register` and auth-v2 challenge issuance), not just the final auth
+    // frame. Otherwise self-registration and challenge spam are unthrottled.
+    if !state.ip_auth_allowed(&addr) {
+        warn!("auth rate limited");
+        let _ = sink
+            .send(Message::text(
+                serde_json::json!({
+                    "t": "err",
+                    "m": "too many auth attempts, please wait"
+                })
+                .to_string(),
+            ))
+            .await;
+        return;
+    }
+
     if msg_type == "register" {
         handle_self_registration(&state, &d, &addr, &mut sink).await;
         return;
@@ -4214,21 +4322,6 @@ where
             return;
         }
     };
-
-    // --- Per-IP auth rate limiting ---
-    if !state.ip_auth_allowed(&addr) {
-        warn!("auth rate limited");
-        let _ = sink
-            .send(Message::text(
-                serde_json::json!({
-                    "t": "err",
-                    "m": "too many auth attempts, please wait"
-                })
-                .to_string(),
-            ))
-            .await;
-        return;
-    }
 
     let AuthInfo {
         username,
@@ -4402,11 +4495,22 @@ where
             // First time this username connects ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â store their credential.
             // The submitted hash is itself a PBKDF2 output, so we wrap it
             // in another salted PBKDF2 layer server-side.
+            // Atomically claim the username so two concurrent first-logins
+            // cannot both persist a credential for the same account.
+            if !state.pending_registrations.insert(username.clone()) {
+                let _ = sink
+                    .send(Message::text(
+                        serde_json::json!({"t":"err","m":"username already in use"}).to_string(),
+                    ))
+                    .await;
+                return;
+            }
             let credential_secret = if let Some(secret) = v2_secret_to_persist.take() {
                 secret
             } else if let Some(secret) = legacy_hash_to_persist.take() {
                 secret
             } else {
+                state.pending_registrations.remove(&username);
                 let _ = sink
                     .send(Message::text(
                         serde_json::json!({"t":"err","m":"missing enrollment credential"})
@@ -4435,6 +4539,9 @@ where
                 }
                 state_for_task
                     .pending_credentials
+                    .remove(&username_for_task);
+                state_for_task
+                    .pending_registrations
                     .remove(&username_for_task);
             });
             info!("credentials created for new user");
@@ -4637,6 +4744,7 @@ where
 
     let mut session = ConnectionSession {
         out_tx: out_tx.clone(),
+        session_digest: State::session_digest(&session_token),
         fresh_required: expected_auth_v2_nonce.is_some(),
         voice_room: None,
         active_voice_room: Arc::new(RwLock::new(None)),
@@ -5175,9 +5283,8 @@ fn resolve_db_key(db_path: &str, cli_key: Option<&str>) -> ChatifyResult<Option<
     }
 
     // 4. Generate a new key and write it to disk.
-    use rand::{rngs::OsRng, RngCore};
     let mut key = <[u8; 32]>::default();
-    OsRng.fill_bytes(&mut key);
+    chatify::os_random_bytes(&mut key);
     let hex_key = hex::encode(key);
     write_db_key_file(&key_path, &hex_key)?;
     println!("Generated new DB encryption key: {}", key_path);
@@ -5503,6 +5610,19 @@ async fn main() -> ChatifyResult<()> {
                 let evicted = cleanup_state.evict_stale_nonce_entries(NONCE_MAX_AGE_SECS);
                 if evicted > 0 && log_enabled {
                     info!("nonce cache: evicted {} stale user entries", evicted);
+                }
+
+                // Reclaim idle channels/rooms and stale bookkeeping. These
+                // maps can otherwise grow without bound from arbitrary
+                // client-supplied channel/room names and transient peers.
+                let pruned_channels =
+                    cleanup_state.prune_idle_channels(NONCE_CLEANUP_INTERVAL_SECS * 60);
+                let pruned_metadata = cleanup_state.prune_stale_metadata();
+                if log_enabled && (pruned_channels > 0 || pruned_metadata > 0) {
+                    info!(
+                        "state cleanup: pruned {} idle channels/rooms, {} stale metadata entries",
+                        pruned_channels, pruned_metadata
+                    );
                 }
             }
         });

@@ -159,16 +159,23 @@ impl MemoryArena {
     }
 
     pub fn alloc(&mut self, size: usize) -> Option<&mut [u8]> {
-        let size = (size + 7) & !7; // Align to 8 bytes
-        if self.ptr + size > self.buffer.len() {
+        // Alignment and slice bounds must use checked arithmetic: on large
+        // attacker-influenced sizes `size + 7` / `ptr + size` would wrap in
+        // release builds, yielding an out-of-bounds slice.
+        let size = size.checked_add(7)? & !7;
+        if size > self.buffer.len() {
+            return None;
+        }
+        if self.ptr.checked_add(size)? > self.buffer.len() {
             self.ptr = 0; // Reset on overflow (simple strategy)
         }
-        if self.ptr + size > self.buffer.len() {
-            return None; // Too large for arena
-        }
         let ptr = self.ptr;
-        self.ptr += size;
-        Some(&mut self.buffer[ptr..ptr + size])
+        let end = ptr.checked_add(size)?;
+        if end > self.buffer.len() {
+            return None;
+        }
+        self.ptr = end;
+        self.buffer.get_mut(ptr..end)
     }
 
     pub fn reset(&mut self) {

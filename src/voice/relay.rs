@@ -100,6 +100,19 @@ impl VoiceRelay {
             .clone()
     }
 
+    /// Looks up an existing room without creating one.
+    ///
+    /// Read-only paths must use this so that querying an unknown room does
+    /// not create a permanent empty entry in the rooms map.
+    pub fn get_room(&self, name: &str) -> Option<Arc<RwLock<VoiceRoom>>> {
+        self.rooms.read().get(name).cloned()
+    }
+
+    /// Removes a room and all of its members.
+    pub fn remove_room(&self, name: &str) -> bool {
+        self.rooms.write().remove(name).is_some()
+    }
+
     /// Adds a member to a room and broadcasts the join event.
     /// Returns a snapshot of all current room members.
     pub fn join_room(&self, room: &str, username: &str) -> Vec<VoiceMemberInfo> {
@@ -120,11 +133,20 @@ impl VoiceRelay {
     /// Removes a member from a room and broadcasts the leave event.
     /// Returns true if the member was present and removed.
     pub fn leave_room(&self, room: &str, username: &str) -> bool {
-        let room_guard = self.get_or_create_room(room);
+        // Do not create a room just to remove a member from it.
+        let Some(room_guard) = self.get_room(room) else {
+            return false;
+        };
         let removed = {
             let mut room = room_guard.write();
             room.remove_member(username)
         };
+
+        // Once the last member leaves, drop the empty room so client-supplied
+        // room names cannot grow the rooms map without bound.
+        if room_guard.read().members.is_empty() {
+            self.remove_room(room);
+        }
 
         if removed.is_some() {
             self.broadcast(VoiceBroadcast::MemberLeft {
@@ -149,7 +171,9 @@ impl VoiceRelay {
         deafened: Option<bool>,
         speaking: Option<bool>,
     ) {
-        let room_guard = self.get_or_create_room(room);
+        let Some(room_guard) = self.get_room(room) else {
+            return;
+        };
         {
             let mut room = room_guard.write();
             room.update_state(username, muted, deafened, speaking);
@@ -169,7 +193,10 @@ impl VoiceRelay {
     }
 
     fn get_members_internal(&self, room: &str) -> Vec<VoiceMemberInfo> {
-        let room_guard = self.get_or_create_room(room);
+        // A query must never create a room.
+        let Some(room_guard) = self.get_room(room) else {
+            return Vec::new();
+        };
         let room = room_guard.read();
 
         room.members

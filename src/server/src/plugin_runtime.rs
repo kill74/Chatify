@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::env;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -532,6 +534,13 @@ impl PluginRuntime {
             process.arg("--chatify-plugin-command").arg(command_name);
         }
 
+        // Put the plugin in its own process group so the whole tree can be
+        // terminated on timeout. Without this, grandchildren inherit the
+        // stdio pipes and keep the reader threads blocked forever after the
+        // direct child is killed.
+        #[cfg(unix)]
+        process.process_group(0);
+
         let mut child = process
             .spawn()
             .map_err(|err| format!("failed to spawn plugin process: {}", err))?;
@@ -756,6 +765,19 @@ fn kill_process_tree(child: &mut Child) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn kill_process_tree(child: &mut Child) -> Result<(), String> {
+    // The child was spawned with its own process group (pgid == pid), so a
+    // negative PID kills every descendant that inherited the stdio pipes.
+    let group = format!("-{}", child.id());
+    let status = Command::new("kill")
+        .arg("-KILL")
+        .arg(&group)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.map(|s| s.success()).unwrap_or(false) {
+        return Ok(());
+    }
+    // Fallback if the external `kill` is unavailable.
     child
         .kill()
         .map_err(|err| format!("failed to terminate plugin process: {}", err))

@@ -767,7 +767,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
- "sha2 0.11.1",
+ "sha2 0.10.9",
  "subtle",
  "tokio",
  "tokio-rustls",

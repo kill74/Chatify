@@ -4,12 +4,12 @@
 //! degrading (e.g. returning empty vectors). This ensures callers handle
 //! cryptographic failures explicitly.
 
+use crate::os_random_bytes;
 use base64::{engine::general_purpose, Engine as _};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2;
-use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -159,7 +159,7 @@ pub fn dec_bytes(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 #[must_use]
 pub fn chacha20_nonce() -> [u8; 12] {
     let mut nonce = <[u8; 12]>::default();
-    OsRng.fill_bytes(&mut nonce);
+    os_random_bytes(&mut nonce);
     nonce
 }
 
@@ -283,7 +283,7 @@ pub fn pw_verify(password: &str, stored: &str) -> bool {
 #[must_use]
 pub fn new_keypair() -> Vec<u8> {
     let mut key = <[u8; 32]>::default();
-    OsRng.fill_bytes(&mut key);
+    os_random_bytes(&mut key);
     let result = key.to_vec();
     key.zeroize();
     result

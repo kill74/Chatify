@@ -27,6 +27,7 @@ use crate::media::{
 };
 use crate::state::{
     ClientState, DisplayedMessage, KeyChangeWarning, ReplyPreview, SharedState, TypingPresence,
+    MAX_MEDIA_TRANSFER_SIZE,
 };
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
 use base64::Engine as _;
@@ -750,6 +751,12 @@ pub async fn handle_file_meta_event(state: &SharedState, data: &serde_json::Valu
     let Some(media) = timeline_media_from_file_meta(data, false, media_enabled) else {
         return;
     };
+    // Zero-size and oversized announcements can never complete safely: the
+    // former is never "complete" by definition, the latter would let a
+    // malicious peer grow our in-memory chunk buffer without bound.
+    if media.size == 0 || media.size > MAX_MEDIA_TRANSFER_SIZE {
+        return;
+    }
     let timeline_id = media_timeline_id(ch, &media.file_id);
     let message = DisplayedMessage {
         id: timeline_id.clone(),
@@ -765,16 +772,20 @@ pub async fn handle_file_meta_event(state: &SharedState, data: &serde_json::Valu
     state_lock.upsert_message(message.clone());
     state_lock.note_incoming_message(ch, from_self);
     if media_enabled {
-        state_lock.pending_media_transfers.insert(
-            timeline_id,
-            PendingMediaTransfer::new(
+        state_lock.prune_pending_media_transfers();
+        // A re-announcement (e.g. history replay) must not discard chunks
+        // already collected for this transfer.
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            state_lock.pending_media_transfers.entry(timeline_id)
+        {
+            entry.insert(PendingMediaTransfer::new(
                 message.id.clone(),
                 ch.to_string(),
                 sender.to_string(),
-                event_ts,
+                chatify::now(),
                 media,
-            ),
-        );
+            ));
+        }
     }
     drop(state_lock);
 
@@ -815,6 +826,9 @@ pub async fn handle_file_chunk_event(state: &SharedState, data: &serde_json::Val
 
         let (latest_media, should_finalize) =
             if let Some(transfer) = state_lock.pending_media_transfers.get_mut(&timeline_id) {
+                if !transfer.can_accept_chunk(index, chunk_bytes.len()) {
+                    return;
+                }
                 transfer.insert_chunk(index, chunk_bytes);
                 (transfer.media.clone(), transfer.is_complete())
             } else {

@@ -5,13 +5,13 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use chatify::metrics::PrometheusMetrics;
 use chatify::performance::{Metrics as PerfMetrics, VecCache};
 use chatify::voice::VoiceRelay;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Notify, RwLock};
@@ -40,6 +40,11 @@ pub struct Channel {
     /// Broadcast sender. The channel capacity (256) is deliberately larger
     /// than [`HISTORY_CAP`] to absorb short bursts without dropping frames.
     pub tx: broadcast::Sender<String>,
+
+    /// Unix timestamp (seconds) of the last access. Used by the periodic
+    /// sweeper to reclaim channels that were created by arbitrary client
+    /// input and are no longer in use.
+    pub last_activity: Arc<AtomicU64>,
 }
 
 impl Channel {
@@ -49,7 +54,14 @@ impl Channel {
         Self {
             history: Arc::new(RwLock::new(VecDeque::with_capacity(HISTORY_CAP))),
             tx,
+            last_activity: Arc::new(AtomicU64::new(chatify::now_secs())),
         }
+    }
+
+    /// Records that this channel was just used.
+    pub fn touch(&self) {
+        self.last_activity
+            .store(chatify::now_secs(), Ordering::Relaxed);
     }
 
     /// Appends `entry` to the in-memory history, evicting the oldest entry if
@@ -87,6 +99,16 @@ pub struct BridgeInfo {
     pub connected_at: f64,
     /// Number of bridge routes.
     pub route_count: usize,
+}
+
+/// Tracks an announced media transfer so chunk frames can be validated
+/// against the sender and declared size from the corresponding `file_meta`.
+#[derive(Clone, Debug)]
+pub struct MediaTransferState {
+    pub sender: String,
+    pub declared_size: u64,
+    pub received_bytes: u64,
+    pub last_activity: f64,
 }
 
 /// In-memory session metadata, keyed by a digest of the bearer token.
@@ -153,8 +175,14 @@ pub struct State {
     /// Per-room voice broadcast senders, keyed by room name.
     pub voice: DashMap<String, broadcast::Sender<String>>,
 
+    /// Last-access timestamps for voice rooms, used by the idle sweeper.
+    pub voice_activity: DashMap<String, u64>,
+
     /// Per-room screen-share relay senders, keyed by room name.
     pub screen: DashMap<String, broadcast::Sender<String>>,
+
+    /// Last-access timestamps for screen-share rooms, used by the idle sweeper.
+    pub screen_activity: DashMap<String, u64>,
 
     /// Current status value for each online user
     /// (e.g. `{"text":"Online","emoji":"✓"}`).
@@ -204,9 +232,17 @@ pub struct State {
     /// being re-hashed and persisted server-side.
     pub pending_credentials: DashMap<String, String>,
 
+    /// Usernames with an in-flight first-registration. Prevents two
+    /// simultaneous first-logins from both passing the `first_login` check
+    /// before either credential row has been persisted.
+    pub pending_registrations: DashSet<String>,
+
     /// Connected bridge instances, keyed by username.
     /// Populated during auth when the client sends `"bridge": true`.
     pub bridges: DashMap<String, BridgeInfo>,
+
+    /// In-flight media announcements, keyed by `(channel, file_id)`.
+    pub media_transfers: DashMap<(String, String), MediaTransferState>,
 
     /// Internal metrics for runtime stats and debugging.
     pub metrics: PerfMetrics,
@@ -284,7 +320,9 @@ impl State {
         let s = Arc::new(Self {
             channels: DashMap::new(),
             voice: DashMap::new(),
+            voice_activity: DashMap::new(),
             screen: DashMap::new(),
+            screen_activity: DashMap::new(),
             user_statuses: DashMap::new(),
             user_pubkeys: DashMap::new(),
             recent_nonces: DashMap::new(),
@@ -296,7 +334,9 @@ impl State {
             ip_last_auth: DashMap::new(),
             session_tokens: DashMap::new(),
             pending_credentials: DashMap::new(),
+            pending_registrations: DashSet::new(),
             bridges: DashMap::new(),
+            media_transfers: DashMap::new(),
             metrics: PerfMetrics::new(),
             prometheus,
             message_cache: VecCache::new(1000),
@@ -318,31 +358,41 @@ impl State {
 
     /// Returns the [`Channel`] for `name`, creating it lazily on first access.
     pub fn chan(&self, name: &str) -> Channel {
-        self.channels.entry(name.into()).or_default().clone()
+        let channel = self.channels.entry(name.into()).or_default().clone();
+        channel.touch();
+        channel
     }
 
     /// Returns the voice broadcast sender for `room`, creating it lazily on
     /// first access.
     pub fn voice_tx(&self, room: &str) -> broadcast::Sender<String> {
-        self.voice
+        let tx = self
+            .voice
             .entry(room.into())
             .or_insert_with(|| {
                 let (tx, _) = broadcast::channel(128);
                 tx
             })
-            .clone()
+            .clone();
+        self.voice_activity
+            .insert(room.to_string(), chatify::now_secs());
+        tx
     }
 
     /// Returns the screen-share relay sender for `room`, creating it lazily
     /// on first access.
     pub fn screen_tx(&self, room: &str) -> broadcast::Sender<String> {
-        self.screen
+        let tx = self
+            .screen
             .entry(room.into())
             .or_insert_with(|| {
                 let (tx, _) = broadcast::channel(128);
                 tx
             })
-            .clone()
+            .clone();
+        self.screen_activity
+            .insert(room.to_string(), chatify::now_secs());
+        tx
     }
 
     /// Returns the number of currently online users.
@@ -520,9 +570,8 @@ impl State {
 
     /// Creates a new session token for a user.
     pub fn create_session(&self, username: &str) -> String {
-        use rand::{rngs::OsRng, RngCore};
         let mut bytes = <[u8; 32]>::default();
-        OsRng.fill_bytes(&mut bytes);
+        chatify::os_random_bytes(&mut bytes);
         let token = hex::encode(bytes);
         let now = chatify::now();
         self.session_tokens.insert(
@@ -542,14 +591,25 @@ impl State {
             .retain(|_, record| record.username != username);
     }
 
-    /// Validates a session token for a user and refreshes its idle timestamp.
-    pub fn validate_session_token(&self, username: &str, token: Option<&str>) -> bool {
-        let Some(token) = token else {
-            return false;
-        };
-        let digest = Self::session_token_digest(token);
+    /// Returns the digest under which a raw session token is stored.
+    ///
+    /// The connection keeps this digest so every frame can be checked against
+    /// the authoritative server-side record without trusting a client-supplied
+    /// token field.
+    pub fn session_digest(token: &str) -> String {
+        Self::session_token_digest(token)
+    }
+
+    /// Returns true while the session identified by `digest` is still valid.
+    ///
+    /// This is the authoritative check performed on every received frame. A
+    /// session is invalidated immediately by `end_session` /
+    /// `invalidate_all_user_sessions` (e.g. on disconnect or password change),
+    /// so a client cannot keep operating after its session has been revoked by
+    /// simply omitting the optional token field.
+    pub fn session_is_active(&self, username: &str, digest: &str) -> bool {
         let now = chatify::now();
-        let Some(mut record) = self.session_tokens.get_mut(&digest) else {
+        let Some(mut record) = self.session_tokens.get_mut(digest) else {
             return false;
         };
 
@@ -557,13 +617,34 @@ impl State {
             || now - record.issued_at > SESSION_TTL_SECS
             || now - record.last_seen_at > SESSION_IDLE_TTL_SECS
         {
+            // Only remove records that are actually expired or malformed. A
+            // username mismatch must never let one user delete another
+            // user's live session (session invalidation by omission/knowing a
+            // token). Explicit revocation goes through `end_session`.
+            let expired = now - record.issued_at > SESSION_TTL_SECS
+                || now - record.last_seen_at > SESSION_IDLE_TTL_SECS;
             drop(record);
-            self.session_tokens.remove(&digest);
+            if expired {
+                self.session_tokens.remove(digest);
+            }
             return false;
         }
 
         record.last_seen_at = now;
         true
+    }
+
+    /// Validates an optional client-supplied session token for a user.
+    ///
+    /// Kept for backwards compatibility with clients that include a token on
+    /// individual frames. Revocation is enforced unconditionally via
+    /// `session_is_active` against the connection's own session digest.
+    pub fn validate_session_token(&self, username: &str, token: Option<&str>) -> bool {
+        let Some(token) = token else {
+            return false;
+        };
+        let digest = Self::session_token_digest(token);
+        self.session_is_active(username, &digest)
     }
 
     /// Invalidates all sessions for a user, for example after password change.
@@ -688,6 +769,174 @@ impl State {
             self.recent_nonces.remove(key);
         }
         count
+    }
+
+    /// Reclaims idle in-memory channels and rooms created by client input.
+    ///
+    /// Only entries with no remaining broadcast subscribers and no activity
+    /// for `max_age_secs` are removed, so active conversations are untouched.
+    pub fn prune_idle_channels(&self, max_age_secs: u64) -> usize {
+        let now = chatify::now_secs();
+        let mut pruned = 0usize;
+
+        self.channels.retain(|name, channel| {
+            let keep = name == "general"
+                || now.saturating_sub(channel.last_activity.load(Ordering::Relaxed)) < max_age_secs
+                || channel.tx.receiver_count() > 0;
+            if !keep {
+                pruned += 1;
+            }
+            keep
+        });
+
+        self.voice.retain(|room, tx| {
+            let activity = self
+                .voice_activity
+                .get(room)
+                .map(|v| *v.value())
+                .unwrap_or(0);
+            let keep = now.saturating_sub(activity) < max_age_secs || tx.receiver_count() > 0;
+            if !keep {
+                self.voice_activity.remove(room);
+                pruned += 1;
+            }
+            keep
+        });
+
+        self.screen.retain(|room, tx| {
+            let activity = self
+                .screen_activity
+                .get(room)
+                .map(|v| *v.value())
+                .unwrap_or(0);
+            let keep = now.saturating_sub(activity) < max_age_secs || tx.receiver_count() > 0;
+            if !keep {
+                self.screen_activity.remove(room);
+                pruned += 1;
+            }
+            keep
+        });
+
+        pruned
+    }
+
+    /// Evicts expired session tokens and stale auth/rate-limit bookkeeping.
+    /// Without this, entries for users/IPs that disappear without a clean
+    /// disconnect accumulate for the lifetime of the process.
+    pub fn prune_stale_metadata(&self) -> usize {
+        let now = chatify::now();
+        let mut pruned = 0usize;
+
+        self.session_tokens.retain(|_, record| {
+            let keep = now - record.issued_at <= SESSION_TTL_SECS
+                && now - record.last_seen_at <= SESSION_IDLE_TTL_SECS;
+            if !keep {
+                pruned += 1;
+            }
+            keep
+        });
+        // Also drop activity timestamps for rooms that have since been
+        // removed, keeping those bookkeeping maps bounded.
+        let voice_rooms: std::collections::HashSet<String> =
+            self.voice.iter().map(|e| e.key().clone()).collect();
+        self.voice_activity
+            .retain(|room, _| voice_rooms.contains(room));
+        let screen_rooms: std::collections::HashSet<String> =
+            self.screen.iter().map(|e| e.key().clone()).collect();
+        self.screen_activity
+            .retain(|room, _| screen_rooms.contains(room));
+
+        self.ip_last_auth.retain(|_, last| {
+            let keep = now - *last < 3600.0;
+            if !keep {
+                pruned += 1;
+            }
+            keep
+        });
+        self.user_msg_rate.retain(|_, (_, window_start)| {
+            let keep = now - *window_start < 120.0;
+            if !keep {
+                pruned += 1;
+            }
+            keep
+        });
+        self.media_transfers.retain(|_, transfer| {
+            let keep = now - transfer.last_activity < 3600.0;
+            if !keep {
+                pruned += 1;
+            }
+            keep
+        });
+
+        pruned
+    }
+
+    /// Registers a `file_meta` announcement. Returns false when the file id
+    /// is already in use by a different sender in the same channel.
+    pub fn announce_media_transfer(
+        &self,
+        channel: &str,
+        file_id: &str,
+        sender: &str,
+        declared_size: u64,
+    ) -> bool {
+        match self
+            .media_transfers
+            .entry((channel.to_string(), file_id.to_string()))
+        {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if entry.get().sender != sender {
+                    return false;
+                }
+                let transfer = entry.get_mut();
+                transfer.declared_size = declared_size;
+                transfer.received_bytes = 0;
+                transfer.last_activity = chatify::now();
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(MediaTransferState {
+                    sender: sender.to_string(),
+                    declared_size,
+                    received_bytes: 0,
+                    last_activity: chatify::now(),
+                });
+                true
+            }
+        }
+    }
+
+    /// Validates and accounts for an incoming chunk. Returns false if there
+    /// is no matching announcement, the sender differs, or the chunk would
+    /// push the transfer past its declared size.
+    pub fn accept_media_chunk(
+        &self,
+        channel: &str,
+        file_id: &str,
+        sender: &str,
+        chunk_len: usize,
+    ) -> bool {
+        let Some(mut transfer) = self
+            .media_transfers
+            .get_mut(&(channel.to_string(), file_id.to_string()))
+        else {
+            return false;
+        };
+        if transfer.sender != sender || chunk_len == 0 {
+            return false;
+        }
+        let added = chunk_len as u64;
+        if transfer
+            .received_bytes
+            .checked_add(added)
+            .is_some_and(|total| total <= transfer.declared_size)
+        {
+            transfer.received_bytes += added;
+            transfer.last_activity = chatify::now();
+            true
+        } else {
+            false
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -853,19 +1102,27 @@ mod tests {
         assert!(state.session_tokens.contains_key(&digest));
         assert!(state.validate_session_token("alice", Some(&token)));
         assert!(!state.validate_session_token("alice", None));
+        assert!(state.session_is_active("alice", &digest));
 
         state.end_session("alice");
         assert!(!state.session_tokens.contains_key(&digest));
+        // A revoked session must be rejected even if the client keeps sending
+        // frames without a token field.
+        assert!(!state.session_is_active("alice", &digest));
     }
 
     #[test]
     fn invalid_or_expired_session_tokens_are_removed() {
         let state = test_state();
 
+        // Presenting another user's valid token must not invalidate their
+        // session — otherwise any user who learns a token can log its owner
+        // out by sending a single frame with a mismatched username.
         let mismatched = state.create_session("alice");
         let mismatched_digest = State::session_token_digest(&mismatched);
         assert!(!state.validate_session_token("bob", Some(&mismatched)));
-        assert!(!state.session_tokens.contains_key(&mismatched_digest));
+        assert!(state.session_tokens.contains_key(&mismatched_digest));
+        assert!(state.session_is_active("alice", &mismatched_digest));
 
         let expired = state.create_session("alice");
         let expired_digest = State::session_token_digest(&expired);
@@ -874,5 +1131,57 @@ mod tests {
         }
         assert!(!state.validate_session_token("alice", Some(&expired)));
         assert!(!state.session_tokens.contains_key(&expired_digest));
+    }
+
+    #[test]
+    fn idle_channels_are_pruned_but_general_is_kept() {
+        let state = test_state();
+        let idle = state.chan("idle-room");
+        idle.last_activity
+            .store(chatify::now_secs().saturating_sub(7200), Ordering::Relaxed);
+        // An active subscriber must keep the channel alive.
+        let subscribed = state.chan("subscribed-room");
+        let _receiver = subscribed.tx.subscribe();
+        subscribed
+            .last_activity
+            .store(chatify::now_secs().saturating_sub(7200), Ordering::Relaxed);
+
+        assert_eq!(state.prune_idle_channels(3600), 1);
+        assert!(!state.channels.contains_key("idle-room"));
+        assert!(state.channels.contains_key("general"));
+        assert!(state.channels.contains_key("subscribed-room"));
+    }
+
+    #[test]
+    fn media_transfers_enforce_sender_and_declared_size() {
+        let state = test_state();
+        assert!(!state.accept_media_chunk("general", "f1", "alice", 8));
+        assert!(state.announce_media_transfer("general", "f1", "alice", 16));
+        assert!(state.accept_media_chunk("general", "f1", "alice", 8));
+        assert!(state.accept_media_chunk("general", "f1", "alice", 8));
+        // One byte over the declared size must be rejected.
+        assert!(!state.accept_media_chunk("general", "f1", "alice", 1));
+        // An unknown file id and a foreign sender must be rejected.
+        assert!(!state.accept_media_chunk("general", "unknown", "alice", 1));
+        assert!(!state.accept_media_chunk("general", "f1", "bob", 1));
+        // Another sender cannot hijack the same file id.
+        assert!(!state.announce_media_transfer("general", "f1", "bob", 8));
+    }
+
+    #[test]
+    fn stale_metadata_is_pruned() {
+        let state = test_state();
+        let token = state.create_session("alice");
+        let digest = State::session_token_digest(&token);
+        if let Some(mut record) = state.session_tokens.get_mut(&digest) {
+            record.issued_at -= SESSION_TTL_SECS + 1.0;
+        }
+        state
+            .ip_last_auth
+            .insert(std::net::IpAddr::from([127, 0, 0, 9]), 1.0);
+
+        assert!(state.prune_stale_metadata() >= 2);
+        assert!(!state.session_tokens.contains_key(&digest));
+        assert!(state.ip_last_auth.is_empty());
     }
 }

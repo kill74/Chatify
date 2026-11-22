@@ -74,7 +74,17 @@ impl CaptureManager {
         if !self.is_running {
             return Err("Capture not started".to_string());
         }
-        let frame_size = (width * height * 4) as usize;
+        // Compute in u64 and cap before converting to usize: `width * height`
+        // overflows u32 for adversarial dimensions and would panic in debug
+        // or wrap into a bogus (potentially huge) allocation in release.
+        const MAX_FRAME_BYTES: u64 = 3840 * 2160 * 4; // 4K RGBA
+        let frame_size = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|bytes| *bytes <= MAX_FRAME_BYTES)
+            .ok_or_else(|| "frame dimensions exceed supported limit".to_string())?;
+        let frame_size = usize::try_from(frame_size)
+            .map_err(|_| "frame dimensions exceed supported limit".to_string())?;
         let buffer: Vec<u8> = (0..frame_size).map(|i| ((i / 4) % 256) as u8).collect();
         self.frame_buffer = buffer.clone();
         Ok(buffer)

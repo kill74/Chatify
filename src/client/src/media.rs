@@ -158,6 +158,21 @@ impl PendingMediaTransfer {
         }
     }
 
+    /// Returns true if a chunk of `bytes.len()` bytes at `index` fits within
+    /// the announced file size, accounting for replacement of an existing
+    /// chunk at the same index.
+    pub fn can_accept_chunk(&self, index: u64, bytes_len: usize) -> bool {
+        if bytes_len == 0 || self.media.size == 0 {
+            return false;
+        }
+        let previous = self.chunks.get(&index).map_or(0, Vec::len) as u64;
+        self.media
+            .received_bytes
+            .saturating_sub(previous)
+            .saturating_add(bytes_len as u64)
+            <= self.media.size
+    }
+
     pub fn insert_chunk(&mut self, index: u64, bytes: Vec<u8>) {
         if let Some(previous) = self.chunks.insert(index, bytes) {
             self.media.received_bytes = self
@@ -489,9 +504,43 @@ fn composite_pixel(pixel: image::Rgba<u8>) -> RgbColor {
 mod tests {
     use super::{
         build_inline_image_preview, build_inline_image_preview_with_support, format_byte_size,
-        format_duration, render_message_plain_lines, MediaKind, MediaRenderStatus, StyledFragment,
-        TimelineMedia, TimelinePayload,
+        format_duration, render_message_plain_lines, MediaKind, MediaRenderStatus,
+        PendingMediaTransfer, StyledFragment, TimelineMedia, TimelinePayload,
     };
+
+    fn test_media(size: u64) -> TimelineMedia {
+        TimelineMedia {
+            file_id: "f1".to_string(),
+            filename: "test.bin".to_string(),
+            media_kind: MediaKind::File,
+            mime: None,
+            size,
+            duration_ms: None,
+            received_bytes: 0,
+            local_path: None,
+            preview: Vec::new(),
+            render_status: MediaRenderStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn pending_transfer_rejects_chunks_beyond_declared_size() {
+        let mut transfer = PendingMediaTransfer::new(
+            "media:general:f1".to_string(),
+            "general".to_string(),
+            "alice".to_string(),
+            0.0,
+            test_media(10),
+        );
+        assert!(transfer.can_accept_chunk(0, 6));
+        transfer.insert_chunk(0, vec![0; 6]);
+        assert!(!transfer.can_accept_chunk(1, 5)); // would exceed size
+        assert!(transfer.can_accept_chunk(1, 4));
+        // Replacing an existing chunk may reuse its bytes.
+        transfer.insert_chunk(1, vec![1; 4]);
+        assert!(transfer.can_accept_chunk(1, 4));
+        assert!(!transfer.can_accept_chunk(1, 5));
+    }
 
     #[test]
     fn format_byte_size_uses_human_units() {

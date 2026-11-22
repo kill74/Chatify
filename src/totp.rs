@@ -4,10 +4,9 @@
 //! backup codes, and recovery mechanisms.
 
 use crate::crypto::{pw_hash, pw_verify, secure_string_eq};
+use crate::os_random_bytes;
 use base64::{engine::general_purpose, Engine as _};
 use hmac::Hmac;
-use rand::rngs::OsRng;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -82,7 +81,7 @@ impl User2FA {
         let plaintext_codes: Vec<String> = (0..10)
             .map(|_| {
                 let mut bytes = [0u8; 8];
-                OsRng.fill_bytes(&mut bytes);
+                os_random_bytes(&mut bytes);
                 hex::encode(bytes)
             })
             .collect();
@@ -181,7 +180,7 @@ fn verify_backup_code_hash(code: &str, stored_hash: &str) -> bool {
 /// Generate a random secret for TOTP
 pub fn generate_secret() -> String {
     let mut bytes = [0u8; 20];
-    OsRng.fill_bytes(&mut bytes);
+    os_random_bytes(&mut bytes);
     general_purpose::STANDARD.encode(bytes)
 }
 

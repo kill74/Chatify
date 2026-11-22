@@ -703,6 +703,8 @@ fn estimate_histogram_percentile_ms(
 pub struct Timer {
     start: Instant,
     callback: Box<dyn Fn(Duration) + Send + Sync>,
+    /// Set by `finish()` so the `Drop` impl does not fire the callback twice.
+    fired: bool,
 }
 
 impl Timer {
@@ -713,17 +715,22 @@ impl Timer {
         Self {
             start: Instant::now(),
             callback: Box::new(callback),
+            fired: false,
         }
     }
 
-    pub fn finish(self) {
+    pub fn finish(mut self) {
         let duration = self.start.elapsed();
         (self.callback)(duration);
+        self.fired = true;
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
+        if self.fired {
+            return;
+        }
         let duration = self.start.elapsed();
         (self.callback)(duration);
     }

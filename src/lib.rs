@@ -23,7 +23,7 @@ pub mod totp;
 pub mod ui;
 pub mod voice;
 
-use rand::RngCore;
+use rand::{rngs::OsRng, TryRngCore};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Normalizes a raw channel name to a safe, consistent format.
@@ -61,9 +61,21 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Fills `dest` with cryptographically secure entropy from the OS.
+///
+/// `rand` 0.9's `OsRng` implements `TryRngCore` rather than `RngCore`, so
+/// callers go through this helper instead of calling `fill_bytes` directly.
+/// A failure to obtain OS entropy is fatal: continuing with predictable
+/// nonces/keys would silently break the protocol's security guarantees.
+pub fn os_random_bytes(dest: &mut [u8]) {
+    OsRng
+        .try_fill_bytes(dest)
+        .expect("OS random number generator failed");
+}
+
 /// Generates a random 32-character hex nonce.
 pub fn fresh_nonce_hex() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    os_random_bytes(&mut bytes);
     hex::encode(bytes)
 }

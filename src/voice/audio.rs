@@ -131,8 +131,8 @@ impl AudioProcessor {
                     if decoded.len().saturating_add(count) > max_samples {
                         return None;
                     }
-                    for chunk in data[i..i + bytes_needed].chunks_exact(2) {
-                        decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    for chunk in data[i..i + bytes_needed].as_chunks::<2>().0 {
+                        decoded.push(i16::from_le_bytes(*chunk));
                     }
                     i += bytes_needed;
                 }

@@ -532,6 +532,7 @@ fn format_discord_relay_text(
     format!("{}...", clipped)
 }
 
+#[allow(clippy::result_large_err)] // serenity's Error is externally defined and used throughout the bridge
 async fn send_to_discord_channel(
     http: &Arc<Http>,
     channel_id_num: u64,
@@ -833,7 +834,7 @@ impl BridgeConfig {
             .unwrap_or(30)
             .max(5);
         let mut instance_id_bytes = <[u8; 8]>::default();
-        rand::thread_rng().fill_bytes(&mut instance_id_bytes);
+        rand::rng().fill_bytes(&mut instance_id_bytes);
         let instance_id = env::var("CHATIFY_BRIDGE_INSTANCE_ID")
             .unwrap_or_else(|_| hex::encode(instance_id_bytes));
         let channel_map = merged_channel_map_from_config();
@@ -889,8 +890,11 @@ fn jittered_backoff_secs(base_secs: u64, jitter_pct: u64) -> u64 {
     }
 
     let mut bytes = <[u8; 8]>::default();
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let noise = u64::from_le_bytes(bytes) % (max_extra + 1);
+    rand::rng().fill_bytes(&mut bytes);
+    // `max_extra + 1` would wrap to zero (division-by-zero panic) when
+    // config values saturate to u64::MAX.
+    let modulus = max_extra.checked_add(1).unwrap_or(max_extra);
+    let noise = u64::from_le_bytes(bytes) % modulus;
     base_secs.saturating_add(noise)
 }
 

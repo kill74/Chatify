@@ -46,6 +46,12 @@ const MAX_MESSAGE_HISTORY: usize = 1000;
 const MAX_REACTION_EVENT_DEDUP: usize = 10_000;
 const MAX_TRUST_AUDIT_ENTRIES: usize = 2_000;
 const MAX_ACTIVITY_LOG: usize = 200;
+/// Maximum number of in-flight media downloads kept in memory.
+pub const MAX_PENDING_MEDIA_TRANSFERS: usize = 32;
+/// Pending transfers with no activity for this long are discarded.
+pub const MEDIA_TRANSFER_TTL_SECS: f64 = 3600.0;
+/// Maximum acknowledged payload size for a media transfer (100 MB).
+pub const MAX_MEDIA_TRANSFER_SIZE: u64 = 100 * 1024 * 1024;
 const TRUST_STORE_SCHEMA_VERSION: u8 = 1;
 #[allow(dead_code)]
 const MAX_RECENT_SENTS: usize = 200;
@@ -475,6 +481,33 @@ impl ClientState {
         }
 
         self.add_message(msg);
+    }
+
+    /// Drops pending transfers that have gone stale and, if still over the
+    /// cap, the oldest ones. Called whenever a new transfer is announced so
+    /// incomplete or abandoned downloads cannot accumulate forever.
+    pub fn prune_pending_media_transfers(&mut self) {
+        let now = chatify::now();
+        self.pending_media_transfers
+            .retain(|_, transfer| now - transfer.announced_at < MEDIA_TRANSFER_TTL_SECS);
+
+        while self.pending_media_transfers.len() > MAX_PENDING_MEDIA_TRANSFERS {
+            let oldest = self
+                .pending_media_transfers
+                .iter()
+                .min_by(|a, b| {
+                    a.1.announced_at
+                        .partial_cmp(&b.1.announced_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    self.pending_media_transfers.remove(&key);
+                }
+                None => break,
+            }
+        }
     }
 
     pub fn update_message<F>(&mut self, id: &str, mut update: F) -> bool
