@@ -494,23 +494,30 @@ impl PluginRuntime {
             PluginSpec::Builtin(plugin_name) => {
                 let mut cmd = Command::new(&self.server_executable);
                 cmd.arg("--chatify-plugin-worker").arg(plugin_name);
+                // Apply the same sanitized environment to builtin workers so
+                // inherited LD_PRELOAD/LD_LIBRARY_PATH cannot inject code.
+                configure_plugin_environment(&mut cmd);
                 cmd
             }
             PluginSpec::External(path) => {
-                if !path.exists() {
-                    return Err(format!(
-                        "plugin executable not found: {}",
-                        path.to_string_lossy()
-                    ));
+                // Re-validate immediately before spawn. The spec was checked
+                // when it was parsed, but the file may have been swapped for
+                // a symlink pointing outside the trusted root since then.
+                let resolved = path
+                    .canonicalize()
+                    .map_err(|err| format!("failed to resolve plugin path: {}", err))?;
+                if resolved != *path {
+                    return Err("plugin path changed after validation".to_string());
                 }
-                if !path.is_file() {
+                validate_external_plugin_path(&resolved)?;
+                if !resolved.is_file() {
                     return Err(format!(
                         "plugin executable path is not a file: {}",
-                        path.to_string_lossy()
+                        resolved.to_string_lossy()
                     ));
                 }
-                let mut cmd = Command::new(path);
-                if let Some(parent) = path.parent() {
+                let mut cmd = Command::new(&resolved);
+                if let Some(parent) = resolved.parent() {
                     cmd.current_dir(parent);
                 }
                 configure_plugin_environment(&mut cmd);

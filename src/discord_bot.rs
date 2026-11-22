@@ -59,7 +59,10 @@ use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 use zeroize::Zeroize;
 
-type WsSender = mpsc::UnboundedSender<WsMessage>;
+/// Bounded sender for the WebSocket writer task. An unbounded queue would let
+/// a flood of Discord events grow memory without limit if the socket stalls.
+type WsSender = mpsc::Sender<WsMessage>;
+const MAX_WS_QUEUE: usize = 256;
 type PayloadMap = HashMap<String, serde_json::Value>;
 const MAX_DISCORD_CONTENT_LEN: usize = 4000;
 const MAX_DISCORD_RELAY_OUT_LEN: usize = 1900;
@@ -787,6 +790,16 @@ struct BridgeConfig {
     channel_map: HashMap<String, String>,
 }
 
+impl Drop for BridgeConfig {
+    fn drop(&mut self) {
+        // The Discord bot token and Chatify password are process secrets.
+        // Plain `String` fields would otherwise linger in memory after the
+        // supervisor or any clone is dropped.
+        self.discord_token.zeroize();
+        self.chatify_password.zeroize();
+    }
+}
+
 impl BridgeConfig {
     fn from_env() -> Self {
         let ws_scheme_raw = env::var("CHATIFY_WS_SCHEME").unwrap_or_else(|_| "ws".to_string());
@@ -898,8 +911,8 @@ fn jittered_backoff_secs(base_secs: u64, jitter_pct: u64) -> u64 {
     base_secs.saturating_add(noise)
 }
 
-fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
-    let _ = tx.send(WsMessage::text(payload.to_string()));
+async fn send_ws_json(tx: &WsSender, payload: serde_json::Value) {
+    let _ = tx.send(WsMessage::text(payload.to_string())).await;
 }
 
 fn fresh_nonce_hex() -> String {
@@ -1165,7 +1178,7 @@ impl EventHandler for DiscordHandler {
             "relay": serde_json::Value::Object(relay)
         });
         if let Some(tx) = ws_tx {
-            send_ws_json(&tx, chatify_msg);
+            send_ws_json(&tx, chatify_msg).await;
             self.metrics.inc_discord_forwarded();
             info!(
                 "event=discord_relayed_to_chatify discord_channel_id={} chatify_channel={} author={} marker={} attachments_count={} reply_present={}",
@@ -1411,7 +1424,7 @@ async fn run_chatify_session(
     info!("event=bridge_connected uri={}", uri);
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
-    let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let (bridge_tx, mut bridge_rx) = mpsc::channel::<WsMessage>(MAX_WS_QUEUE);
     let writer_metrics = metrics.clone();
     tokio::spawn(async move {
         while let Some(msg) = bridge_rx.recv().await {
@@ -1445,7 +1458,7 @@ async fn run_chatify_session(
             "bridge_instance_id": bot_state.bridge_src_tag,
             "bridge_routes": bot_state.channel_map.len(),
         });
-        send_ws_json(&bridge_tx, auth_msg);
+        send_ws_json(&bridge_tx, auth_msg).await;
         info!(
             "event=bridge_auth_sent routes={}",
             bot_state.channel_map.len()
@@ -1522,7 +1535,7 @@ async fn run_chatify_session(
         let frame = if let Some(interval) = ping_interval.as_mut() {
             tokio::select! {
                 _ = interval.tick() => {
-                    send_ws_json(&bridge_tx, serde_json::json!({"t": "ping", "ts": chatify::now_secs()}));
+                    send_ws_json(&bridge_tx, serde_json::json!({"t": "ping", "ts": chatify::now_secs()})).await;
                     metrics.inc_pings_sent();
                     debug!("event=chatify_ping");
                     continue;
@@ -1551,7 +1564,7 @@ async fn run_chatify_session(
                 return Err("Chatify connection closed".to_string());
             }
             Ok(WsMessage::Ping(payload)) => {
-                let _ = bridge_tx.send(WsMessage::Pong(payload));
+                let _ = bridge_tx.send(WsMessage::Pong(payload)).await;
             }
             Ok(_) => {}
             Err(e) => {
@@ -1601,10 +1614,34 @@ async fn bridge_supervisor(
     }
 }
 
+/// Refuses to send the Chatify credential hash over an unencrypted WebSocket
+/// to a remote host unless explicitly opted in via `CHATIFY_ALLOW_INSECURE=1`.
+fn enforce_transport_policy(cfg: &BridgeConfig) -> Result<(), String> {
+    if cfg.chatify_ws_scheme == "wss" {
+        return Ok(());
+    }
+    let host = cfg.chatify_host.to_ascii_lowercase();
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || env::var("CHATIFY_ALLOW_INSECURE").unwrap_or_default() == "1"
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing plaintext ws:// connection to remote host {}; set CHATIFY_WS_SCHEME=wss or CHATIFY_ALLOW_INSECURE=1",
+        cfg.chatify_host
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     // Load environment variables.
     let cfg = BridgeConfig::from_env();
+    if let Err(err) = enforce_transport_policy(&cfg) {
+        eprintln!("configuration error: {}", err);
+        std::process::exit(2);
+    }
 
     // Set up logging.
     if env::var("CHATIFY_LOG").unwrap_or_default() == "1" {

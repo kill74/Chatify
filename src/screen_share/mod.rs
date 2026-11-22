@@ -148,8 +148,15 @@ impl ScreenShareManager {
             bitrate: options.quality.bitrate(),
         };
 
-        let encoder = encode::Encoder::new(encoder_config)
-            .map_err(|e| format!("Failed to initialize encoder: {}", e))?;
+        let encoder = match encode::Encoder::new(encoder_config) {
+            Ok(encoder) => encoder,
+            Err(err) => {
+                // Capture was already started above; stop it before bailing so
+                // OS capture handles are not leaked on the error path.
+                capture_manager.stop();
+                return Err(format!("Failed to initialize encoder: {}", err));
+            }
+        };
 
         let webrtc_manager = webrtc::WebRTCManager::new();
 

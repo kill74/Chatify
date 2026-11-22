@@ -107,6 +107,11 @@ pub struct Args {
     #[arg(long, default_value_t = 8080)]
     pub health_port: u16,
 
+    /// Address the health/metrics HTTP server binds to. Defaults to loopback
+    /// so health probes are not exposed to the network by accident.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub health_bind: String,
+
     /// Enable Prometheus metrics endpoint.
     #[arg(long, default_value_t = true)]
     pub metrics_enabled: bool,
@@ -122,6 +127,12 @@ pub struct Args {
     /// Enable shutdown HTTP endpoint for orchestration.
     #[arg(long)]
     pub shutdown_endpoint: bool,
+
+    /// Shared secret required on `/shutdown` requests (header
+    /// `X-Shutdown-Token` or `?token=`). Strongly recommended whenever the
+    /// endpoint is enabled, especially with a non-loopback health bind.
+    #[arg(long)]
+    pub shutdown_token: Option<String>,
 
     /// Maximum messages per user per minute (0 = unlimited).
     #[arg(long, default_value_t = 60)]

@@ -1138,7 +1138,7 @@ async fn handle_event(
             // Send an encrypted direct message.
             // The sender's public key is injected by the server so the
             // recipient can verify / decrypt without a separate lookup.
-            let target = d["to"].as_str().unwrap_or("").to_string();
+            let target = d["to"].as_str().unwrap_or("").trim().to_lowercase();
             let c = d["c"].as_str().unwrap_or("").to_string();
             let ptxt = d["p"].as_str().unwrap_or("").to_string();
             let searchable = if ptxt.is_empty() {
@@ -1146,7 +1146,25 @@ async fn handle_event(
             } else {
                 ptxt.as_str()
             };
-            if c.is_empty() || target.is_empty() {
+            if c.is_empty() || !is_valid_username(&target) {
+                send_err(out_tx, "invalid DM recipient", &state.metrics);
+                return;
+            }
+            // Do not let a client inject ciphertext into an arbitrary or
+            // non-existent account's DM channel. Self-DMs are also rejected:
+            // they produce two copies of the same ciphertext in one channel.
+            if target == username {
+                send_err(out_tx, "cannot send a DM to yourself", &state.metrics);
+                return;
+            }
+            // First-login credentials are persisted in a background task, so
+            // a freshly authenticated recipient may not have a stored row yet.
+            // Pending state counts as an existing account for this check.
+            let recipient_exists = state.pending_credentials.contains_key(&target)
+                || state.pending_registrations.contains(&target)
+                || matches!(state.store.credential_state(&target), Ok(Some(_)));
+            if !recipient_exists {
+                send_err(out_tx, "DM recipient does not exist", &state.metrics);
                 return;
             }
             let sender_pk = state
@@ -3262,6 +3280,10 @@ fn parse_event_query_scope(raw: Option<&str>) -> ChatifyResult<EventQueryScope> 
                 "invalid dm conversation target".to_string(),
             ));
         }
+        // Access control is enforced by the DB layer: every `dm_*` query is
+        // parameterized with the authenticated caller and the peer, returning
+        // only rows where the caller is sender or recipient. A third party
+        // asking for `dm:<victim>` therefore receives no events.
         return Ok(EventQueryScope::DmConversation(peer));
     }
 
@@ -3297,6 +3319,7 @@ async fn start_health_server(
     metrics: Option<Arc<std::sync::Mutex<PrometheusMetrics>>>,
     metrics_enabled: bool,
     shutdown_endpoint_enabled: bool,
+    shutdown_token: Option<String>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     loop {
@@ -3310,10 +3333,11 @@ async fn start_health_server(
 
             accept_result = listener.accept() => {
                 match accept_result {
-                    Ok((mut stream, _addr)) => {
+                    Ok((mut stream, addr)) => {
                         let state = state.clone();
                         let metrics = metrics.clone();
                         let shutdown_tx = shutdown_tx.clone();
+                        let shutdown_token = shutdown_token.clone();
 
                         tokio::spawn(async move {
                             let start = Instant::now();
@@ -3336,11 +3360,16 @@ async fn start_health_server(
                                             create_ready_response(&state)
                                         }
                                         "/shutdown" | "/shutdown/" if shutdown_endpoint_enabled && method == "POST" => {
-                                            if state.initiate_shutdown() {
-                                                let _ = shutdown_tx.send(()).await;
-                                                create_shutdown_response("initiated")
+                                            if shutdown_request_authorized(&request, addr, shutdown_token.as_deref()) {
+                                                if state.initiate_shutdown() {
+                                                    let _ = shutdown_tx.send(()).await;
+                                                    create_shutdown_response("initiated")
+                                                } else {
+                                                    create_shutdown_response("already_in_progress")
+                                                }
                                             } else {
-                                                create_shutdown_response("already_in_progress")
+                                                warn!("rejected unauthenticated shutdown request from {}", addr);
+                                                create_unauthorized_response()
                                             }
                                         }
                                         "/shutdown" | "/shutdown/" if shutdown_endpoint_enabled => {
@@ -3478,6 +3507,48 @@ fn create_shutdown_response(status: &str) -> String {
         body.len(),
         body
     )
+}
+
+fn create_unauthorized_response() -> String {
+    let body = "Unauthorized";
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// Authorizes a `/shutdown` request.
+///
+/// Two independent controls are supported: the request must originate from a
+/// loopback address (the health server binds to loopback by default), and if
+/// `--shutdown-token` was configured, it must also be supplied in the
+/// `X-Shutdown-Token` header or as a `?token=` query parameter.
+fn shutdown_request_authorized(
+    request: &str,
+    addr: std::net::SocketAddr,
+    expected_token: Option<&str>,
+) -> bool {
+    if !addr.ip().is_loopback() {
+        return false;
+    }
+    match expected_token {
+        None => true,
+        Some("") => false,
+        Some(expected) => {
+            // Parse the `X-Shutdown-Token` header (case-insensitive) with a
+            // constant-time comparison of the value.
+            let header_ok = request.lines().any(|line| {
+                let line = line.trim_end_matches('\r');
+                let Some((name, value)) = line.split_once(':') else {
+                    return false;
+                };
+                name.trim().eq_ignore_ascii_case("x-shutdown-token")
+                    && chatify::crypto::secure_string_eq(value.trim(), expected)
+            });
+            header_ok || request.contains(&format!("token={}", expected))
+        }
+    }
 }
 
 fn create_method_not_allowed_response() -> String {
@@ -5559,6 +5630,10 @@ async fn main() -> ChatifyResult<()> {
         }
     );
 
+    if args.shutdown_endpoint && args.shutdown_token.is_none() {
+        warn!("shutdown endpoint enabled without --shutdown-token: requests are accepted only from loopback");
+    }
+
     // Shutdown channel for orchestration
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -5568,9 +5643,11 @@ async fn main() -> ChatifyResult<()> {
         let health_state = state.clone();
         let health_enabled = args.metrics_enabled;
         let shutdown_endpoint_enabled = args.shutdown_endpoint;
+        let shutdown_token = args.shutdown_token.clone();
+        let health_bind = args.health_bind.clone();
         let health_shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
-            let addr = format!("0.0.0.0:{}", args.health_port);
+            let addr = format!("{}:{}", health_bind, args.health_port);
             match TcpListener::bind(&addr).await {
                 Ok(listener) => {
                     println!(" Health/Metrics server running on http://{}", addr);
@@ -5583,6 +5660,7 @@ async fn main() -> ChatifyResult<()> {
                         health_metrics,
                         health_enabled,
                         shutdown_endpoint_enabled,
+                        shutdown_token,
                         health_shutdown_tx,
                     )
                     .await;

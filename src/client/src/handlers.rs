@@ -32,6 +32,15 @@ use crate::state::{
 use crate::voice::{decode_voice_frame, VoiceEvent, VoicePlaybackPacket};
 use base64::Engine as _;
 use chatify::notifications::NotificationService;
+use chatify::ui::ansi::sanitize_terminal;
+
+/// Removes terminal control sequences from untrusted wire data before it is
+/// stored or printed. Chat messages and usernames are attacker-controlled in
+/// a shared chat: without this, a sender could inject OSC 52 sequences to
+/// overwrite the recipient's clipboard or OSC 8 hyperlinks.
+fn clean_wire_text(value: &str) -> String {
+    sanitize_terminal(value)
+}
 
 /// Emit a line of output to the UI (with newline).
 macro_rules! println {
@@ -578,9 +587,9 @@ pub async fn handle_db_profile_event(_state: &SharedState, data: &serde_json::Va
 }
 
 pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts: u64) {
-    let ch = data.get("ch").and_then(|v| v.as_str()).unwrap_or("general");
-    let u = data.get("u").and_then(|v| v.as_str()).unwrap_or("?");
-    let c = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+    let ch = clean_wire_text(data.get("ch").and_then(|v| v.as_str()).unwrap_or("general"));
+    let u = clean_wire_text(data.get("u").and_then(|v| v.as_str()).unwrap_or("?"));
+    let c = clean_wire_text(data.get("c").and_then(|v| v.as_str()).unwrap_or(""));
     let pk = data.get("pk").and_then(|v| v.as_str()).unwrap_or("");
     let msg_id = extract_msg_id(data);
     let event_ts = extract_ts(data, ts);
@@ -590,18 +599,32 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
     let current_user = state_lock.me.clone();
     let from_self = !current_user.is_empty() && u.eq_ignore_ascii_case(&current_user);
     let notification_config = state_lock.config.notifications.clone();
+
+    // Decrypt the wire ciphertext with the channel key. Legacy plaintext
+    // messages fall through unchanged.
+    state_lock.ensure_channel_key(&ch);
+    let plaintext = state_lock.decrypt_content(&ch, &c);
+    let plaintext = clean_wire_text(&plaintext);
+
     let mut message = make_text_message(
         msg_id.clone(),
         event_ts,
         ch.to_string(),
         u.to_string(),
-        c.to_string(),
+        plaintext.clone(),
         true,
     );
-    message.reply = reply_preview_from_event(data);
+    message.reply = reply_preview_from_event(data).map(|mut preview| {
+        let scope = message.channel.clone();
+        state_lock.ensure_channel_key(&scope);
+        preview.preview = preview
+            .preview
+            .map(|value| clean_wire_text(&state_lock.decrypt_content(&scope, &value)));
+        preview
+    });
     state_lock.add_message(message.clone());
-    state_lock.note_incoming_message(ch, from_self);
-    let trust_warning = state_lock.observe_user_key(u, pk);
+    state_lock.note_incoming_message(&ch, from_self);
+    let trust_warning = state_lock.observe_user_key(&u, pk);
     if let Some(warning) = trust_warning.as_ref() {
         state_lock.add_message(make_text_message(
             String::new(),
@@ -649,9 +672,9 @@ pub async fn handle_msg_event(state: &SharedState, data: &serde_json::Value, ts:
 }
 
 pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: u64) {
-    let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
-    let to = data.get("to").and_then(|v| v.as_str()).unwrap_or("");
-    let content = data.get("c").and_then(|v| v.as_str()).unwrap_or("");
+    let from = clean_wire_text(data.get("from").and_then(|v| v.as_str()).unwrap_or("?"));
+    let to = clean_wire_text(data.get("to").and_then(|v| v.as_str()).unwrap_or(""));
+    let content = clean_wire_text(data.get("c").and_then(|v| v.as_str()).unwrap_or(""));
     let pk = data.get("pk").and_then(|v| v.as_str()).unwrap_or("");
     let msg_id = extract_msg_id(data);
     let event_ts = extract_ts(data, ts);
@@ -662,15 +685,26 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
 
     let my_user = state_lock.me.clone();
     let from_is_me = !my_user.is_empty() && from.eq_ignore_ascii_case(&my_user);
-    let peer = if from_is_me { to } else { from };
+    let peer = if from_is_me { to.clone() } else { from.clone() };
     let scope = format!("dm:{}", peer.to_ascii_lowercase());
+
+    // Derive the DM key before decrypting. For incoming messages the event
+    // carries the sender's authenticated public key; for our own echoed
+    // messages we already have the recipient's key in the directory.
+    if from_is_me {
+        state_lock.ensure_dm_key(&peer);
+    } else {
+        state_lock.ensure_dm_key_from_pubkey(&peer, pk);
+    }
+    let mut plaintext = state_lock.decrypt_dm_content(&peer, &content);
+    plaintext = clean_wire_text(&plaintext);
 
     let message = make_text_message(
         msg_id.clone(),
         event_ts,
         scope,
         from.to_string(),
-        content.to_string(),
+        plaintext,
         true,
     );
     state_lock.add_message(message.clone());
@@ -679,7 +713,7 @@ pub async fn handle_dm_event(state: &SharedState, data: &serde_json::Value, ts: 
     let trust_warning = if from_is_me {
         None
     } else {
-        state_lock.observe_user_key(from, pk)
+        state_lock.observe_user_key(&from, pk)
     };
 
     if let Some(warning) = trust_warning.as_ref() {
@@ -975,15 +1009,22 @@ async fn ingest_timeline_events(
                 let content = event.get("c").and_then(|v| v.as_str()).unwrap_or("");
                 let sender = event.get("u").and_then(|v| v.as_str()).unwrap_or("?");
                 let event_ts = extract_ts(event, 0);
+                state_lock.ensure_channel_key(scope);
+                let plaintext = clean_wire_text(&state_lock.decrypt_content(scope, content));
                 let mut message = make_text_message(
                     extract_msg_id(event),
                     event_ts,
                     scope.to_string(),
                     sender.to_string(),
-                    content.to_string(),
+                    plaintext,
                     true,
                 );
-                message.reply = reply_preview_from_event(event);
+                message.reply = reply_preview_from_event(event).map(|mut preview| {
+                    preview.preview = preview
+                        .preview
+                        .map(|value| clean_wire_text(&state_lock.decrypt_content(scope, &value)));
+                    preview
+                });
                 state_lock.add_message(message);
             }
             "dm" => {
@@ -994,12 +1035,16 @@ async fn ingest_timeline_events(
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let event_ts = extract_ts(event, 0);
+                let peer = scope.strip_prefix("dm:").unwrap_or(scope);
+                let pk = event.get("pk").and_then(|v| v.as_str()).unwrap_or("");
+                state_lock.ensure_dm_key_from_pubkey(peer, pk);
+                let plaintext = clean_wire_text(&state_lock.decrypt_dm_content(peer, content));
                 state_lock.add_message(make_text_message(
                     extract_msg_id(event),
                     event_ts,
                     scope.to_string(),
                     sender.to_string(),
-                    content.to_string(),
+                    plaintext,
                     true,
                 ));
             }
@@ -1624,19 +1669,22 @@ pub async fn handle_status_update_event(state: &SharedState, data: &serde_json::
 }
 
 pub async fn handle_typing_event(state: &SharedState, data: &serde_json::Value, _ts: u64) {
-    let user = data
-        .get("u")
-        .or_else(|| data.get("from"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
+    let user = clean_wire_text(
+        data.get("u")
+            .or_else(|| data.get("from"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim(),
+    );
     if user.is_empty() {
         return;
     }
 
     let typing = data.get("typing").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Use local wall-clock time for TTL bookkeeping. Trusting a wire-supplied
+    // timestamp would let a peer keep a phantom "typing" entry alive forever
+    // by sending timestamps in the future.
     let now_ts = chatify::now() as u64;
-    let event_ts = extract_ts(data, now_ts) as u64;
 
     let mut state_lock = state.lock().await;
     if !state_lock.me.is_empty() && user.eq_ignore_ascii_case(&state_lock.me) {
@@ -1680,7 +1728,7 @@ pub async fn handle_typing_event(state: &SharedState, data: &serde_json::Value, 
             key,
             TypingPresence {
                 user: user.to_string(),
-                timestamp: event_ts,
+                timestamp: now_ts,
             },
         );
     } else {

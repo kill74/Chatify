@@ -24,7 +24,7 @@ use chatify_client::{
     args::{Args, ClientConfig},
     handlers,
     state::{ClientState, MediaGalleryFilter, OutgoingMediaMeta, SharedState},
-    voice::{start_voice_session, VoiceEvent},
+    voice::start_voice_session,
 };
 
 macro_rules! println {
@@ -1426,24 +1426,24 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                             return true;
                         }
                     };
-                    let event_tx = started.event_tx;
-
                     let mut state_lock = state.lock().await;
                     if state_lock.voice_active {
-                        let _ = event_tx.send(VoiceEvent::Stop);
+                        // Stop and join the newly started thread before bailing.
+                        chatify_client::voice::stop_voice_session(started);
                         println!("Voice became active concurrently; keeping existing session.");
                         return true;
                     }
 
                     if let Err(err) = state_lock.send_voice_join(&room) {
-                        let _ = event_tx.send(VoiceEvent::Stop);
+                        chatify_client::voice::stop_voice_session(started);
                         eprintln!("failed to join voice room: {}", err);
                         return true;
                     }
 
                     state_lock.voice_session = Some(chatify_client::state::VoiceSession {
                         room: room.clone(),
-                        event_tx,
+                        event_tx: started.event_tx,
+                        task: started.task,
                     });
                     state_lock.voice_active = true;
                     state_lock.voice_muted = false;
@@ -1458,26 +1458,36 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                         return true;
                     }
 
-                    let mut state_lock = state.lock().await;
-                    let Some(session) = state_lock.voice_session.take() else {
-                        println!("Voice is not active.");
-                        return true;
+                    let session = {
+                        let mut state_lock = state.lock().await;
+                        let Some(session) = state_lock.voice_session.take() else {
+                            println!("Voice is not active.");
+                            return true;
+                        };
+
+                        if let Err(err) = state_lock.send_voice_leave(&session.room) {
+                            eprintln!("failed to leave voice room: {}", err);
+                        }
+
+                        state_lock.voice_active = false;
+                        state_lock.voice_muted = false;
+                        state_lock.voice_deafened = false;
+                        state_lock.voice_speaking = false;
+                        state_lock.voice_members.clear();
+                        session
                     };
 
-                    let room = session.room.clone();
-                    let _ = session.event_tx.send(VoiceEvent::Stop);
+                    // Join the microphone/playback thread without holding the
+                    // async state lock (join is a blocking operation).
+                    chatify_client::voice::stop_voice_session(
+                        chatify_client::voice::VoiceSession {
+                            room: session.room.clone(),
+                            event_tx: session.event_tx,
+                            task: session.task,
+                        },
+                    );
 
-                    if let Err(err) = state_lock.send_voice_leave(&room) {
-                        eprintln!("failed to leave voice room: {}", err);
-                    }
-
-                    state_lock.voice_active = false;
-                    state_lock.voice_muted = false;
-                    state_lock.voice_deafened = false;
-                    state_lock.voice_speaking = false;
-                    state_lock.voice_members.clear();
-
-                    println!("Voice stopped for room #{}.", room);
+                    println!("Voice stopped for room #{}.", session.room);
                 }
                 "mute" => {
                     if parts.next().is_some() {
@@ -2434,7 +2444,7 @@ async fn handle_user_input(state: &SharedState, input: &str) -> bool {
                 return true;
             }
 
-            let state_lock = state.lock().await;
+            let mut state_lock = state.lock().await;
             let channel = state_lock.ch.clone();
             if channel.starts_with("dm:") {
                 println!("Replies are available in channels for now.");
@@ -2544,41 +2554,14 @@ async fn run_input_loop(state: SharedState) {
     }
 }
 
-#[tokio::main]
-async fn main() -> ChatifyResult<()> {
-    let args = Args::parse();
-    let config = Config::load();
-    NotificationService::init();
-    let client_config = args.merge_with_config(&config);
-
-    if client_config.log_enabled {
-        let _ = env_logger::Builder::from_default_env()
-            .format_timestamp_secs()
-            .try_init();
-    }
-
-    enforce_transport_policy(&client_config)?;
-
-    let uri = client_config.uri();
-    info!("Connecting to {}", uri);
-
-    let default_username = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "user".to_string());
-    let input_username = prompt_input("Username", Some(&default_username))?;
-    let username = sanitize_username(&input_username);
-
-    let mut password = String::new();
-    while password.is_empty() {
-        password = prompt_secret_input("Password")?;
-        if password.is_empty() {
-            println!("Password cannot be empty.");
-        }
-    }
-    let pw_hash = pw_hash_client(&password).map_err(ChatifyError::Validation)?;
-    password.zeroize();
-
-    let (ws_stream, _) = connect_async(&uri).await?;
+async fn run_client_session(
+    uri: &str,
+    username: &str,
+    pw_hash: &str,
+    client_config: &ClientConfig,
+    config: chatify::config::Config,
+) -> ChatifyResult<()> {
+    let (ws_stream, _) = connect_async(uri).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -2594,8 +2577,8 @@ async fn main() -> ChatifyResult<()> {
 
     {
         let mut state_lock = state.lock().await;
-        state_lock.me = username.clone();
-        state_lock.pw = pw_hash.clone();
+        state_lock.me = username.to_string();
+        state_lock.pw = pw_hash.to_string();
         state_lock.priv_key = priv_key;
 
         match state_lock.load_trust_store() {
@@ -2655,8 +2638,8 @@ async fn main() -> ChatifyResult<()> {
         .get("sn")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ChatifyError::Message("auth challenge missing nonce".to_string()))?;
-    let proof = auth_proof(&pw_hash, &username, &client_nonce, server_nonce)
-        .map_err(ChatifyError::Crypto)?;
+    let proof =
+        auth_proof(pw_hash, username, &client_nonce, server_nonce).map_err(ChatifyError::Crypto)?;
     let include_enrollment_secret = challenge
         .get("enroll")
         .and_then(|v| v.as_bool())
@@ -2676,7 +2659,7 @@ async fn main() -> ChatifyResult<()> {
         "status": {"text": "Online", "emoji": ""}
     });
     if include_enrollment_secret {
-        auth_finish["pw"] = serde_json::Value::String(pw_hash.clone());
+        auth_finish["pw"] = serde_json::Value::String(pw_hash.to_string());
     }
     write.send(Message::text(auth_finish.to_string())).await?;
 
@@ -2720,7 +2703,6 @@ async fn main() -> ChatifyResult<()> {
     });
 
     let recv_state = state.clone();
-    let _uri = uri.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(msg) = read.next().await {
             match msg {
@@ -2732,11 +2714,11 @@ async fn main() -> ChatifyResult<()> {
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    eprintln!("\n[disconnected] Connection closed. Please restart the client.");
+                    eprintln!("\n[disconnected] Connection closed.");
                     break;
                 }
                 Err(e) => {
-                    eprintln!("\n[error] Connection error: {}. Please restart.", e);
+                    eprintln!("\n[error] Connection error: {}.", e);
                     break;
                 }
                 _ => {}
@@ -2768,16 +2750,94 @@ async fn main() -> ChatifyResult<()> {
         }
     });
 
-    tokio::select! {
-        _ = &mut input_task => {}
-        _ = &mut recv_task => {}
-    }
+    // A finished input task means the user quit intentionally; a finished
+    // receive task means the connection dropped (close, error, or EOF) and
+    // should trigger the reconnect loop when auto_reconnect is enabled.
+    let connection_lost = tokio::select! {
+        _ = &mut input_task => false,
+        _ = &mut recv_task => true,
+    };
 
     send_task.abort();
     recv_task.abort();
     input_task.abort();
 
-    println!("Disconnected");
+    // Release the microphone and join the voice thread on every disconnect,
+    // including network failures and /quit. Otherwise the capture thread can
+    // outlive the connection and keep the mic open.
+    let voice_session = state.lock().await.voice_session.take();
+    if let Some(session) = voice_session {
+        chatify_client::voice::stop_voice_session(chatify_client::voice::VoiceSession {
+            room: session.room,
+            event_tx: session.event_tx,
+            task: session.task,
+        });
+    }
+
+    if connection_lost {
+        println!("Disconnected");
+        Err(ChatifyError::Message("connection lost".to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> ChatifyResult<()> {
+    let args = Args::parse();
+    let config = Config::load();
+    NotificationService::init();
+    let client_config = args.merge_with_config(&config);
+
+    if client_config.log_enabled {
+        let _ = env_logger::Builder::from_default_env()
+            .format_timestamp_secs()
+            .try_init();
+    }
+
+    enforce_transport_policy(&client_config)?;
+
+    let uri = client_config.uri();
+    info!("Connecting to {}", uri);
+
+    let default_username = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".to_string());
+    let input_username = prompt_input("Username", Some(&default_username))?;
+    let username = sanitize_username(&input_username);
+
+    let mut password = String::new();
+    while password.is_empty() {
+        password = prompt_secret_input("Password")?;
+        if password.is_empty() {
+            println!("Password cannot be empty.");
+        }
+    }
+    let mut pw_hash = pw_hash_client(&password).map_err(ChatifyError::Validation)?;
+    password.zeroize();
+
+    // Reconnect loop. Session tokens are ephemeral (per AGENTS.md), so every
+    // reconnection performs a full authentication using the same credentials.
+    let mut attempt = 0u32;
+    loop {
+        match run_client_session(&uri, &username, &pw_hash, &client_config, config.clone()).await {
+            Ok(()) => {
+                // Clean user-initiated exit (e.g. /quit) ends the process.
+                break;
+            }
+            Err(err) => {
+                eprintln!("\n[disconnected] {}", err);
+                if !client_config.auto_reconnect {
+                    break;
+                }
+                attempt += 1;
+                let delay = std::cmp::min(attempt, 6); // cap backoff at 6s
+                eprintln!("Reconnecting in {}s (attempt {})...", delay, attempt);
+                tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+            }
+        }
+    }
+    pw_hash.zeroize();
     Ok(())
 }
 

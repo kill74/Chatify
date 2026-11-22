@@ -40,7 +40,9 @@ use crate::media::{
     render_message_lines, MediaKind, MediaRenderStatus, RgbColor, StyledFragment, StyledLine,
     TimelineMedia, TimelinePayload,
 };
-use crate::state::{ActivityEntry, ClientState, MediaGalleryState, ReplyPreview, SharedState};
+use crate::state::{
+    ActivityEntry, ClientState, MediaGalleryState, ReplyPreview, SharedState, MAX_COMMAND_HISTORY,
+};
 use chatify::error::{ChatifyError, ChatifyResult};
 
 #[derive(Clone, Debug)]
@@ -1876,6 +1878,9 @@ async fn submit_current_input(state: &SharedState) -> UiAction {
                 .unwrap_or(true)
         {
             state_lock.command_history.push(command.clone());
+            if state_lock.command_history.len() > MAX_COMMAND_HISTORY {
+                state_lock.command_history.remove(0);
+            }
         }
         state_lock.history_index = None;
         state_lock.input_buffer.clear();

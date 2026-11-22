@@ -2976,6 +2976,91 @@ async fn search_contract_supports_dm_scope() {
     assert!(found, "expected DM event in dm:bob search response");
 }
 
+/// Verifies that a client cannot send a DM to itself.
+#[tokio::test]
+async fn dm_contract_rejects_self_addressed_message() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::text(
+            json!({"t": "dm", "to": "alice", "c": "self-cipher"}).to_string(),
+        ))
+        .await
+        .expect("send self-addressed dm");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("yourself"),
+        "expected self-DM rejection, got: {}",
+        msg
+    );
+}
+
+/// Verifies that a client cannot inject ciphertext into a non-existent
+/// account's DM channel.
+#[tokio::test]
+async fn dm_contract_rejects_unknown_recipient() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+
+    alice
+        .send(Message::text(
+            json!({"t": "dm", "to": "ghost", "c": "spam-cipher"}).to_string(),
+        ))
+        .await
+        .expect("send dm to unknown recipient");
+
+    let err = recv_by_type(&mut alice, "err").await;
+    let msg = err.get("m").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("does not exist"),
+        "expected unknown-recipient rejection, got: {}",
+        msg
+    );
+}
+
+/// Verifies that DM history is scoped to the authenticated caller: a third
+/// party querying `dm:<peer>` must not receive another users' conversation.
+#[tokio::test]
+async fn dm_contract_hides_history_from_third_parties() {
+    let server = start_server().await;
+    let mut alice = connect_and_auth(&server.url, "alice").await;
+    let _bob = connect_and_auth(&server.url, "bob").await;
+    let mut charlie = connect_and_auth(&server.url, "charlie").await;
+
+    alice
+        .send(Message::text(
+            json!({"t": "dm", "to": "bob", "c": "private-cipher", "p": "private marker"})
+                .to_string(),
+        ))
+        .await
+        .expect("send dm");
+    // Consume alice's own echo if the server sends one.
+    let _ = recv_by_type(&mut alice, "dm").await;
+
+    charlie
+        .send(Message::text(
+            json!({"t": "history", "ch": "dm:bob", "limit": 50}).to_string(),
+        ))
+        .await
+        .expect("request third-party dm history");
+
+    let history = recv_by_type(&mut charlie, "history").await;
+    let events = history
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("history events must be an array");
+    assert!(
+        !events.iter().any(|e| {
+            e.get("t").and_then(|v| v.as_str()) == Some("dm")
+                && e.get("c").and_then(|v| v.as_str()) == Some("private-cipher")
+        }),
+        "third party must not see another users' DM"
+    );
+}
+
 /// Verifies that the `"rewind"` RPC returns messages sent within the requested
 /// time window.
 ///

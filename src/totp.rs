@@ -104,6 +104,14 @@ impl User2FA {
         }
 
         if let Some(config) = &self.totp_config {
+            // Only the SHA256/6-digit scheme we actually generate is supported.
+            // A tampered DB row must not silently be ignored — reject it.
+            if !config.algorithm.eq_ignore_ascii_case("SHA256")
+                || !(6..=10).contains(&config.digits)
+                || config.step == 0
+            {
+                return false;
+            }
             // Check ±1 time window for clock skew tolerance
             // Use integer arithmetic to avoid f64 precision loss.
             let current_time = now();
@@ -113,7 +121,7 @@ impl User2FA {
             let current_counter = (current_time as u64) / config.step;
             for offset in -1..=1i64 {
                 let check_counter = (current_counter as i64 + offset).max(0) as u64;
-                let check_code = generate_hotp_code(&config.secret, check_counter);
+                let check_code = generate_hotp_code(&config.secret, check_counter, config.digits);
                 if secure_string_eq(code, &check_code) {
                     return true;
                 }
@@ -188,11 +196,11 @@ pub fn generate_secret() -> String {
 #[cfg(test)]
 fn generate_totp_code_at_time(secret: &str, step: u64, time: f64) -> String {
     let counter = (time as u64) / step;
-    generate_hotp_code(secret, counter)
+    generate_hotp_code(secret, counter, 6)
 }
 
-/// Generate an HOTP code
-fn generate_hotp_code(secret: &str, counter: u64) -> String {
+/// Generate an HOTP code with the requested number of digits (6–10).
+fn generate_hotp_code(secret: &str, counter: u64, digits: u32) -> String {
     let decoded_secret = match general_purpose::STANDARD.decode(secret) {
         Ok(s) => s,
         Err(_) => return String::new(),
@@ -221,9 +229,11 @@ fn generate_hotp_code(secret: &str, counter: u64) -> String {
         | ((digest[offset + 2] as u32 & 0xFF) << 8)
         | (digest[offset + 3] as u32 & 0xFF);
 
-    // Generate the OTP digits
-    let otp = binary % 1_000_000;
-    format!("{:06}", otp)
+    // Generate the OTP digits (6–10, defaulting to 6 for malformed configs).
+    let digits = digits.clamp(6, 10);
+    let modulus = 10u32.pow(digits);
+    let otp = binary % modulus;
+    format!("{:0width$}", otp, width = digits as usize)
 }
 
 /// Generate a QR code URL for TOTP setup

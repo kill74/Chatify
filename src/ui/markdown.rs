@@ -5,6 +5,8 @@
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
+use super::ansi::sanitize_terminal;
+
 /// Renders markdown text into an ANSI-escaped terminal string.
 ///
 /// # Arguments
@@ -18,7 +20,9 @@ pub fn render_markdown(
     enable_syntax_highlighting: bool,
 ) -> String {
     if !enable_markdown {
-        return input.to_string();
+        // Even with markdown disabled this string may be written to the
+        // terminal, so untrusted control sequences must still be removed.
+        return sanitize_terminal(input);
     }
 
     let parser = Parser::new(input);
@@ -30,21 +34,22 @@ pub fn render_markdown(
     for event in parser {
         match event {
             Event::Text(text) => {
+                let safe = sanitize_terminal(&text);
                 if in_code_block {
-                    code_buffer.push_str(&text);
+                    code_buffer.push_str(&safe);
                 } else {
-                    out.push_str(&text);
+                    out.push_str(&safe);
                 }
             }
             Event::Code(code) => {
                 // Inline code: highlight slightly
                 out.push_str("\x1b[36m"); // Cyan for inline code
-                out.push_str(&code);
+                out.push_str(&sanitize_terminal(&code));
                 out.push_str("\x1b[0m");
             }
             Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang))) => {
                 in_code_block = true;
-                code_lang = lang.to_string();
+                code_lang = sanitize_terminal(&lang);
             }
             Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Indented)) => {
                 in_code_block = true;
@@ -65,7 +70,7 @@ pub fn render_markdown(
                     }
                 } else {
                     out.push_str("\x1b[2m"); // Dim for plain code blocks
-                    out.push_str(&code_buffer);
+                    out.push_str(&sanitize_terminal(&code_buffer));
                     out.push_str("\x1b[0m\n");
                 }
                 code_buffer.clear();
@@ -90,7 +95,7 @@ pub fn render_markdown(
 fn highlight_code_block(code: &str) -> String {
     let mut output = String::new();
     output.push_str("\x1b[38;5;152m");
-    output.push_str(code);
+    output.push_str(&sanitize_terminal(code));
     if !code.ends_with('\n') {
         output.push('\n');
     }
@@ -106,6 +111,33 @@ mod tests {
     fn markdown_disabled_returns_input_unchanged() {
         let input = "**hi** `there`";
         assert_eq!(render_markdown(input, false, true), input);
+    }
+
+    #[test]
+    fn untrusted_control_sequences_are_removed_from_rendered_markdown() {
+        // Inline code preserves the raw string as a Code event, so this
+        // exercises our sanitizer directly rather than pulldown-cmark's own
+        // control-byte filtering.
+        let malicious = "hi `\x1b]52;c;c2VjcmV0\x07secret\x1b[2J` **bold**";
+        let rendered = render_markdown(malicious, true, true);
+
+        assert!(!rendered.contains("]52"), "OSC 52 must not survive");
+        assert!(
+            !rendered.contains("c2VjcmV0"),
+            "clipboard payload must not survive"
+        );
+        assert!(
+            !rendered.contains("\x1b[2J"),
+            "screen-clear CSI must not survive"
+        );
+        assert!(rendered.contains("secret"));
+        assert!(rendered.contains("bold"));
+    }
+
+    #[test]
+    fn markdown_disabled_still_sanitizes_control_sequences() {
+        let rendered = render_markdown("hi\x1b]52;c;c2VjcmV0\x07", false, true);
+        assert_eq!(rendered, "hi");
     }
 
     #[test]
