@@ -27,7 +27,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tungstenite = "0.29"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
